@@ -4219,7 +4219,7 @@ class App(tk.Tk):
                     st = self.doc.building_anim_state(b['base'])
                 except Exception:
                     continue
-                if st['state'] in ('stuck', 'frozen', 'loop'):
+                if st['state'] in ('stuck', 'frozen', 'loop', 'half'):
                     bad.append((b, st))
                 elif st['state'] == 'buildup':
                     n_buildup += 1
@@ -4238,7 +4238,8 @@ class App(tk.Tk):
                                 '说明那不是建造动画问题（可能是 SHP/art 缺帧）。'
                                 % (total, tail))
             return
-        ZH = {'stuck': '卡住', 'frozen': '不播(显示不全)', 'loop': '一直播'}
+        ZH = {'stuck': '卡住', 'frozen': '不播(显示不全)', 'loop': '一直播',
+              'half': '半完成(无头/残缺)'}
         lines = ['%-10s (%3d,%3d)  %-12s  AC=%d 10C=%d 534=%d 6E4=%d'
                  % (b['type'], b['x'], b['y'], ZH[st['state']],
                     st['vals']['+0xAC'], st['vals']['+0x10C'],
@@ -4315,7 +4316,9 @@ class App(tk.Tk):
                 return
         ZH = {'stuck': '卡住（+0x534=1 但 +0x6E4=0）',
               'frozen': '不播（+0x534=0 但 +0x10C=0）',
-              'loop': '一直播（+0xAC=5 播不完）'}.get(st['state'], st['state'])
+              'loop': '一直播（+0xAC=5 播不完）',
+              'half': '半完成（没建完却已置 6E4=1 ⇒ 无头/残缺，还按建成吃电）'
+                      }.get(st['state'], st['state'])
         todo = {'stuck': '+0x6E4=1',
                 'frozen': '+0x10C=2 且 +0xAC=18',
                 'loop': '+0xAC=18'}.get(st['state'], '全套完成态 4 个字段')

@@ -5832,6 +5832,11 @@ class SaveDoc(object):
         playing = (vals['+0x10C'] != 0)
         if finished:
             state = 'done' if accepted else 'stuck'
+        elif accepted:
+            # ★§193.12/13（2026-10-23 玩家三档实测）：没完工（534=0）却已被"接受"（6E4=1）
+            #   ⇒ 引擎认为"已接收但没建成" ⇒ **模型停在半完成帧**（光棱塔就是没头），
+            #   而且**开始按已建成算电力**（三座一起才提示"电力不足"）。
+            state = 'half'
         elif not playing:
             state = 'frozen'
         elif vals['+0xAC'] == 5:
@@ -5847,7 +5852,12 @@ class SaveDoc(object):
                     break
         except Exception:
             pass
-        if state == 'stuck':
+        if state == 'half':
+            txt = ('⚠ 半完成（显示残缺，如光棱塔"无头"）：+0x534=0（没建完）但 +0x6E4=1'
+                   '（已被接受）⇒ 引擎把模型停在半完成帧，**而且已经按建成算电力**。\n'
+                   '   修法：把 +0x6E4 改回 0（让它回到"建造中"，进游戏播一遍动画后完整）；'
+                   '若想直接显示成品，就写完整完成态 AC=5 / 10C=0 / 534=1 / 6E4=1。')
+        elif state == 'stuck':
             txt = ('⚠ 卡住（显示不全）：+0x534=1（已完成）但 +0x6E4=0（动画没结束标记），'
                    '引擎既不播动画也不渲染完成图 ⇒ 这栋在地图上是残缺的。\n'
                    '   修法：写 1 个字节 +0x6E4=1（跳到完成图），'
@@ -5874,7 +5884,7 @@ class SaveDoc(object):
             txt = '✅ 已完成（+0x534=1 且 +0x6E4=1），直接显示完成图'
         return {'base': base, 'type': nm, 'vals': vals, 'state': state,
                 'done_mark': finished and accepted, 'accepted': accepted,
-                'pending': state in ('stuck', 'frozen', 'loop'),   # 兼容旧字段 = 需要修
+                'pending': state in ('stuck', 'frozen', 'loop', 'half'),   # 兼容旧字段 = 需要修
                 # ★§171：buildup 且 +0xD0 过大 ⇒ 会播两遍（不是坏档，但可一键优化成一遍）
                 'replay': state == 'buildup' and vals['+0xD0'] >= self.BLD_D0_REPLAY,
                 'phase': vals['+0xD0'], 'text': txt}
@@ -5910,7 +5920,8 @@ class SaveDoc(object):
     def repair_building_anim(self, base, force=False, phase=None, full=False):
         """把「显示不全 / 一直播」的建筑修好（§170 十四档定稿，in-game 已验）→ dict。
 
-        ★五态语义见 `building_anim_state()`：只有 `stuck / frozen / loop` 需要修。
+        ★六态语义见 `building_anim_state()`：`stuck / frozen / loop / half` 需要修。
+          * `'half'`    ⇒ 把 `+0x6E4` 改回 **0**（§193.13 玩家 T21 实测：三塔全 0 ⇒ 全都有头）
           * `'stuck'`   ⇒ 补 `+0x6E4=1`（E 档：A→E 只差这 1 字节，显示正常）
           * `'frozen'`  ⇒ 写全套完成态 4 字段（`AC=5/10C=0/534=1/6E4=1`）
           * `'loop'`    ⇒ 同上（直接跳到完成图，不再无限播）
@@ -5936,6 +5947,10 @@ class SaveDoc(object):
             plan = dict(self.BLD_ANIM_OK)
         elif state == 'stuck':
             plan = dict(self.BLD_ANIM_MIN_FIX)      # 1 字节就够（A→E 已证）
+        elif state == 'half':
+            # ★半完成：改回"建造中"（6E4=0）⇒ 重载播一遍动画后模型完整。
+            #   T21 实测：三座 6E4=0 的塔进游戏全部有头、正常。
+            plan = {'+0x6E4': 0}
         else:                                       # frozen / loop
             plan = dict(self.BLD_ANIM_OK)           # 直接写成完成态 4 个字段
         if phase is None:
