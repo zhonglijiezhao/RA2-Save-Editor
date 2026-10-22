@@ -1,0 +1,80 @@
+# ================= 构建 / 打包产物 =================
+build/
+build_dist/
+build_dist_*/
+build_dist_new/
+build_dist_tmp*/
+build_p[0-9]*/
+build_work/
+_build_bak/
+*.spec.bak
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ================= 逆向 / 取证工作区（★含游戏二进制，绝对不能提交）=================
+# _re/ 里有 gamemd.exe（4.8MB 版权文件）与反汇编快照
+_re/
+_mem/
+_memsnap/
+_exp/
+_expmix*/
+_ref_rust/
+_vid_frames/
+_crash*/
+_pylibs/
+
+# ================= 游戏文件 / 存档样本（版权 + 隐私）=================
+*.SAV
+*.sav
+*.MAP
+*.map
+*.MIX
+*.mix
+*.SHP
+*.shp
+*.VXL
+*.vxl
+*.HVA
+*.hva
+*.pcx
+*.PCX
+*.bin
+*.dmp
+*.bak
+ALL01UMD*
+新建文件夹*/
+
+# ★core/unit_comp_lib/*.bin 是**本工具自己生成的**伴随对象模板（每个 1KB 的存档片段，
+#   不含美术素材），必须跟代码一起走，所以单独放行。
+!core/unit_comp_lib/*.bin
+
+# ★core/ini_builtin/ 里是游戏原版 rulesmd.ini / artmd.ini（EA 版权），不开源、不提交。
+#   需要的人把自己的游戏文件放进去即可（见该目录 README.md）。
+core/ini_builtin/*.ini
+
+# ================= 运行期产物 =================
+_selftest_out/
+自检结果.txt
+启动错误.txt
+*.log
+_build*.log
+*.out
+*.bak*
+自检_*.txt
+_view_*.png
+
+# ================= 开发期的临时探针脚本 =================
+# 根目录有 300+ 个 _xxx.py 一次性探针；仓库只保留**自检**与**路径工具**，
+# 其余留在本地（它们依赖本地存档样本，公开也没有意义）。
+_*.py
+!_selftest_*.py
+!_paths.py
+_*.txt
+_*.json
+_*.cmd
+
+# ================= 内部交接档 / 草稿 =================
+handoff-*.md
+docs/handoff-*.md
+_doc*.md

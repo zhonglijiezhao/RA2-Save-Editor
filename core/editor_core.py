@@ -1,0 +1,10607 @@
+# -*- coding: utf-8 -*-
+"""RA2/YR 存档编辑 — 业务核心层（纯 Python，无 GUI 依赖，可单独测试）
+
+对外 API:
+    doc = SaveDoc(path)          # 打开并解码
+    doc.info                     # dict: 任务名/阵营/时间/金钱...
+    doc.records                  # list[Rec]: 触发/Tag 记录
+    doc.set_money(v)             # 改玩家阵营金钱
+    doc.houses() / set_house_money(short, v)   # 全部所属方金钱（12 阵营）
+    doc.toggle_trigger(rec, on)  # 启用/禁用触发
+    doc.events()  / set_event(ev, etype=, arg=)    # 事件（对象签名定位）
+    doc.actions() / set_action(ac, atype=, arg=)   # 行为（对象签名定位）
+    doc.save(out_path)           # 重编码 + CFB 重建落盘
+"""
+import sys, os, re, struct, hashlib, datetime, shutil, json, bisect, base64
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from cfb import CFB                      # noqa: E402
+from lzo1x import lzo1x_decompress       # noqa: E402
+from lzo_compress import compress        # noqa: E402
+import cfb_surgery                       # noqa: E402
+import cfb_write                         # noqa: E402  (从零重建容器的写入器)
+from fa2_tables import (EVENT_TYPES, ACTION_TYPES,     # noqa: E402
+                        event_name, event_ptype, action_name, action_ptype,
+                        event_note, action_note,
+                        SCRIPT_ACTIONS, SCRIPT_PARAM_TYPES,
+                        script_action_name, script_action_ptype)
+from map_ini import MapIni, find_maps                  # noqa: E402
+
+# ---- 事件 / 行为对象：用「对象签名」确定性定位（2026-10-13 定案）----
+# 每个事件/行为对象体内含 16 字节签名（跨档稳定，58 档批量验证 100% 命中）：
+#   obj+0 : 4F0EC392/4F0EC393   obj+4 : 11D20A55
+#   obj+8 : 6000A7AC            obj+12: B55B0508
+# 布局：类型在 obj+64、参数在 obj+72（对外报的「记录起点」即 obj+64）。
+# 数组 = `[行为对象…][4 字节][事件对象…]`；**行为对象固定 168 字节**，
+# **事件对象尺寸随档变化**（108 / 124，实测）⇒ 禁止用固定步长拼链。
+OBJ_SIG = struct.pack('<III', 0x11D20A55, 0x6000A7AC, 0xB55B0508)
+OBJ_TYPE_OFF = 64
+OBJ_ARG_OFF = 72
+ACTION_SIZE = 168
+
+# ---- §175 行为 56/57（设置 / 清除局部变量）的**变量号不在 +72，而在 +164** ----
+# 证据（gamemd.exe 静态反汇编，2026-10-22）：
+#   ActionClass::Execute 分派 = `edx = [esi+0x2C] - 1; cmp edx,0x90; jmp [edx*4+0x6DFDEC]`
+#     （0x6DD8D7 起；表索引 = 行为类型 − 1）
+#   表[55] → 0x6DF1DE（case 56）: `mov ecx,[esi+0x90]` → `push 1` → SetLocalVariable(idx, 1)
+#   表[56] → 0x6DF201（case 57）: `mov edx,[esi+0x90]` → SetLocalVariable(idx, <值>)
+#   ⇒ 运行期字段 +0x90 ↔ 存档记录 +0xA4（差 0x14 记录头，与 类型 +0x2C↔+0x40 同理）
+# ⚠ 写错到 +72 时引擎读 +164 得 0 ⇒ **永远去设置变量 0**，看起来"设了但检查的那个变量没动"。
+ACT_VAR_OFF = 164
+ACTION_VAR_TYPES = (56, 57)
+
+# ---- §175 局部变量表（ScenarioClass 里的定长槽数组）----
+# 引擎侧（gamemd.exe）：
+#   GetLocalVariable 0x689A00: `if (i >= 0x64) return false;`
+#       `al = [this + i*41 + 0x24B2]`      ← 值（1 字节）
+#   FindLocalVariableByName 0x689AC0 / 0x689A30: 遍历 100 槽，步长 0x29，名字在 `this + i*41 + 0x248A`
+#   SetLocalVariable 0x689910: 写 `[this + i*41 + 0x24B2]`，若值有变则 `this[0x34AA]=1` 并 call 0x6E5820(i)
+#   LoadLocalVariableNames 0x689B20: 清空 100 槽后按 `[VariableNames]` 的 01..99 依次填名字
+# ⇒ 槽 = **name[40] + value(u8) = 41B**，共 **100 槽（索引 0..99）**，明文基址 **0x248A**。
+#   FA2 名称框里的"第 N 个"（1..99）对应引擎索引 **N-1**（事件/行为参数就是引擎索引）。
+LOCALVAR_BASE = 0x248A
+LOCALVAR_SLOT = 0x29
+LOCALVAR_NAME_LEN = 40
+LOCALVAR_COUNT = 100
+
+# ★★★2026-10-22 勘误（§176）：**存档自足 —— 读档不会被地图覆盖**（玩家实测：删掉地图
+#   存档照样能读、触发照样执行；本工具整条管线也证明了存档自带全部触发/路径点/变量状态）。
+#   地图 `[VariableNames]` 只在**读地图 / 开局**时被消费，不是读档路径：
+#     `LoadLocalVariableNames 0x689B20`：
+#        ① 先把 100 槽的**名字首字节**逐槽清 0（`mov byte [eax],0; add eax,0x29` × 100）；
+#        ② 按 `[VariableNames]` 条目数 count（`0x526960` 取键数，≥0x64 截 100）循环：
+#           键 → atoi 得**引擎索引**，值串 `Name,Default` → 名字写槽首、默认值写槽尾
+#           （`mov byte [ebx+0x24B2], setne(atoi(...))`）。
+#     ★它**唯一的调用者**在 `0x68A734`，紧跟其后就是写 `Ranking/ParTimeEasy/ParTimeMedium`
+#       （`0x52A760`）—— 那是**地图读/写**（ScenarioClass::Read/WriteScenario）路径，
+#       ⇒ 这份表是"地图里的变量定义"，不是"读档时覆盖存档"。
+#   所以变量有两处，各管一段（工具两边都写）：
+#     · 存档 0x248A 的 100 槽 = **运行期状态**（权威；事件 36 判的就是它）
+#     · 地图 `[VariableNames]`（`i=Name,Default`）= **地编里能选中的变量清单 + 开局默认值**
+#   玩家原话：「A 变量是我把默认值从 0 改成了 1，所以 AAAAA 的写法一开局就成立；
+#              B 默认 0，所以要先 BBBBB 改值，CCCCC 再检测 B=1」。
+MAPVAR_SECTION = 'VariableNames'
+SCENARIO_EXTS = ('.map', '.mmx', '.yrm', '.mpr')
+
+# ---- §181 ★★★★★「纯电平查询」事件必须挂计时心跳（T10 定案，2026-10-22）----
+# 机制（工具里早就写着、但直到 T10 才在局部变量上闭环验证）：
+#   create_trigger: `ticks = ev_arg * LOGIC_FPS if ev_type == 13 else 0`
+#   `ticks > 0` 才把 CellTag 自键**登记进「定时触发器挂接表」**
+#   ⇒ 表外的触发**读档后没有人驱动**，只有靠"对象/标签回调"才会被评估。
+# 事件分两类：
+#   · 回调型：1 进入 / 7 摧毁 / 29 被摧毁或占领 / 48 被任何事物摧毁 …（有对象触发回调）
+#   · **轮询型：36 局部变量≠0 / 37 局部变量==0** —— 纯电平查询，没有回调可依赖
+# ⇒ 36/37 若不伴随计时事件 ⇒ 永不评估（读档后完全不动，且工具/FA2 里看着一切正常）。
+# T8/T9/T10 实测（每一条都与本模型吻合）：
+#   T8-C 13/9s+36(0) 出 ；T8-F 36(3) 单出 ✗ ；T9-P1 13/6s+36(3) 出 ；T9-P4 纯 36 ✗ ；
+#   T10-Q1 纯 36 ✗ / Q2 13+36 ✓ / Q3 13 ✓（同格可建）⇒ 唯一差别就是"挂不挂计时事件"。
+#   T10 档的「定时触发器挂接表」实测只有 2 个键 = Q2+Q3 的 CellTag，**Q1 不在表里**。
+POLL_EVENT_TYPES = frozenset((36, 37))
+HEARTBEAT_EVENT = 13          # 「流逝时间」—— 最省心的心跳（arg = 秒）
+HEARTBEAT_SEC = 1             # 心跳秒数：1 秒起，对"全部满足才执行"的逻辑无副作用
+
+
+def _cfg_span(raw, sec):
+    """字节流里定位 `[sec]` 段 → `(头起点, 内容起点, 内容终点)`；没有则 None。
+
+    内容终点 = 下一个 `\\r\\n[` / `\\n[` 的换行处 ⇒ 段尾那个空行保持不动。
+    """
+    tag = ('[' + sec + ']').encode('ascii')
+    i = raw.lower().find(tag.lower())
+    if i < 0:
+        return None
+    b = i + len(tag)
+    while b < len(raw) and raw[b:b + 1] in (b'\r', b'\n'):
+        b += 1
+    j = len(raw)
+    for pat in (b'\r\n[', b'\n['):
+        k = raw.find(pat, b)
+        if 0 <= k < j:
+            j = k
+    return i, b, j
+
+
+def parse_scenario_variables(raw):
+    """解析地图 `[VariableNames]` 段 → `[(idx, name, default), …]`（按 idx 升序）。
+
+    条目形如 `0=A,1`（引擎索引 = 键；名字与默认值用逗号隔开，默认值缺省按 0）。
+    """
+    sp = _cfg_span(raw, MAPVAR_SECTION)
+    if not sp:
+        return []
+    body = raw[sp[1]:sp[2]].decode('latin1', 'replace')
+    items = []
+    for ln in body.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        ln = ln.strip()
+        if not ln or ln.startswith(';') or '=' not in ln:
+            continue
+        k, v = ln.split('=', 1)
+        try:
+            idx = int(k.strip(), 10)
+        except ValueError:
+            continue
+        nm, dv = v, '0'
+        if ',' in v:
+            nm, dv = v.split(',', 1)
+        nm = nm.strip()
+        try:
+            ival = int(float(dv.strip() or '0'))
+        except ValueError:
+            ival = 0
+        items.append((idx, nm, ival & 0xFF))
+    return sorted(items, key=lambda t: t[0])
+
+
+def read_scenario_variables(path):
+    """读地图文件的局部变量定义 → `{'path','items','exists'}`。"""
+    if not path or not os.path.exists(path):
+        return {'path': path, 'items': [], 'exists': False}
+    raw = open(path, 'rb').read()
+    return {'path': path, 'items': parse_scenario_variables(raw), 'exists': True}
+
+
+# ★★★★★ 2026-10-22 §191：**FA2sp 的 `[Digest]` 校验**
+#   地图末尾有 `[Digest]` / `1=<base64>`，值是：
+#       base64( sha1( 整个地图文件去掉 [Digest] 段、并把 CRLF 换成 LF ) )
+#   （两个不同版本的地图都逐字节复现成功 ⇒ 算法确认）
+#   游戏/FA2 靠它判断"地图是否被外部改过"。我们改 `[VariableNames]` 之后**必须同步重算**，
+#   否则玩家会看到「地图被人修改」的提示（玩家实踩）。
+_MAP_DIGEST_SECTION = 'Digest'
+
+
+def map_digest_of(raw):
+    """算一份地图应有的 `[Digest]` 值（base64 字符串）；地图没有该段也照算。"""
+    m = re.search(rb'\[Digest\]\r?\n[^\r\n]*\r?\n?', raw)
+    body = (raw[:m.start()] + raw[m.end():]) if m else raw
+    return base64.b64encode(hashlib.sha1(body.replace(b'\r\n', b'\n')).digest()).decode()
+
+
+def refresh_map_digest(raw):
+    """把 `[Digest]` 段的值改成本次内容对应的正确值（没有该段就原样返回）。"""
+    m = re.search(rb'(\[Digest\]\r?\n)1=([A-Za-z0-9+/=]+)', raw)
+    if not m:
+        return raw
+    want = map_digest_of(raw).encode()
+    return raw[:m.start(2)] + want + raw[m.end(2):]
+
+
+def write_scenario_variables(path, items, backup=True):
+    """**原地改写地图的 `[VariableNames]`**（只动这一段，其余字节一字不改）→ dict。
+
+    `items` = `[(idx, name, default), …]`；`name` 为空 ⇒ 该号不写入（等于不定义）。
+    ★为什么"两边都要写"见文件头 §176 注释：地图这段 = **地编清单 + 开局默认值**，
+      存档 0x248A 那 100 槽 = **运行期权威值**（读档**不会**被地图覆盖，玩家实证）。
+    首次改写会留一份 `<地图>.bak`（已存在则不覆盖），便于回滚。
+    """
+    items = [(int(i), str(n or '').strip(), int(d or 0) & 0xFF)
+             for (i, n, d) in (items or [])]
+    items = [(i, n, d) for (i, n, d) in items if n]
+    for (i, n, _d) in items:
+        if not (0 <= i < LOCALVAR_COUNT):
+            raise ValueError('变量索引 %d 越界（引擎只认 0..%d）' % (i, LOCALVAR_COUNT - 1))
+        if any(c in n for c in ',\r\n='):
+            raise ValueError('变量名 %r 不能含逗号/等号/换行（那会破坏 INI）' % (n,))
+    items.sort(key=lambda t: t[0])
+    raw = open(path, 'rb').read()
+    lines = ['%d=%s,%d' % (i, n, d) for (i, n, d) in items]
+    block = ('\r\n'.join(lines) + ('\r\n' if lines else '')).encode('latin1')
+    sp = _cfg_span(raw, MAPVAR_SECTION)
+    if sp:
+        new = raw[:sp[1]] + block + raw[sp[2]:]
+        mode = 'replaced'
+    else:
+        head = ('[%s]\r\n' % MAPVAR_SECTION).encode('ascii')
+        add = head + block + b'\r\n'
+        anchor = _cfg_span(raw, 'Waypoints')
+        if anchor:                       # 尽量贴近 FA2 的位置（在 [Waypoints] 之前）
+            at = anchor[0]
+            while at > 0 and raw[at - 1:at] in (b'\r', b'\n'):
+                at -= 1
+            new = raw[:at] + b'\r\n\r\n' + add + raw[at:]
+        else:
+            new = raw + (b'\r\n' if not raw.endswith(b'\n') else b'') + add
+        mode = 'added'
+    bak = None
+    if backup:
+        bak = path + '.bak'
+        if not os.path.exists(bak):
+            with open(bak, 'wb') as f:
+                f.write(raw)
+    # ★§191：改完必须重算 [Digest]，否则游戏/FA2 会提示「地图被人修改」
+    dig_before = map_digest_of(raw)
+    new = refresh_map_digest(new)
+    dig_after = map_digest_of(new)
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(new)
+    os.replace(tmp, path)
+    return {'path': path, 'mode': mode, 'count': len(items),
+            'digest_before': dig_before, 'digest_after': dig_after,
+            'backup': bak if (bak and os.path.exists(bak)) else None,
+            'items': items}
+
+
+# ---------------- 地图路径点（★2026-10-22：玩家要求"125 的落点要写进地图路径点"） ----------------
+WAYPOINT_SECTION = 'Waypoints'
+
+
+def parse_scenario_waypoints(raw):
+    """解析地图 `[Waypoints]` → `{号: (x, y)}`；编码是 **`y×1000 + x`**（`0=84068` ⇒ (68,84)）。
+
+    已用存档对拍确认方向：`同触发.SAV` 存档路径点 0 = (68,84)、地图 `0=84068` ⇒ 值 = y*1000+x。
+    """
+    sp = _cfg_span(raw, WAYPOINT_SECTION)
+    if not sp:
+        return {}
+    body = raw[sp[1]:sp[2]].decode('latin1', 'replace')
+    out = {}
+    for ln in body.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        ln = ln.strip()
+        if not ln or ln.startswith(';') or '=' not in ln:
+            continue
+        k, v = ln.split('=', 1)
+        k, v = k.strip(), v.strip()
+        if not k.isdigit():
+            continue
+        try:
+            iv = int(float(v.split(',')[0] or '0'))
+        except ValueError:
+            continue
+        n = int(k, 10)
+        if iv <= 0:
+            continue
+        y, x = divmod(iv, 1000)
+        out[n] = (x, y)
+    return out
+
+
+def read_scenario_waypoints(path):
+    """读地图文件的 `[Waypoints]` → `{'path','items','exists'}`。"""
+    if not path or not os.path.exists(path):
+        return {'path': path, 'items': {}, 'exists': False}
+    raw = open(path, 'rb').read()
+    return {'path': path, 'items': parse_scenario_waypoints(raw), 'exists': True}
+
+
+def write_scenario_waypoints(path, items, backup=True):
+    """**原地改写地图的 `[Waypoints]`**（只动这一段）→ dict。
+
+    `items` = `{号: (x, y)}` 或 `[(号, (x,y)), …]`；编码写成 `号=y*1000+x`。
+    ★为什么要写：行为 125「把建筑建于路径点 N」的落点就是路径点坐标；
+      玩家实测口径 —— **建筑落在哪，那个格的路径点就得在（存档 + 地图都对得上）**。
+      存档里那份（`set_waypoint`）决定运行期落点，地图这份决定地编/重载时看得见。
+    首次改写留 `<地图>.bak`（已存在则不覆盖）。
+    """
+    if isinstance(items, dict):
+        pairs = list(items.items())
+    else:
+        pairs = list(items or [])
+    clean = {}
+    for n, c in pairs:
+        if isinstance(c, (tuple, list)) and len(c) >= 2 and c[0] is not None and c[1] is not None:
+            x, y = int(c[0]), int(c[1])
+        elif isinstance(c, int) and c > 0:          # 直接给编码值
+            y, x = divmod(c, 1000)
+        else:
+            continue
+        if x <= 0 and y <= 0:
+            continue
+        clean[int(n)] = (x, y)
+    for n in clean:
+        if not (0 <= n < LOCALVAR_COUNT * 100):     # 上限宽松，只防负数/离谱值
+            raise ValueError('路径点号 %d 越界' % n)
+    raw = open(path, 'rb').read()
+    lines = ['%d=%d' % (n, y * 1000 + x) for n, (x, y) in sorted(clean.items())]
+    block = ('\r\n'.join(lines) + ('\r\n' if lines else '')).encode('latin1')
+    sp = _cfg_span(raw, WAYPOINT_SECTION)
+    if sp:
+        new = raw[:sp[1]] + block + raw[sp[2]:]
+        mode = 'replaced'
+    else:
+        head = ('[%s]\r\n' % WAYPOINT_SECTION).encode('ascii')
+        new = raw + (b'\r\n' if not raw.endswith(b'\n') else b'') + head + block + b'\r\n'
+        mode = 'added'
+    bak = None
+    if backup:
+        bak = path + '.bak'
+        if not os.path.exists(bak):
+            with open(bak, 'wb') as f:
+                f.write(raw)
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(new)
+    os.replace(tmp, path)
+    return {'path': path, 'mode': mode, 'count': len(clean),
+            'backup': bak if (bak and os.path.exists(bak)) else None,
+            'items': dict(sorted(clean.items()))}
+
+
+def read_map_ini_size(path):
+    """读地图 `[Map] Size=a,b,c,d` → (c, d)（= 右/下边界，单位格）；读不出返回 None。
+
+    ★为什么需要它（2026-10-22 实踩）：官方地图也叫 `ALL01UMD.MAP`。玩家把自己的测试图
+    （`Size=0,0,80,80`，9 条路径点）移走后，上溯查找会在 `E:\\` 根目录撞上**原版**
+    `ALL01UMD.MAP`（`Size=0,0,120,120`，350 条路径点）。认错图轻则提示错乱，重则
+    `register_waypoints_to_map()` 把路径点写进**别人的地图**。⇒ 必须按尺寸核对。
+    """
+    try:
+        raw = open(path, 'rb').read()
+    except Exception:
+        return None
+    low = raw.lower()
+    i = low.find(b'[map]')
+    if i < 0:
+        return None
+    j = low.find(b'size=', i, i + 4000)
+    if j < 0:
+        return None
+    k = raw.find(b'\n', j)
+    if k < 0:
+        k = j + 40
+    txt = raw[j + 5:k].decode('latin1').strip()
+    parts = [p.strip() for p in txt.split(',')]
+    if len(parts) < 4:
+        return None
+    try:
+        return (int(parts[2]), int(parts[3]))
+    except Exception:
+        return None
+
+
+def find_scenario_map(save_path, name=None, extra_dirs=None, size=None):
+    """按存档内嵌的地图名找地图文件（Windows 不区分大小写）→ 路径 或 None。
+
+    `size` = 存档自带的 (W, H)（`SaveDoc.map_size()`）：
+      · 给了就**只接受 `[Map] Size` 右/下值与之一致**的候选（防同名官方图误认）；
+      · 候选全都尺寸不符 ⇒ 返回 None，宁可"没找到"也不要写坏别人的图。
+    """
+    if not name:
+        return None
+    dirs = []
+    try:
+        d = os.path.dirname(os.path.abspath(save_path))
+        for _ in range(4):               # 存档目录 + 上溯 3 级
+            if d and d not in dirs:
+                dirs.append(d)
+            nd = os.path.dirname(d)
+            if nd == d:
+                break
+            d = nd
+    except Exception:
+        pass
+    for d in (extra_dirs or []):
+        if d and d not in dirs:
+            dirs.append(d)
+    for d in dirs:
+        p = os.path.join(d, name)
+        if not os.path.exists(p):
+            continue
+        if size:
+            got = read_map_ini_size(p)
+            if got and tuple(got) != tuple(size):
+                continue                 # 尺寸不符 ⇒ 同名异图，跳过
+        return p
+    return None
+
+# 遗留常量：仅为兼容旧脚本引用，**定位逻辑已不再使用固定步长**
+EVENT_STEP = 108
+ACTION_STEP = 168
+
+# ---- 触发「运行时启用位」（2026-10-13 定案，跨图通用）----
+# 每个触发对象体内含 16 字节**类 GUID**（触发对象类型）：
+#   1D 时实测两图同一常量：243509BA-4CF4-11D2-BC26-00104B8FB04D
+# 「启用位」= 该 GUID **前 8 字节**处的 1 个字节：1=启用 / 0=禁用。
+# ★ 记录内偏移**随图变化**（新图 +236 / 旧图 +328），因为 GUID 前有变长内容
+#   ⇒ 不能写死偏移，必须用 GUID 当锚点。
+# 证据：60+ 档统计，10 个「已知游戏内状态」的档 100% 吻合，零误报；
+#   其中旧图 6691/6692 与用户游戏内实测（不胜利/胜利）逐字节对应。
+TRIG_CLASS_GUID = bytes.fromhex('243509baf44cd211bc2600104b8fb04d')
+TRIG_FLAG_BACK = 8
+
+# ---- 自制地图的另一种触发记录格式（2026-10-14 SAVE2DD8 实测）----
+# 自制任务地图的触发 ID 是**随机八位十六进制**（064BA67C…），不是 FA2 顺序的 01xxxxxx；
+# 记录体 200B 等距：ID@+0、名字@+64（**UTF-8/ASCII**，老档是 GBK）、
+# +116 顺序索引、+120..122 = 01 01 01（难度位，与老格式同）、**+123 = 运行期启用位**
+# （1=启用；47/47 与地图 [Triggers] 禁用标志完美对拍）、+152 恒定类 GUID
+# C02D1591-0A2A-11D2-ACA7-006008055BB5（记录体里无 243509BA ⇒ 老锚点失效）。
+TRIG_CLASS_GUID2 = bytes.fromhex('91152dc02a0ad211aca7006008055bb5')
+TRIG_CLASS_GUID0 = bytes.fromhex('90152dc0')          # 老格式 TagClass C02D1590-… 的前 4 字节
+TRIG_GUID2_HEAD = bytes.fromhex('ba093524f44cd211')   # 老触发 GUID 前 8 字节（判归属用短锚）
+
+# ---- 标签（Tag）类 GUID 与「重复类型」（★2026-10-20 玩家 + ModEnc 定案）----
+# TAG_CLASS_GUID 的稳定**尾 12 字节**（首 4 字节会 ±1，不能整串匹配：
+#   实测 SAVE18BE 里 C 的标签记录多带 4 字节字段，首 4 字节从 33 e4 f6 54 变 32 e4 f6 54）。
+TAG_GUID_TAIL = bytes.fromhex('ed09d211aca5006008055bb5')
+TAG_PERSIST_WIN = (124, 168)        # GUID 尾搜索窗（记录带额外字段时会整体漂 ±4）
+TAG_PERSIST_OFF = 120               # ★标签记录 +120 (u32) = 持久性 = "重复类型"
+                                     #   0=一次性·任一挂载  1=一次性·挂载清空  2=可重复
+                                     #   ★"任一/全部"说的是**标签挂在多个对象上时**哪个对象的事件算数，
+                                     #     不是"一个触发里多个事件"的关系！（见 §156 纠错）
+                                     #   同一触发内的多个事件恒为 AND（全部成立才执行），与持久性无关
+TAG_REC_DELTA = 56                  # 记录帧 = 标签对象帧 + 56（⇒ 记录+120 = 对象+0xB0）
+
+# ======== §192（2026-10-22）TagTypeClass 报文全字段表 ========
+# 硬证据：
+#   · RTTI：`.?AVTagTypeClass@@` TypeDescriptor @0x842CB0 → COL @0x80BCF0 → **vtable 0x7F45C4**
+#     （另有 3 个基类子对象 vtable：0x7F45A8 / 0x7F45A0 / 0x7F4598，都在对象 +0/4/8/0xC）
+#   · vtable[12] = 0x6E64A0 `mov eax,0xA4; ret` ⇒ **对象体 = 164B**；vtable[11] = 0x6E6490 返回 **0x2D = 45**（ClassID）
+#   · `TagTypeClass::WriteINI` @0x6E6160 —— 写地图 `[Tags]` 那一行，格式串 `"%d,%s,%s"`：
+#         sprintf(dst, "%d,%s,%s", this+0x9C, this+0x64, trigger->0x24)   ⇒ 持久性/名字/触发ID 三个字段落实
+#         （trigger 为空时走 `"%s,<none>"`；键名 = this+0x24）
+#   · 实测语料：SAVE4CA2（82 个标签）/ SAVE18BE（83）/ 同触发.SAV / 触发C为地编写入.sav
+#     +0x9C 分布 {0:73, 2:9} 与 `tag_persist()` 完全一致；+0x98 = 0..81 严格递增（序号）
+#     +0xA0 逐个命中某个 54F6E434（触发实例）记录的自键 ⇒ 标签→触发 的连线
+TAG_TYPE_GUID = bytes.fromhex('33e4f654ed09d211aca5006008055bb5')   # 54F6E433（同 TRIG_TAGOBJ_GUID）
+TAG_TYPE_REC_SIZE = 184              # 记录 = [16B GUID][4B 自键][164B 对象体]
+TAG_TYPE_SIZE = 164                  # 对象体（= Size() 0xA4）
+TAG_TYPE_OBJ_DELTA = 20              # 对象体起点 = GUID 起点 + 20
+TAG_TYPE_VTABLES = (0x7F45C4, 0x7F45A8, 0x7F45A0, 0x7F4598)   # 跨档恒定，克隆时保留、从零造时照抄
+TAG_TYPE_IDLEN_OFF = 0x10            # u32 恒 -1（AbstractClass 的 ID 初值）
+TAG_TYPE_ID_OFF = 0x24               # char[8] **唯一 ID 串**（"01000001"…= 0x01000000|计数，%08X）
+                                     #   同时是地图 `[Tags]` 的键名
+TAG_TYPE_NAME_OFF = 0x64             # char[52] 名字（★GBK，不是 UTF-8）
+TAG_TYPE_NAME_LEN = 52
+TAG_TYPE_INDEX_OFF = 0x98            # u32 集群内**序号**（0 基，必须与位置一致）
+TAG_TYPE_PERSIST_OFF = 0x9C          # u32 持久性 / "重复类型" 0/1/2（= 地图 [Tags] 第 0 字段）
+TAG_TYPE_TRIGGER_OFF = 0xA0          # 键 → 触发实例（TriggerTypeClass，C02D1591）
+TAG_TYPE_STATIC60_OFF = 0x60         # 静态常量指针 0x00887734（引擎 .data，82/82 恒定，别动）
+TAG_TYPE_STATIC60 = 0x00887734
+# ★"垃圾槽"：+0x14/+0x20/+0x2C..+0x5F 是**没被序列化使用的残留区**。
+#   实测：刚建好就存的档（同触发.SAV / 触发C为地编写入.sav）里全 0；
+#         长期任务档 SAVE4CA2 的 82 个标签里有 439 个 dword 非 0，值是旧键(0x13xxxxxx)、
+#         裸指针(0x10xxxxxx) 甚至短串(0x584948)，但游戏照样跑 ⇒ **残留本身无害**。
+#   工具侧仍然清零（克隆模板会把这些旧值原样搬进新触发，归零 = 让新标签和"刚建的"一致）。
+TAG_TYPE_STALE = ((0x14, 0x24), (0x2C, 0x60))
+
+# ---- 触发「流逝时间」的**运行期帧数**（2026-10-13 定案）----
+# 触发记录里有个恒定的 4 字节标记 `C4 60 72 00`（游戏数据段里的一个静态指针常量），
+# 其**后一个 u32 = 该触发「流逝时间」的等待帧数 = 秒 × 15**（RA2 逻辑帧率 15 fps）。
+#
+# ★ 为什么必须同时改这里：事件对象里 `+72` 的 u32 是**秒**（= 地图 INI 里写的值），
+#   而引擎实际计时用的是这里的**帧**。实测（用户游戏内验证）：
+#     · 只把事件 `+72` 由 60 改成 10  ⇒ 游戏仍在 **60 秒**时触发（改动被忽略）
+#     · 同时把标记处由 900 改成 150 ⇒ 见 README 的验证记录
+#   跨档核对（标记处 ÷15 全部等于某个事件的秒数）：
+#     新图 13/60→900 ✓ ; 13/5→75 ✓ ; 13/20→300 ✓ ; 13/4789→71835 ✓ ; 13/1337→20055 ✓
+#   ⇒ 秒数×15 恒为 15 的整数倍，可作为校验条件。
+TIME_MARK = bytes.fromhex('c4607200')
+LOGIC_FPS = 15
+
+# ---- 新写触发（2026-10-14 五轮实验 + V1/V2/V4 游戏内实测通过）----
+TRIG_INSTANCE_GUID = bytes.fromhex('91152dc02a0ad211aca7006008055bb5')  # C02D1591 触发实例
+TRIG_TAGOBJ_GUID = bytes.fromhex('33e4f654ed09d211aca5006008055bb5')    # 54F6E433 标签对象
+TRIG_OBJ_SIZE = 200
+TAG_OBJ_SIZE = 184
+
+# ---- 触发「集群」的另两个成员：TagNode / CellTag（2026-10-14 定案）----
+# ★★★ 游戏地编写入的权威档（触发C为地编写入.sav）证明：一个可用触发 = **六件套**
+#     [标签 184B][CellTag 76B][实例 200B][TagNode 92B]（各带 4B 组计数，同区 0x13xxxxxx 键）
+#     + 事件/行为对象。少了 TagNode/CellTag ⇒ 行为触发链断裂：
+#     实测「只有电厂自爆生效，地图点亮/胜利都不生效」；补齐后 10 秒点亮、30 秒胜利（玩家实测）。
+#   · CellTag +56 = 标签键、+60 = TagNode 键、+64 = 挂接数（无挂接 = 0）；
+#   · TagNode +56 = 触发实例键、+80 = 「流逝时间」等待帧数（秒 × 15）、+88 最低位 = 启用状态；
+#   · 组内顺序 = 追加到组尾，与权威档一致。
+TRIG_NODE_GUID = bytes.fromhex('90152dc02a0ad211aca7006008055bb5')   # C02D1590 TagNode
+TRIG_NODE_SIZE = 92
+TRIG_CELLGUID = bytes.fromhex('32e4f654ed09d211aca5006008055bb5')   # 54F6E432 CellTag
+TRIG_CELL_SIZE = 76
+# ★2026-10-17：**新开局的档里没有 TagNode/CellTag 可克隆** —— 用"空壳模板"从零造。
+#   类常量（`+20..+35` 四个 vtable 指针、TagNode `+76`）跨档恒定、由引擎写入；
+#   其余全 0，键/链接/计时帧/启用位由 `create_trigger` 填。
+TRIG_NODE_TEMPLATE = bytes.fromhex(
+    '90152dc02a0ad211aca7006008055bb5'
+    '00000000' '58587f003c587f0034587f002c587f00' 'ffffffff'
+    + '00' * 36 + '52947c00' + '00' * 12)          # 92B
+TRIG_CELL_TEMPLATE = bytes.fromhex(
+    '32e4f654ed09d211aca5006008055bb5'
+    '00000000' 'e0447f00c4447f00bc447f00b4447f00' 'ffffffff'
+    + '00' * 36)                                    # 76B
+# 「定时触发器激活登记表」在**空表**时的结构指纹：`[u32 0 字段][u32 14][u32 14][u32 0a]`
+#   （表 = `[u32 n][cell 键 × n]` 紧跟这段）⇒ 用它反推 count 位置 = 指纹起点 − 4 − 4n。
+TIMER_TABLE_TAIL = bytes.fromhex('00000000' '14000000' '14000000' '0a000000')
+NODE_TRIGKEY_OFF = 56        # TagNode → 触发实例键
+NODE_TICKS_OFF = 80          # TagNode → 等待帧数（秒 × LOGIC_FPS）
+NODE_FLAG_OFF = 88           # TagNode → 启用状态（最低位 1=启用 / 0=禁用）
+NODE_SPARE76 = 0x007C9452    # TagNode +76：权威档同字段值（引擎似会重算，取实测通过件原值）
+CELL_TAGKEY_OFF = 56         # CellTag → 标签键
+CELL_NODEKEY_OFF = 60        # CellTag → TagNode 键
+CELL_COUNT_OFF = 64          # CellTag → 挂接数（无挂接 = 0）
+NODEGRP_BASE_KEY = 0x133FD000   # TagNode/CellTag 键所在区（同区未用键 +0x1000 起）
+
+# 触发记录的字段偏移（★相对**记录起点** = 触发实例对象 + 56 处的 ID 字符串）：
+#   +64 名字 / +120..123 难度位+启用副本 / +172 序号 / +192 事件键 / +196 行为键
+TRIG_REC_INST_BACK = 56      # 记录起点 − 56 = 触发实例对象起点（本格式判据）
+TRIG_REC_IDX_OFF = 172       # 触发/标签对象：集群内**序号**（0 基，必须与位置一致）
+TRIG_REC_FLAG_COPY = 123     # 记录 +123 = 启用状态的**副本**（与 TagNode+88 同步写）
+TRIG_REC_QUAD_OFF = 120      # 记录 +120..123 = 难度位 01 01 01 + 启用副本
+TRIG_REC_QUAD = b'\x01\x01\x01'
+
+# CONTENTS 分块（★★★ 游戏行为，2026-10-14 实测：进档弹框的根因就在分块）
+CONTENTS_CHUNK = 65536       # 明文按 65536 切
+CONTENTS_UNPACKED = 65536    # 块头 unpacked 恒为 65536（末块可短于声明值）
+
+
+def trig_flag_offset(pl, off, next_off):
+    """在 [off, next_off) 内定位该触发记录的「运行时启用位」绝对偏移；找不到返回 None。
+
+    next_off 用于限定"属于本条记录"的范围（通常 = 下一条记录的起点），
+    否则会把后面别的对象的 GUID 误认成自己的。
+    """
+    p = pl.find(TRIG_CLASS_GUID, off, next_off)
+    if p < 0:
+        return None
+    q = p - TRIG_FLAG_BACK
+    if q < off or q >= len(pl) or pl[q] > 1:
+        return None
+    return q
+
+
+MONEY_SIG = bytes.fromhex('5c197e00')    # 金钱标记（前置 4 字节签名）
+MIRROR_DELTA = 7708                      # 权威镜像 = 所属方记录起点 + 7708 (u24)
+HOUSES = ['Americans', 'British', 'French', 'Germans', 'Russians', 'YuriCountry',
+          'Africans', 'Alliance', 'Arabs', 'Confederation', 'Neutral']
+
+# ---- 所属方（House）记录数组 ----
+# 存档里有一串严格的 464 字节步长记录，以阵营短名开头，顺序 = rules [Countries] 注册序。
+# 每个记录起点 + MIRROR_DELTA 就是该所属方的金钱（u24）。已实测：多档金额互不相同。
+HOUSE_STEP = 464
+HOUSE_CHAIN = ['Americans', 'Alliance', 'French', 'Germans', 'British',
+               'Africans', 'Arabs', 'Confederation', 'Russians', 'YuriCountry']
+HOUSE_CN = {
+    'Americans': '美国', 'Alliance': '韩国', 'French': '法国', 'Germans': '德国',
+    'British': '英国', 'Africans': '利比亚', 'Arabs': '伊拉克',
+    'Confederation': '古巴', 'Russians': '苏俄', 'YuriCountry': '尤里',
+    'Neutral': '中立', 'Special': '特殊', 'Civilian': '平民',
+}
+HOUSE_MIN_CHAIN = 6                       # 至少要连续命中几项才认这是数组
+
+# 「所属方经济结构」——每个阵营的金钱字段布局（2026-10-13 用独特金额实测确认）：
+#   60 字节固定模板（5 个浮点常量 + 5 + 10）
+#   → u32 阵营位掩码（= 1 << 在 [Countries] 里的注册序）
+#   → u24 金钱
+# 再往 +304 字节是同一阵营的第二份副本（值相同）。
+# 实测：一次性命中 9 个 AI 阵营，值与地图 Credits×100 逐一吻合。
+HOUSE_ECON_TPL = bytes.fromhex(
+    '9999f93f000000403333f33f000000a0'
+    '9999e93f000000000000f03f2085eb51'
+    'e17af43f00000040e17a943f000000e0'
+    '51b89e3f050000000a000000')
+HOUSE_ECON_GAP = 304
+HOUSE_ORDER = HOUSE_CHAIN + ['Neutral', 'Special']    # 12 个（含中立/特殊）
+# ---- 「行为的参数类型」有**两套编号**，别混用（2026-10-20 交叉验证）----
+#   · ENGINE_PTYPE_TEXT = 引擎口径，出现在地图 `[Actions]` 每块的第 2 个字段；
+#     行为对象在存档里只存「类型 + 参数」，参数怎么解释是引擎按这张表内置的。
+#     数值含义来自 vera20k 的逆向注释（TActionClass::Read @0x006DD5B0 等）＋ 我们用
+#     all01umd.map 的真实数据对拍（见主文档 §126）。
+#   · ACTION_TYPES/EVENT_TYPES 里那个 ptype 是**地编 FAData 口径**，只用来给 UI 提示，
+#     两套数字不通用（例如「胜利者是」引擎侧=0 字面数值，地编侧=2 所属方）。
+ENGINE_PTYPE_TEXT = {
+    0: '字面数值',
+    1: '作战小队',
+    2: '触发',
+    3: '标签',
+    4: 'CSF 文本标签',
+    5: '作战小队(5)',
+    6: 'EVA 语音',
+    7: '语音 Voc',
+    8: '主题 Theme',
+    9: '内联类型名 + 路径点',
+    10: '内联类型名（建筑/单位）',
+    11: '数值 + 附加(token8)',
+}
+
+COUNTRY_ORDER = HOUSE_ORDER                           # 所属方型参数的取值顺序（同注册序）
+# ★ 2026-10-17：建筑载荷 `+1344` 用的「运行期阵营序号」兜底表（10 国 = 注册序 0..9；Neutral = 12）。
+#   ⚠ 只有前 10 国与 Neutral 有实测支撑（母本 / 大任务档两档一致）；Special 未实测（取 11 兜底）。
+#   能用时**一律优先从本档已有建筑反解**（`SaveDoc.house_run_index()`），本表只做兜底。
+HOUSE_RUN_INDEX = {n: i for i, n in enumerate(HOUSE_CHAIN)}
+HOUSE_RUN_INDEX.update({'Neutral': 12, 'Special': 11})
+IDRE = re.compile(rb'01[0-9A-F]{6}')
+
+
+class TriggerUnavailable(RuntimeError):
+    """本档**没法新写触发**（缺触发集群 / 缺事件与行为对象组）。
+
+    调用方（GUI/CLI）应当捕获它并**退回「直接落成」**，而不是把技术性 traceback 甩给玩家。
+    `reason` 是给玩家看的一句话；`detail` 是给开发者看的诊断。
+    """
+
+    def __init__(self, reason, detail=''):
+        RuntimeError.__init__(self, reason)
+        self.reason = reason
+        self.detail = detail
+
+
+class UnitUnavailable(RuntimeError):
+    """本档没法克隆放置该单位（档内没有同类型模板）。"""
+
+    def __init__(self, reason, detail=''):
+        RuntimeError.__init__(self, reason)
+        self.reason = reason
+        self.detail = detail
+
+
+class Rec(object):
+    """一条记录（触发/Tag/其它）"""
+    __slots__ = ('sid', 'name', 'off', 'kind', 'enabled', 'can_toggle', 'note', 'flag_off')
+
+    def __init__(self, sid, name, off, kind, enabled, can_toggle, note=''):
+        self.sid = sid
+        self.name = name
+        self.off = off
+        self.kind = kind
+        self.flag_off = None        # 触发：运行时启用位的绝对偏移（定位到才有）
+        self.enabled = enabled
+        self.can_toggle = can_toggle
+        self.note = note
+
+    def __repr__(self):
+        return '<Rec %s %s %s enabled=%s>' % (self.sid, self.name, self.kind, self.enabled)
+
+
+def _is_hex4(m):
+    return all(0x30 <= c <= 0x39 or 0x41 <= c <= 0x46 for c in m)
+
+
+def _decode_txt(b):
+    """记录名 / 文本解码：新档是 UTF-8，老档是 GBK。两者都可能"成功解码但错"，
+    按 CJK 字符数挑更可信的那个（GBK 字节被 UTF-8 误解码时几乎不出 CJK）。"""
+    if not b:
+        return ''
+    s8 = sg = None
+    try:
+        s8 = b.decode('utf-8')
+    except Exception:
+        pass
+    try:
+        sg = b.decode('gbk')
+    except Exception:
+        pass
+    if s8 is not None and sg is not None:
+        # ★ UTF-8 CJK 三字节序列（E4-E9 开头）计数：真 UTF-8 中文≥2 个基本必中；
+        #   GBK 字节偶合概率低（2026-10-14：GBK 误解出的 CJK 数更多曾把
+        #   「测试触发D」翻成「娴嬭瘯瑙﹀彂D」，靠这条判据修正）
+        n3 = 0
+        for i in range(len(b) - 2):
+            if 0xE4 <= b[i] <= 0xE9 and 0x80 <= b[i + 1] <= 0xBF and 0x80 <= b[i + 2] <= 0xBF:
+                n3 += 1
+        if n3 >= 2:
+            return s8
+        cjk = lambda s: sum(1 for ch in s if '\u4e00' <= ch <= '\u9fff')
+        return s8 if cjk(s8) >= cjk(sg) else sg
+    return s8 if s8 is not None else (sg or '')
+
+
+def _filetime(u64):
+    if not u64:
+        return '-'
+    try:
+        return (datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=u64 // 10)
+                ).strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return '-'
+
+
+def _lzo_pack_chunks(segs):
+    """**多进程 worker**：把一批 64KB 明文块压成 LZO1X（模块级函数才能被 pickle）。
+
+    ★2026-10-17 21:4x：纯 Python 压缩器约 3.5 MB/s，39 MB 的大任务档要 11 秒。
+      插入字节会让后面所有块移位 ⇒ 几乎整档都要重压，没法靠"复用旧块"绕过。
+      这里只是把块分给几个进程并行；失败（打包环境/多进程被拦）就回退串行。
+    """
+    from lzo_compress import compress
+    return [compress(s) for s in segs]
+
+
+def _parallel_compress(segs, workers=4):
+    """并压缩一批块；不行就返回 None 让调用方串行。"""
+    import multiprocessing as mp
+    n = max(1, min(workers, (mp.cpu_count() or 1)))
+    if n < 2 or len(segs) < 48:
+        return None
+    k = (len(segs) + n - 1) // n
+    parts = [segs[i:i + k] for i in range(0, len(segs), k)]
+    try:
+        import concurrent.futures as cf
+        ctx = mp.get_context('spawn')
+        with cf.ProcessPoolExecutor(max_workers=n, mp_context=ctx) as ex:
+            res = list(ex.map(_lzo_pack_chunks, parts))
+        out = []
+        for r in res:
+            out.extend(r)
+        return out if len(out) == len(segs) else None
+    except Exception:
+        return None
+
+
+class SaveDoc(object):
+    def __init__(self, path):
+        self.path = path
+        self.error = None
+        self.load()
+
+    # ---------- 读取 ----------
+    # ★2026-10-17 20:5x：**明文磁盘缓存**（大任务档 39MB / 纯 Python LZO 解压要 2.6 秒）。
+    #   键 = 原文件 md5（存档一改，缓存键就变，天然不会读到旧数据）；
+    #   只在"同一份档反复打开"时生效 —— 玩家改一次、进游戏验一次的工作流正好吃这个红利。
+    #   缓存内容 = 明文 + 分块表（_rechunk 复用未改动块的压缩字节要用它）。
+    _CACHE_MAGIC = b'RSED1'
+
+    @staticmethod
+    def _cache_dir():
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        d = os.path.join(base, 'RA2SED_cache')
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            return None
+        return d
+
+    def _load_plain(self, raw, cc):
+        """→ (plain, ranges, 来源)。缓存不可用/损坏时回退到真正的 LZO 解压。"""
+        md5 = hashlib.md5(raw).hexdigest()
+        cdir = self._cache_dir()
+        cp = os.path.join(cdir, md5 + '.bin') if cdir else None
+        if cp and os.path.exists(cp):
+            try:
+                with open(cp, 'rb') as f:
+                    if f.read(5) == self._CACHE_MAGIC:
+                        n = struct.unpack('<I', f.read(4))[0]
+                        blk = f.read(16 * n)
+                        rs = [struct.unpack_from('<IIII', blk, 16 * i) for i in range(n)]
+                        plain = f.read()
+                        if rs and rs[-1][0] + rs[-1][1] == len(plain):
+                            return plain, [tuple(r) for r in rs], 'cache'
+            except Exception:
+                pass
+        plain, ranges = self._decode(cc)
+        if cp:
+            try:
+                with open(cp, 'wb') as f:
+                    f.write(self._CACHE_MAGIC + struct.pack('<I', len(ranges)))
+                    for r in ranges:
+                        f.write(struct.pack('<IIII', *r))
+                    f.write(plain)
+                # 只保留最近 4 份（大任务档一份 39MB）
+                fs = sorted((os.path.join(cdir, x) for x in os.listdir(cdir)
+                             if x.endswith('.bin')), key=os.path.getmtime)
+                for old in fs[:-4]:
+                    try:
+                        os.remove(old)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return plain, ranges, 'decode'
+
+    def load(self):
+        self.raw = open(self.path, 'rb').read()
+        self.cfb = CFB(self.raw)
+        self.contents = self.cfb.open('CONTENTS')
+        self.plain_orig, self.ranges, self.plain_src = self._load_plain(self.raw, self.contents)
+        self.plain = bytearray(self.plain_orig)
+        self._house_arr = None           # 所属方记录数组缓存
+        self._house_econ = None          # 所属方经济结构缓存
+        self._house_keys_memo = None     # 阵营短名 → House 对象键 缓存（2026-10-17）
+        self._objs = None                # 事件/行为对象缓存（签名定位）
+        self._map = None                 # 挂载的地图（权威真值 + 归属）
+        self._mapm = None                # 地图对拍结果
+        self._events = None              # 事件表缓存
+        self._actions = None             # 行为表缓存
+        self._ticks = None               # 「流逝时间」帧数块缓存
+        self._celltags = None            # CellTag 节点缓存
+        self._ctimerlist = None          # 「定时触发器挂接表」定位缓存
+        self._blds = None                # 建筑对象缓存（2026-10-15）
+        # ★本次会话里由**我们注入**的建筑键（2026-10-17，P1「N27 弹框」定案）：
+        #   克隆模板绝不能取这些记录 —— 它们本身是"异类型 + 我们的补丁"的产物，
+        #   再拿它当模板会产出**混血记录** ⇒ 载入弹框。
+        self._injected_keys = set()
+        self._btypes = None              # 类型对象索引缓存
+        self._bld_tmp = None             # 建筑扫描中间表
+        self._bnames = None              # 建筑类型名集合（rulesmd [BuildingTypes] ∪ artmd Foundation）
+        self.time_sync_note = ''         # 最近一次时间同步的结果说明（供界面提示）
+        self._tables_lowconf = False     # 类型空间校验未通过 ⇒ 低置信（只读提示用）
+        self._tagrecs = None              # 标签记录缓存（tag_records，按类 GUID 尾识别）
+        self.info = self._read_info()
+        self.records = self._scan_records()
+        self.pending_money = None
+        self.pending_houses = {}         # short -> 目标金额
+        self.pending_triggers = {}       # sid -> bool
+        self.pending_events = {}         # 事件偏移 -> (类型, 参数)
+        self.pending_actions = {}        # 行为偏移 -> (类型, 参数)
+        self.pending_attach = []         # 挂接操作 [(字段偏移, 旧值)]
+
+    @staticmethod
+    def _decode(cc):
+        pos = 0
+        out = bytearray()
+        ranges = []
+        while pos + 8 <= len(cc):
+            pk, uk = struct.unpack_from('<II', cc, pos)
+            if pk == 0:
+                break
+            seg = cc[pos + 8:pos + 8 + pk]
+            o, consumed = lzo1x_decompress(seg, uk)      # 带期望长度 ⇒ 能走 C 后端
+            ranges.append((len(out), len(o), pos, pk))
+            out += o
+            pos += 8 + pk
+        return bytes(out), ranges
+
+    def _read_info(self):
+        pl = self.plain
+        c = self.cfb
+        def s(name):
+            try:
+                return c.open(name) or b''
+            except Exception:
+                return b''
+        info = {}
+        self.info = info        # 提前挂上：下面 get_money() 内部要读“玩家阵营”
+        info['文件'] = os.path.basename(self.path)
+        info['文件大小'] = '%d B' % len(self.raw)
+        info['明文大小'] = '%.1f MB' % (len(pl) / 1048576.0)
+        info['块数'] = len(self.ranges)
+        _ts = self.map_tile_size()
+        _sz = self.map_size()
+        if _ts:
+            info['地图尺寸'] = '%d×%d（格子表反推，与 FA2 同口径）' % _ts
+            if _sz and _sz != _ts:
+                info['地图尺寸'] += '；0x348E 那组是 %d×%d（不是 [Map] Size 口径）' % _sz
+        else:
+            info['地图尺寸'] = ('%d×%d（存档自带）' % _sz) if _sz else '未读出'
+        # 任务名：文件头部 16KB 里的 UTF-16LE 中文串
+        info['任务名'] = self._find_title() or '-'
+        # 玩家阵营
+        ph = s('Player House')
+        hid = ph[:4] if len(ph) >= 4 else b''
+        info['玩家阵营'] = self._house_of_id(hid) or '-'
+        info['玩家阵营ID'] = hid.hex(' ') if hid else '-'
+        info['开始时间'] = _filetime(struct.unpack_from('<Q', s('Start Time') + b'\x00' * 8, 0)[0])
+        info['存档时间'] = _filetime(struct.unpack_from('<Q', s('Last Save Time') + b'\x00' * 8, 0)[0])
+        # 金钱（权威镜像优先）
+        self._house_off_cache = None
+        info['金钱'] = self.get_money()
+        info['金钱字段'] = self._money_field_desc()
+        info['所属方数组'] = '已定位 %d 个' % len(self.find_house_array()) \
+            if self.find_house_array() else '未找到（仅能改当前玩家）'
+        ne = sum(1 for v in self.find_house_econ().values() if v)
+        info['经济块'] = '已定位 %d/12 个%s' % (ne, '' if ne == 12 else
+                                        '（其余未定位 —— 大型自制任务的档里'
+                                        '经济块模板会被 mod 改掉，见 README）')
+        if ne < 6:
+            # 自定义所属方任务：提前定位（会回填 玩家阵营/金钱/经济块 描述）
+            self.find_custom_houses()
+        return info
+
+    def _money_field_desc(self):
+        main, mirror = self.find_money_offsets()
+        if mirror is None:
+            return '未定位（该档没有所属方记录数组）'
+        d = ['镜像@%d' % mirror]
+        if main is not None:
+            d.append('主字段@%d' % main)
+        return ' / '.join(d)
+
+    def _find_title(self):
+        """任务名：文件头 16KB 内最长的含 CJK 的 UTF-16LE 串（两种对齐都试）"""
+        best = ''
+        pat = re.compile(u'[\u4e00-\u9fff\u3000-\u303f\uff00-\uffefA-Za-z0-9 _:\\-]{3,}')
+        head = self.raw[:16384]
+        for start in (0, 1):
+            try:
+                txt = head[start:].decode('utf-16le', 'ignore')
+            except Exception:
+                continue
+            for m in pat.finditer(txt):
+                s = m.group().strip()
+                cjk = sum(1 for ch in s if '\u4e00' <= ch <= '\u9fff')
+                if cjk >= 2 and len(s) > len(best):
+                    best = s
+        return best
+
+    def _house_of_id(self, hid):
+        """玩家阵营 ID -> 阵营短名（找 'X House' 记录）"""
+        if not hid or len(hid) < 4:
+            return None
+        pl = self.plain
+        q = 0
+        while True:
+            i = pl.find(hid, q)
+            if i < 0:
+                return None
+            q = i + 1
+            # 记录形式: b"X House\x00" + 若干 0 + hid
+            j = i - 1
+            while j >= 0 and pl[j] == 0:
+                j -= 1
+            k = j
+            while k >= 0 and 0x20 <= pl[k] < 0x7f:
+                k -= 1
+            name = pl[k + 1:j + 1]
+            try:
+                s = name.decode('ascii')
+            except Exception:
+                continue
+            if s.endswith(' House') and 3 <= len(s) <= 24:
+                return s[:-6]
+        return None
+
+    # ---------- 金钱 ----------
+    def _find_house_array_precise(self):
+        """精确：以 'Americans' 为锚，其后每 464 字节依次是 Alliance/French/..."""
+        pl = self.plain
+        q = 0
+        while True:
+            p = pl.find(b'Americans', q)
+            if p < 0:
+                return {}
+            q = p + 1
+            if pl[p + 9:p + 15] == b' House':
+                continue
+            tmp = {}
+            for i, nm in enumerate(HOUSE_CHAIN):
+                o = p + HOUSE_STEP * i
+                if o + len(nm) > len(pl) or pl[o:o + len(nm)] != nm.encode():
+                    break
+                tmp[nm] = o
+            if len(tmp) >= HOUSE_MIN_CHAIN:
+                for k in range(len(HOUSE_CHAIN), len(HOUSE_CHAIN) + 4):
+                    o = p + HOUSE_STEP * k
+                    if o + 7 <= len(pl) and pl[o:o + 7] == b'Neutral':
+                        tmp['Neutral'] = o
+                        break
+                return tmp
+
+    _HOUSE_NAME_RE = re.compile(rb'[A-Za-z][A-Za-z0-9_]{2,19}(?=\x00)')
+
+    def _find_house_array_loose(self):
+        """宽松：不假定名字，找一条 464 间隔、连续 ≥5 项的 ASCII 名字链。
+
+        要求首项是已知阵营名，避免把明文里其它等距字符串误判成所属方数组。
+
+        ★★2026-10-18 性能重写：老写法
+              cands = set(m.start() for m in namere.finditer(pl))
+          在 39MB 明文上会产出海量候选（正则全扫 + Python 逐个建 set），
+          实测单次 **260 秒** —— 这就是大任务档"打开要 4 分钟"的唯一原因。
+          现在改为**用已知阵营名做种子**：链首本来就要求是 `HOUSE_CN` 里的名字，
+          所以只需在 13 个已知名字的出现处起链（13 次 `bytes.find`，C 速度）；
+          链上后续项仍按"464 等距 + 该位置是个 ASCII 名字"判断，不要求是已知名。
+          种子一个都没凑出链时，回落到老的全扫实现（`_loose_full`）保证不改变行为。
+        """
+        pl = self.plain
+        namere = self._HOUSE_NAME_RE
+        seeds = set()
+        for nm in HOUSE_CN:
+            pat = nm.encode()
+            i = pl.find(pat)
+            while i >= 0:
+                end = i + len(pat)
+                # 必须整词：后面紧跟 \0，前面不是名字字符（避免 'XAmericans' 这类误命中）
+                if end < len(pl) and pl[end] == 0:
+                    prev = pl[i - 1] if i > 0 else 0
+                    if not (prev == 95 or 48 <= prev <= 57 or 65 <= prev <= 90 or 97 <= prev <= 122):
+                        seeds.add(i)
+                i = pl.find(pat, i + 1)
+        best = None
+        for p in sorted(seeds):
+            n = 0
+            for i in range(16):
+                if namere.match(pl, p + HOUSE_STEP * i):
+                    n += 1
+                else:
+                    break
+            if n >= 5 and (best is None or n > best[1]):
+                best = (p, n)
+        if best is None:
+            return self._find_house_array_loose_full()
+        out = {}
+        for i in range(20):
+            m = namere.match(pl, best[0] + HOUSE_STEP * i)
+            if not m:
+                break
+            out[m.group().decode('ascii', 'ignore')] = best[0] + HOUSE_STEP * i
+        return out
+
+    def _find_house_array_loose_full(self):
+        """老实现（全扫 ASCII 名字）—— 只在种子法失败时兜底，39MB 档约 260 秒。"""
+        pl = self.plain
+        namere = self._HOUSE_NAME_RE
+        cands = set(m.start() for m in namere.finditer(pl))
+        best = None
+        for p in sorted(cands):
+            n = 0
+            for i in range(16):
+                if p + HOUSE_STEP * i in cands:
+                    n += 1
+                else:
+                    break
+            if n >= 5 and (best is None or n > best[1]):
+                best = (p, n)
+        if not best:
+            return {}
+        p0 = best[0]
+        first = namere.match(pl, p0)
+        if not first or first.group().decode('ascii', 'ignore') not in HOUSE_CN:
+            return {}
+        out = {}
+        for i in range(20):
+            m = namere.match(pl, p0 + HOUSE_STEP * i)
+            if not m:
+                break
+            out[m.group().decode('ascii', 'ignore')] = p0 + HOUSE_STEP * i
+        return out
+
+    def find_house_array(self):
+        """定位「所属方记录数组」，返回 {阵营短名: 记录起点偏移}；找不到返回 {}。
+
+        每个记录起点 + MIRROR_DELTA 即该所属方的金钱（u24）。
+        实测依据：多档中各项 +MIRROR_DELTA 处的 u24 互不相同（如 10 / 10000），
+                  且与已知玩家金额吻合 ⇒ 数组平行、公式通用。
+        先走精确链（名字顺序固定），失败再走宽松链（只要求 464 等距 + 首项是已知阵营）。
+        """
+        if getattr(self, '_house_arr', None):
+            return self._house_arr
+        arr = self._find_house_array_precise() or self._find_house_array_loose()
+        self._house_arr = arr
+        return arr
+
+    # ★★★★★ 2026-10-17 22:5x：**House 对象 + 800 = 该阵营的金钱**（大任务档唯一可用的判据）
+    #   验证：玩家档 SAVE4AE1（993795）、OK1（1000000）里 `对象+800` 与"主字段（签名定位）"
+    #   逐值相同；SAVE0029（v1/v2/v3 全灭）里 12 个阵营该字段给出 0/13000/2000000/2004000
+    #   —— 正是任务预设的 AI 资金。
+    HOUSE_MONEY_REL = 800
+
+    def find_house_econ(self):
+        """定位每个所属方的「经济结构」金钱字段（带**防重入**与**空结果缓存**）。
+
+        ★★2026-10-18 性能修复（大任务档打开 245s → 秒级）：
+          `find_house_econ()` 内部会调 `house_keys()`，而 `house_keys()` 又会回调
+          `find_house_econ()` —— 两边都"算完才缓存"，于是**互相递归 498 层**，
+          每层都重扫一遍 39MB（cProfile：`bytes.find` 51151 次 / 117s，
+          `_house_obj_off` 5959 次 / 105s）。
+          现在：① 计算期间置 busy 标志，重入直接返回空表；
+                ② 结果（**包括空表**）一律缓存 —— 原来用 `if ...:` 判真假，
+                   空表永远不缓存，等于每次都重算。
+        """
+        if getattr(self, '_house_econ', None) is not None:
+            return self._house_econ
+        if getattr(self, '_house_econ_busy', False):
+            return {}
+        self._house_econ_busy = True
+        try:
+            return self._find_house_econ_impl()
+        finally:
+            self._house_econ_busy = False
+
+    def _find_house_econ_impl(self):
+        """定位每个所属方的「经济结构」金钱字段（真正的实现）。
+
+        结构 = 60 字节固定模板 → u32 位掩码（= 1 << [Countries] 注册序）→ u24 金钱；
+        再 +304 字节是同一阵营的**第二份副本**（值相同）。
+
+        返回 {阵营短名: [偏移1, 偏移2]}。
+        实测：多个存档里一次性命中 9 个 AI 阵营，值与该阵营在地图里的 Credits×100
+        逐一吻合；用户改动地图 Credits 后新开局，这些值随之同步变化 ⇒ 确认就是金钱字段。
+        （当前玩家的那份结构不含该浮点模板，故仍由 find_money_offsets 的镜像字段负责。）
+        """
+        pl = self.plain
+        out = {}
+        q = 0
+        while True:
+            p = pl.find(HOUSE_ECON_TPL, q)
+            if p < 0:
+                break
+            q = p + 1
+            moff = p + len(HOUSE_ECON_TPL)
+            if moff + 8 > len(pl):
+                continue
+            mask = struct.unpack_from('<I', pl, moff)[0]
+            if mask == 0 or (mask & (mask - 1)):     # 必须是 2 的幂
+                continue
+            idx = mask.bit_length() - 1
+            if idx >= len(HOUSE_ORDER):
+                continue
+            lst = out.setdefault(HOUSE_ORDER[idx], [])
+            mo = moff + 4
+            if mo + 3 <= len(pl):
+                lst.append(mo)
+            # ★ +304 字段 = **引擎运行期的活钱**（2026-10-14 定案）：普通档里它与
+            #   主字段（初始金钱快照）相等；mod 大任务档里它会随游戏进程分叉
+            #   （实测同一档四连拍：主字段纹丝不动、+304 在涨）。
+            #   ⇒ 写钱必须**两处一起写**，只写主字段 = 改了不改用
+            #   （实测 Neutral 只写主字段 ⇒ 游戏内无效）。
+            s = mo + HOUSE_ECON_GAP
+            if s + 3 <= len(pl):
+                lst.append(s)
+
+        # ---- v2：锚点扫描（大型自制任务格式，2026-10-14 定案）----
+        # mod 会把模板里的浮点（每阵营 AI 参数）改掉、位掩码字段也会变，
+        # 但「51 B8 9E 3F 05 00 00 00 + 金钱@+16(u32≤0xFFFFFF)」跨档稳定：
+        #   · 老档 11 块，金钱值与 v1 完全一致；
+        #   · SAVE5C7B/SAVE2E1F 各 10 块，已知阵营（独特值实验 / 掩码法）全部
+        #     落在顺序指派的正确槽位上（Alliance..Neutral，Special 的块模板变体
+        #     不同、另由 v3 兜底）。
+        anchor = bytes.fromhex('51b89e3f05000000')
+        v2 = []
+        q = 0
+        while True:
+            t = pl.find(anchor, q)
+            if t < 0:
+                break
+            q = t + 1
+            if t + 20 > len(pl):
+                continue
+            v = struct.unpack_from('<I', pl, t + 16)[0]
+            if v <= 0xFFFFFF:
+                v2.append((t + 16, v))
+        # 顺序指派：11 块 = Alliance..Special；10 块 = Alliance..Neutral
+        # （两个独立档都实测缺最后一块 Special —— 它的模板是变体；且已知阵营
+        #   的槽位逐一吻合，见上。块数不是 10/11 时不动，避免乱指派。）
+        order = HOUSE_ORDER[1:]                       # Alliance..Special
+        if len(v2) in (10, 11):
+            for (mo, _v), nm in zip(v2, order[:len(v2)]):
+                lst = out.setdefault(nm, [])
+                if mo not in lst:
+                    lst.insert(0, mo)
+                # +304 副本 = 引擎活钱（见 v1 处注释），无条件一起写
+                s = mo + HOUSE_ECON_GAP
+                if s + 3 <= len(pl) and s not in lst:
+                    lst.append(s)
+
+        # ---- v3：尾部兜底（Special 的块模板是变体，锚点扫描会漏）----
+        # ★★ 2026-10-14 SAVE1F12 案例修订（旧判据已证伪删除）：
+        #   旧判据要求「+304 副本 == 主字段」——但 +304 已被证实是**运行期活钱**，
+        #   游戏中途存的档必然分叉（实测 8623100 vs 8623055）⇒ 旧判据把真块毙掉了。
+        #   另外 Special 变体块的掩码 = **盟友位集**而非 2 的幂（实测 3073 =
+        #   Americans|Neutral|Special，正是 FA2 里治安官的盟友列表），v1 也拒收。
+        #   ⇒ 新判据（全部来自真块实测，窗口内唯一命中；裸放宽会误报 TaskForce/Script
+        #   数组里成片的 `05 00 00 00 0a 00 00 00`，窗口内 496 处，缺一不可）：
+        #   ① 金钱 u32 ≤ 0xFFFFFF、第 4 字节 0（★允许 v=0：SAVE5C7B 实测 Special
+        #     快照/活钱均为 0 时块仍在，结构特征足以唯一识别——旧"值为 0 跳过"
+        #     会让被改成 0 钱的所属方在编辑器里"消失"）；
+        #   ② money-12..-9 == `05 00 00 00` 且 money-8..-5 == `0a 00 00 00`（模板尾常量）；
+        #   ③ money-16..-13 为 f32 ∈ [0.05, 4.0]（模板 AI 参数浮点，mod 变体也在此范围）；
+        #   ④ 掩码 u32@money-4 ≤ 0xFFF 且含 rest[0] 的注册位（Special 恒含自己的 bit；
+        #     全档 39MB 内此特征仅命中真块——盟友含 Special 的其它阵营块都在窗口之前）；
+        #   ⑤ +304 活钱 u32 第 4 字节 0，且与快照同数量级（|Δ| ≤ max(v,4096)，
+        #     允许游戏进程造成的合理漂移；噪声处 v304 几乎全为 0 或相差悬殊）。
+        if out:
+            last = max(mo for lst in out.values() for mo in lst)
+            used = {nm for nm, lst in out.items() if lst}
+            rest = [nm for nm in HOUSE_ORDER[1:] if nm not in used]
+            limit = min(len(pl) - 312, last + 400000)
+            q = last
+            while q < limit and rest:
+                v = int.from_bytes(pl[q:q + 3], 'little')
+                v304 = int.from_bytes(pl[q + 304:q + 307], 'little')
+                mask = struct.unpack_from('<I', pl, q - 4)[0] if q >= 4 else 0
+                try:
+                    f = struct.unpack_from('<f', pl, q - 16)[0]
+                except Exception:
+                    f = 0.0
+                idx0 = HOUSE_ORDER.index(rest[0])
+                exp_bit = 1 << idx0
+                if (v <= 0xFFFFFF and pl[q + 3] == 0
+                        and pl[q - 12:q - 8] == b'\x05\x00\x00\x00'
+                        and pl[q - 8:q - 4] == b'\x0a\x00\x00\x00'
+                        and 0.05 <= f <= 4.0
+                        and mask <= 0xFFF and (mask & exp_bit)
+                        and v304 <= 0xFFFFFF and pl[q + 307] == 0
+                        and abs(v304 - v) <= max(v, 4096)):
+                    nm = rest.pop(0)
+                    lst = out.setdefault(nm, [])
+                    lst.append(q)
+                    lst.append(q + HOUSE_ECON_GAP)
+                    q += HOUSE_ECON_GAP
+                else:
+                    q += 1
+        if len([v for v in out.values() if v]) < 6:
+            # ★兜底（大任务档）：v1/v2/v3 都定位不到时，用 House 对象 + 800。
+            #   有验证依据（见 HOUSE_MONEY_REL 注释），且只在"老判据几乎全灭"时才用，
+            #   不会覆盖/干扰普通档已经验证过的经济块偏移。
+            try:
+                hk = self.house_keys()
+            except Exception:
+                hk = {}
+            for nm in HOUSE_ORDER:
+                lst = out.setdefault(nm, [])
+                if lst:
+                    continue
+                k = hk.get(nm)
+                off = self._house_obj_off(k) if k else None
+                if off is None:
+                    continue
+                p = off + self.HOUSE_MONEY_REL
+                if p + 4 <= len(self.plain):
+                    lst.append(p)
+        self._house_econ = out
+        return out
+
+    # ---- 自定义所属方任务（2026-10-14 SAVE2DD8 实测）----
+    # 自制任务的所属方不叫标准 12 阵营，而是地图 [Houses] 里的自定义名
+    # （'Player House' / 'BadGuy1 House'…，≤8 家）。每个 HouseClass 一条大记录：
+    # 【经济块（模板→盟友位掩码→u32 金钱→+304 活钱）】…【ASCII 名 'X House\0'】。
+    # 实测（8 家）：名字都在自己块的后面 ≤250KB，且块序==名序；掩码=盟友位集
+    # （Player=1、BadGuy1-3+Civie1=30、Other1-3=32/64/128）；Civie1 的钱 65982400
+    # **超出 u24**，金錢字段是 u32（两副本都是）。
+    CUSTOM_HOUSE_SIG = re.compile(rb'[\x3d\x3e\x3f]')   # 模板参数浮点的高字节（LE 第 4 字节）
+
+    def find_custom_houses(self):
+        """自定义所属方任务的金钱定位；返回 list[dict] 或 []。
+
+        判据三重（缺一不可，全档 11MB 裸签名会误报百余处）：
+        ① 结构：f32@-16 与 f32@-24 ∈ [0.05,4]（模板 AI 参数）+ 盟友掩码 u32@-4
+           ∈ (0,0xFF] + 金钱 u32 ≤ 0x03FFFFFF + 活钱副本不高于快照的合理倍数；
+        ② 配对：每个块后 ≤250KB 处有唯一的 'X House\0' ASCII 名，块↔名按距离
+           贪心一一配对（滤掉 'White House'/'Sydney Opera House' 之类建筑名与噪声块）；
+        ③ 顺序：配对完成后块序与名序一致（记录连续存放才可信）。
+        """
+        if getattr(self, '_custom_houses', None) is not None:
+            return self._custom_houses
+        self._custom_houses = []
+        pl = self.plain
+        blks = []
+        for m in self.CUSTOM_HOUSE_SIG.finditer(pl):
+            p = m.start()                      # = money-16 的高字节 → money = p+13
+            q = p + 13
+            if q + 312 > len(pl):
+                continue
+            f1 = struct.unpack_from('<f', pl, p - 3)[0]      # money-16
+            if not (0.05 <= f1 <= 4.0):
+                continue
+            f2 = struct.unpack_from('<f', pl, p - 11)[0]     # money-24
+            if not (0.05 <= f2 <= 4.0):
+                continue
+            mask = struct.unpack_from('<I', pl, p + 9)[0]    # money-4
+            if not (0 < mask <= 0xFF):
+                continue
+            v = struct.unpack_from('<I', pl, q)[0]
+            v304 = struct.unpack_from('<I', pl, q + 304)[0]
+            if v > 0x0FFFFFFF:          # 268M（RA2 金钱显示上限）；噪声多为 2^28 以上
+                continue
+            if not (v304 <= v or (v > 0 and v304 <= 4 * v + 50000)):
+                continue
+            blks.append((q, mask))
+        if not blks:
+            return []
+        # 阵营名候选：'X House\0'（ASCII 名向回走到底）
+        names = []
+        q = 0
+        while True:
+            i = pl.find(b' House\x00', q)
+            if i < 0:
+                break
+            q = i + 1
+            j = i
+            while j > 0 and 0x20 <= pl[j - 1] < 0x7f and i - j < 32:
+                j -= 1
+            nm = pl[j:i].decode('ascii', 'ignore').strip()
+            if nm:
+                names.append((i, nm + ' House'))
+        # 贪心配对（距离短优先，名字必须在块后面）
+        pairs = []
+        for b, mask in blks:
+            for no, nm in names:
+                if b < no <= b + 250000:
+                    pairs.append((no - b, b, mask, no, nm))
+        pairs.sort()
+        used_b, used_n = set(), set()
+        out = []
+        for d, b, mask, no, nm in pairs:
+            if b in used_b or no in used_n:
+                continue
+            used_b.add(b)
+            used_n.add(no)
+            out.append({'name': nm, 'block': b, 'name_off': no, 'mask': mask})
+        out.sort(key=lambda x: x['block'])
+        # 顺序校验：块序 == 名序
+        noffs = [x['name_off'] for x in out]
+        if len(out) < 2 or noffs != sorted(noffs):
+            return []
+        # 玩家：经济块活钱 == 主字段（5C197E00+4）的那个；兑不了再用掩码=1 兕底
+        mainv = None
+        mi = pl.find(MONEY_SIG)
+        if mi >= 0 and mi + 7 <= len(pl):
+            mainv = int.from_bytes(pl[mi + 4:mi + 7], 'little')
+        player = None
+        for x in out:
+            x['money'] = struct.unpack_from('<I', pl, x['block'])[0]
+            x['live'] = struct.unpack_from('<I', pl, x['block'] + 304)[0]
+        if mainv is not None:
+            c = [x for x in out if (x['live'] & 0xFFFFFF) == mainv]
+            if len(c) == 1:
+                player = c[0]
+        if player is None:
+            c1 = [x for x in out if x['mask'] == 1]
+            if len(c1) == 1:
+                player = c1[0]
+        for x in out:
+            x['is_player'] = (x is player)
+        if player is not None and hasattr(self, 'info'):
+            self.info['玩家阵营'] = self.norm_house(player['name'])   # ★去掉 ' House' 后缀（2026-10-17）
+            self.info['金钱'] = player['live']
+            self.info['经济块'] = ('自定义所属方任务：定位 %d 个阵营经济块（u32 双字段）'
+                                  % len(out))
+        self._custom_houses = out
+        return out
+
+    def houses(self):
+        """全部所属方：list[dict(short, cn, off, money_off, money_offs, money,
+                                is_player, verified)]，按注册序排列、当前玩家置顶。
+
+        money_offs = 写入时要一起改的全部偏移：
+          · AI 阵营 = 经济结构里的两份副本
+          · 当前玩家 = 镜像字段（+ 经济结构副本），写时另加主字段
+        """
+        pl = self.plain
+        me = self.player_house()
+        hk = self.house_keys()          # ★2026-10-17：阵营短名 → House 对象键（写"所属方"要用）
+        econ = self.find_house_econ()
+        nstd = sum(1 for v in econ.values() if v)
+        if nstd < 6:
+            # 自定义所属方任务（2026-10-14）：标准 12 阵营几乎全未定位时，
+            # 改用自定义阵营列表（按块序，玩家置顶）
+            cust = self.find_custom_houses()
+            if cust:
+                rows = []
+                for x in cust:
+                    offs = [x['block'], x['block'] + 304]
+                    if x['is_player']:
+                        mi = self.plain.find(MONEY_SIG)
+                        if mi >= 0:
+                            offs.append(mi + 4)
+                    rows.append({'short': self.norm_house(x['name']),
+                                 'cn': self.norm_house(x['name']),
+                                 'key': hk.get(self.norm_house(x['name'])),
+                                 'off': x['block'], 'money_off': x['block'],
+                                 'money_offs': offs,
+                                 'u32_offs': (x['block'], x['block'] + 304),
+                                 'money': x['money'],
+                                 'is_player': x['is_player'], 'verified': True})
+                rows.sort(key=lambda d: (0 if d['is_player'] else 1,
+                                         d['money_offs'][0]))
+                return rows
+        arr = self.find_house_array()
+        out = []
+        for short in HOUSE_ORDER:
+            offs = list(econ.get(short, []))
+            is_player = (short == me)
+            mirror_off = None
+            if is_player and short in arr:
+                mo = arr[short] + MIRROR_DELTA
+                if mo not in offs:
+                    offs.insert(0, mo)
+                mirror_off = mo
+            v = None
+            if offs and offs[0] + 3 <= len(pl):
+                v = int.from_bytes(pl[offs[0]:offs[0] + 3], 'little')
+            # 经济块副本是 u32（第 4 字节恒 0，写 4 字节不变；Civie1 类大金额需要）；
+            # 玩家镜像字段是 u24
+            u32 = tuple(mo for mo in offs if mo != mirror_off)
+            out.append({'short': short, 'cn': HOUSE_CN.get(short, ''),
+                        'key': hk.get(short),
+                        'off': offs[0] if offs else None,
+                        'money_off': offs[0] if offs else None,
+                        'money_offs': offs, 'u32_offs': u32, 'money': v,
+                        'is_player': is_player, 'verified': bool(offs)})
+        idx = {n: i for i, n in enumerate(HOUSE_ORDER)}
+        out.sort(key=lambda d: (0 if d['is_player'] else 1, idx.get(d['short'], 99)))
+        return out
+
+    def player_house(self):
+        """当前玩家阵营短名（info 尚未建立时返回 None）。
+
+        ★2026-10-17 修：`find_custom_houses()` 会把 **"Americans House"** 整串写进
+          `info['玩家阵营']`（'X House' 形式），而 `houses()['short']` / `HOUSE_ORDER` 用的是
+          **去掉 " House" 的短名** ⇒ 二者不相等会让 `is_player`、镜像金钱、`set_money` 的分支
+          全部落空。这里统一去掉 " House" 后缀，成为唯一的"阵营短名"口径。
+        """
+        h = self.info.get('玩家阵营') if hasattr(self, 'info') else None
+        if not h or h == '-':
+            return None
+        return self.norm_house(h)
+
+    @staticmethod
+    def norm_house(name):
+        """阵营名归一化：去掉 "X House" 的 " House" 后缀（唯一口径）。"""
+        s = str(name or '').strip()
+        return s[:-6] if s.endswith(' House') else s
+
+    def find_money_offsets(self):
+        """返回 (main_off, mirror_off)，均为 u24。
+
+        镜像偏移**只**来自所属方记录数组；定位不到就是 None。
+        （早期版本会退回“短名首次出现 + 7708”，实测在某些存档里那个位置是
+          数据区的裸名字串而非记录起点，会读出垃圾值，故已废弃该回退。）
+        """
+        i = self.plain.find(MONEY_SIG)
+        main = i + 4 if i >= 0 else None
+        me = self.player_house()
+        arr = self.find_house_array()
+        mirror = arr[me] + MIRROR_DELTA if (me and me in arr) else None
+        return main, mirror
+
+    def get_money(self):
+        """当前玩家金钱。未定位到所属方数组（即镜像字段）时返回 None —— 不再猜测，
+        避免把 CSF 标签/主字段里的无关数字当成金钱显示出来。"""
+        main, mirror = self.find_money_offsets()
+        if mirror is None:
+            return None
+        pl = self.plain
+        for off in (mirror, main):
+            if off is not None and off + 3 <= len(pl):
+                v = int.from_bytes(pl[off:off + 3], 'little')
+                if 0 <= v <= 0xFFFFFF:
+                    return v
+        return None
+
+    @staticmethod
+    def _chk_money(value):
+        v = int(value)
+        if not (0 <= v <= 0xFFFFFF):
+            raise ValueError('金额需在 0 ~ 16,777,215 之间')
+        return v
+
+    def set_money(self, value):
+        """改当前玩家金钱（等价于 set_house_money(玩家阵营, v)）。
+
+        未定位到所属方数组时**拒绝写入** —— 此时任何写入都是基于未知偏移的猜测，
+        宁可报错也不要改坏存档里的其它数据。
+        """
+        me = self.player_house()
+        if me:
+            for x in self.houses():
+                if x['short'] == me:
+                    if x['money_offs']:
+                        return self.set_house_money(me, value)
+                    break
+        if me and me in self.find_house_array():
+            return self.set_house_money(me, value)
+        raise RuntimeError('该存档未定位到所属方记录数组；为避免改错位置，已拒绝写入。\n'
+                           '可改用“所属方金钱”页，或选另一个存档。')
+
+    def set_house_money(self, short, value):
+        """改指定所属方的金钱。
+
+        定位依据见 find_house_econ() / find_custom_houses()：
+        AI 阵营写「经济结构」的两份副本（★u32，2026-10-14： Civie1 实测 65982400
+        超出 u24，字段是 4 字节；标准块第 4 字节恒 0，写 4 字节不变）；
+        当前玩家写其镜像字段（u24，上限 16777215）+ 经济块副本 + 主字段。
+        """
+        h = None
+        for x in self.houses():
+            if x['short'] == short:
+                h = x
+                break
+        if not h or not h['money_offs']:
+            raise RuntimeError('该存档里未定位到所属方 %s 的金钱字段' % short)
+        value = int(value)
+        u32 = set(h.get('u32_offs') or ())
+        if not u32 or short == self.player_house():
+            if not (0 <= value <= 0xFFFFFF):
+                raise ValueError('金额需在 0 ~ 16,777,215 之间'
+                                 '（玩家金钱的镜像/主字段是 3 字节 u24）')
+        elif not (0 <= value <= 0xFFFFFFFF):
+            raise ValueError('金额需在 0 ~ 4,294,967,295 之间')
+        old = h['money']
+        for mo in h['money_offs']:
+            n = 4 if mo in u32 else 3
+            if mo + n <= len(self.plain):
+                self.plain[mo:mo + n] = (value & 0xFFFFFFFF).to_bytes(n, 'little')
+        self.pending_houses[short] = value
+        if short == self.player_house():
+            i = self.plain.find(MONEY_SIG)
+            if i >= 0 and i + 7 <= len(self.plain):
+                self.plain[i + 4:i + 7] = value.to_bytes(3, 'little')
+            self.pending_money = value
+        return old
+
+    # ---------- 事件表 / 行为表（对象签名定位）----------
+    def _invalidate_if_shifted(self):
+        """明文长度变了 ⇒ 所有"按偏移缓存"的结果作废。
+
+        ★2026-10-17 22:1x 修（玩家 GUI 实测：先放一栋楼、再用触发法就报
+          「事件组计数注册字段(0)与实际对象数(615)不符」）：
+          放建筑/放单位/新写触发都是**插入**，明文变长后旧的 `_objs` 偏移全部失效，
+          于是"组计数"读到了别处的 0。原地改（长度不变）的偏移仍然有效，故用长度做判据。
+        """
+        n = len(self.plain)
+        if getattr(self, '_cache_len', None) == n:
+            return
+        self._cache_len = n
+        self._objs = None            # 事件/行为对象
+        self._blds = None            # 建筑对象
+        self._coffs = None           # 格对象偏移表
+        self._ckey = None            # 格键 → 坐标
+        self._events = None
+        self._actions = None
+        self._celltags = None
+        self._btypes = None
+        self._house_keys_memo = None
+        self._bld_tmp = None
+
+    def _objects(self):
+        self._invalidate_if_shifted()
+        """定位全部「事件/行为 对象」，返回按偏移升序的 [dict(obj, off, type, arg)]。
+
+        ★★★ 判据（2026-10-13 实测确立，替代此前的固定步长启发式）
+        每个事件/行为对象体内含一段 **16 字节恒定签名**（4 个 u32，跨档稳定，
+        7 档 + 58 档批量验证 100% 命中）：
+            obj+0  : 4F0EC392 / 4F0EC393（随对象微变）
+            obj+4  : 11D20A55
+            obj+8  : 6000A7AC
+            obj+12 : B55B0508
+        对象布局：**类型在 obj+64、参数在 obj+72** ⇒ 我们对外报的「记录起点」= obj+64。
+
+        数组结构：`[行为对象…] [4 字节] [事件对象…]` 连续存放。
+        - 行为对象**固定 168 字节**
+        - 事件对象尺寸**随档变化**（小任务档 108，大 mod 任务档实测 124）
+          ⇒ **绝不能用固定步长**拼链（这正是旧实现锁定到巧合假链的根因）。
+
+        旧实现（按 `[类型][0][参数]` 三元组 + 108 步长拼链）已**删除**：
+        明文里有大量巧合三元组（实测同一档 10 万+ 条候选），
+        曾把浮点数组当成事件表显示成「类型 63/64/72」等垃圾值 —— 该方案已证伪。
+        """
+        if getattr(self, '_objs', None) is not None:
+            return self._objs
+        pl = self.plain
+        pos, q = [], 0
+        while True:
+            i = pl.find(OBJ_SIG, q)          # 签名第 2~4 字
+            if i < 0:
+                break
+            q = i + 1
+            o = i - 4                        # 签名第 1 字
+            if o < 64 or o + 76 > len(pl):
+                continue
+            t = int.from_bytes(pl[o + OBJ_TYPE_OFF:o + OBJ_TYPE_OFF + 4], 'little')
+            a = int.from_bytes(pl[o + OBJ_ARG_OFF:o + OBJ_ARG_OFF + 4], 'little')
+            # ★ 必须**允许 type == 0**：类型 0（-无事件-/-无行为-）虽然危险，但一旦被写进去，
+            #   对象依然存在。若在此过滤掉，数组就会出现"空洞" ⇒ 工具自己读错
+            #   （实测：把 2 个事件改成 0 后，界面只剩 2 条事件，地图对拍也报"数量不符"）。
+            if t > 0xFFFF or a > 0xFFFFFF:
+                continue
+            pos.append({'obj': o, 'off': o + OBJ_TYPE_OFF, 'type': t, 'arg': a,
+                        'key': int.from_bytes(pl[o + 16:o + 20], 'little')})
+        pos.sort(key=lambda d: d['obj'])
+        self._objs = pos
+        return pos
+
+    def _split_tables(self):
+        """把对象序列切成 (行为列表, 事件列表)。
+
+        规则：从左侧起，**行为对象之间恒为 168 字节**；第一个 Δ≠168 处即
+        「行为段 → 事件段」的分界（实测分界 Δ=172 = 168 + 4 字节间隙）。
+        切完做一次**类型空间校验**（行为段类型须全在 ACTION_TYPES，事件段须全在
+        EVENT_TYPES），不通过则退回「全是事件」并标记低置信（宁可不给，也不乱给）。
+        """
+        objs = self._objects()
+        if not objs:
+            return [], []
+        if len(objs) == 1:                   # 只有一个对象：按类型空间判归属
+            t = objs[0]['type']
+            if t in ACTION_TYPES and t not in EVENT_TYPES:
+                return objs, []
+            if t in EVENT_TYPES and t not in ACTION_TYPES:
+                return [], objs
+            return [], objs                 # 两边都合法 ⇒ 保守按事件处理
+        cut = len(objs)                # 默认：全是行为（无分界）
+        for i in range(len(objs) - 1):
+            if objs[i + 1]['obj'] - objs[i]['obj'] != ACTION_SIZE:
+                cut = i + 1
+                break
+        acts, evs = objs[:cut], objs[cut:]
+        ok_a = all(o['type'] in ACTION_TYPES for o in acts)
+        ok_e = all(o['type'] in EVENT_TYPES for o in evs)
+        if not (ok_a and ok_e):             # 校验失败 ⇒ 退化（不猜）
+            self._tables_lowconf = True
+            return [], objs
+        return acts, evs
+
+    # ---------- 「流逝时间」运行期帧数 ----------
+    def tick_blocks(self):
+        """全档扫描 `C4 60 72 00` 标记块，返回 {帧数字段的绝对偏移: 值}。
+
+        值 = 等待秒数 × 15（校验：必须能被 15 整除，否则视为巧合命中、剔除）。
+        """
+        if getattr(self, '_ticks', None) is not None:
+            return self._ticks
+        pl = self.plain
+        cur = self.plain
+        out = {}
+        q = 0
+        while True:
+            i = pl.find(TIME_MARK, q)
+            if i < 0:
+                break
+            q = i + 1
+            if i + 8 > len(pl):
+                continue
+            v = int.from_bytes(cur[i + 4:i + 8], 'little')   # 取当前值（便于连续编辑）
+            if 0 < v <= 0xFFFFFFF and v % LOGIC_FPS == 0:
+                out[i + 4] = v
+        self._ticks = out
+        return out
+
+    def time_ticks(self):
+        """当前档里「流逝时间」的帧数值（唯一时返回，多个/没有时返回 None）。"""
+        b = self.tick_blocks()
+        return list(b.values())[0] if len(b) == 1 else None
+
+    def sync_time_ticks(self, old_arg, new_arg, match_by_value=True):
+        """把「流逝时间」的运行期帧数从 old_arg×15 同步成 new_arg×15。
+
+        只在能**唯一确定**目标时写入：优先按"旧值 = old_arg×15"匹配；
+        匹配不到时，若全档只有一个帧数块且只有一个事件，也认（单触发地图）。
+        其余情况**不猜**，返回 None 并留下说明文字。
+        """
+        self.time_sync_note = ''
+        want, new = int(old_arg) * LOGIC_FPS, int(new_arg) * LOGIC_FPS
+        cands = [o for o, v in self.tick_blocks().items() if v == want] if match_by_value \
+            else []
+        if not cands:
+            allb = self.tick_blocks()
+            if len(allb) == 1 and len(self.events()) == 1:
+                cands = list(allb.keys())      # 单触发 / 单事件 ⇒ 唯一目标，直接写
+            else:
+                self.time_sync_note = (
+                    '⚠ 未找到与 %d 秒匹配的运行期帧数（应为 %d）：本次只改了事件里的秒数，'
+                    '读档后等待时间可能仍是原值。' % (old_arg, want))
+                return None
+        for o in cands:
+            self.plain[o:o + 4] = new.to_bytes(4, 'little')
+        self._ticks = None
+        self.time_sync_note = ('已同步运行期帧数 %d → %d（等待 %d 秒 → %d 秒，%d fps）'
+                               % (want, new, old_arg, new_arg, LOGIC_FPS))
+        return new
+
+    def events(self):
+        self._invalidate_if_shifted()
+        """事件数组：list[dict(off, type, name, ptype, arg, arg_text)]
+
+        顺序 = 地编事件列表顺序（同一触发的事件连续）。★ 归属仍不可直接读取
+        （存档里没有「每触发挂几个事件」的字段），故不猜归属。
+        """
+        if getattr(self, '_events', None) is not None:
+            return self._events
+        _, evs = self._split_tables()
+        out = [self._mk('event', o) for o in evs]
+        self._events = out
+        return out
+
+    def actions(self):
+        self._invalidate_if_shifted()
+        """行为数组，字段同事件（类型编号与地编行为列表一一对应）。"""
+        if getattr(self, '_actions', None) is not None:
+            return self._actions
+        acts, _ = self._split_tables()
+        out = [self._mk('action', o) for o in acts]
+        # §175：行为 56/57 的真正参数是 +164 的变量号；+72 恒 0（引擎也不看）
+        pl = self.plain
+        for d in out:
+            if d.get('type') in ACTION_VAR_TYPES:
+                o = d.get('obj')
+                if o is not None and o + ACT_VAR_OFF + 4 <= len(pl):
+                    v = int.from_bytes(pl[o + ACT_VAR_OFF:o + ACT_VAR_OFF + 4], 'little')
+                    d['var'] = v
+                    d['arg'] = v
+        self._actions = out
+        return out
+
+    # ================= §175 局部变量表（先有变量，触发才选得中）=================
+    # 玩家原话：「在地编中要先写局部变量，写完后写触发时才选择写好的局部变量，
+    #           局部变量的总数为 99 条，超过无效」
+    # ⇒ 本组 API 就是"先写局部变量"那一步；`make_local_var_recipe` 会自动调用。
+    def _lv_sane(self):
+        """明文里 0x248A 起是否是变量表（100 槽 × 41B，槽内 name[40]+value）。"""
+        need = LOCALVAR_BASE + LOCALVAR_COUNT * LOCALVAR_SLOT
+        if len(self.plain) < need:
+            return False
+        # 抽查前 8 槽：要么全 0，要么是"可打印 ASCII 且以 0 结束"的名字
+        for i in range(8):
+            off = LOCALVAR_BASE + i * LOCALVAR_SLOT
+            raw = bytes(self.plain[off:off + LOCALVAR_NAME_LEN])
+            body = raw.split(b'\x00')[0]
+            if not body:
+                continue
+            if len(body) >= LOCALVAR_NAME_LEN or not all(32 <= c < 127 for c in body):
+                return False
+        return True
+
+    def _lv_offset(self, idx, what='变量'):
+        idx = int(idx)
+        if not (0 <= idx < LOCALVAR_COUNT):
+            raise ValueError('%s索引 %d 越界（引擎只认 0..%d，地编名称框是 1..99）'
+                             % (what, idx, LOCALVAR_COUNT - 1))
+        off = LOCALVAR_BASE + idx * LOCALVAR_SLOT
+        if off + LOCALVAR_SLOT > len(self.plain):
+            raise RuntimeError('明文太短（%d B），变量表偏移 0x%X 越界' % (len(self.plain), off))
+        return off
+
+    def local_var_table(self):
+        """读 100 槽 → `[{index, fa2, name, value, default, source, off}]`。
+
+        `index` = 引擎参数（事件/行为里写的号，0 基）；`fa2` = 地编名称框里的"第几条"。
+        `value` = 存档里的运行期值（**读档后生效的就是它**，存档自足）；
+        `name`/`default` 优先取**地图 `[VariableNames]`**（`source='map'`，那是地编里能选中的
+        清单与开局默认值），地图找不到时退回存档镜像（`source='save'`）。
+        """
+        pl = self.plain
+        mvar = self._map_vars_map()
+        out = []
+        for i in range(LOCALVAR_COUNT):
+            off = LOCALVAR_BASE + i * LOCALVAR_SLOT
+            if off + LOCALVAR_SLOT > len(pl):
+                break
+            raw = bytes(pl[off:off + LOCALVAR_NAME_LEN])
+            nm_save = raw.split(b'\x00')[0].decode('latin1', 'replace')
+            mv = mvar.get(i)
+            out.append({'index': i, 'fa2': i + 1,
+                        'name': nm_save,              # ★存档里的名字（本工具编辑的对象）
+                        'name_save': nm_save,
+                        'name_map': (mv['name'] if mv else None),   # 地图里定义的名字
+                        'value': pl[off + LOCALVAR_NAME_LEN],
+                        'default': (mv['default'] if mv else None),  # 地图里的默认值
+                        'source': 'map' if mv else 'save',
+                        'off': off})
+        return out
+
+    def _map_vars_map(self, extra_dirs=None):
+        """`{index: {name, default}}`（带 path+mtime 缓存，地图一改自动失效）。"""
+        p = self.scenario_map_path(extra_dirs)
+        if not p:
+            return {}
+        try:
+            ck = (p, os.path.getmtime(p), os.path.getsize(p))
+        except OSError:
+            return {}
+        if getattr(self, '_mapvars_key', None) == ck:
+            return getattr(self, '_mapvars_cache', {}) or {}
+        try:
+            r = read_scenario_variables(p)
+        except Exception:
+            return {}
+        self._mapvars_cache = {i: {'name': n, 'default': d} for (i, n, d) in r['items']}
+        self._mapvars_key = ck
+        return self._mapvars_cache
+
+    def local_var(self, idx):
+        off = self._lv_offset(idx)
+        raw = bytes(self.plain[off:off + LOCALVAR_NAME_LEN])
+        row = self.local_var_table()[int(idx)]
+        return {'index': int(idx), 'fa2': int(idx) + 1,
+                'name': row['name'], 'name_save': row['name_save'],
+                'name_map': row['name_map'],
+                'value': self.plain[off + LOCALVAR_NAME_LEN],
+                'default': row['default'], 'source': row['source'], 'off': off}
+
+    def set_local_var_name(self, idx, name):
+        """给**存档镜像**里的变量命名（空字符串 = 清名）。
+
+        ⚠这只是**存档运行态**里的名字；地编/FA2 里能选中的变量清单来自地图
+          `[VariableNames]`（开局默认值也在那）。要"地编里也看得见"请用 `define_local_var()`。
+        """
+        off = self._lv_offset(idx)
+        s = ('' if name is None else str(name)).strip()
+        b = s.encode('ascii', 'ignore')[:LOCALVAR_NAME_LEN - 1]
+        self.plain[off:off + LOCALVAR_NAME_LEN] = b.ljust(LOCALVAR_NAME_LEN, b'\x00')
+        return self.local_var(idx)
+
+    def set_local_var_value(self, idx, value):
+        """**直接写存档里的变量值**（绕开行为 56）。事件 36 判定的是"值 ≠ 0"。
+
+        存档自足（§176 勘误）：这个值读档后就生效。地图里的默认值只影响**新开一局**；
+          想让新开局也是 v，请用 `set_local_var_default()`（同时改地图）。
+        返回 dict 的 `persist` 表示"该号是否也在地图里有定义"（True = 与地图一致/无冲突）。
+        """
+        off = self._lv_offset(idx)
+        v = int(value)
+        if not 0 <= v <= 255:
+            raise ValueError('变量值必须是 0..255（引擎按 1 字节存）：%r' % (value,))
+        self.plain[off + LOCALVAR_NAME_LEN] = v
+        d = self.local_var(idx)
+        d['persist'] = (d.get('source') != 'map')
+        if d.get('source') == 'map':
+            d['note'] = ('该变量在地图里已定义（默认值 %s）⇒ 读档时值会被重置为 %s；'
+                         '要改初值请用 set_local_var_default()'
+                         % (d.get('default'), d.get('default')))
+        return d
+
+    def clear_local_var(self, idx):
+        """清空一个变量（名字 + 值都归 0）。"""
+        off = self._lv_offset(idx)
+        self.plain[off:off + LOCALVAR_SLOT] = b'\x00' * LOCALVAR_SLOT
+        return self.local_var(idx)
+
+    def ensure_local_var(self, idx, name=None, value=None, write_map=False,
+                         extra_dirs=None):
+        """确保某号变量**在地图里已定义**：没定义就补一个（默认 `V<n>`），可顺手设默认值。
+
+        ★§176：定义写进地图 `[VariableNames]`（存档镜像同步）。
+          传 `write_map=False` 时退回"只改存档镜像"的老行为（读档会被覆盖，除未定义槽外）。
+        """
+        if write_map:
+            cur = self.local_var(idx)
+            # ★2026-10-22 修：**名字优先取"地图里的那份"**，别再优先取存档里的。
+            #   原因（实测踩坑）：某个存档 3 号槽存着垃圾名 `0`，而地图里是 `D`；
+            #   旧逻辑取存档名 ⇒ 把地图的 `D` 冲成 `0`（一处坏名污染整张图）。
+            #   地图那份才是地编显示/可选的那份，理应更权威；纯数字名一律丢弃。
+            nm = name
+            if nm is None:
+                for cand in (cur.get('name_map'), cur.get('name_save')):
+                    cs = str(cand or '').strip()
+                    if cs and not cs.isdigit():
+                        nm = cs
+                        break
+                else:
+                    nm = 'V%d' % (int(idx) + 1)
+            # ★已有地图默认值时不传 value 就原样保留（别把玩家 A=1 这类默认值冲掉）
+            dv = (int(value) if value is not None
+                  else int(cur['default'] if cur['default'] is not None else 0))
+            try:
+                return self.define_local_var(idx, nm, dv, extra_dirs=extra_dirs)
+            except RuntimeError:
+                pass                          # 地图找不到 → 退回镜像写法
+        cur = self.local_var(idx)
+        if name is not None:
+            self.set_local_var_name(idx, name)
+        elif not cur['name_save']:
+            self.set_local_var_name(idx, 'V%d' % (int(idx) + 1))
+        # 注：地图里的默认值不动（那是"开局初值"，不是本次要改的东西）
+        if value is not None:
+            self.set_local_var_value(idx, value)
+        return self.local_var(idx)
+
+    def local_var_defined(self):
+        """已命名（地图里定义过或镜像里有名）的变量 → `[{index, fa2, name, value, default}]`。"""
+        return [v for v in self.local_var_table() if v['name']]
+
+    # ---- ★§176 地图端：变量的**定义**（名字 + 默认值）只认地图 `[VariableNames]` ----
+    def scenario_map_name(self):
+        """存档里内嵌的场景文件名（如 `ALL01UMD.MAP`）→ str 或 None。
+
+        实测位置：明文 `0x1264` 附近，`[u32 1][名字 + \\0 填充]`，全大写、无目录。
+        """
+        pl = bytes(self.plain)
+        low = pl.lower()
+        for ext in SCENARIO_EXTS:
+            q = low.find(ext.encode('ascii'))
+            while q >= 0:
+                s = q
+                while s > 0 and 32 <= pl[s - 1] < 127:
+                    s -= 1
+                name = pl[s:q + len(ext)].decode('latin1')
+                if 3 < len(name) <= 80 and '\\' not in name and '/' not in name:
+                    return name
+                q = low.find(ext.encode('ascii'), q + 1)
+        return None
+
+    def scenario_map_path(self, extra_dirs=None, refresh=False):
+        """定位场景地图文件 → 路径 或 None（找不到时给出 `map_lookup_hint()`）。"""
+        if not refresh and getattr(self, '_map_path_done', False):
+            return getattr(self, '_map_path', None)
+        nm = self.scenario_map_name()
+        self._map_name = nm
+        # ★带上存档自带尺寸做同名异图过滤（官方 ALL01UMD.MAP 也是这个名字）
+        try:
+            sz = self.map_size()
+        except Exception:
+            sz = None
+        self._map_path = find_scenario_map(self.path, nm, extra_dirs, size=sz)
+        self._map_path_done = True
+        return self._map_path
+
+    def map_lookup_hint(self):
+        """没找到地图时给玩家的提示（含内嵌名与搜索过的目录）。"""
+        nm = getattr(self, '_map_name', None) or self.scenario_map_name() or '(未识别)'
+        return ('存档内嵌场景名 = %s；请在存档同目录（或 E:/YURI）放同名地图文件，'
+                '或手动指定地图路径' % nm)
+
+    def map_variables(self, extra_dirs=None):
+        """读地图里已定义的变量 → `{'path','exists','items':[{index,fa2,name,default}]}`。"""
+        p = self.scenario_map_path(extra_dirs)
+        r = read_scenario_variables(p)
+        out = {'path': p, 'exists': bool(r['exists']), 'items': [],
+               'map_name': self.scenario_map_name()}
+        for (i, n, d) in r['items']:
+            out['items'].append({'index': i, 'fa2': i + 1, 'name': n, 'default': d})
+        if not p:
+            out['hint'] = self.map_lookup_hint()
+        return out
+
+    def map_waypoints(self, extra_dirs=None):
+        """读地图 `[Waypoints]` → `{'path','exists','items':{号:(x,y)}}`（编码 `y*1000+x`）。"""
+        p = self.scenario_map_path(extra_dirs)
+        r = read_scenario_waypoints(p)
+        out = {'path': p, 'exists': bool(r['exists']), 'items': dict(r['items']),
+               'map_name': self.scenario_map_name()}
+        if not p:
+            out['hint'] = self.map_lookup_hint()
+        return out
+
+    def register_waypoints_to_map(self, nums=None, extra_dirs=None, map_path=None,
+                                  backup=True):
+        """**把存档里的路径点同步进地图 `[Waypoints]`** → dict。
+
+        玩家口径（2026-10-22）：「125 触发是要有路径点的，你要把建筑落在那里，
+        **要写那里的路径点**」—— 存档里的 `set_waypoint` 管运行期落点，地图这份管
+        "地编里 / 重载时这个格确实是个路径点"。两边对得上才与地编手做的档一致。
+
+        `nums` = 要同步的号（None ⇒ 存档里**所有**已定义路径点）；只增不删：
+        地图里原有的号一律保留（存档同号以存档为准）。
+        返回 `{'path','mode','backup','added','updated','total','items'}`。
+        """
+        mp = map_path or self.scenario_map_path(extra_dirs)
+        if not mp:
+            raise RuntimeError('找不到地图文件，无法同步路径点。' + self.map_lookup_hint())
+        save_wp = self.waypoints_save()
+        if not save_wp:
+            raise RuntimeError('存档里定位不到路径点表（不做猜测）')
+        cur = dict(read_scenario_waypoints(mp)['items'])
+        want = save_wp if nums is None else {
+            int(n): save_wp[int(n)] for n in nums if int(n) in save_wp}
+        if not want:
+            raise RuntimeError('要同步的路径点在存档里不存在')
+        added, updated = [], []
+        for n, c in want.items():
+            if n not in cur:
+                added.append(n)
+            elif cur[n] != c:
+                updated.append(n)
+            cur[n] = c
+        info = write_scenario_waypoints(mp, cur, backup=backup)
+        info.update({'added': sorted(added), 'updated': sorted(updated),
+                     'total': len(cur), 'items': dict(sorted(cur.items()))})
+        return info
+
+    def define_local_var(self, idx, name=None, default=0, write_map=False,
+                         extra_dirs=None, map_path=None):
+        """**定义（或改默认值）一个局部变量** —— 写进地图 `[VariableNames]`。
+
+        这是"地编里先写局部变量"那一步。`name=None` 保留原名；`default` 是**读档时**的值。
+        ★为什么同时写地图：存档是**自足**的（读档不会被地图覆盖），但地编里"能选中的变量"
+          和"开局的默认值"来自地图 `[VariableNames]` ⇒ 只改存档时 FA2 里看不到这个变量、
+          新开一局也没有默认值。两边都写才与地编流程一致（地图首次改写会留 `.bak`）。
+        返回 `{'index','fa2','name','default','map','backup','value_in_save'}`。
+        """
+        idx = int(idx)
+        if not (0 <= idx < LOCALVAR_COUNT):
+            raise ValueError('变量索引 %d 越界（引擎只认 0..%d）' % (idx, LOCALVAR_COUNT - 1))
+        # ★显式传入的纯数字名**先拒**（与地图在不在无关）：地编里变量名必须能被选中，
+        #   纯数字不是合法变量名。放在找地图之前，才能保证"参数非法"永远先报 ValueError。
+        if name is not None:
+            _n = str(name).strip()
+            if _n and _n.isdigit():
+                raise ValueError('变量名不能是纯数字（%r 不是合法变量名）' % (_n,))
+        mp = map_path or self.scenario_map_path(extra_dirs)
+        if write_map and not mp:
+            raise RuntimeError('找不到地图文件，无法定义变量。' + self.map_lookup_hint())
+        cur = {i: (n, d) for (i, n, d) in
+               ([(x['index'], x['name'], x['default']) for x in self.map_variables(
+                   extra_dirs)['items']] if write_map else [])}
+        nm = str(name).strip() if name is not None else cur.get(idx, ('', 0))[0]
+        # ★2026-10-22 修：**纯数字名是垃圾**（曾把一个存档里 3 号槽的 `0` 写进地图，
+        #   把玩家地图的 `3=D` 冲成 `3=0`）。地编里变量名必须能被选中，
+        #   纯数字不是合法变量名 ⇒ 显式传入时直接拒，推导出来的则退化成 `V<n>`。
+        if nm and nm.isdigit():
+            if name is not None:
+                raise ValueError('变量名不能是纯数字（%r 不是合法变量名）' % (nm,))
+            nm = ''
+        if not nm:
+            nm = 'V%d' % (idx + 1)
+        if name is not None or idx not in cur:
+            cur[idx] = (nm, int(default or 0))
+        elif default is not None:
+            cur[idx] = (nm, int(default or 0))
+        info = {}
+        if write_map:
+            info = write_scenario_variables(mp, [(i, n, d) for i, (n, d) in cur.items()])
+        # 顺手把存档镜像也对齐（工具自己回读、以及"未定义槽"的值都靠它）
+        self.set_local_var_name(idx, nm)
+        self.set_local_var_value(idx, cur[idx][1])
+        out = self.local_var(idx)          # 带 name/value/default/source/off
+        out.update({'map': mp, 'backup': info.get('backup'),
+                    'map_mode': info.get('mode'), 'value_in_save': cur[idx][1],
+                    'default': cur[idx][1]})
+        return out
+
+    def set_local_var_default(self, idx, value, extra_dirs=None, map_path=None):
+        """改某个**已定义**变量的默认值（= 读档后的初值）。未定义会抛错。"""
+        mp = map_path or self.scenario_map_path(extra_dirs)
+        if not mp:
+            raise RuntimeError('找不到地图文件。' + self.map_lookup_hint())
+        items = [(x['index'], x['name'], x['default']) for x in self.map_variables(extra_dirs)['items']]
+        if not any(i == int(idx) for (i, _n, _d) in items):
+            raise RuntimeError('变量 %d 还没在地图里定义，请先 define_local_var()' % int(idx))
+        v = int(value)
+        if not 0 <= v <= 255:
+            raise ValueError('变量值必须是 0..255：%r' % (value,))
+        items = [(i, n, (v if i == int(idx) else d)) for (i, n, d) in items]
+        info = write_scenario_variables(mp, items)
+        self.set_local_var_value(idx, v)
+        return {'index': int(idx), 'default': v, 'map': mp, 'backup': info.get('backup')}
+
+    def remove_local_var(self, idx, extra_dirs=None, map_path=None):
+        """从地图里删掉一个变量定义（存档镜像一并清空）。"""
+        mp = map_path or self.scenario_map_path(extra_dirs)
+        if not mp:
+            raise RuntimeError('找不到地图文件。' + self.map_lookup_hint())
+        items = [(x['index'], x['name'], x['default']) for x in self.map_variables(extra_dirs)['items']]
+        items = [(i, n, d) for (i, n, d) in items if i != int(idx)]
+        info = write_scenario_variables(mp, items)
+        self.clear_local_var(idx)
+        return {'index': int(idx), 'removed': True, 'map': mp, 'backup': info.get('backup')}
+
+
+    # ★★★ 2026-10-18 定案：**行为是链表** —— 行为对象 `obj + 0x3C` = 下一条行为的自键，
+    #   写成 0 就是这条触发的最后一条。实测 SAVE0029（大任务档）：
+    #     1197 条指向下一条 + 616 条链尾(0) = 1813 = **全部行为，0 例外**；
+    #     616 个触发实例的 `+196` 恰好是 616 条链的头 ⇒ **一条链 = 一个触发的全部行为**。
+    #   ⇒ 有了它，不挂地图也能把每条行为归属到触发（以前只有链头那 616 条能认领）。
+    ACTION_NEXT_OFF = 0x3C
+
+    def action_owner_sids(self):
+        """{行为自键: 触发 sid} —— 沿行为链把**每一条**行为都归属到触发（无需地图）。"""
+        pl = self.plain
+        by_key = {a.get('key'): a for a in self.actions() if a.get('key')}
+        out = {}
+        for sid, d in self.runtime_links().items():
+            k, seen = d['ac'], set()
+            while k and k in by_key and k not in seen:
+                seen.add(k)
+                out.setdefault(k, sid)
+                if by_key[k]['obj'] + self.ACTION_NEXT_OFF + 4 > len(pl):
+                    break
+                k = struct.unpack_from('<I', pl, by_key[k]['obj'] + self.ACTION_NEXT_OFF)[0]
+        return out
+
+    def pending_build_triggers(self):
+        """本档里**「行为 125 将建筑建于…」**的触发 → `[(sid, 名字)]`。
+
+        ★2026-10-22 §188（玩家实踩）：这些触发**读档就会建建筑**。
+        我们做实验时用「⚡ 触发法」加楼会留下这种触发；之后每次拿这份档当基档做别的实验，
+        它们都会额外刷出建筑 ⇒ 实验结果被污染（T14 就是这样废掉的）。
+        调用方（GUI/脚本）应当先提示或先 `soft_disable_trigger()`。
+        """
+        owners = self.action_owner_sids()
+        names = {r.sid: r.name for r in self.records if r.kind == '触发'}
+        out, checked = [], {}
+        for a in self.actions():
+            if a.get('type') != 125:
+                continue
+            sid = owners.get(a.get('key'))
+            if not sid:
+                continue
+            if sid not in checked:
+                # ★只报「真的会触发」的：软禁用过的（事件 13 + 参数拉到上限）要排除
+                try:
+                    ev = (self.trigger_detail(sid) or {}).get('event') or {}
+                    dead = (ev.get('type') == 13
+                            and int(ev.get('arg') or 0) >= self.SOFTOFF_TIME_SEC)
+                except Exception:
+                    dead = False
+                checked[sid] = not dead
+            if checked[sid] and (sid, names.get(sid)) not in out:
+                out.append((sid, names.get(sid) or sid))
+        return out
+
+    def action_chain(self, head_key, limit=512):
+        """从一条行为自键出发，沿 `obj+0x3C` 走完整条链 → [行为自键, ...]。"""
+        pl = self.plain
+        by_key = {a.get('key'): a for a in self.actions() if a.get('key')}
+        out, seen, k = [], set(), head_key
+        while k and k in by_key and k not in seen and len(out) < limit:
+            out.append(k)
+            seen.add(k)
+            if by_key[k]['obj'] + self.ACTION_NEXT_OFF + 4 > len(pl):
+                break
+            k = struct.unpack_from('<I', pl, by_key[k]['obj'] + self.ACTION_NEXT_OFF)[0]
+        return out
+
+    # ★★★ 2026-10-21 §157：事件也是链表（`obj+0x3C` = 下一条事件自键），与行为同构。
+    #   链头 = 触发实例 `+192`。以前只有行为走了链，事件只看链头那一条。
+    EVENT_NEXT_OFF = 0x3C
+
+    def event_chain(self, head_key, limit=512):
+        """从一条事件自键出发，沿 `obj+0x3C` 走完整条链 → [事件自键, ...]。"""
+        pl = self.plain
+        by_key = {e.get('key'): e for e in self.events() if e.get('key')}
+        out, seen, k = [], set(), head_key
+        while k and k in by_key and k not in seen and len(out) < limit:
+            out.append(k)
+            seen.add(k)
+            if by_key[k]['obj'] + self.EVENT_NEXT_OFF + 4 > len(pl):
+                break
+            k = struct.unpack_from('<I', pl, by_key[k]['obj'] + self.EVENT_NEXT_OFF)[0]
+        return out
+
+    def trigger_event_list(self, sid):
+        """触发的事件链 → [{'type','arg','name','key'}]（按链序，链头取实例 +192）。"""
+        d = self.runtime_links().get(sid)
+        if not d:
+            return []
+        by_key = {e.get('key'): e for e in self.events() if e.get('key')}
+        out = []
+        for k in self.event_chain(d.get('ev')):
+            e = by_key.get(k)
+            if e:
+                out.append({'type': e.get('type'), 'arg': e.get('arg'),
+                            'name': e.get('name'), 'key': k})
+        return out
+
+    def _mk(self, kind, o):        # ★改成实例方法：参数文案要用到阵营顺序（house_order）
+        t, v = o['type'], o['arg']
+        nm, pt = (event_name(t), event_ptype(t)) if kind == 'event' else \
+                 (action_name(t), action_ptype(t))
+        return {'off': o['off'], 'obj': o['obj'], 'type': t, 'arg': v,
+                'name': nm, 'ptype': pt, 'arg_text': self._arg_text(pt, v),
+                'key': o.get('key'),
+                'owner': None, 'map_type': None, 'map_arg': None}
+
+    def _revalidate_event(self, ev):
+        """校验 ev 的偏移仍指向同一事件对象（恒定签名 + 自键），漂移则重定位。
+
+        ★ 背景：同会话内计时表登记 / 修复等操作会**插字节**，GUI/循环里持有的
+        ev 字典偏移会全体漂移 ⇒ 直接按旧 off 写 = 写进别的对象。签名
+        （obj+4..16 恒定 12B）+ 自键双校验，不匹配就按键回查新位置。"""
+        key = ev.get('key')
+        obj = ev.get('obj')
+        if key is not None and 0 <= obj and obj + 20 <= len(self.plain) and \
+                self.plain[obj + 4:obj + 16] == OBJ_SIG[4:] and \
+                int.from_bytes(self.plain[obj + 16:obj + 20], 'little') == key:
+            return
+        if key is None:
+            return
+        for od in self._objects():
+            if int.from_bytes(self.plain[od['obj'] + 16:od['obj'] + 20], 'little') == key:
+                ev['obj'] = od['obj']
+                ev['off'] = od['off']
+                return
+        raise RuntimeError('事件对象（键 %08X）重定位失败 —— 明文结构异常' % key)
+
+    # ---------- 地图对照（权威真值 + 归属）----------
+    def attach_map(self, path):
+        """挂载地图文件（.map/.yrm）。
+
+        地图 INI 的 `[Events]` / `[Actions]` **以触发ID 为键**，是「哪个触发挂哪些事件/行为」
+        的唯一权威来源（存档里没有这个归属字段）。挂上后：
+          - `events()` / `actions()` 的每项多出 `owner`（所属触发ID）与 `map_type/map_arg`（地图值）
+          - `map_status` 给出对拍结论（值完全一致 / 仅结构一致 / 数量不符 / 无地图）
+        """
+        self._map = MapIni(path) if path else None
+        self._mapm = None
+        self._events = None
+        self._actions = None
+        self._apply_map()
+        if path:
+            try:
+                ids = set(r.sid for r in self.records if r.kind == '触发')
+                self._assoc_put(ids, path)
+            except Exception:
+                pass
+        return self._mapm['mode'] if self._mapm else 'no_map'
+
+    # ---------- 路径点表（★★★2026-10-17 定案：**就在存档里**，不看地图） ----------
+    #   明文 `1586 + 4×号` 起，共 `702` 项（号 0..701），每项 = `u16 x` + `u16 y`（**x 在前**）。
+    #   ⇒ 与地图 `[Waypoints]` 的 `y×1000+x` 编码**无关**；数组起点 1586 `% 4 == 2`
+    #     （**不是 4 字节对齐**）、坐标也不是任何 u32 打包值 —— 这正是此前
+    #     「按 u32 对齐搜 / 按 y*1000+x 搜 / 按格子索引搜」全部 0 命中的原因。
+    #   证据（2026-10-17 一次性锁死）：
+    #     ① `五路径点档.SAV` 读出 98/99/431/578/654 五个点，与 `all01umd.map` 的
+    #        `[Waypoints]`（80080/74084/91088/85089/86082）**5/5 逐条吻合**；
+    #     ② 同一地图族 140+ 份存档全部读出 `98=(80,80) 99=(80,79)`，与地图原值一致；
+    #     ③ 400×400 大任务档读出 115 个路径点、坐标 ≤310 ≤ 图幅 ⇒ 跨图幅成立；
+    #     ④ 三份同族档（五路径点 / 刷光棱塔德国 / 刷光棱塔韩国）同一条读到**各自不同**的值
+    #        （99 = (84,74)/(84,74)/(70,77)）⇒ 是活的存档数据，不是常量。
+    #   ⇒ 这同时解释了「删掉地图照样能刷建筑」：落点完全由存档自带。
+    WP_BASE = 1586              # 表首地址（明文偏移，1 号路径点 = 1590）
+    WP_COUNT = 702             # 项数（号 0..701，与 YR 引擎上限一致）
+    WP_COORD_MAX = 511         # 坐标合理性宽上界（400×400 图实测最大 310）
+    # 表前 38 字节的固定结构：`02 00 00 00 | 00*4 | FF*4 | <ptr> | <u32> | FF*4 | <ptr>`
+    WP_ANCHOR = b'\x02\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff'
+    WP_ANCHOR_TO_ARRAY = 38    # 锚点 → 表首的距离
+
+    def waypoint_base(self, pl=None):
+        """定位路径点表基址（明文偏移）；定位不到返回 `None`（**绝不瞎猜**）。
+
+        锚点 = 表前 38 字节的固定前缀 + 两个"堆指针形状"的 4 字节 + 中间 `FF FF FF FF`；
+        再用「非零项坐标 ≤ WP_COORD_MAX」收口。`ScenarioClass` 头在明文最前面 ⇒ 取最小候选。
+        """
+        pl = self.plain if pl is None else pl
+        n = len(pl)
+        i = 0
+        found = []
+        while True:
+            j = pl.find(self.WP_ANCHOR, i)
+            if j < 0:
+                break
+            i = j + 1
+            base = j + self.WP_ANCHOR_TO_ARRAY
+            if base + 4 * self.WP_COUNT > n:
+                continue
+            p1 = struct.unpack_from('<I', pl, j + 12)[0]
+            if not (0x01000000 <= p1 <= 0x20000000):
+                continue
+            # ★2026-10-18 00:0x：这个槽在别的存档里是 `FF FF FF FF`（空指针），
+            #   但在"引擎重存后"的 SAVE4823 里变成了一个真实指针（0x002A8F8C）
+            #   ⇒ 只认 FFFFFFFF 会让整张路径点表定位失败（写路径点直接抛异常）。
+            #   放宽成"空指针或像样的指针"，靠下面 702 项坐标范围校验收口。
+            slot = struct.unpack_from('<I', pl, j + 20)[0]
+            if not (slot == 0xFFFFFFFF or 0x00010000 <= slot <= 0x9FFFFFFF):
+                continue
+            p2 = struct.unpack_from('<I', pl, j + 24)[0]
+            if not (0x01000000 <= p2 <= 0x20000000):
+                continue
+            ok = True
+            for k in range(self.WP_COUNT):
+                x, y = struct.unpack_from('<HH', pl, base + 4 * k)
+                if (x or y) and (x > self.WP_COORD_MAX or y > self.WP_COORD_MAX):
+                    ok = False
+                    break
+            if ok:
+                found.append(base)
+        return min(found) if found else None
+
+    def waypoint_offset(self, n):
+        """第 n 号路径点在明文里的偏移（定位失败 / 号越界 → None）。"""
+        base = self.waypoint_base()
+        n = int(n)
+        if base is None or not (0 <= n < self.WP_COUNT):
+            return None
+        return base + 4 * n
+
+    def waypoints_save(self):
+        """**存档本体**里的路径点表 → {号: (x, y)}（权威来源；定位不到返回 {}）。"""
+        base = self.waypoint_base()
+        if base is None:
+            return {}
+        out = {}
+        for k in range(self.WP_COUNT):
+            x, y = struct.unpack_from('<HH', self.plain, base + 4 * k)
+            if x or y:
+                out[k] = (x, y)
+        return out
+
+    def waypoint_cell(self, n):
+        """第 n 号路径点的格子 (x, y)；没定义 → None。"""
+        off = self.waypoint_offset(n)
+        if off is None:
+            return None
+        x, y = struct.unpack_from('<HH', self.plain, off)
+        return (x, y) if (x or y) else None
+
+    def set_waypoint(self, n, x, y):
+        """把第 n 号路径点写到格子 (x, y)。**零增长**（原地改 4 字节，明文长度不变）。
+
+        `x is None or y is None or x < 0 or y < 0` ⇒ 删除该路径点（写 (0, 0)）。
+        写完立即回读校验，返回最终 (x, y)。
+        """
+        off = self.waypoint_offset(n)
+        if off is None:
+            raise RuntimeError('定位不到存档里的路径点表（不做猜测）')
+        if x is None or y is None or x < 0 or y < 0:
+            x = y = 0
+        x, y = int(x), int(y)
+        if x > self.WP_COORD_MAX or y > self.WP_COORD_MAX:
+            raise ValueError('坐标超出范围（0..%d）：(%d,%d)'
+                             % (self.WP_COORD_MAX, x, y))
+        struct.pack_into('<HH', self.plain, off, x, y)
+        back = struct.unpack_from('<HH', self.plain, off)[0:2]
+        if tuple(back) != (x, y):
+            raise RuntimeError('写入后回读不一致：%r != %r' % (tuple(back), (x, y)))
+        return (x, y)
+
+    def waypoints_from_map(self):
+        """挂载地图的 `[Waypoints]` → {号: (x, y)}（地图 INI 视角，编码 `y×1000+x`）。
+
+        仅作对照用：**存档自足**，落点以 `waypoints_save()` 为准。
+        """
+        m = self._map
+        try:
+            return m.waypoints() if m is not None else {}
+        except Exception:
+            return {}
+
+    def waypoints(self):
+        """路径点 {号: (x, y)} —— **优先存档本体**，定位不到才退回挂载地图。"""
+        base = self.waypoint_base()
+        if base is not None:
+            return self.waypoints_save()
+        return self.waypoints_from_map()
+
+    def waypoint_of_cell(self, x, y):
+        """该格子对应的路径点编号（没有 → None）。存档优先，地图兜底。"""
+        for n, (wx, wy) in self.waypoints_save().items():
+            if (wx, wy) == (x, y):
+                return n
+        m = self._map
+        try:
+            return m.waypoint_of_cell(x, y) if m is not None else None
+        except Exception:
+            return None
+
+    # ---------------- 地图关联记忆（★2026-10-20） ----------------
+    #   玩家："我打开桌面的档不高亮、放 E:\YURI 就高亮" —— 根因是**地图匹配是启发式**：
+    #   换个目录，`find_maps` 找到的图集变了、重叠度就不够了。所以把"这份档配过哪张图"
+    #   记下来（按 存档名 + 触发ID集合 指纹），下次**哪怕换目录**也优先用回它。
+    MAP_ASSOC_FILE = os.path.join(os.path.expanduser('~'), '.ra2_save_editor', 'map_assoc.json')
+
+    @staticmethod
+    def _assoc_key(path, ids):
+        import hashlib
+        h = hashlib.md5('|'.join(sorted(ids)).encode('utf-8')).hexdigest()[:10]
+        return '%s|%d|%s' % (os.path.basename(str(path)).lower(), len(ids), h)
+
+    def _assoc_load(self):
+        try:
+            with open(self.MAP_ASSOC_FILE, encoding='utf-8') as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _assoc_get(self, ids):
+        p = self._assoc_load().get(self._assoc_key(self.path, ids))
+        return p if p and os.path.isfile(p) else None
+
+    def _assoc_put(self, ids, map_path):
+        try:
+            d = self._assoc_load()
+            d[self._assoc_key(self.path, ids)] = os.path.abspath(map_path)
+            os.makedirs(os.path.dirname(self.MAP_ASSOC_FILE), exist_ok=True)
+            with open(self.MAP_ASSOC_FILE, 'w', encoding='utf-8') as f:
+                json.dump(d, f, ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+
+    def auto_attach_map(self, extra_dirs=(), min_overlap=0.6):
+        """按「触发ID 集合」在存档所在目录（及其子目录）里找地图并**自动挂载**。
+
+        ★ 必须有足够重叠才算候选（默认 60%）：否则会把无关地图硬挂上（实测踩过 ——
+        `D:\\233\\RA2YR` 下 7 个触发的档被挂到了只共 1 个 ID 的 all01umd.map）。
+        候选可能仍有多个（同一地图的不同版本常共用触发ID）⇒ 优先选**数值完全对拍成功**的。
+        ★2026-10-20：**先试"上次配过的那张图"**（存在关联记忆里），命中就直接挂 ——
+          这样存档换个目录、或者原目录里那堆图被挪走，也不会突然"没地图"。
+        """
+        from map_ini import MapIni as _MI, find_maps as _fm
+        here = os.path.dirname(os.path.abspath(self.path))
+        dirs = [here] + [d for d in extra_dirs if d]
+        ids = set(r.sid for r in self.records if r.kind == '触发')
+        # ① 关联记忆优先
+        _cached = self._assoc_get(ids)
+        if _cached:
+            try:
+                _m = _MI(_cached)
+                _mids = _m.trigger_ids()
+                _den = max(len(ids), len(_mids)) or 1
+                if _mids and len(ids & _mids) / float(_den) >= min_overlap:
+                    self._map, self._mapm = _m, None
+                    self._apply_map()
+                    if self._mapm:
+                        self._mapm['cached'] = True
+                        return self._mapm['mode']
+            except Exception:
+                pass
+            self._map = None
+            self._mapm = None
+        seen = set()
+        cands = []
+        for p in _fm(dirs)[:80]:
+            key = os.path.normcase(os.path.abspath(p))
+            if key in seen:                       # 同一文件别来两次（否则排序会打平）
+                continue
+            seen.add(key)
+            try:
+                if os.path.getsize(p) > 20 * 1024 * 1024:      # 超大文件跳过（非正常地图）
+                    continue
+            except OSError:
+                continue
+            try:
+                m = _MI(p)
+            except Exception:
+                continue
+            mids = m.trigger_ids()
+            if not mids:
+                continue
+            # 重叠度按**较大一侧**算（否则小地图会靠"占满自己"蒙混过关 ——
+            # 实测：7 个触发的存档曾被只含 1 个触发的杂图判成 100% 重叠）
+            denom = max(len(ids), len(mids)) or 1
+            ov = len(ids & mids) / float(denom)
+            if ov < min_overlap:
+                continue
+            cands.append((0 if mids == ids else 1, -ov, p, m))
+        best = None
+        for _, negov, p, m in sorted(cands, key=lambda x: (x[0], x[1])):
+            self._map = m
+            self._mapm = None
+            self._apply_map()
+            mm = self._mapm
+            rank = (mm['mode'] != 'exact', mm['mode'] != 'structural',
+                    negov, mm['ev_mismatch'] + mm['ac_mismatch'])
+            if best is None or rank < best[0]:
+                best = (rank, p, m, mm)
+            if mm['mode'] == 'exact' and negov == -1.0:
+                break
+        if best is None:
+            self._map = None
+            self._mapm = None
+            return 'no_map'
+        self._map, self._mapm = best[2], best[3]
+        self._apply_map()
+        try:                                  # ★记住"这份档配这张图"，换目录也认
+            self._assoc_put(ids, best[1])
+        except Exception:
+            pass
+        # ★ 用地图的权威 ID 集合**修正记录分类** —— 大型自制任务的档里
+        #   「触发定义」与「触发实例」是两个独立数组，定义数组的 +120 处不是
+        #   01 01 01 01，启发式会把触发判成「未识别结构」（实测 SAVE5C7B：
+        #   86 条触发全部中招）。地图 [Triggers]/[Tags] 的 ID 是权威判据。
+        m = self._map
+        tids = m.trigger_ids()
+        tagids = set(m.tag_trigger_map().keys())
+        changed = 0
+        for r in self.records:
+            old = r.kind
+            if r.sid in tids:
+                r.kind = '触发'
+            elif r.sid in tagids:
+                r.kind = '标签'
+            if r.kind != old:
+                changed += 1
+        if changed:
+            self._assign_trigger_flags(self.records)
+            self._mapm['reclass'] = changed
+        return self._mapm['mode']
+
+    # ---------------- 重复类型（★2026-10-20 定位 / 2026-10-21 语义纠错） ----------------
+    # ⚠ 历史错误：以前把**触发**行 `[Triggers]` 的第 4 字段当"重复类型"。那是**禁用标志**！
+    #   ModEnc 权威格式：`ID=HOUSE, LINKED_TRIGGER, NAME, DISABLED, EASY, NORMAL, HARD, TRANSFERABLE`
+    #   ⇒ 大档 SAVE48DB 里"地图里一条型2都没有"、`+123` 完美分离两组，就是因为读的是禁用位。
+    # ✔ 正确来源（ModEnc + 玩家 2026-10-20 用 SAVE18BE 三条 0/1/2 定案）：**标签行**
+    #   `[Tags] TAGID=PERSISTENCE, NAME, TRIGGERID`
+    #   第 0 字段 = 持久性 = "重复类型"。ModEnc 原文（[Tags] 页 PERSISTENCE 表）：
+    #     0 = Volatile        —— 触发瞬间标签即销毁；挂多个对象时**任一**被触发就够
+    #     1 = Semi-persistent —— 维护挂载对象计数，**全部**对象都触发过才真正触发，然后销毁
+    #     2 = Persistent      —— 标签永不销毁，条件每次满足都再触发一次
+    #   ★★2026-10-21 玩家纠错（§156）：这里的"任一/全部"说的是**标签挂在多个对象上**时
+    #     哪个对象的事件算数；**同一触发里的多个事件永远是 AND（少一个都不执行）**，
+    #     与持久性取值无关。别再把它读成"多条件是任一满足还是全部满足"。
+    #   ModEnc 原话："Whether and when a tag is removed after being triggered is controlled
+    #   solely by the PERSISTENCE parameter of the tag entry. Final Sun and Final Alert 2
+    #   write the persistence value to the tag, not to the trigger."
+    #   ★★2026-10-21/22 玩家实测（§157–§161）：**持久性 1 = 半持久，盯的是"挂载列表清空"**。
+    #     引擎只在**一个**地方记账：`CellTag` 记录的 `+0x40`（= 标签还挂着几个对象）。
+    #     每有一个挂载对象**离场**就 -1，减到 **0** 才执行一次，随后标签被销毁。
+    #     ★★「-1 会发生」不等于「-1 与事件无关」（§162 更正 §161）：
+    #       卖 3 栋也执行，原以为证明"计数不看事件"，但 **FA2 地编说明写明事件 48
+    #       「被任何事物摧毁」本身就包含**摧毁 / 占领 / 心控 / **变卖**"（事件 7 才只管摧毁）。
+    #       ⇒ 卖 3 栋可能是"变卖满足了事件 48"、"也可能是"离场就 -1"，两说都成立，
+    #         §161 那句"与事件类型无关"已撤回。
+    #       仍成立的部分：卖与炸在存档层面等价（卖 1 与炸 1 都到 count=2 的状态）；
+    #         挂 1 栋即执行；计数只此一处。
+    #       判别实验（一次只改事件类型）：同样"挂 3 栋 + 全部变卖"，
+    #         用 **48**（含变卖）已实测执行；用 **7**（不含变卖）若也执行 ⇒ 计数唯一驱动，
+    #         若不执行 ⇒ 必须"事件对该对象满足"才 -1。见 §162.4。
+    #     证据（§160 四档，同一张图连存档）：0/1/2 栋被摧毁 ⇒ 该计数 **3/2/1** 严格递减、
+    #       与建筑列表里存活的 GAPOWR 数一一相等，触发器一直不执行；第 3 栋一炸 ⇒ 计数归零、
+    #       标签记录 + CellTag 节点**双双消失**、行为执行。而 Trigger 定义/实例/事件对象在
+    #       "count=1 未执行"与"count=0 已执行"两档之间**逐 u32 完全一致** ⇒ 没有第二个计数器。
+    #     证据（§161 三档）：`卖掉一栋` count=2 未执行、`摧毁剩余两栋后结果执行`(卖1+炸2) 已执行、
+    #       `卖掉三栋后结果执行`(全程没有摧毁) 已执行、`只挂一栋 摧毁后执行` 已执行
+    #       ⇒ **卖也照减**（但"为什么减"见上面的 §162 更正）。
+    #       FA2 地编对三个摧毁类事件的差别（`EVENT_NOTES[7/29/48]`）：
+    #         7 = 只算摧毁（碎片伤害、占领、变卖、心控**都不算**）；
+    #         29 = 摧毁/占领/心控/变卖都算，**不含"渗透后消失"**；
+    #         48 = 摧毁/占领/心控/变卖都算，**可用于有子机的单位**。
+    #       · 正当用法（玩家原话）：**摧毁事件挂 N 个建筑/单位，全部被摧毁后才执行结果**；
+    #       · 坑 1 **挂 0 个对象**（地图级触发）⇒ 没有对象可"-1"，永远到不了 0 ⇒ 永不触发。
+    #               实测样本：`01000470` = 3×事件 36（三个局部变量）+ 行为 1（胜利），
+    #               `attached = 0`；持久性 0 正常，改 1 就永远不执行。
+    #       · 坑 2（引擎 BUG）：**进入事件（1）挂多个对象 + 持久 1 ⇒ 永不执行** ——
+    #               进入不会把对象从标签上摘下来，计数恒等于原值、永远降不到 0（§159 实测
+    #               三栋全进入后 count 仍是 3）。所以作者们改用**局部变量**：
+    #               每栋各一条「持久 0 · 事件 1 → 行为 56 设置局部变量 N」，
+    #               再加一条「持久 0 · N×事件 36 → 结果行为」的汇总触发。
+    #   ⚠ 这一层是**存档级硬证据 + 玩家实测**，仍未做引擎反汇编；"离场即 -1"的入口在哪未证。
+    # ★存档自足：**标签记录 +120 (u32) 就是这个持久性**（SAVE48DB 82/82、SAVE18BE 83/83 对拍）。
+    REPEAT_TEXT = {'0': '一次性·任一挂载', '1': '一次性·挂载清空', '2': '可重复'}
+    LOCAL_VAR_EVENTS = (36, 37)
+
+    def local_var_events(self, sid):
+        """触发里含哪些"局部变量类"事件 → [类型号...]（空 = 一条都没有）。"""
+        try:
+            return [e['type'] for e in self.trigger_event_list(sid)
+                    if e['type'] in self.LOCAL_VAR_EVENTS]
+        except Exception:
+            return []
+
+    def trigger_attach_count(self, sid):
+        """触发挂接的对象数（= 它那条 CellTag 上站着的建筑数）；读不到算 0。"""
+        try:
+            return int(self.trigger_detail(sid).get('attached') or 0)
+        except Exception:
+            return 0
+
+    # ★★★ 2026-10-22 §163：**计数会漏账** —— CellTag `+0x40` 不一定等于"实际还活着几个"。
+    #   四档实测（持久 1 + 事件 13 流逝时间 + 事件 48 摧毁 + 挂 3 栋电厂）：
+    #     · 先等满 30 秒再炸 3 栋 ⇒ 计数 3 → 0、执行（正常）
+    #     · **先炸完 3 栋再等 30 秒 ⇒ 计数**仍是 3**、不执行**（3 次离场一次都没记账）
+    #     · 同一条触发只留事件 48 时，炸 0/1/2 栋 ⇒ 计数 3/2/1（每次都记）⇒ 说明"记账"被
+    #       **同一触发里其它（更晚满足的）事件**卡住了，不是"离场就一定 -1"。
+    #   ⇒ 判据：`count 字段 > 实际存活挂载建筑数` = 漏账 ⇒ 这条持久 1 触发已经废了。
+    #   ★★§164（同日晚，两档补刀）：**−1 挂在"摧毁类事件被满足"的回调上**，不是挂在"对象离场"上。
+    #     只换事件类型、只做变卖（72 小时内两两对照）：
+    #       事件 48（认变卖）：卖 1 栋 ⇒ 计数 2；卖 3 栋 ⇒ 归零、执行
+    #       事件 7 （不认变卖）：卖 1 栋 ⇒ 计数**仍 3**；卖 3 栋 ⇒ 计数**仍 3**、不执行
+    #     ⇒ §162 的"实验 A2"结论 = **必须事件对该对象满足才 −1**。
+    #     于是所有"持久 1 永不执行"的坑是同一句话的三种情形（都缺"事件满足 + 对象离场"同时成立）：
+    #       ① 事件不认这种离场方式（7 + 变卖；7 也不认碎片伤害/占领/心控）
+    #       ② 事件没被接管（多事件、链头未满足，§163）
+    #       ③ 压根没有离场（进入事件 1，§159）
+    #   ⚠ 只认**建筑**（attach_overview 按格中心坐标反查）；若标签挂的是单位，live 会算成 0，
+    #     此时不要急着报漏账（调用方按"是否挂建筑"自行取舍）。
+    def attach_live_count(self, sid):
+        """实际存活、且标签字段指向这条触发的**建筑**数（几何扫描，不看 count 字段）。
+
+        与 `trigger_attach_count()` 的差 = §163 的"漏账"量。读不到返回 None。
+        """
+        n = len(self.plain)
+        if getattr(self, '_live_len', None) != n:
+            self._live_len, self._live_map = n, None
+        if getattr(self, '_live_map', None) is None:
+            agg = {}
+            try:
+                for ov in self.attach_overview() or []:
+                    tid = ov.get('trigger_id')
+                    if not tid:
+                        continue
+                    agg[tid] = agg.get(tid, 0) + len(ov.get('buildings') or [])
+            except Exception:
+                return None
+            self._live_map = agg
+        return self._live_map.get(sid)
+
+    # ★★★ 2026-10-22 §159/§160：运行期状态的存档指纹（六档实测，见主文档）
+    #   ① 「已执行」唯一的可靠指纹 = **CellTag 节点消失**（`celltag_nodes()` 里找不到它）。
+    #      · 持久 0（局部变量法 A/B/C/D）：4 个节点 → 0 个
+    #      · 持久 1（摧毁法，3 栋全炸）：1 个节点 → 0 个
+    #   ② 标签记录（TagClass）在执行后**可能整条消失**（摧毁法档 tag_records 为空），
+    #      也可能残留（局部变量法档 A/B/C 还在、只有地图级的 D 消失）⇒ **不能**用
+    #      "标签记录在不在"反推执行与否；只作附加信息。
+    #      （§159 曾写"Tag 记录还在、名字还在"—— 那只对 A/B/C 成立，§160 已更正。）
+    #   ③ 事件对象 `+0x68` 是"触发者"槽：局部变量法 A/B/C 由 0 → 指针；但摧毁法四档
+    #      **全程为 0**（含已执行档）⇒ 它不普适，别拿它当"跑没跑过"的判据。
+    #   ④ CellTag `+0x35`：未执行档里是名字残留 ASCII（108/255），**不是计数器**。
+    #   ★ 真正的计数器只有一个：**CellTag 记录 `+0x40` = 还挂着几个对象**（§160 实测
+    #     摧毁 0/1/2/3 栋 ⇒ 3/2/1/(节点消失)）。持久 1 就是等它减到 0。
+    EVENT_FIRED_PTR_OFF = 0x68
+    TAG_RAW_BYTE_OFF = 0x35
+    CELLTAG_COUNT_OFF = 0x40
+
+    def semi_persist_remaining(self, sid):
+        """持久 1 的「还差几个对象」→ 剩余挂载数；节点已消失返回 0；读不到 None。
+
+        引擎只记这一处（CellTag `+0x40`）：每有一个挂载对象**离场**（被摧毁 / 被卖掉 / 被移除）
+        就 -1，减到 0 才执行。所以「持久 1 + 摧毁类」能正常工作，「持久 1 + 进入事件」永远
+        降不到 0（§159 BUG）；卖与炸在存档里表现完全一样（§161 三档实测）。
+        """
+        try:
+            o = self.trigger_objects(sid)
+        except Exception:
+            return None
+        c = o.get('cell')
+        if c is None:
+            return 0 if o.get('tag_obj') is not None else None
+        if c + self.CELLTAG_COUNT_OFF + 4 > len(self.plain):
+            return None
+        return int.from_bytes(
+            self.plain[c + self.CELLTAG_COUNT_OFF:c + self.CELLTAG_COUNT_OFF + 4], 'little')
+
+    def trigger_runtime_state(self, sid):
+        """这条触发在本档里的**运行期状态**（只读推断，§159/§160 实测）。
+
+        → {'has_tag','has_node','attached','remain','executed','ev_fired','tag_byte',
+           'live','leak','text'}
+          · executed = CellTag 节点已消失（一次性标签被消费，无论持久 0 还是 1）
+          · remain   = 还挂着几个对象（= 持久 1 的"还差几个"），节点消失后为 0
+          · ev_fired = 事件 `+0x68` 有触发者指针（**只对部分事件类型写入**，摧毁法全程为 0）
+          · tag_byte = CellTag `+0x35` 原始字节（语义未定，别当计数器）
+          · live     = 实际存活且挂着这条触发的**建筑**数（几何扫描，§163）
+          · leak     = remain − live > 0 ⇒ 有离场没被记账（§163：先摧毁、后满足其它事件）
+        """
+        st = {'has_tag': False, 'has_node': False, 'attached': 0, 'remain': None,
+              'executed': False, 'ev_fired': False, 'tag_byte': 0,
+              'live': None, 'leak': None, 'suppress': None, 'busy': None,
+              'verdict': '', 'text': ''}
+        try:
+            o = self.trigger_objects(sid)
+        except Exception:
+            st['text'] = '读不到这条触发的对象'
+            return st
+        pl = self.plain
+        st['has_tag'] = o['tag_obj'] is not None
+        st['has_node'] = o['cell'] is not None
+        try:
+            st['attached'] = self.trigger_attach_count(sid)
+        except Exception:
+            pass
+        try:
+            st['remain'] = self.semi_persist_remaining(sid)
+        except Exception:
+            pass
+        try:
+            st['live'] = self.attach_live_count(sid)
+        except Exception:
+            pass
+        if st['remain'] is not None and st['live'] is not None:
+            st['leak'] = st['remain'] - st['live']
+        if o['ev'] is not None and o['ev'] + 0x6C <= len(pl):
+            st['ev_fired'] = bool(int.from_bytes(
+                pl[o['ev'] + self.EVENT_FIRED_PTR_OFF:o['ev'] + self.EVENT_FIRED_PTR_OFF + 4],
+                'little'))
+        if o['cell'] is not None and o['cell'] + self.TAG_RAW_BYTE_OFF + 1 <= len(pl):
+            st['tag_byte'] = int(pl[o['cell'] + self.TAG_RAW_BYTE_OFF])
+        try:
+            fl = self.celltag_flags(sid)
+        except Exception:
+            fl = None
+        if fl:
+            st['suppress'], st['busy'] = fl['suppress'], fl['busy']
+        st['executed'] = bool(st['has_tag'] and not st['has_node'])
+        # ★2026-10-22 §168：引擎真相（0x6E53A0 / 0x485250 / 0x485130）⇒ 状态收敛成五个之一
+        if not st['has_tag']:
+            st['verdict'] = 'no_tag'
+        elif st['executed']:
+            st['verdict'] = 'executed'
+        elif st['suppress']:
+            st['verdict'] = 'suppressed'
+        elif st['leak'] and st['leak'] > 0:
+            st['verdict'] = 'dead'
+        elif st['remain'] == 1:
+            st['verdict'] = 'ready'
+        else:
+            st['verdict'] = 'waiting'
+        if not st['has_tag']:
+            st['text'] = '本档找不到这条触发的标签（只有定义，或标签已被销毁且无残留）'
+        elif st['executed']:
+            st['text'] = ('已执行：CellTag 节点已消失（挂载数归零后执行、标签被销毁）')
+        elif st['suppress']:
+            st['text'] = ('⚠ 标签被**抑制**：CellTag 标志字节 +0x34 = %d（正常应为 0）⇒ '
+                          '引擎在 0x6E53A0 一进门就 return，连计数都不动 ⇒ 这条触发在本档里'
+                          '彻底失效。存档若有损坏，可用「清零抑制位」修。' % st['suppress'])
+        elif st['leak'] and st['leak'] > 0:
+            st['text'] = ('⚠ 计数漏账：CellTag 还写着 %d 个，实际存活挂载建筑只有 %d 个 ⇒ '
+                          '有 %d 次离场**没被记账**（持久 1 只在"这条触发全部事件都已满足"的'
+                          '窗口里才给离场 −1，窗口外的离场永久丢、不回补：'
+                          '① 事件类型不认这种离场方式 —— 如事件 7 不认变卖；'
+                          '② 同一触发里还有事件没满足 —— 时间没到 / 对方阵营建筑还在，§163/§165/§167）'
+                          '⇒ 这条触发永远不会执行'
+                          '（本判断只统计建筑；挂单位时请忽略此提示）'
+                          % (st['remain'], st['live'], st['leak']))
+        else:
+            st['text'] = ('未执行：CellTag 节点还在，还挂 %d 个对象'
+                          '（持久 1 要等它减到 0 才执行）' % st['attached'])
+        return st
+
+    # ★★★ 2026-10-22 §168：引擎侧反汇编（REA/Ghidra + capstone，细节见主文档 §168）把上面
+    #   这些实测全部归到三支函数上：
+    #     · SetTag(obj, cellTag)       @0x485250：旧标签 +0x2C--、obj+0x3C = 新标签、新标签 +0x2C++
+    #     · RemoveTag(obj, tag)        @0x485130：obj+0x3C == tag ⇒ tag+0x2C--、清 obj+0x3C
+    #     · CellTag::判事件并记账       @0x6E53A0：遍历 CellTag+0x28 的实例链，逐个跑
+    #       「全部事件是否满足」@0x7264C0（一路 AND）；**只有满足**才在函数尾部走
+    #       SetTag(obj, NULL) ⇒ 计数 −1；而 **计数本来就是 1** 的那一次才当场执行行为、
+    #       并把 CellTag 登记进待处理表（随后被消费 ⇒ 节点从存档里消失）。
+    #   ⇒ 「丢账」不是记账坏了，而是"事件没满足 ⇒ 连摘除都不做"，对象一消失这笔账就永久没了。
+    #   ⇒ 能救回来的修法只有一条：**把 CellTag+0x40 改回"实际还活着几个"**（§168.4 推论 1）。
+    #   ※ CellTag 记录头是 20 字节（[CLSID 16B][自身键 4B]）+ 对象体 56B ⇒ 共 76B；
+    #     所以"记录 +0x40" 对应"对象 +0x2C"，两个数字都是同一个字段，别再当成两处。
+    CELLTAG_SUPPRESS_OFF = 0x34   # 非 0 ⇒ 0x6E53A0 一进门就 return（静默失效，最难查）
+    CELLTAG_BUSY_OFF = 0x35       # 重入保护，读档后应当回到 0
+
+    def celltag_flags(self, sid):
+        """CellTag 的两个标志字节 → {'suppress','busy'}；读不到返回 None。
+
+        · suppress（记录 +0x48 / 对象 +0x34）非 0 ⇒ 引擎**一进门就 return**，
+          这条触发在本档里彻底失效（连计数都不动）。正常档应为 0。
+        · busy（记录 +0x49 / 对象 +0x35）是重入保护，正常档也应为 0；
+          若留成 1，说明存档正好写在一帧中间（罕见，但会让触发卡住）。
+        """
+        try:
+            o = self.trigger_objects(sid)
+        except Exception:
+            return None
+        c = o.get('cell')
+        if c is None or c + self.CELLTAG_BUSY_OFF + 1 > len(self.plain):
+            return None
+        return {'suppress': int(self.plain[c + self.CELLTAG_SUPPRESS_OFF]),
+                'busy': int(self.plain[c + self.CELLTAG_BUSY_OFF])}
+
+    def clear_celltag_flags(self, sid):
+        """把 CellTag 的 `+0x34`（抑制）/`+0x35`（重入残留）清零 → {'old':(s,b),'new':(0,0)}。
+
+        仅在存档损坏 / 崩溃前落盘的档上需要；正常档这两个字节本来就是 0。
+        """
+        fl = self.celltag_flags(sid)
+        if fl is None:
+            raise RuntimeError('这条触发在本档里没有 CellTag 节点')
+        o = self.trigger_objects(sid)
+        c = o['cell']
+        old = (fl['suppress'], fl['busy'])
+        if old != (0, 0):
+            self.plain[c + self.CELLTAG_SUPPRESS_OFF] = 0
+            self.plain[c + self.CELLTAG_BUSY_OFF] = 0
+        return {'old': old, 'new': (0, 0)}
+
+    def set_attach_count(self, sid, n):
+        """原地改写 CellTag 的**剩余挂载数**（记录 `+0x40` / 对象 `+0x2C`）。
+
+        → {'old','new','off'}。这是 §168 之后唯一能"救回丢账档"的写操作：
+        引擎只认这个数，把它改成实际存活数后，剩下的对象每离场一次就 −1，
+        减到 1 的那一次就会执行。
+        ⚠ 只改 4 字节、不动明文长度 ⇒ 不需要重压。防御：当前值必须是 0..64 的合理数。
+        """
+        n = int(n)
+        if not 0 <= n <= 64:
+            raise ValueError('挂载数只能是 0..64')
+        try:
+            o = self.trigger_objects(sid)
+        except Exception:
+            raise RuntimeError('读不到触发 %s 的对象' % sid)
+        c = o.get('cell')
+        if c is None:
+            raise RuntimeError('这条触发在本档里没有 CellTag 节点（可能已执行 / 只有定义）')
+        p = c + self.CELLTAG_COUNT_OFF
+        if p + 4 > len(self.plain):
+            raise RuntimeError('CellTag 计数位置越界，已拒绝写入')
+        old = int.from_bytes(self.plain[p:p + 4], 'little')
+        if old > 64:
+            raise RuntimeError('CellTag 计数当前值 = %d（不合理）⇒ 定位可能出错，已拒绝写入'
+                               % old)
+        self.plain[p:p + 4] = struct.pack('<I', n)
+        self._live_len = None
+        return {'old': old, 'new': n, 'off': p}
+
+    def repair_attach_leak(self, sid):
+        """把"丢账"档的挂载数改回**实际存活建筑数**（§168.4 推论 1 的落地）。
+
+        → {'ok','old','live','new','text'}
+          · ok=False 且 live==0 ⇒ 不可救：挂载对象全没了，再也不会有"离场"来触发它。
+            这种情况只能把持久性改成 0（条件满足即执行），或重新挂接对象。
+          · ok=True ⇒ 计数已改成 live，剩下 live 次离场会依次 −1，最后一次执行。
+        """
+        st = self.trigger_runtime_state(sid)
+        remain, live = st.get('remain'), st.get('live')
+        if remain is None:
+            return {'ok': False, 'old': None, 'live': live, 'new': None,
+                    'text': '读不到这条触发的 CellTag 计数'}
+        if live is None:
+            return {'ok': False, 'old': remain, 'live': None, 'new': None,
+                    'text': '统计不到存活挂载建筑（标签挂的可能是单位/其它对象），请手动填数'}
+        if live <= 0:
+            return {'ok': False, 'old': remain, 'live': 0, 'new': None,
+                    'text': '挂载建筑已经全部离场 ⇒ **救不回来**（不会再有离场来 −1）。'
+                            '请把持久性改成 0，或重新给这条触发挂接对象。'}
+        if remain == live:
+            return {'ok': True, 'old': remain, 'live': live, 'new': live,
+                    'text': '计数本来就是 %d，与实际存活一致，无需修复' % live}
+        r = self.set_attach_count(sid, live)
+        return {'ok': True, 'old': r['old'], 'live': live, 'new': r['new'],
+                'text': '已把挂载数从 %d 改成实际存活数 %d ⇒ 剩下 %d 次离场会依次 −1，'
+                        '最后一次执行' % (r['old'], live, live)}
+
+    def repeat_pitfall(self, sid, persistence=None, attached=None):
+        """持久性选择的**坑**提示串（'' = 没问题）。GUI 写盘前弹确认用。
+
+        ★§158 定案（持久性 1 = 计数型，见上面注释）：
+          * 1 + 挂 0 个对象          ⇒ **永不触发**（没有对象可"-1"）
+          * 1 + 进入事件(1) + ≥2 对象 ⇒ **已知 BUG，永不执行**（改为局部变量写法）
+          * 1 + 摧毁类(7/29/48) + ≥1 对象 ⇒ **正常**（逐个离场 −1，全部离场后执行一次）→ 不报警
+          * 1 + 挂 ≥1 对象 + **多条事件** ⇒ 危险（§163）：离场只有在"其它事件已满足"时
+            才被记账，先炸后等 ⇒ 计数不减 ⇒ 永不执行
+          * 2                          ⇒ 条件满足后会**反复执行**同一条行为
+        ⚠ 事件 7 与 29/48 的差别（§162）：7 **不算变卖/占领/心控**；若你打算靠"卖"让对象
+          离场，用 7 时事件可能一直不满足 —— 改用 48（29 亦可，但 29 不含"渗透后消失"）。
+        """
+        cur = persistence
+        if cur is None:
+            try:
+                cur = int(self.trigger_repeat_type(sid) or 0)
+            except Exception:
+                cur = 0
+        cur = int(cur)
+        if cur == 0:
+            return ''
+        try:
+            types = [e['type'] for e in self.trigger_event_list(sid)]
+        except Exception:
+            types = []
+        if attached is None:
+            attached = self.trigger_attach_count(sid)
+        attached = int(attached or 0)
+        evs = [t for t in types if t in self.LOCAL_VAR_EVENTS]
+
+        if cur == 1:
+            if 1 in types and attached >= 2:
+                return ('⚠ 已知 BUG：持久性 1 + **进入事件（1）** 挂到 %d 个对象上 ⇒ '
+                        '条件全满足也**永不执行**。\n'
+                        '机制（§160/§161 实测）：持久 1 等的是「CellTag 的**剩余挂载数减到 0**」，'
+                        '而只有挂载对象被摘除（离场）才会让它 -1；进入不会摘对象，'
+                        '计数恒为 %d ⇒ 永远到不了 0。\n'
+                        '社区通行写法：每栋各挂一条「持久 0 · 事件 1 进入 → 行为 56 设置局部变量 N」，'
+                        '再配一条**持久 0** 的汇总触发（N × 事件 36 局部变量被设置）去执行结果。'
+                        % (attached, attached))
+            if attached == 0:
+                return ('持久性 1 等的是「CellTag 剩余挂载数减到 0」'
+                        '（§160/§161 实测：炸掉或卖掉 0/1/2 栋 ⇒ 计数 3/2/1，最后一个离场才归零执行）。\n'
+                        '这条触发挂接对象数 = **0** ⇒ 没有对象可以让它 -1 ⇒ **永不执行**'
+                        '（玩家实测：三个局部变量全满足仍不执行）。请留 0。')
+            if 1 in types:
+                return ('持久性 1 + 进入事件（1）只挂了 1 个对象：计数只有 1、又不会被进入摘掉，'
+                        '**很可能也永不执行**（挂两个以上是已确认的 BUG）。建议改持久 0。'
+                        '当前剩余挂载数 = %d。' % attached)
+            if evs and attached >= 0:
+                return ('持久性 1 + 局部变量事件（类型 %s）⇒ **永不触发**（§157 玩家实测，'
+                        '局部变量全满足也不执行）。持久性请留 0。'
+                        % '/'.join(sorted({str(e) for e in evs})))
+            # ★§166：8「任何事件」恒真 ⇒ 不会挡记账（玩家实测：48+8 挂 3 栋，开局炸完 3 栋照样执行）
+            _blocking = [t for t in types if t != 8]
+            if len(_blocking) > 1 and attached >= 1:
+                return ('⚠ 持久性 1 + **多条事件** + 挂 %d 个对象：只有这条触发的**全部事件都满足**'
+                        '之后，挂载对象的摧毁/变卖才被记账；在那之前的离场**永久丢账**'
+                        '（§163/§165 实测：「流逝时间 30/60 秒」+「被摧毁」挂 3 栋，先炸后等 ⇒ '
+                        'CellTag 计数一直停在 3、永不执行；**把两条事件换个顺序也没用**）。\n'
+                        '稳妥写法：把"等待"放到**另一条**触发（或局部变量）里去满足，'
+                        '本条只留摧毁类事件；或让第二条事件**开局即满足**（如「8 任何事件」）。'
+                        % attached)
+            return ''
+
+        if cur == 2 and (len(types) > 1 or evs):
+            desc = ('含 %s局部变量事件（类型 %s）'
+                    % (('%d 个' % len(evs)) if len(evs) > 1 else '',
+                       '/'.join(sorted({str(e) for e in evs})))) if evs else '多条事件'
+            return ('持久性 2（可重复）会让它在条件满足后**反复执行**同一条行为'
+                    '（本触发%s，共 %d 个事件）。只想执行一次请留 0。' % (desc, len(types)))
+        return ''
+
+    def tag_records(self):
+        """存档里的标签记录 [(sid, name, off)] —— 按标签类 GUID 尾识别。
+
+        ★2026-10-20：以前只靠 `_scan_records` 的分类，而分类里的 +120..123 四字节判据
+          会把"持久性=1/2"的标签误判成'其它'（SAVE18BE 里 B1/C1 两条就中招）。
+          这里改用**类 GUID 尾**匹配（窗 +124..+168，容忍 ±4 漂移），
+          实测 SAVE48DB 精确命中 82 条（= 地图 82 个标签，零误报、不混入触发记录）。
+        """
+        if self._tagrecs is None:
+            lo, hi = TAG_PERSIST_WIN
+            out = []
+            for r in self.records:
+                w = self.plain[r.off + lo:r.off + hi]
+                if TAG_GUID_TAIL in w:
+                    out.append((r.sid, r.name, r.off))
+            self._tagrecs = out
+        return self._tagrecs
+
+    def tag_persist(self, tag_sid):
+        """标签的持久性（= 重复类型）'0'/'1'/'2'；读不到返回 None。"""
+        for sid, _nm, off in self.tag_records():
+            if sid == tag_sid:
+                v = int.from_bytes(
+                    self.plain[off + TAG_PERSIST_OFF:off + TAG_PERSIST_OFF + 4],
+                    'little')
+                return str(v) if 0 <= v <= 3 else None
+        return None
+
+    # ---------- 改已有触发的"触发类型"（★2026-10-20 玩家要求） ----------
+    def tag_obj_off(self, rec_off):
+        """标签**记录帧**偏移 → 标签**对象帧**偏移（差 56B）。
+
+        ★必须做**真校验**，不能拿 `obj+120` 和 `rec+64` 比 —— 那俩本来就是同一段字节
+          （曾因此写出一个空转的校验）。真正的锚点是**标签类 GUID**：
+          记录帧里 `TAG_GUID_TAIL` 落在 +132..+144，换算到对象帧就是 **+184..+200**。
+          实测：SAVE48DB 82/82、AB 样本 2/2、trig2 1/1 全命中；
+          非标签记录 0 误报（三份档各验过）。
+        """
+        obj = rec_off - TAG_REC_DELTA
+        if obj < 0 or obj + 204 > len(self.plain):
+            return None
+        if TAG_GUID_TAIL not in self.plain[obj + 184:obj + 204]:
+            return None
+        return obj
+
+    # ================= §192 标签（TagTypeClass）全字段 =================
+    def tag_type_records(self):
+        """逐个 164B 标签对象体读全字段（§192 字段表）。
+
+        返回 [{rec, obj, key, sid, name, index, persist, trig_key, ok_vt}]
+          rec      记录起点（= 54F6E433 处）
+          obj      对象体起点（= rec + 20）
+          key      记录自键（rec + 16）
+          sid      +0x24 的 8 字节 ID 串（地图 `[Tags]` 的键名）
+          name     +0x64 起 52B（GBK）
+          index    +0x98 集群内序号
+          persist  +0x9C 持久性/重复类型
+          trig_key +0xA0 → 触发实例的键
+          ok_vt    4 个 vtable 是否与引擎一致（不一致 ⇒ 记录可能被截断/错位）
+        """
+        pl = self.plain
+        V = TAG_TYPE_VTABLES
+        out = []
+        i = pl.find(TAG_TYPE_GUID)
+        while i >= 0:
+            if i + TAG_TYPE_REC_SIZE <= len(pl):
+                obj = i + TAG_TYPE_OBJ_DELTA
+                u = lambda o: struct.unpack_from('<I', pl, obj + o)[0]
+                sid = pl[obj + TAG_TYPE_ID_OFF:obj + TAG_TYPE_ID_OFF + 8]
+                nm_raw = pl[obj + TAG_TYPE_NAME_OFF:obj + TAG_TYPE_NAME_OFF + TAG_TYPE_NAME_LEN]
+                tk = u(TAG_TYPE_TRIGGER_OFF)
+                out.append({
+                    'rec': i,
+                    'obj': obj,
+                    'key': struct.unpack_from('<I', pl, i + 16)[0],
+                    'sid': sid.split(b'\x00')[0].decode('latin1'),
+                    'name': _decode_txt(nm_raw.split(b'\x00')[0]),
+                    'index': u(TAG_TYPE_INDEX_OFF),
+                    'persist': u(TAG_TYPE_PERSIST_OFF),
+                    'trig_key': tk,
+                    'trig_sid': self._sid_of_key(tk),
+                    'ok_vt': (u(0), u(4), u(8), u(0xC)) == V,
+                })
+            i = pl.find(TAG_TYPE_GUID, i + 1)
+        return out
+
+    def tag_fields(self, tag_sid):
+        """按标签 ID（如 '01000001'）取字段 dict（见 `tag_type_records`）；没有返回 None。"""
+        want = str(tag_sid).strip().upper()
+        for t in self.tag_type_records():
+            if t['sid'].upper() == want:
+                t = dict(t)
+                t['trig_sid'] = self._sid_of_key(t['trig_key'])
+                return t
+        return None
+
+    def _sid_of_key(self, key):
+        """任一类记录的**自键** → 它的 ID 串（找不到返回 None）。首次调用建一次全档索引。"""
+        if not key:
+            return None
+        m = getattr(self, '_key2sid', None)
+        if m is None:
+            m = {}
+            pl = self.plain
+            for guid in (TRIG_INSTANCE_GUID, TRIG_TAGOBJ_GUID, TRIG_NODE_GUID, TRIG_CELLGUID):
+                i = pl.find(guid)
+                while i >= 0:
+                    if i + 24 <= len(pl):
+                        k = struct.unpack_from('<I', pl, i + 16)[0]
+                        sid = pl[i + TAG_TYPE_OBJ_DELTA + TAG_TYPE_ID_OFF:
+                                 i + TAG_TYPE_OBJ_DELTA + TAG_TYPE_ID_OFF + 8]
+                        sid = sid.split(b'\x00')[0].decode('latin1')
+                        if sid and k not in m:
+                            m[k] = sid
+                    i = pl.find(guid, i + 1)
+            self._key2sid = m
+        return m.get(key)
+
+    def set_tag_name(self, tag_sid, name):
+        """改标签**名字**（对象体 +0x64，52B 定长、GBK、原地覆盖、长度不变）。
+
+        ★只动内存，不动明文长度 ⇒ 不需要重压。返 {'old','new','len'}。
+        """
+        f = self.tag_fields(tag_sid)
+        if f is None:
+            raise RuntimeError('没找到标签 %s' % tag_sid)
+        old = f['name']
+        try:
+            b = str(name).encode('gbk')
+        except Exception:
+            b = str(name).encode('utf-8', 'ignore')
+        span = TAG_TYPE_NAME_LEN
+        if len(b) > span - 1:
+            raise RuntimeError('标签名太长：GBK %d 字节 > %d（会盖掉后面的序号字段）'
+                               % (len(b), span - 1))
+        obj = f['obj']
+        self.plain[obj + TAG_TYPE_NAME_OFF:obj + TAG_TYPE_NAME_OFF + span] = \
+            b + b'\x00' * (span - len(b))
+        return {'old': old, 'new': str(name), 'len': len(b)}
+
+    def scrub_tag_stale(self, rec_off):
+        """把标签记录里的**垃圾槽**（TAG_TYPE_STALE）清零 —— 克隆模板后必须调。
+
+        实测（SAVE4CA2，82 个标签）：+0x14/+0x20/+0x2C..+0x5F 在 FA2 产物里恒为 0，
+        但从存档模板克隆会继承旧住户的 **旧键 0x13xxxxxx / 裸指针 0x10xxxxxx**
+        （28~38 个标签碰到过）。§188 那类"引擎把触发跳过"的坑，很可能就来自这些脏槽。
+        """
+        obj = rec_off + TAG_TYPE_OBJ_DELTA
+        n = 0
+        for lo, hi in TAG_TYPE_STALE:
+            for o in range(lo, hi, 4):
+                if any(self.plain[obj + o:obj + o + 4]):
+                    n += 1
+                self.plain[obj + o:obj + o + 4] = b'\x00' * 4
+        return n
+
+    def tag_health(self):
+        """标签集群体检 → dict{count, bad_vt, idx_bad, dup_sid, persist_dist}。"""
+        ts = self.tag_type_records()
+        idx = [t['index'] for t in ts]
+        sids = [t['sid'] for t in ts]
+        dist = {}
+        for t in ts:
+            dist[t['persist']] = dist.get(t['persist'], 0) + 1
+        return {
+            'count': len(ts),
+            'bad_vt': [t['sid'] for t in ts if not t['ok_vt']],
+            'idx_bad': [ts[k]['sid'] for k, v in enumerate(idx) if v != k],
+            'dup_sid': sorted({s for s in sids if sids.count(s) > 1}),
+            'persist_dist': dist,
+        }
+
+    def set_trigger_repeat_type(self, sid, persistence):
+        """改触发的**触发类型（= 标签持久性）**：原地写它挂的每个标签对象 `+0xB0`。
+
+        ★2026-10-20：这是**原地改写 4 字节**（不增删对象、不动明文长度）⇒ 不需要重压，
+          安全性很高。返回 {'changed','old','new','tags','total'}。
+        ⚠ 取值语义（§156 纠错后）：0 = 一次性·任一挂载（触发即销毁标签）
+          1 = 一次性·挂载清空（挂载对象全触发过才触发一次）2 = 可重复。
+          **与"同一触发里多个事件是任一还是全部"无关** —— 多事件恒为 AND。
+        ★★§157（玩家实测）：触发里若有**局部变量事件 36/37**，持久性必须留 0 ——
+          写 1 ⇒ **永远不会触发**；写 2 ⇒ 条件满足后**反复执行**。
+          返回值里多一个 `warn`（非空 = 该提醒用户），GUI 用它弹确认。
+        """
+        persistence = int(persistence)
+        if persistence not in (0, 1, 2):
+            raise ValueError('触发类型只能是 0/1/2（0 一次性·任一挂载 / '
+                             '1 一次性·挂载清空 / 2 可重复）')
+        tags = [t for t, g in self.trigger_tag_pairs() if g == sid]
+        if not tags:
+            raise RuntimeError('没找到触发 %s 对应的标签' % sid)
+        tset = set(tags)
+        old = None
+        n = 0
+        done = []
+        for tag_sid, _nm, off in self.tag_records():
+            if tag_sid not in tset:
+                continue
+            obj = self.tag_obj_off(off)
+            if obj is None:
+                continue
+            v = int.from_bytes(self.plain[obj + 0xB0:obj + 0xB4], 'little')
+            # ★最后一道闸：这个字节本来就只能是 0/1/2/3。若不是 ⇒ 帧差/锚点判断出了问题，
+            #   **拒绝写入**（宁可报错也别把 4 字节乱写到别人的字段上）。
+            if v not in (0, 1, 2, 3):
+                raise RuntimeError(
+                    '标签 %s 的持久性字节当前值 = %d（不是 0/1/2/3）⇒ 定位可能出错，已拒绝写入'
+                    % (tag_sid, v))
+            if old is None:
+                old = v
+            if v != persistence:
+                self.plain[obj + 0xB0:obj + 0xB4] = struct.pack('<I', persistence)
+                n += 1
+            done.append(tag_sid)
+        if not done:
+            raise RuntimeError('标签 %s 的对象帧校验失败，已拒绝写入（避免写错位置）'
+                               % ','.join(sorted(tset)))
+        # ★§157：含局部变量事件（36/37）的触发，写 1 等于让它永不触发、写 2 会反复执行。
+        #   这里**不拦**（有的地图作者故意要 2 的重复效果），但把警告串带回去，GUI 弹确认。
+        return {'changed': n, 'old': old, 'new': persistence,
+                'tags': done, 'total': len(done),
+                'warn': self.repeat_pitfall(sid, persistence)}
+
+    def trigger_tag_pairs(self):
+        """[(tag_sid, trig_sid)] —— 标签 → 触发。
+
+        优先用**已挂地图**的 `[Tags]` 末字段（权威）；没挂地图则用命名规律：
+        FinalSun 把标签命名为「触发名 + " N"」（如 `A2号信标铁幕a` → `A2号信标铁幕a 1`）。
+        """
+        m = getattr(self, '_map', None)
+        if m:
+            pairs = [(tid, trig) for tid, trig in m.tag_trigger_map().items() if trig]
+            # ★2026-10-20：地图里没有的标签（= 本工具新建的触发，地图还不知道它）
+            #   必须用命名规律兜底，否则新触发的"触发类型"永远读不出来。
+            known = {t for t, _g in pairs}
+            pairs += [(t, g) for t, g in self._tag_pairs_by_name() if t not in known]
+            return pairs
+        return self._tag_pairs_by_name()
+
+    def _tag_pairs_by_name(self):
+        """按命名规律把标签对到触发：FinalSun 把标签命名为「触发名 + " N"」。
+        ⚠ 不能从右往左把所有数字段都剥掉（会剥出 `A3号信标铁幕a` 这种不存在的名字），
+          改用**最长触发名前缀 + 剩余部分是纯数字**来匹配。"""
+        trig_by_name = {}
+        for r in self.records:
+            if r.kind == '触发' and r.name:
+                trig_by_name.setdefault(r.name, []).append(r.sid)
+        names = sorted(trig_by_name, key=len, reverse=True)   # 长的优先 ⇒ 最具体的触发名
+        out = []
+        for sid, nm, _off in self.tag_records():
+            if not nm:
+                continue
+            for tn in names:
+                if nm.startswith(tn):
+                    rest = nm[len(tn):].strip()
+                    if rest.isdigit():
+                        # 同名触发无法用名字区分 ⇒ 都挂上（持久性取任一，实测同名同值）
+                        for tsid in trig_by_name[tn]:
+                            out.append((sid, tsid))
+                        break
+        return out
+
+    def trigger_repeat_type(self, sid):
+        """触发重复类型 '0'/'1'/'2'；都读不到 ⇒ None。
+
+        ★优先级：**存档里的标签持久性**（存档自足） → 地图 `[Tags]` 第 0 字段兜底。
+          注意：一个触发可挂多个标签；只有任一标签是持久(2) 才算"会重复"。
+        """
+        if not sid:
+            return None
+        vals = []
+        for tag_sid, trig_sid in self.trigger_tag_pairs():
+            if trig_sid == sid:
+                p = self.tag_persist(tag_sid)
+                if p is None and getattr(self, '_map', None):
+                    # 存档里这条标签没了（执行后销毁）⇒ 退回地图的 [Tags] 字段
+                    try:
+                        raw = self._map.tags.get(str(tag_sid))
+                        if raw:
+                            f = [x.strip() for x in raw.split(',')]
+                            if f and f[0] in ('0', '1', '2'):
+                                p = f[0]
+                    except Exception:
+                        pass
+                if p is not None:
+                    vals.append(p)
+        if not vals:
+            return None
+        return '2' if '2' in vals else vals[0]
+
+    def detach_map(self):
+        self._map = None
+        self._mapm = None
+        self._events = None
+        self._actions = None
+
+    @property
+    def map_path(self):
+        return self._map.path if getattr(self, '_map', None) else None
+
+    @property
+    def map_status(self):
+        """dict: mode / text / ev_mismatch / ac_mismatch / triggers …"""
+        return self._mapm
+
+    def _apply_map(self):
+        """把地图的归属/真值填进事件、行为列表（不改任何字节）"""
+        self._events = None
+        self._actions = None
+        evs, acs = self.events(), self.actions()
+        if not getattr(self, '_map', None):
+            self._mapm = None
+            return
+        m = self._map
+        ids = set(r.sid for r in self.records if r.kind == '触发')
+        res = {'path': m.path, 'name': m.name, 'encoding': m.encoding,
+               'same_ids': (m.trigger_ids() == ids),
+               'same_ids_n': len(m.trigger_ids() & ids),
+               'triggers': len(m.triggers), 'ev_mismatch': 0, 'ac_mismatch': 0}
+        for key, tag, groups, lst in (('ev', '事件', m.events_by_trigger(), evs),
+                                      ('ac', '行为', m.actions_by_trigger(), acs)):
+            own, mvals, total = self._associate(groups, lst)
+            if own is None:                        # 数量不符 ⇒ 归属不给（不猜）
+                res[key + '_ok'] = False
+                res[key + '_n_map'] = total
+                res[key + '_n_save'] = len(lst)
+                continue
+            res[key + '_ok'] = True
+            for it, o, mv in zip(lst, own, mvals):
+                it['owner'] = o
+                if mv:
+                    it['map_type'], it['map_arg'] = mv
+            res[key + '_mismatch'] = sum(
+                1 for it, mv in zip(lst, mvals) if mv and (it['type'], it['arg']) != mv)
+        if res['ev_ok'] and res['ac_ok']:
+            res['mode'] = 'exact' if not (res['ev_mismatch'] or res['ac_mismatch']) \
+                else 'structural'
+        elif res['ev_ok'] or res['ac_ok']:
+            res['mode'] = 'partial'
+        else:
+            res['mode'] = 'count_mismatch'
+        res['text'] = self._status_text(res, evs, acs)
+        # 每个触发挂几个条件/行为（供「触发」页显示），以及 标签→触发 的指向
+        per = {}
+        for tid, recs in m.events_by_trigger():
+            per.setdefault(tid, {})['ev'] = len(recs)
+        for tid, recs in m.actions_by_trigger():
+            per.setdefault(tid, {})['ac'] = len(recs)
+        res['per_trigger'] = per
+        res['tag_to_trigger'] = m.tag_trigger_map()
+        self._mapm = res
+
+    @staticmethod
+    def _associate(groups, lst):
+        """把地图的分组按顺序摊到存档数组上。
+
+        返回 (owner 列表 或 None, 地图值列表, 地图记录总数)。
+        总数不符 ⇒ 返回 None（**不猜**，界面显示"无法对应"）。
+        """
+        total = sum(len(r) for _, r in groups)
+        if not groups or total != len(lst):
+            return None, [], total
+        seq = []
+        for tid, recs in groups:
+            seq += [(tid, r) for r in recs]
+        return [t for t, _ in seq], [r for _, r in seq], total
+
+    @staticmethod
+    def _status_text(res, evs, acs):
+        ev_ok, ac_ok = res['ev_ok'], res['ac_ok']
+        parts = []
+        for key, tag, n in (('ev', '事件', len(evs)), ('ac', '行为', len(acs))):
+            if not res.get(key + '_ok'):
+                parts.append('%s 数量不符（存档 %d / 地图 %d）⇒ 不显示%s归属'
+                             % (tag, n, res.get(key + '_n_map'), tag))
+            elif res.get(key + '_mismatch'):
+                parts.append('%s 有 %d 处数值与地图不同' % (tag, res[key + '_mismatch']))
+            else:
+                parts.append('%s 已对应 ✓' % tag)
+        if ev_ok and ac_ok and not (res['ev_mismatch'] or res['ac_mismatch']):
+            head = '地图对照一致 ✓'
+        elif ev_ok and ac_ok:
+            head = '地图结构相符（数值有差异，地图可能是另一版本）'
+        else:
+            head = '地图部分对照'
+        return '%s：%s' % (head, '；'.join(parts))
+
+    def house_order(self):
+        """「所属方序号」的真实顺序（缓存）：**玩家恒为 0**，其余按存档注册序。
+
+        ★★2026-10-20 玩家实测定案：行为/事件的「所属方型」参数用的是**这个序号**，
+          不是地编 `[Countries]` 的国家枚举。证据（改.SAV）：
+            · 玩家 = Russians；任务自带的「1a最后胜利a」触发行为 1 参数 = **0** ⇒ 0 = 玩家自己；
+            · 玩家把参数填成 8（按国家枚举 8=苏俄）⇒ 实际指向**古巴**（本序列表第 9 个）
+              ⇒ 读档变成"古巴获胜" ⇒ 玩家失败。与玩家反馈完全一致。
+        """
+        if getattr(self, '_horder', None) is not None:
+            return self._horder
+        out = []
+        try:
+            for h in (self.houses() or []):
+                out.append({'short': h.get('short') or '', 'cn': h.get('cn') or '',
+                            'is_player': bool(h.get('is_player'))})
+        except Exception:
+            out = []
+        self._horder = out
+        return out
+
+    def house_index(self, name):
+        """阵营短名/中文名 → 所属方序号（用于写"所属方型"参数）；找不到返回 None。"""
+        name = (name or '').strip()
+        for i, h in enumerate(self.house_order()):
+            if name and name in (h['short'], h['cn']):
+                return i
+        return None
+
+    def _arg_text(self, ptype, v):
+        """把参数按类型翻译成人话（能翻就翻，翻不了给原值）"""
+        if ptype == 0:
+            return ''
+        if ptype == 2:
+            ho = self.house_order()
+            if 0 <= v < len(ho):
+                h = ho[v]
+                nm = h['cn'] or h['short']
+                return ('%s（玩家）' % nm) if h['is_player'] else nm
+            return '所属方#%d' % v
+        if ptype == 6:
+            return str(v)
+        return str(v)
+
+    def set_event(self, ev, etype=None, arg=None):
+        """改一条事件的类型 / 参数（原地改 u32，不改变长度）
+
+        ⚠ **禁止把类型改成 0（`-无事件-`）**：地编 `FAData.ini` 里 0 是
+        `空事件，没作用。` 的**占位项** ⇒ 写成它没有任何用处，只会冒险。
+        实测带 0 的档读档直接崩；但注意：**改成合法类型也可能崩**（另有原因，见 排错手册 §11），
+        所以这里只做"拒绝无意义/危险写法"的保护，不代表改别的类型就一定安全。
+        要"取消一个条件"请**去地图里删掉该事件**（存档里数组长度固定，删不掉），
+        或改成永不满足的条件（如 `13 流逝时间` 配一个很大的秒数）。
+        """
+        if not (0 <= ev['off'] and ev['off'] + 12 <= len(self.plain)):
+            raise RuntimeError('事件偏移越界')
+        self._revalidate_event(ev)          # ★同会话插字节后 GUI 手里的 ev 可能已漂移
+        old_type, old_arg0 = ev['type'], ev['arg']
+        if etype is not None:
+            etype = int(etype)
+            if etype == 0:
+                raise ValueError(
+                    '不能把事件类型设为 0「-无事件-」：\n'
+                    '地编里它是占位项（“空事件，没作用”），写成它没有任何用处。\n\n'
+                    '要取消一个条件，请在地编里删掉该事件（存档里数组长度固定），\n'
+                    '或改成永不满足的条件，例如「13 流逝时间」并把秒数设得极大。')
+            if etype not in EVENT_TYPES:
+                raise ValueError('未知事件类型 %d' % etype)
+            self.plain[ev['off']:ev['off'] + 4] = etype.to_bytes(4, 'little')
+            ev['type'] = etype
+            ev['name'] = event_name(etype)
+            ev['ptype'] = event_ptype(etype)
+        if arg is not None:
+            arg = int(arg)
+            if not (0 <= arg <= 0xFFFFFF):
+                raise ValueError('参数需在 0 ~ 16777215 之间')
+            self.plain[ev['off'] + 8:ev['off'] + 12] = arg.to_bytes(4, 'little')
+            ev['arg'] = arg
+            # ★「13 流逝时间」：事件里的秒数只是"地图 INI 的副本"，引擎计时用的是
+            #   该触发 **TagNode +80 的帧数**（= 秒×15，15 fps）⇒ 必须一起改
+            #   （2026-10-13 用户游戏内实测确认；2026-10-15 改为按「事件→实例→TagNode」
+            #   键链直写，不再按旧值全局匹配 —— 旧写法在 old_arg=0 时会弹
+            #   「未找到与 0 秒匹配」的误导性警告，且多事件档定位不到帧数块）。
+            if ev['type'] == 13 and (old_type != 13 or old_arg0 != arg):
+                node_off, inst_off = self.node_of_event(ev)
+                if node_off is not None:
+                    old_frames = int.from_bytes(
+                        self.plain[node_off + NODE_TICKS_OFF:node_off + NODE_TICKS_OFF + 4],
+                        'little')
+                    frames = arg * LOGIC_FPS
+                    self.plain[node_off + NODE_TICKS_OFF:
+                               node_off + NODE_TICKS_OFF + 4] = frames.to_bytes(4, 'little')
+                    self._ticks = None
+                    extra = ''
+                    if old_frames == 0 and frames > 0:
+                        # 帧数 0 → 正 ⇒ 该触发此前不是计时触发，要补计时表登记
+                        m = self._instance_maps()
+                        ck = m['cell_of_tag'].get(m['tag_of_inst'].get(inst_off))
+                        if ck is not None:
+                            extra = self._timer_ensure_registered(ck)
+                            if extra:
+                                extra = '　' + extra
+                        else:
+                            extra = '　⚠ 该触发没有 CellTag，计时表无法登记（请用「修复缺组件触发」）'
+                    self.time_sync_note = ('已同步运行期帧数 → %d（等待 %d 秒，%d fps）%s'
+                                           % (frames, arg, LOGIC_FPS, extra))
+                else:
+                    self.time_sync_note = (
+                        '⚠ 该触发缺少运行期节点（TagNode）——引擎不会执行它，'
+                        '改事件类型/参数都不会生效。请到「触发」页用'
+                        '「修复缺组件触发…」补齐后再改。')
+        # ★类型级运行期同步（2026-10-15 R2/R4 实测定案）：触发必须被**武装**
+        #   （TagNode +80 帧数 > 0 ⇒ 进计时表）引擎才会每帧轮询它；无挂接触发
+        #   帧数=0 ⇒ 没有任何机制检查 ⇒ 改什么事件都不生效。
+        node_off, inst_off = self.node_of_event(ev)
+        if ev['type'] == 8 and node_off is not None:
+            old = int.from_bytes(self.plain[node_off + NODE_TICKS_OFF:
+                                            node_off + NODE_TICKS_OFF + 4], 'little')
+            if old == 0:
+                # 「任何事件」永远为真 ⇒ 武装 15 帧（进表即被轮询，进游戏立刻触发）
+                self.plain[node_off + NODE_TICKS_OFF:
+                           node_off + NODE_TICKS_OFF + 4] = (15).to_bytes(4, 'little')
+                self._ticks = None
+                m = self._instance_maps()
+                ck = m['cell_of_tag'].get(m['tag_of_inst'].get(inst_off))
+                extra = ''
+                if ck is not None:
+                    extra = self._timer_ensure_registered(ck)
+                    if extra:
+                        extra = '　' + extra
+                else:
+                    extra = '　⚠ 该触发没有 CellTag，计时表无法登记（请用「修复缺组件触发」）'
+                self.time_sync_note = ('「8 任何事件」已武装：TagNode 帧数 0→15'
+                                       '（进计时表即被轮询，进入游戏立刻触发）%s' % extra)
+        elif node_off is None and not (getattr(self, 'time_sync_note', '') or ''):
+            # 非 13 号路径（如改成 8）也要让 GUI 知道根因（一键修复就靠这条提示触发）
+            self.time_sync_note = (
+                '⚠ 该触发缺少运行期节点（TagNode）——引擎不会执行它，'
+                '改事件类型/参数都不会生效。请到「触发」页用'
+                '「修复缺组件触发…」补齐后再改。')
+        ev['arg_text'] = self._arg_text(ev['ptype'], ev['arg'])
+        self._revalidate_event(ev)          # 计时表登记等插字节操作后重定位一次
+        self.pending_events[ev['off']] = (ev['type'], ev['arg'])
+        return ev
+
+    def set_action(self, ac, atype=None, arg=None):
+        """改一条行为的类型 / 参数
+
+        ⚠ 同样**禁止改成 0（`-无行为-`）**：地编里是占位项，写成它没有用处只会冒险。
+        """
+        if not (0 <= ac['off'] and ac['off'] + 12 <= len(self.plain)):
+            raise RuntimeError('行为偏移越界')
+        if atype is not None:
+            atype = int(atype)
+            if atype == 0:
+                raise ValueError(
+                    '不能把行为类型设为 0「-无行为-」：\n'
+                    '地编里它是占位项，写成它没有任何用处。\n\n'
+                    '要取消一个行为，请在地编里删掉它（存档里数组长度固定）。')
+            if atype not in ACTION_TYPES:
+                raise ValueError('未知行为类型 %d' % atype)
+            self.plain[ac['off']:ac['off'] + 4] = atype.to_bytes(4, 'little')
+            ac['type'] = atype
+            ac['name'] = action_name(atype)
+            ac['ptype'] = action_ptype(atype)
+        if arg is not None:
+            arg = int(arg)
+            if not (0 <= arg <= 0xFFFFFF):
+                raise ValueError('参数需在 0 ~ 16777215 之间')
+            self.plain[ac['off'] + 8:ac['off'] + 12] = arg.to_bytes(4, 'little')
+            ac['arg'] = arg
+        ac['arg_text'] = self._arg_text(ac['ptype'], ac['arg'])
+        self.pending_actions[ac['off']] = (ac['type'], ac['arg'])
+        return ac
+
+    # ---------- 记录 ----------
+    # 大型自制任务格式（2026-10-14 实测 SAVE5C7B，明文 37.4MB / 599 块）：
+    # 「触发/标签 定义」是独立数组（等距 232），类 GUID `61DE341E-0774-11D2-ACA5-00600805B5B5`
+    # 在对象 +176；对象 +120 处 **01=触发 / 00=标签**（86 条 vs 地图 82 触发、95 条 vs 82 标签）。
+    # 老的小图档里定义+实例挤在一条 352B 记录里（C02D1590@+148、243509BA@+240），两种格式并存。
+    # 第三种（2026-10-14 SAVE2DD8）：200B 等距、无 243509BA、随机八位十六进制 ID，见 TRIG_CLASS_GUID2 注释。
+    TRIGDEF_GUID = bytes.fromhex('1e34de617407d211aca5006008055bb5')
+    GENID_RE = re.compile(rb'(?<![0-9A-Za-z])[0-9A-F]{8}(?=\x00)')
+    NAME_MARK = bytes.fromhex('34778800')          # 记录名前的恒定标记（名字紧随其后）
+    TAG_CLASS_GUID = bytes.fromhex('33e4f654ed09d211aca5006008055bb5')  # 54F6E433-09ED-11D2
+    TRIG_CLASS_GUID_FAM0 = bytes.fromhex('90152dc02a0ad211aca7006008055bb5')  # C02D1590-0A2A-…
+
+    def _scan_records(self):
+        pl = self.plain
+        out = {}
+
+        def _add(off, m):
+            nm_raw = pl[off + 64:off + 96].split(b'\x00')[0]
+            nm = _decode_txt(nm_raw)
+            if not nm or not (1 <= len(nm) <= 48):
+                return
+            quad = pl[off + 120:off + 123]
+            # ★2026-10-20：先认**标签**。以前靠 +120..123 四字节判据，
+            #   会把"持久性=1/2"的标签判成'其它'（SAVE18BE 的 B1/C1 两条就中招）。
+            lo, hi = TAG_PERSIST_WIN
+            if TAG_GUID_TAIL in pl[off + lo:off + hi]:
+                kind = '标签'
+            elif m.group().decode() in self._ai_ids():
+                # ★★2026-10-20 修正（玩家指出"灰色行和下面的触发重复"）：
+                #   存档里**特遣部队/作战小队/动作脚本**和触发/标签共用同一套"8 位 ID + 名字"
+                #   的定长记录容器，以前只看 "+176 是不是某个 GUID" 就判成触发，
+                #   ⇒ 任务图里的 AI 对象被列成"灰色触发"（SAVE0029/SAVE48DB 各 37 条，
+                #     另有 82 条动作脚本被列成"标签"）。现在先按 ID 认 AI 三大件，归 'AI'。
+                kind = 'AI'
+            elif pl[off + 176:off + 192] == self.TRIGDEF_GUID:
+                kind = '触发' if pl[off + 120] == 1 else '标签'
+            elif quad == b'\x01\x01\x01':
+                kind = '触发'
+            elif pl[off + 120:off + 124] == b'\x00\x00\x00\x00':
+                kind = '标签'
+            else:
+                kind = '其它'
+            out[off] = Rec(m.group().decode(), nm, off, kind, None, False, '')
+
+        # ---- 第一遍：老 ID 前缀 01xxxxxx（FA2 顺序编号）----
+        for m in IDRE.finditer(pl):
+            if not _is_hex4(m.group()):
+                continue
+            off = m.start()
+            if off + 400 > len(pl):
+                continue
+            _add(off, m)
+
+        # ---- 第二遍：随机八位十六进制 ID（自制地图，2026-10-14）----
+        # 校验：名字在恒定标记 34778800 之后（偏移可变，标签/触发都适用）
+        # + 分类（+120..123 全为 0/1：难度位+启用位 / 标签零段）+ 类 GUID + 成簇。
+        gen = {}
+        for m in self.GENID_RE.finditer(pl):
+            off = m.start()
+            if off in out or off + 400 > len(pl):
+                continue
+            mk = pl.find(self.NAME_MARK, off + 8, off + 120)
+            if mk < 0:
+                continue
+            nm = _decode_txt(pl[mk + 4:off + 160].split(b'\x00')[0])
+            if not nm or not (1 <= len(nm) <= 48):
+                continue
+            span = pl[off:off + 200]
+            is_trig = (TRIG_CLASS_GUID2 in span
+                       or self.TRIG_CLASS_GUID_FAM0 in span
+                       or TRIG_GUID2_HEAD in span)
+            is_tag = (self.TAG_CLASS_GUID in span
+                      or b'\xe4\xf6\x54\xed\x09\xd2\x11' in span   # GUID 变体（首字节可差 1）
+                      or TAG_GUID_TAIL in span)                    # 尾 12 字节（★2026-10-20）
+            if is_tag and not is_trig:
+                kind = '标签'          # 标签 +120 区是计数/ID，不必为 0/1
+            elif is_trig and all(b in (0, 1) for b in pl[off + 120:off + 124]):
+                kind = '触发'
+            else:
+                continue
+            gen[off] = (m, kind, nm)
+        # 成簇过滤：孤立的八位十六进制候选多半是巧合（真记录都是连续数组）
+        goffs = sorted(gen)
+        for i, off in enumerate(goffs):
+            near = (i > 0 and off - goffs[i - 1] <= 600) or \
+                   (i + 1 < len(goffs) and goffs[i + 1] - off <= 600)
+            if not near:
+                continue
+            m, kind, nm = gen[off]
+            out[off] = Rec(m.group().decode(), nm, off, kind, None, False, '')
+
+        records = sorted(out.values(), key=lambda r: r.off)
+        # ---- 触发「运行时启用位」定位（跨图通用，2026-10-13 定案）----
+        self._assign_trigger_flags(records)
+        return records
+
+    # AI 三大件的类 GUID（与 ai_objects.AI_CLASSES 同源，这里内联一份避免循环依赖）
+    AI_CLASS_GUIDS = (bytes.fromhex('4ea6dbd17807d211aca5006008055bb5'),   # TeamType   268B
+                      bytes.fromhex('1e34de617407d211aca5006008055bb5'),   # TaskForce  232B
+                      bytes.fromhex('47a6f3428907d211aca5006008055bb5'))   # ScriptType 584B
+
+    def _ai_ids(self):
+        """「AI 三大件」（作战小队/特遣部队/动作脚本）的 8 位 ID 集合（缓存）。
+
+        ★2026-10-20（玩家指出灰行与触发"重复"后的定案）：这三类和触发/标签共用
+        "8 位 ID + 名字" 的定长记录容器 ⇒ 必须按 ID 先认出来，否则会冒充触发/标签。
+        ID 在这三个对象头部 `+0x38`（与 ai_objects.ID_OFF 一致）。
+        """
+        if getattr(self, '_aiids', None) is not None:
+            return self._aiids
+        pl = self.plain
+        out = set()
+        for guid in self.AI_CLASS_GUIDS:
+            q = 0
+            while True:
+                i = pl.find(guid, q)
+                if i < 0:
+                    break
+                q = i + 1
+                sid = pl[i + 0x38:i + 0x38 + 8].split(b'\x00')[0]
+                try:
+                    out.add(sid.decode('ascii'))
+                except Exception:
+                    pass
+        self._aiids = out
+        return out
+
+    def _assign_trigger_flags(self, out):
+        """按当前 kind 给每条记录设置 启用位 / 只读 状态（分类变更后需重跑）。"""
+        pl = self.plain
+        offs = sorted(r.off for r in out)
+
+        def _nxt(o):
+            return next((x for x in offs if x > o), min(len(pl), o + 2400))
+
+        for r in out:
+            if r.kind == '触发':
+                # 启用位 = 触发类 GUID 前 8 字节。★搜索窗硬上限 400 字节：
+                # 老档 GUID 在记录 +236/+328 处；窗口放开会把**后面别的对象**的
+                # GUID 误认成自己的（大档里对象数组彼此挨得很近，实测风险）。
+                fo = trig_flag_offset(pl, r.off, min(_nxt(r.off), r.off + 400))
+                r.flag_off = fo
+                if fo is None and all(b in (0, 1) for b in pl[r.off + 120:r.off + 124]) \
+                        and (TRIG_CLASS_GUID2 in pl[r.off:r.off + 200]
+                             or self.TRIG_CLASS_GUID_FAM0 in pl[r.off:r.off + 200]):
+                    # 新格式（200B 记录，2026-10-14 SAVE2DD8）：无 243509BA GUID，
+                    # 启用位固定在 +123（难度位后一字节）；47/47 与地图禁用标志对拍。
+                    # ⚠ 老格式里 +123 是地图定义副本（无效），两种格式不要混淆。
+                    fo = r.off + 123
+                    r.flag_off = fo
+                if fo is None:
+                    r.enabled = None
+                    r.can_toggle = False
+                    if pl[r.off + 176:r.off + 192] == self.TRIGDEF_GUID:
+                        r.note = ('大任务格式：这里只有「触发定义」，运行期启用位'
+                                  '不在这条记录里（未定位）· 只读')
+                    else:
+                        r.note = '启用位未定位（该记录内无触发类 GUID）· 只读'
+                else:
+                    r.enabled = bool(pl[fo])
+                    r.can_toggle = True
+                    r.note = '启用位@+%d = %d' % (fo - r.off, pl[fo])
+            elif r.kind == '标签':
+                r.flag_off = None
+                r.enabled = None
+                r.can_toggle = False
+                r.note = 'Tag 记录（只读）'
+            else:
+                r.flag_off = None
+                r.enabled = None
+                r.can_toggle = False
+                r.note = '未识别结构（只读）'
+        self.layout_ok = any(r.flag_off is not None for r in out)
+
+    def _trig_flag_off(self, rec):
+        """该触发记录的「运行时启用位」相对偏移；定位不到返回 None。
+
+        ★★★ 判据（2026-10-13 定案，跨图通用）：
+          触发对象体内含恒定 16 字节**类 GUID** `243509BA-4CF4-11D2-BC26-00104B8FB04D`，
+          **启用位 = 该 GUID 前 8 字节处的 1 个字节**（1=启用 / 0=禁用）。
+
+        ★ 记录内偏移**随图变化**（实测新图 +236、旧图 +328）—— 因为 GUID 前有变长内容
+          （指针数组等）⇒ **绝不能写死偏移**（我前面几轮就是栽在这上面）。
+        ★ 归属：GUID 必须落在「本条记录起点 ~ 下一条记录起点」之间，否则会误认后面对象的 GUID。
+
+        证据链（全部为游戏内可验证的状态）：
+          · 外挂禁用实验：T0(启用)/T1(禁用)/T2(恢复) 三档，**只有这一字节** 1→0→1；
+          · 旧图成对档 6691(禁用)/6692(启用)：该字节 0/1，且用户游戏内实测「不胜利/胜利」；
+          · `测试B禁用.sav`、`无外挂 测试B已禁用.sav`、`单触发 禁用状态.sav` 均读出 0；
+          · 60+ 档扫描：该位置**要么不是 0/1（则判只读），要么就是 0/1**，零误报。
+        """
+        fo = getattr(rec, 'flag_off', None)
+        if fo is not None:
+            return fo - rec.off
+        recs = getattr(self, 'records', None) or []
+        offs = sorted(r.off for r in recs)
+        nxt = next((x for x in offs if x > rec.off), min(len(self.plain), rec.off + 2400))
+        p = trig_flag_offset(self.plain, rec.off, nxt)
+        return None if p is None else p - rec.off
+
+    def can_toggle_trigger(self, rec):
+        return rec.kind == '触发' and self._trig_flag_off(rec) is not None
+
+    # ---------- 挂接（CellTag）管理 ----------
+    # 2026-10-14 五轮实验定案（详见 SKILL.md「正向挂接定案」）：
+    #   建筑.tag 字段 → 标签运行期对象 X（CellTag 节点 +16 处的指针）；
+    #   CellTag 节点 +64 = 该标签挂的建筑数；
+    #   挂上 = 建筑字段←X + 计数+1（两侧缺一不可，游戏内实测：双电厂/跨类型地堡）；
+    #   解除 = 字段清 0 + 计数−1（同构）。
+    CELLTAG_GUID = bytes.fromhex('32e4f654ed09d211')   # CellTag 运行期类 GUID
+
+    def celltag_nodes(self):
+        self._invalidate_if_shifted()
+        """扫描全部 CellTag 节点 → [{'node','x','count','count_pos'}]"""
+        if getattr(self, '_celltags', None) is not None:
+            return self._celltags
+        pl = self.plain          # ★ 工作副本（挂/解后计数变化要能读到）
+        out = []
+        q = 0
+        while True:
+            i = pl.find(self.CELLTAG_GUID, q)
+            if i < 0:
+                break
+            q = i + 1
+            if i + 68 > len(pl):
+                continue
+            out.append({'node': i,
+                        'x': struct.unpack_from('<I', pl, i + 16)[0],
+                        'count_pos': i + 64,
+                        'count': struct.unpack_from('<I', pl, i + 64)[0]})
+        self._celltags = out
+        return out
+
+    def _coords_pat(self, cx, cy):
+        return struct.pack('<II', cx * 256 + 128, cy * 256 + 128)
+
+    def timer_table_slot(self):
+        """**空表**时定位「定时触发器激活登记表」的计数位置；定位不到返回 None。
+
+        空表没有元素可当证据（`celltag_timer_list()` 直接返回 None），只能靠结构指纹：
+        表 = `[u32 n][cell 键 × n]`，其后紧跟 `[u32 0][u32 14][u32 14][u32 0a]`
+        （2026-10-17 在 all01umd 家族 4 份档上逐字节核对；n=0 时表头正好落在这段之前）。
+        要求指纹**全档唯一**，且推出来的 count 位置确实是 u32 0 —— 否则宁可不给。
+        """
+        pl = self.plain
+        hits = []
+        i = 0
+        while True:
+            j = pl.find(TIMER_TABLE_TAIL, i)
+            if j < 0:
+                break
+            hits.append(j)
+            i = j + 1
+        if len(hits) != 1:
+            return None
+        pos = hits[0] - 4
+        if pos < 0 or struct.unpack_from('<I', pl, pos)[0] != 0:
+            return None
+        return pos
+
+    def celltag_timer_list(self):
+        """定位「定时触发器挂接表」：[count][count × CellTag 键][变长尾]。
+
+        ★★★ 2026-10-14 找到的**新写触发不生效的那一环**（实测 4 档自洽）：
+          表里放的是**带计时的触发**（TagNode `+80` 帧数 > 0）所对应的 **CellTag 自身键**。
+          证据（帧数 → 表内容）：
+            · 原基档  A=150, B=0, C=450  ⇒ 表 = [A的Cell, C的Cell]，count=2；
+            · C开     B=0,   C=450       ⇒ 表 = [C的Cell]，count=1；
+            · C关     B=0                ⇒ 表 = []，count=0；
+            · 工具写出的档 A=150,C=450   ⇒ 表仍只有 [A的Cell]（**漏维护**）——
+              这正与「地编写入（地图写，表里有 C）10 秒点亮＋30 秒胜利」
+              /「工具写：10 秒点亮、不胜利」的分叉完全对应。
+        判据（用于定位，跨图通用）：
+          ① 表元素 = 某个 CellTag 对象的自身键（GUID+16）；
+          ② 该键在全档**只出现两处**：自己的 +16、以及本表里；
+          ③ 元素个数与「TagNode 帧数 > 0 的触发数」一致（用于在多个候选中择优）。
+        返回 {'count_pos', 'list_pos', 'keys', 'expected', 'n'}；定位不到返回 None。
+        """
+        if getattr(self, '_ctimerlist', None) is not None:
+            return self._ctimerlist
+        pl = self.plain
+        keys = set()
+        for nd in self.celltag_nodes():
+            keys.add(nd['x'])
+        if not keys:
+            self._ctimerlist = None
+            return None
+        # 期望元素数 = TagNode 帧数 > 0 的个数
+        expected = 0
+        q = 0
+        while True:
+            i = pl.find(TRIG_NODE_GUID, q)
+            if i < 0:
+                break
+            q = i + 1
+            if i + NODE_FLAG_OFF + 4 > len(pl):
+                continue
+            t = struct.unpack_from('<I', pl, i + NODE_TICKS_OFF)[0]
+            if 0 < t < 0x7FFFFFFF:
+                expected += 1
+        # ★2026-10-17 22:5x：**别对 515 个键逐个全档 find**（39MB 档要 7.7 秒）。
+        #   取 60 个种子，直接按"连续 CellTag 键区 + 段首计数"认表（与表头位置无关）。
+        cands = []
+        seen_cp = set()
+        seeds = list(keys)[:60]
+        for k in seeds:
+            pat = struct.pack('<I', k)
+            q = 0
+            while True:
+                o = pl.find(pat, q)
+                if o < 0:
+                    break
+                q = o + 1
+                e = o
+                while e + 4 <= len(pl):
+                    v = struct.unpack_from('<I', pl, e)[0]
+                    if v in keys:
+                        e += 4
+                    else:
+                        break
+                st = o
+                while st - 4 >= 0:
+                    v = struct.unpack_from('<I', pl, st - 4)[0]
+                    if v in keys:
+                        st -= 4
+                    else:
+                        break
+                n = (e - st) // 4
+                cp = st - 4
+                if cp < 0 or n < 1 or cp in seen_cp:
+                    continue
+                if struct.unpack_from('<I', pl, cp)[0] != n:
+                    continue
+                seen_cp.add(cp)
+                vals = [struct.unpack_from('<I', pl, st + 4 * j)[0] for j in range(n)]
+                cands.append((cp, n, vals))
+        # 去重（同一 cp）
+        seen, uniq = set(), []
+        for cp, n, vals in cands:
+            if cp in seen:
+                continue
+            seen.add(cp)
+            uniq.append((cp, n, vals))
+        best = None
+        for cp, n, vals in uniq:
+            if n == expected:
+                best = (cp, n, vals)
+                break
+        if best is None and uniq:
+            # ★2026-10-17 22:5x：大任务档里这张表有 **320** 条（旧上限 256 直接滤掉 ⇒
+            #   定位失败 ⇒ 新触发不登记 ⇒ **引擎不武装它**）。
+            #   择优依据 = "表里装了多少个**有计时**的 CellTag"：真表覆盖 203/204，
+            #   其它候选覆盖 0 ⇒ 不靠数量猜。
+            node_ticks = {}
+            q = 0
+            while True:
+                i = pl.find(TRIG_NODE_GUID, q)
+                if i < 0:
+                    break
+                q = i + 1
+                if i + NODE_TICKS_OFF + 4 <= len(pl):
+                    node_ticks[struct.unpack_from('<I', pl, i + 16)[0]] = \
+                        struct.unpack_from('<I', pl, i + NODE_TICKS_OFF)[0]
+            tick_cells = set()
+            for nd0 in self.celltag_nodes():
+                nk = struct.unpack_from('<I', pl, nd0['node'] + 60)[0]
+                if node_ticks.get(nk, 0) > 0:
+                    tick_cells.add(nd0['x'])
+            uniq.sort(key=lambda it: (len(set(it[2]) & tick_cells), it[1]), reverse=True)
+            if uniq and (set(uniq[0][2]) & tick_cells):
+                best = uniq[0]
+            elif len(uniq) == 1:
+                best = uniq[0]
+        self._ctimerlist = None if best is None else {
+            'count_pos': best[0], 'list_pos': best[0] + 4,
+            'keys': best[2], 'expected': expected, 'n': best[1]}
+        return self._ctimerlist
+
+    # ---------- 触发运行期组件：诊断 / 修复（2026-10-15）----------
+    # 背景（四档解剖定案，见 _exp/dissect_D.py）：
+    #   「修改已有触发的事件类型不生效」的根因**不是** set_event 写错 —— 事件对象确实
+    #   改对了（实例键链验证），而是该触发**从根上缺 TagNode/CellTag**（老 V1~V4 式的
+    #   残缺集群），引擎根本不会执行它。对照组：新写触发 E（六件套齐全）测试通过。
+    #   ⇒ 修复 = 给缺组件的触发补齐 TagNode(+CellTag) + 计时表登记，全部复用
+    #     create_trigger 已游戏内验收的克隆机器。
+
+    def _instance_maps(self):
+        """扫描触发集群键链（缓存）：
+        {'inst': {实例键: 偏移}, 'sid': {实例键: sid}, 'tag_of_inst': {实例键: 标签键},
+         'node_of_inst': {实例键: node偏移}, 'cell_of_tag': {标签键: cell**自键**}}"""
+        if getattr(self, '_instmaps', None) is not None:
+            return self._instmaps
+        pl = self.plain
+        inst, sid, tag_of, node_of, cell_of = {}, {}, {}, {}, {}
+        q = 0
+        while True:
+            i = pl.find(TRIG_INSTANCE_GUID, q)
+            if i < 0:
+                break
+            q = i + 1
+            if i + TRIG_OBJ_SIZE > len(pl):
+                continue
+            k = int.from_bytes(pl[i + 16:i + 20], 'little')
+            inst[k] = i
+            sid[k] = pl[i + 56:i + 64].split(b'\x00')[0].decode('ascii', 'replace')
+        q = 0
+        while True:
+            i = pl.find(TRIG_TAGOBJ_GUID, q)
+            if i < 0:
+                break
+            q = i + 1
+            if i + TAG_OBJ_SIZE > len(pl):
+                continue
+            tag_of[int.from_bytes(pl[i + 180:i + 184], 'little')] = \
+                int.from_bytes(pl[i + 16:i + 20], 'little')
+        q = 0
+        while True:
+            i = pl.find(TRIG_NODE_GUID, q)
+            if i < 0:
+                break
+            q = i + 1
+            if i + TRIG_NODE_SIZE > len(pl):
+                continue
+            node_of.setdefault(int.from_bytes(pl[i + NODE_TRIGKEY_OFF:
+                                                  i + NODE_TRIGKEY_OFF + 4], 'little'), i)
+        q = 0
+        while True:
+            i = pl.find(TRIG_CELLGUID, q)
+            if i < 0:
+                break
+            q = i + 1
+            if i + TRIG_CELL_SIZE > len(pl):
+                continue
+            cell_of.setdefault(int.from_bytes(pl[i + CELL_TAGKEY_OFF:
+                                                  i + CELL_TAGKEY_OFF + 4], 'little'),
+                               int.from_bytes(pl[i + 16:i + 20], 'little'))
+        self._instmaps = {'inst': inst, 'sid': sid, 'tag_of_inst': tag_of,
+                          'node_of_inst': node_of, 'cell_of_tag': cell_of}
+        return self._instmaps
+
+    def runtime_status(self):
+        """每个触发实例的运行期组件状态（GUI「触发」页诊断用）：
+        [{'inst_off', 'inst_key', 'sid', 'name', 'tag_key', 'has_node', 'node_off',
+          'ticks', 'has_cell', 'record_enabled'}]，按实例偏移升序。"""
+        m = self._instance_maps()
+        recs = {r.sid: r for r in self.records if r.kind == '触发'}
+        out = []
+        for k, off in sorted(m['inst'].items(), key=lambda x: x[1]):
+            nm = self.plain[off + 120:off + 172].split(b'\x00')[0]
+            try:
+                nm = nm.decode('utf-8')
+            except UnicodeDecodeError:
+                nm = nm.decode('gbk', 'replace')
+            node_off = m['node_of_inst'].get(k)
+            rec = recs.get(m['sid'].get(k, ''))
+            out.append({
+                'inst_off': off, 'inst_key': k, 'sid': m['sid'].get(k, ''),
+                'name': nm, 'tag_key': m['tag_of_inst'].get(k),
+                'has_node': node_off is not None, 'node_off': node_off,
+                'ticks': int.from_bytes(self.plain[node_off + NODE_TICKS_OFF:
+                                                   node_off + NODE_TICKS_OFF + 4], 'little')
+                if node_off is not None else None,
+                'has_cell': m['tag_of_inst'].get(k) in m['cell_of_tag'],
+                'record_enabled': (rec.enabled if rec is not None
+                                   and rec.enabled is not None else True),
+                # ★运行期启用位 = TagNode+88 最低位（大任务档：定义字节≠运行期状态，
+                #   被触发链启用的触发定义里仍是"禁用"——2026-10-15 SAVE194E 实战定案）
+                'rt_enabled': bool(int.from_bytes(self.plain[node_off + NODE_FLAG_OFF:
+                                                             node_off + NODE_FLAG_OFF + 4],
+                                                  'little') & 1)
+                if node_off is not None else None})
+        return out
+
+    def node_of_event(self, ev):
+        """事件 → 所属触发实例 → TagNode。
+        返回 (node偏移|None, 实例**自键**|None)。依据：实例 +192 = 事件对象自键（一一对应）。
+        ★返回键不返回偏移：插入字节后偏移会漂移，而 `tag_of_inst` 以键为键 ——
+          曾因返回偏移导致 0→正帧数时的计时表登记永远查空（2026-10-15 自检抓到）。"""
+        pl = self.plain
+        if not (0 <= ev['obj'] and ev['obj'] + 20 <= len(pl)):
+            return None, None
+        evkey = int.from_bytes(pl[ev['obj'] + 16:ev['obj'] + 20], 'little')
+        m = self._instance_maps()
+        for k, off in m['inst'].items():
+            if int.from_bytes(pl[off + 192:off + 196], 'little') == evkey:
+                return m['node_of_inst'].get(k), k
+        return None, None
+
+    def _timer_ensure_registered(self, cell_key):
+        """把 CellTag 自键登记进「定时触发器挂接表」（已登记则不动）。
+        返回提示文字。★ 只处理 0→N 方向；N→0（移除）会移动表尾变长数据，尚未需要。
+        ★★ 表尾插 4 字节 ⇒ 其后全部明文偏移 +4：必须平移 pending 偏移并失效全部
+        缓存（否则同会话的后续编辑会写错位 —— 2026-10-15 自检抓到）。"""
+        tl = self.celltag_timer_list()
+        if tl is None:
+            return '（⚠ 未定位到「定时触发器挂接表」，计时触发可能不武装）'
+        if cell_key in tl['keys']:
+            return ''
+        pl = self.plain
+        pos = tl['list_pos'] + 4 * tl['n']
+        pl[pos:pos] = struct.pack('<I', cell_key)
+        pl[tl['count_pos']:tl['count_pos'] + 4] = \
+            struct.pack('<I', tl['n'] + 1)
+        self._ctimerlist = None
+        # ---- 簿记：低位插入 ⇒ 高位偏移全部 +4 ----
+        for store in (self.pending_events, self.pending_actions):
+            if store:
+                moved = {}
+                for k, v in store.items():
+                    moved[k + (4 if k >= pos else 0)] = v
+                store.clear()
+                store.update(moved)
+        if self.pending_attach:
+            self.pending_attach = [(f + (4 if f >= pos else 0), old)
+                                   for f, old in self.pending_attach]
+        self._objs = self._events = self._actions = None
+        self._ticks = self._celltags = self._ctimerlist = None
+        self._instmaps = None
+        return ''
+
+    def repair_trigger_runtime(self, inst_off, ticks=None, enabled=None):
+        """给**缺运行期组件**的已有触发补齐 TagNode / CellTag（+ 计时表登记）。
+
+        ★ 这就是「修改已有触发的事件类型不生效」的修复（2026-10-15 四档解剖定案）：
+          该触发缺 TagNode/CellTag ⇒ 引擎不执行它 ⇒ 改事件/改启用位都无效。
+        - inst_off：触发实例的**自键**（推荐，插入字节后仍稳定）或当前明文偏移；
+        - ticks=None：按该触发当前事件自动算（13 流逝时间 → 秒×15，否则 0）；
+        - enabled=None：按触发记录的启用位（读不到默认 1）；
+        - 已有 TagNode 的触发调用本方法 = no-op（返回 already=True）。
+        返回 {'inst_key', 'node_key', 'cell_key', 'ticks', 'already', 'warnings'}。
+        """
+        pl = self.plain
+        m = self._instance_maps()
+        # 定位实例：优先按自键（★插入字节会使偏移后移，键才是不变量）
+        if inst_off in m['inst']:
+            ikey = inst_off
+            inst_off = m['inst'][ikey]
+        else:
+            ikey = next((k for k, o in m['inst'].items() if o == inst_off), None)
+        if ikey is None:
+            raise ValueError('找不到触发实例 @%s' % (hex(inst_off),))
+        warnings = []
+        if m['node_of_inst'].get(ikey) is not None:
+            nd = m['node_of_inst'][ikey]
+            return {'inst_key': ikey,
+                    'node_key': int.from_bytes(pl[nd + 16:nd + 20], 'little'),
+                    'cell_key': m['cell_of_tag'].get(m['tag_of_inst'].get(ikey)),
+                    'ticks': int.from_bytes(pl[nd + NODE_TICKS_OFF:nd + NODE_TICKS_OFF + 4],
+                                            'little'),
+                    'already': True, 'warnings': ['该触发已有 TagNode，无需修复']}
+        grps = self._newtrig_groups()
+        node_pos, cell_pos = grps.get('node'), grps.get('cell')
+        if not node_pos or not cell_pos:
+            raise RuntimeError('档内没有 TagNode/CellTag 对象组，无法修复')
+        # ticks / enabled 自动值（★直接读明文 —— _objects() 缓存可能已被 set_event 改掉）
+        evkey = int.from_bytes(pl[inst_off + 192:inst_off + 196], 'little')
+        ev_obj = next((o for o in self._objects()
+                       if int.from_bytes(pl[o['obj'] + 16:o['obj'] + 20], 'little') == evkey),
+                      None)
+        if ticks is None:
+            ev_type = int.from_bytes(pl[ev_obj['obj'] + OBJ_TYPE_OFF:
+                                        ev_obj['obj'] + OBJ_TYPE_OFF + 4], 'little') \
+                if ev_obj is not None else 0
+            ev_arg = int.from_bytes(pl[ev_obj['obj'] + OBJ_ARG_OFF:
+                                       ev_obj['obj'] + OBJ_ARG_OFF + 4], 'little') \
+                if ev_obj is not None else 0
+            if ev_type == 13:
+                ticks = ev_arg * LOGIC_FPS
+            elif ev_type == 8:
+                # ★事件 8「任何事件」永远为真，但帧数=0（不进计时表）⇒ 引擎不轮询 ⇒ 永不触发
+                #   （2026-10-15 R2/R4 单变量实测定案）⇒ 自动武装为 15 帧（进表即立刻触发）
+                ticks = 15
+                warnings.append('事件为「8 任何事件」：已自动武装 TagNode 帧数=15 '
+                                '（帧数 0 不进计时表、引擎不轮询 ⇒ 永不触发，R2/R4 实测定案）')
+            else:
+                ticks = 0
+        if enabled is None:
+            rec = next((r for r in self.records
+                        if r.kind == '触发' and r.sid == m['sid'].get(ikey)), None)
+            enabled = 1 if rec is None or rec.enabled is None else int(bool(rec.enabled))
+        # 新键：同类最大键 +0x1000，全档查重
+        used = []
+        def fresh(pos_list):
+            v = (max(int.from_bytes(pl[p + 16:p + 20], 'little') for p in pos_list)
+                 + 0x1000) & 0xFFFFFFFF
+            while pl.find(struct.pack('<I', v)) >= 0 or v in used:
+                v = (v + 0x1000) & 0xFFFFFFFF
+            used.append(v)
+            return v
+        K_NODE = fresh(node_pos)
+        K_CELL = fresh(cell_pos)
+        tpl_node = bytes(pl[node_pos[0]:node_pos[0] + TRIG_NODE_SIZE])
+        tpl_cell = bytes(pl[cell_pos[0]:cell_pos[0] + TRIG_CELL_SIZE])
+        # 构造（与 create_trigger 同款，已游戏内验收）
+        nb = bytearray(TRIG_NODE_SIZE)
+        nb[0:16] = TRIG_NODE_GUID
+        nb[16:20] = struct.pack('<I', K_NODE)
+        nb[20:36] = tpl_node[20:36]
+        nb[36:40] = b'\xff' * 4
+        nb[NODE_TRIGKEY_OFF:NODE_TRIGKEY_OFF + 4] = struct.pack('<I', ikey)
+        nb[76:80] = struct.pack('<I', NODE_SPARE76)
+        nb[NODE_TICKS_OFF:NODE_TICKS_OFF + 4] = struct.pack('<I', int(ticks))
+        nb[NODE_FLAG_OFF:NODE_FLAG_OFF + 4] = struct.pack('<I', 1 if enabled else 0)
+        tag_key = m['tag_of_inst'].get(ikey)
+        if tag_key is None:
+            warnings.append('该触发没有对应的标签对象（tag@+180 落空）——CellTag 已按 0 标签键写出，'
+                            '若不生效请反馈样本')
+        cb = bytearray(TRIG_CELL_SIZE)
+        cb[0:16] = TRIG_CELLGUID
+        cb[16:20] = struct.pack('<I', K_CELL)
+        cb[20:36] = tpl_cell[20:36]
+        cb[36:40] = b'\xff' * 4
+        cb[CELL_TAGKEY_OFF:CELL_TAGKEY_OFF + 4] = struct.pack('<I', tag_key or 0)
+        cb[CELL_NODEKEY_OFF:CELL_NODEKEY_OFF + 4] = struct.pack('<I', K_NODE)
+        cb[64:68] = struct.pack('<I', 0)          # 挂接数 0
+        # 插入：node/cell 组尾 + 计时表尾（ticks>0 时）；降序应用
+        ins = [(node_pos[-1] + TRIG_NODE_SIZE, bytes(nb)),
+               (cell_pos[-1] + TRIG_CELL_SIZE, bytes(cb))]
+        if ticks > 0:
+            tl = self.celltag_timer_list()
+            if tl is None:
+                warnings.append('未定位到「定时触发器挂接表」——计时触发可能不触发')
+            else:
+                ins.append((tl['list_pos'] + 4 * tl['n'], struct.pack('<I', K_CELL)))
+                pl[tl['count_pos']:tl['count_pos'] + 4] = struct.pack('<I', tl['n'] + 1)
+                self._ctimerlist = None
+        for pos, data in sorted(ins, key=lambda x: -x[0]):
+            pl[pos:pos] = data
+        # 组计数 +1（插入后重新定位；只动 node/cell 两组）
+        for guid in (TRIG_NODE_GUID, TRIG_CELLGUID):
+            p0 = pl.find(guid)
+            if p0 >= 4:
+                old = int.from_bytes(pl[p0 - 4:p0], 'little')
+                pl[p0 - 4:p0] = struct.pack('<I', old + 1)
+        # pending 偏移平移（簿记一致性，同 create_trigger）
+        for store in (self.pending_events, self.pending_actions):
+            if store:
+                moved = {}
+                for k, v in store.items():
+                    moved[k + sum(len(d) for p, d in ins if p <= k)] = v
+                store.clear()
+                store.update(moved)
+        if self.pending_attach:
+            self.pending_attach = [(f + sum(len(d) for p, d in ins if p <= f), old)
+                                   for f, old in self.pending_attach]
+        # 缓存全失效 + 重扫
+        self._objs = self._events = self._actions = None
+        self._ticks = self._celltags = self._ctimerlist = None
+        self._instmaps = None
+        self._house_econ = self._custom_houses = None
+        self._house_keys_memo = None
+        self._tagrecs = None            # ★2026-10-20：标签记录缓存也要失效（否则新建触发的类型读不出）
+        self.records = self._scan_records()
+        if self._map:
+            self._events = None
+            self._actions = None
+            self._apply_map()
+        self.pending_newtrig = True
+        return {'inst_key': ikey, 'node_key': K_NODE, 'cell_key': K_CELL,
+                'ticks': int(ticks), 'already': False, 'warnings': warnings}
+
+    def set_trigger_never_fire(self, rec):
+        """大任务档「等效禁用」：把触发的事件参数改成 9999999 秒（大数法），
+        TagNode+80 经 set_event 键链同步 → 两种启用模型（恢复冻结倒计时 /
+        按事件参数重新武装）都不会再触发。
+        ★适用于「运行期启用位未定位 · 只读」的记录——定义字节≠运行期状态
+        （2026-10-15 SAVE194E 实战验证：刷兵2号禁用后 10 秒必崩 → 大数法禁用 → 不崩）。
+        返回 {'changed', 'note'}。"""
+        rt = {s['name']: s for s in self.runtime_status()}
+        s = rt.get(rec.name)
+        if s is None:
+            raise RuntimeError('按名字 %r 配对不到运行期实例' % rec.name)
+        if not s['has_node']:
+            return {'changed': False,
+                    'note': '该触发没有运行期节点（TagNode）——本来就不会被引擎执行'}
+        evkey = int.from_bytes(self.plain[s['inst_off'] + 192:
+                                          s['inst_off'] + 196], 'little')
+        ev = next((e for e in self.events()
+                   if int.from_bytes(self.plain[e['obj'] + 16:e['obj'] + 20],
+                                     'little') == evkey), None)
+        if ev is None:
+            raise RuntimeError('找不到该触发的事件对象（键 %08X）' % evkey)
+        old = (ev['type'], ev['arg'])
+        self.set_event(ev, arg=9999999)
+        return {'changed': True, 'old': old, 'new': (ev['type'], ev['arg']),
+                'note': getattr(self, 'time_sync_note', '')}
+
+    def runtime_links(self):
+        """运行期键链（**按 sid**，不按名字）：{触发 sid: {'inst_key','ev','ac','name'}}。
+
+        ★2026-10-18 定案：实例对象里的名字只有 **52 字节**（`+120..+172`），长名会被截断
+          （大任务档里 "…Clone Clone Clone" 这种名字一截就对不上 records 里的全名），
+          所以「选中触发 → 高亮它的事件/行为」**必须走 sid**，不能靠名字比。
+        """
+        m = self._instance_maps()
+        pl = self.plain
+        out = {}
+        for k, off in m['inst'].items():
+            nm = pl[off + 120:off + 172].split(b'\x00')[0]
+            try:
+                nm = nm.decode('utf-8')
+            except UnicodeDecodeError:
+                nm = nm.decode('gbk', 'replace')
+            out[m['sid'].get(k, '')] = {
+                'inst_key': k,
+                'ev': int.from_bytes(pl[off + 192:off + 196], 'little'),
+                'ac': int.from_bytes(pl[off + 196:off + 200], 'little'),
+                'name': nm,
+            }
+        return out
+
+    def runtime_owner_names(self):
+        """(事件键→**实例内名**, 行为键→实例内名) —— 名字是实例里那份原始 52 字节。
+
+        ★2026-10-18 为什么还需要它：`records[].name` 与实例 `+120` 里的名字**长度不同**
+          （记录侧更短、会被截断），两边直接相等只能在名字够短时成立。
+          GUI 的「选中触发→高亮」用它做**前缀兜底**（sid 对不上时用），
+          显示用的全名走 `runtime_owners()`。
+        """
+        links = self.runtime_links()
+        ev, ac = {}, {}
+        for d in links.values():
+            ev[d['ev']] = d['name']
+            ac[d['ac']] = d['name']
+        return ev, ac
+
+    def runtime_owners(self):
+        """运行期归属（★无需地图）：(事件归属{事件自键: 触发名}, 行为归属{行为自键: 触发名})。
+
+        触发实例 `+192`=事件自键、`+196`=行为自键、`+120`=触发名。
+        ★2026-10-18：名字改成取 records 里的**完整名**（同 sid），实例里那份会被 52 字节截断。
+        """
+        links = self.runtime_links()
+        nmap = {r.sid: r.name for r in self.records if r.kind == '触发'}
+        ev, ac = {}, {}
+        for sid, d in links.items():
+            nm = nmap.get(sid) or d['name']
+            ev[d['ev']] = nm
+            ac[d['ac']] = nm
+        return ev, ac
+
+    def locate_building_field(self, cx, cy, mode='zero', x=None):
+        """按地图格子坐标定位建筑 tag 字段。
+
+        命中判据（实验定案）：像素坐标对 (cx,cy)×256+128 在明文中命中 2 处且
+        **恰好相差 440**（建筑对象内 +104 与 +544 两份坐标副本）→ tag 字段 = 命中−104。
+        mode='zero' 要求字段现值 0（未挂接）；'x' 要求字段值 == x（已挂该标签）。
+        返回 (字段偏移, None) 或 (None, 错误说明)。
+        """
+        pl = self.plain          # ★ 工作副本
+        pat = self._coords_pat(cx, cy)
+        hits = []
+        q = 0
+        while True:
+            i = pl.find(pat, q)
+            if i < 0:
+                break
+            hits.append(i)
+            q = i + 1
+        hset = set(hits)
+        tfs = set()
+        for h in hits:
+            tf = h - 104
+            if tf < 4 or tf + 4 > len(pl):
+                continue
+            v = struct.unpack_from('<I', pl, tf)[0]
+            if mode == 'zero' and v != 0:
+                continue
+            if mode == 'x' and (x is None or v != x):
+                continue
+            if (h + 440) not in hset:        # 第二份坐标副本自洽
+                continue
+            tfs.add(tf)
+        if len(tfs) == 1:
+            return tfs.pop(), None
+        if not tfs:
+            return None, ('格(%d,%d) 在存档中未定位到建筑（常见原因：存档比地图旧）' % (cx, cy))
+        return None, '格(%d,%d) 定位不唯一（%d 处）' % (cx, cy, len(tfs))
+
+    # 坐标合理性上界：**不能用地图 [Map] Size 当界**——实测 all01umd.map 声明
+    # `Size=0,0,80,80` 却有 (85,77) 的建筑（超出声明范围），旧实现因此把该建筑
+    # 的挂接从总览里漏掉（2026-10-15 修）。
+    MAXPIX = 512 * 256
+
+    def attach_overview(self):
+        """挂接总览（建议先挂地图，否则建筑类型解不出）。返回 list of dict:
+          {node, x, tag_key, count, count_pos, tagid, trigger_id, trigger_name,
+           buildings: [{field, cx, cy, type, map_idx, tagid}]}
+
+        ★2026-10-15：触发/标签改走**键链**解析（与地图、建筑都无关）：
+        CellTag+56 = 标签键 → 标签对象+180 = 触发实例键 → 实例+56 = 触发 ID。
+        好处：**未挂接任何建筑的 CellTag 也能报出它属于哪个触发**（新建的触发
+        挂接数为 0 时依然可选中并挂到建筑上）；建筑列表仍按 X 在全档的出现点
+        （+104/+108 像素坐标）反查，命中地图 [Structures] 时补类型。
+        """
+        pl = self.plain          # ★ 工作副本
+        m = getattr(self, '_map', None)
+        smap = {(s['x'], s['y']): s for s in (m.structures() if m else [])}
+        t2t = m.tag_trigger_map() if m else {}
+        names = {r.sid: r.name for r in self.records}
+
+        def _index(guid):
+            """类 GUID → {自身键: 对象偏移}"""
+            out, q = {}, 0
+            while True:
+                i = pl.find(guid, q)
+                if i < 0:
+                    return out
+                q = i + 1
+                out[struct.unpack_from('<I', pl, i + 16)[0]] = i
+
+        tags_by_key = _index(TRIG_TAGOBJ_GUID)
+        insts_by_key = _index(TRIG_INSTANCE_GUID)
+        out = []
+        for nd in self.celltag_nodes():
+            X = nd['x']
+            pat = struct.pack('<I', X)
+            q = 0
+            blds = []
+            while True:
+                p = pl.find(pat, q)
+                if p < 0:
+                    break
+                q = p + 1
+                if p == nd['node'] + 16 or p + 112 > len(pl):
+                    continue
+                px, py = struct.unpack_from('<II', pl, p + 104)
+                if not (0 < px < self.MAXPIX and 0 < py < self.MAXPIX):
+                    continue
+                cx, cy = (px - 128) // 256, (py - 128) // 256
+                s = smap.get((cx, cy))
+                blds.append({'field': p, 'cx': cx, 'cy': cy,
+                             'type': s['type'] if s else None,
+                             'map_idx': s['idx'] if s else None,
+                             'tagid': s['tagid'] if s else None})
+            # ★键链解析：CellTag → 标签 → 触发（不依赖地图）
+            k_tag = int.from_bytes(pl[nd['node'] + 56:nd['node'] + 60], 'little')
+            t_off = tags_by_key.get(k_tag)
+            k_trig = (int.from_bytes(pl[t_off + 180:t_off + 184], 'little')
+                      if t_off else 0)
+            i_off = insts_by_key.get(k_trig)
+            tid = pl[i_off + 56:i_off + 64].decode('latin1') if i_off else None
+            tag_sid = pl[t_off + 56:t_off + 64].decode('latin1') if t_off else None
+            if not (tid and tid in names):
+                # 兜底：回退到旧路（建筑 → 地图 [Structures] 的 Tag 列 → 触发）
+                tagids = set(b['tagid'] for b in blds if b['tagid'])
+                mid = tagids.pop() if len(tagids) == 1 else None
+                tid = t2t.get(mid) if mid else tid
+                tag_sid = tag_sid or mid
+            out.append({'node': nd['node'], 'x': X, 'tag_key': k_tag,
+                        'count': nd['count'], 'count_pos': nd['count_pos'],
+                        'tagid': tag_sid,
+                        'trigger_id': tid,
+                        'trigger_name': names.get(tid, '') if tid else '',
+                        'buildings': blds})
+        out.sort(key=lambda d: (-len(d['buildings']), d['node']))
+        return out
+
+    def attach_trigger_to_building(self, node_off, field_off):
+        """把 node 的标签挂到指定建筑（字段写 X + 计数+1）。返回字段旧值。"""
+        nd = [n for n in self.celltag_nodes() if n['node'] == node_off]
+        if not nd:
+            raise RuntimeError('CellTag 节点未找到（存档已变化？请重新扫描）')
+        nd = nd[0]
+        old = struct.unpack_from('<I', self.plain, field_off)[0]
+        if old == nd['x']:
+            raise RuntimeError('该建筑已挂此触发，无需重复')
+        if old != 0:
+            raise RuntimeError('该建筑已挂其它触发（须先解除旧挂接）')
+        self.plain[field_off:field_off + 4] = struct.pack('<I', nd['x'])
+        self.plain[nd['count_pos']:nd['count_pos'] + 4] = \
+            struct.pack('<I', nd['count'] + 1)
+        self.pending_attach.append((field_off, old))
+        self._celltags = None
+        return old
+
+    def detach_building(self, node_off, field_off):
+        """解除建筑的挂接（字段清 0 + 计数−1）。计数为 1 时拒绝（防清空成悬空节点），
+        请改用「禁用触发」。返回字段旧值。"""
+        nd = [n for n in self.celltag_nodes() if n['node'] == node_off]
+        if not nd:
+            raise RuntimeError('CellTag 节点未找到（存档已变化？请重新扫描）')
+        nd = nd[0]
+        old = struct.unpack_from('<I', self.plain, field_off)[0]
+        if old != nd['x']:
+            raise RuntimeError('该建筑未挂此标签，无法解除')
+        if nd['count'] <= 1:
+            raise RuntimeError('该标签只剩这一栋建筑——解除会留下空挂接节点。\n'
+                               '如想让触发彻底失效，请改用「触发」页的禁用功能。')
+        self.plain[field_off:field_off + 4] = b'\x00' * 4
+        self.plain[nd['count_pos']:nd['count_pos'] + 4] = \
+            struct.pack('<I', nd['count'] - 1)
+        self.pending_attach.append((field_off, old))
+        self._celltags = None
+        return old
+
+    def free_attach_slot(self, cx, cy, mode='zero'):
+        """给 (cx,cy) 那栋建筑**找一个"可以写 CellTag 键"的字段位置** → `(字段偏移|None, 说明)`。
+
+        FA2 里一栋建筑只能挂一个标签，所以这里要处理"已经挂在别的触发上"的情况：
+          * `mode='zero'`（默认，保守）⇒ 已挂接就**拒绝**，说明里带上旧 CellTag 键，让玩家自己决定
+          * `mode='force'` ⇒ 先把旧挂接**解掉**（旧 CellTag 计数 −1），再返回字段
+            ⚠ 旧标签只剩这一栋时 `detach_building` 会拒（避免留下空挂接节点）——
+              那种情况请改用"禁用触发"，别硬摘
+          * `mode='any'` ⇒ 不看现值，直接返回字段（调用方自己负责计数一致性）
+        返回 `(field_off, None)` 表示可用；`(None, 原因)` 表示不可用。
+        """
+        x, y = int(cx), int(cy)
+        f, err = self.locate_building_field(x, y, mode='zero')
+        if f is not None:
+            return f, None
+        # ★注意 mode 默认就是 'zero'，想看"已挂接的那处"必须显式传 'any'
+        f2, err2 = self.locate_building_field(x, y, mode='any')
+        if f2 is None:
+            return None, err2 or err or ('格(%d,%d) 未定位到建筑' % (x, y))
+        old = struct.unpack_from('<I', self.plain, f2)[0]
+        if mode == 'any':
+            return f2, None
+        if mode != 'force':
+            return None, ('格(%d,%d) 已经挂在 CellTag %08X 上（另有触发在用它）'
+                          '—— 想改挂请用 force，或先在「挂接」页解除' % (x, y, old))
+        nd = next((n for n in self.celltag_nodes() if n['x'] == old), None)
+        if nd is None:
+            return None, ('格(%d,%d) 挂着 CellTag %08X，但档里找不到对应节点'
+                          '（可能是别的程序写的）—— 已拒绝' % (x, y, old))
+        try:
+            self.detach_building(nd['node'], f2)
+        except Exception as e:
+            return None, '格(%d,%d) 解挂失败：%s' % (x, y, e)
+        return f2, None
+
+    # ------------------------------------------------------------------ #
+    # 建筑（2026-10-15 新解：对象定长 1860B；+0x4EC = 类型对象自键）
+    #   类型对象 = [16B 类GUID（尾 8 字节恒为 aca4-006008055bb5）][+8 自键][+48 "类型ID\0"]
+    #   建筑对象 = +0 挂接CellTag键 / +40 所属方指针 / +56,+60 耐久 / +104,+108 锚点像素坐标
+    #             （+544,+548 坐标副本）/ +0x4EC 类型键
+    #   坐标语义 = 格 × 256 + 128；**地图坐标是菱形(iso)系**（Size=0,0,W,H 的图坐标到 2W/2H）
+    # ------------------------------------------------------------------ #
+    BLD_SIZE = 1860
+    # ★★记录长度是**类型特有**的（2026-10-16 定案）：多数类型 1860（载荷 1844），
+    #   个别类型（GAAIRC / AMRADR 等）载荷 1856 ⇒ 记录 **1872**。
+    #   建筑组**后面紧跟**一条固定结构：`0c 00 00 00` + GUID `d9338bae-1c06-11d2-aca4-008008055bb5`
+    #   （四个母本实测全部一致）⇒ **组尾 = 该结构的位置**，不能一律按 `hs[-1] + 1860` 算，
+    #   否则末栋是"长记录"时会把新记录插进它的尾部 12 字节里（2026-10-16 弹框真因之一）。
+    BLD_TAIL_MARK = b'\x0c\x00\x00\x00' + bytes.fromhex('d9338bae1c06d211aca4006008055bb5')
+    COMP_SIZE = 476          # 建筑伴随对象大小（引擎放建筑时新建，实测）
+    # ★★伴随对象（2026-10-16 重新定案）：
+    #   · 它是**登记在 表0/表1 里的独立对象**（建筑记录的 +1388/+1392/+1396/+1400 是
+    #     "伴随对象键"列表，实测一栋可有 1~4 个）；
+    #   · 本档伴随对象是 **476B 等距的连续数组**（母本 16 个 / 外挂放置 17 个，间距恒 476）；
+    #   · 类 GUID `c32d270e-…` 以 **`c3 2d 27 0e`（Data1 大端写法）** 存在 +0x10，自身键在 +0x20，
+    #     格×256 在 +0xC0/+0xC4；
+    #   · 逐 dword 统计（母本 16 个 / 外挂 17 个）：**恒定 76~78 个字段**（类常量），变动 41~43 个
+    #     —— **连引擎自己新建的那一个也带着临时指针（0x02CAxxxx…）** ⇒ 加载器不依赖变动字段。
+    COMP_MARK = bytes.fromhex('c32d270e')   # 类 GUID 前 4 字节（实测存法）
+    COMP_KEY_OFF = 0x20
+    COMP_CELLX_OFF = 0xC0
+    COMP_CELLY_OFF = 0xC4
+    # ★★建筑记录里唯一的"自我引用"字段（2026-10-16 逐 dword 扫描定案）：
+    #   载荷 +264 恒等于 **自身键 + 0x9C**（母本 11/11、外挂 12/12、手放 12/12）。
+    #   克隆模板时留着模板的值 ⇒ 指向模板建筑的内部 ⇒ 注入对象与模板共享自身内存。
+    BLD_SELFREF_OFF = 264
+    BLD_SELFREF_DELTA = 0x9C
+    # ★★★格子占用表（2026-10-16 定案，两档 22 栋 22/22 全中）
+    #   存档里有一张 **格 → 占用对象键** 的表：格条目 **348 字节等距**，
+    #   格偏移 = base + 348 × (80·cx + 79·cy)；占用对象的键写在 **格+0**，
+    #   格 **−8** 处写 1（占用标记）。建筑占格 = {(cx+i, cy+j)}：
+    #   i < W, j < H，WxH 取自 artmd.ini 的 `Foundation=`。
+    #   ★**缺这张表 = 建筑能显示、却点不中/打不着**（鼠标拾取走格子，不走"类型→art"）。
+    CELL_STRIDE = 348
+    CELL_XK = 80
+    CELL_YK = 79
+    CELL_FLAG_OFF = -8
+    CELL_FLAG2_OFF = 0x1C
+    # ★★★2026-10-18 修正：上面 `CELL_XK/YK` 只在 **80×80 的小图**上成立。
+    #   实测大任务图（203×295）的格索引是 `180·x + 179·y − 32400`，
+    #   与 `80/79` 完全不符 ⇒ `_cell_base()` 返回 None ⇒ 删除建筑时"清格"整步被静默跳过
+    #   （这正是大图删除建筑弹框、小图却正常的真正原因）。
+    #   ⇒ 现在改用**与图尺寸无关**的定位：格对象本身是 348B 定长槽，槽 +0 是类 GUID，
+    #     连续排布；槽内 +0x38 = (x,y) u16、+0xF8 = 占用对象键。
+    #   槽内需要清成"空"的 4 个字段（逐字段对比"未卖电厂→卖掉电厂"得到）：
+    CELL_STRUCT_GUID = bytes.fromhex('ce99bfc18c1ad2118175006008055bb5')
+    CELL_STRUCT_STRIDE = 348
+    CELL_STRUCT_XY = 0x38
+    CELL_STRUCT_OCC = 0xF8
+    CELL_STRUCT_CLEAR = (0xF0, 0xF8, 0x114, 0x138)
+    # ★2026-10-18 玩家经验：FA2 虽然支持到 256×256，但**所有任务都被限制在 200×200 以内**，
+    #   从业没见过更大的任务图 ⇒ 读出的尺寸只要超过 200×200，基本就是读错了（口径不对/字段偏移错）。
+    MAP_TILE_MAX = 200
+    _CELL_STRUCT_MIN = 64          # 少于这么多槽就不认（防止误认单条 GUID）
+    _ART_PATHS = [
+        r'E:\YURI\artmd.ini',
+        r'E:\YURI\artmd - 原版副本.ini',
+        r'C:\Users\zhao5\Desktop\WorkBuddy\红警MOD制作素材工具与教程\artmd.ini',
+    ]
+    _foundation_cache = None
+    BLD_TYPEKEY_OFF = 0x4EC
+    BLD_HP_OFF = 56
+    # ★★★★★ 2026-10-17 定案：**所属方（House）字段 = 记录载荷 +336**（+544 是同一份键的第二副本）。
+    #   证据：大任务档 1143 栋 / 12 阵营 —— +336 有 8 种取值且**全部是本档 House 对象的键**
+    #   （逐栋核对）；母本 11 栋全部 = 玩家 House 键；**伴随对象里 0/637 个含 House 键**
+    #   ⇒ 改所属方只需改建筑记录的这两处。写一定要**两处一起写**。
+    #   ⚠ 旧常量 40 是错的（它落在载荷 +96 = 类常量 0x0087E294 上，从不携带信息）。
+    #   ⚠ 本类里有两套帧：`g+16` 帧（= 载荷帧，remove_building/bld_rows 用）
+    #     与 `buildings()` 的 b 帧（b = 载荷 + 56，由 COORD_RE 命中位置 − back 反推）。
+    BLD_OWNER_OFF = 336           # 载荷帧：所属方 House 键
+    BLD_OWNER2_OFF = 544          # 载荷帧：同一键的第二副本
+    BLD_HOUSE_OFF = 280           # b 帧里的同一字段（= 336 − 56），供 `buildings()['house']` 用
+    # ★★★★★ 2026-10-17 补：**载荷 +1344 = 该栋主人的「运行期阵营序号」（小整数）**。
+    #   发现法 = 在 1143 栋 / 9 阵营的大任务档里对**每个偏移**做「取值 ↔ 阵营」双射穷举：
+    #   只有两个偏移全档双射 —— **+336（House 键）与 +1344（序号）**。
+    #   实测映射：Americans 0 / Alliance 1 / French 2 / Germans 3 / British 4 / Africans 5 /
+    #   Arabs 6 / Confederation 7 / Russians 8 / YuriCountry 9 / **Neutral 12**（两档一致）。
+    #   ⚠ House 对象自己的 +68 是「类型序」（Neutral = 10），**不等于**这个运行期序号，
+    #     House 对象里也**没有**存这个序号（0x1200 内全扫过）；档里也没有"12 键成排的阵营数组"。
+    #   ⇒ 只能「从本档已有建筑反解（多数票），否则退回 HOUSE_RUN_INDEX 表」——见 `house_run_index()`。
+    BLD_OWNER_IDX_OFF = 1344      # 载荷帧：主人阵营的运行期序号（b 帧 = 1400）
+    BLD_COORD_OFF = 104
+    BLD_COORD2_OFF = 544          # 坐标第二副本（与 +104 相差 440）
+    # ★★★★★ 2026-10-22 §169：**建筑「生长动画没播完」的存档指纹**
+    #   现象：刚放下（或触发法新建）的建筑会播 Buildup（从地面长出来），此时存档 ⇒
+    #         重载后它停在生长中途 = **显示不全**；打它一下（触发重绘/换图）就恢复正常。
+    #   来源：「电厂放下 动画未播放完成.SAV」vs「电厂动画播放完成.SAV」，
+    #         用**同一档内 新建筑 vs 老建筑**扣掉时间噪音后的四元对照，
+    #         再用 **37 个存档 / 8971 栋建筑** 的全库分布交叉验证。
+    #     偏移(base帧) 对象偏移  正常值            坏档值  全库分布
+    #     +120        +0xAC    5（或 -1）         18      5×7797 / -1×1173 / **18×1**
+    #     +136        +0xBC    0                  1       0×8402 / 1×569
+    #     base帧   对象偏移  建造中  已完成   全库分布（8971 栋）
+    #     +120      +0xAC     18      5       5×7797 / -1×1173 / **18×1**
+    #     +136      +0xBC      1      0       0×8402 / 1×569
+    #     +156      +0xD0      1      100（类型相关）  100×3834 / 16×1228 / 14 / 15 …
+    #     +216      **+0x10C**  2      0       0×8970 / **2×1**
+    #     +1280     +0x534      0      1       1×8970 / **0×1**
+    #     +1712     **+0x6E4**  0      1       1×6806 / 0×2141（u8）
+    #   ★★ v14（§170）纠正两处标签错误：老标签 `+0xFC` 实为 **对象 +0x10C**，
+    #      老标签 `+0x6E0` 实为 **对象 +0x6E4**（BLD_ANIM_OFF 存的是 base 帧偏移，
+    #      对象偏移 = base 偏移 + 52）。引擎 `A(建造中)→B(完成)` 实写 diff 证明
+    #      **+0x6E4 是引擎自己在"播完那一刻"置 1 的**（+0x10C 同时 2→0）。
+    #   ⚠ base = **对象体起点 + 52**（vtable 0x7E3EBC 在 `base-52`；记录 = [16B CLSID][4B 自键][对象体]）
+    #     ⇒ 读写一律用 `base + 偏移`，不要再 ±52。
+    BLD_ANIM_OFF = {'+0xAC': 120, '+0xBC': 136, '+0xD0': 156,
+                    '+0x10C': 216, '+0x534': 1280, '+0x6E4': 1712}
+    BLD_ANIM_OFF_ALIAS = {'+0xFC': '+0x10C', '+0x6E0': '+0x6E4'}   # 旧标签兼容
+    # ★★★「动画已完成」标记 = 这两个值同时成立（8989 栋里**各自只有 1 栋**不同）：
+    #     +0x10C == 0   +0x534 == 1
+    #   ⚠ `+0xD0` **不能**当通用判据 —— 它在 GAPOWR 上是 100，但 ATESLA/GTGCAN 等
+    #     正常就是 14/15/16；只有"同类建筑"之间比它才有意义（见 `repair(phase=…)`）。
+    BLD_ANIM_BAD = {'+0x10C': 0, '+0x534': 1}      # 旧名，语义见下（= 完成标记的期望值）
+    BLD_ANIM_DONE_MARK = {'+0x10C': 0, '+0x534': 1}   # 「动画已播完」标记
+    # ★★跳到"完成态"用的字段组（E 档 in-game 已验正常）：
+    #   `+0xBC`（D 档证明无用）与 `+0xD0`（F 档证明不必需）都不写。
+    BLD_ANIM_OK = {'+0xAC': 5, '+0x10C': 0, '+0x534': 1, '+0x6E4': 1}
+    # ★★★跳到完成态其实**只需要 1 个字节**：`+0x6E4 = 1`
+    #   （A 档 = 5/1/1/0/1/0 显示不全；E 档 = A + 6E4=1 显示正常 ⇒ A→E 只差这一个字节）
+    BLD_ANIM_MIN_FIX = {'+0x6E4': 1}
+    # ★★★★★§170（2026-10-22，第十四档 in-game）**重播建造动画**的配方
+    #   真值表（字段序 AC/BC/D0/M10C/534/M6E4，同一栋 GAPOWR(80,82)）：
+    #     档                         五元组           in-game
+    #     ────────────────────────────────────────────────────────────
+    #     原始A / I 档               18/1/1/2/0/0    ✅ 播完整建造动画
+    #     H 档                       18/1/1/2/0/1    ✅ 播完整建造动画  ← 与 K 只差 AC
+    #     K 档 撤标记+FC             5/1/1/2/0/1    ❌ **一直播放**（死循环）
+    #     J 档 只撤 534              5/1/1/0/0/1    ❌ 显示不全        ← 与 K 只差 10C
+    #     L 档 D0=100 撤标记          5/0/100/0/0/1  ❌ 显示不全
+    #     ────────────────────────────────────────────────────────────
+    #   ⇒ ①`+0xAC` 决定**播完会不会停**：18=会停，5=无限循环
+    #     ②`+0x10C` 必须是 2（≠0）才会播；=0 干脆不播 ⇒ 显示不全
+    #     ③`+0x6E4` 在建造动画分支里**无关**（A 与 H 只差它，两档都完美）
+    #   ⇒ 只撤 `+0x534` **远远不够** —— 这正是 J/K/L 三档全灭的原因。
+    # ★★★§171 定案（in-game，P/Q/R + M + N2 四档）：**`+0xD0` 必须是 1**。
+    #   老 MIN 配方（只写 AC/10C/534）会留下完成态的 `+0xD0=100` ⇒ 进游戏**播两遍**动画。
+    #   P 只把 D0 改 100 ⇒ 播两遍；Q 只把 BC 改 0 ⇒ 播一次（正常）；R 两项都改 ⇒ 播两遍
+    #   ⇒ **`+0xD0 ≠ 1` 是"多播一遍"的唯一原因，`+0xBC` 与播放次数无关**。
+    #   机制推断：D0 是「建造进度」，=100 表示进度已满；引擎发现"进度满但标记未写"
+    #   就再补一遍完整 Buildup，第二遍才把标记落实 ⇒ 播两遍后正常。
+    # ★★★★★ §187（2026-10-22 晚，解释 N2 vs T13b 的矛盾）：**`+0x6E4` 必须写 0**。
+    #   §170 当年判"6E4 在建造动画分支里无关"（原始A=0 与 H=1 都播一遍）——
+    #   但那两档都是**原生建筑（有伴随动画对象）**，伴随对象能兜住；
+    #   **工具凭空插的楼没有伴随对象**，这时 6E4 就是唯一开关：
+    #     · N2 新加的 ATESLA：模板是"建造中"那栋电厂 ⇒ 继承 `6E4=0` ⇒ **播了一遍** ✅
+    #     · T13b 直接落成的电厂：模板是完成态 ⇒ 继承 `6E4=1` ⇒ **不播**（玩家实测）❌
+    #   引擎侧语义也对得上：`0x739B6A mov byte ptr [esi+0x6e0], 1` 就是"播完置 1"。
+    #   ⇒ 配方统一带上 `6E4=0`（对原生建筑无害：A/H 两档实测都播）。
+    BLD_ANIM_BUILDUP_MIN = {'+0xAC': 18, '+0xD0': 1, '+0x10C': 2, '+0x534': 0,
+                            '+0x6E4': 0}
+    # 照抄 GAPOWR 原始档的完整「建造中」形态（M 档 in-game 已验："播一遍建造动画，正常"）：
+    BLD_ANIM_BUILDUP_FULL = {'+0xAC': 18, '+0xBC': 1, '+0xD0': 1,
+                             '+0x10C': 2, '+0x534': 0, '+0x6E4': 0}
+    # ★§171：`+0xAC=18` 已证实**跨建筑类型通用**（GAPOWR 与 ATESLA/光棱塔 同档实测都播一遍）。
+    #   留在表里只为将来万一遇到特例时覆盖；默认不查表，直接 18。
+    BLD_ANIM_AC_BUILDUP = {'GAPOWR': 18, 'ATESLA': 18}
+    # ★「建造中」应有的 `+0xD0` 值（写入配方用）与「会多播一遍」的判据阈值
+    BLD_D0_BUILDUP = 1
+    BLD_D0_REPLAY = 2      # +0xD0 >= 2 且 534==0 ⇒ 进游戏会播两遍（P/R 档实测）
+    # ★★★**`+0x6E4` 是 u8 标志位，不是 u32**（引擎侧证据，2026-10-22）：
+    #   `0x739B00  mov al, byte ptr [esi+0x6e0]`（esi = 对象体-4）`test al,al` / `jne …`
+    #   `0x739B6A  mov byte ptr [esi+0x6e0], 1` + `0x739B70 mov byte ptr [esi+0x6e1], 0`
+    #   另有 `0x735424 / 0x739B6C / 0x739C6C` 三处写 `mov byte ptr [esi+0x6e0], bl`。
+    #   ⇒ 读写必须按 **1 字节**，否则会顺手把高 3 字节清零（现在是 0 所以没炸，但那是运气）。
+    #   ⇒ 这也解释了全库二值分布（1×6806 / 0×2141）：它是开关，不是"完成度"。
+    BLD_ANIM_U8 = {'+0x6E4'}
+    # ★★★in-game 实测全表（2026-10-22 §170，十四档，同一栋 GAPOWR(80,82)）：
+    #   档                    AC  BC   D0 10C  534  6E4   in-game
+    #   ───────────────────────────────────────────────────────────────
+    #   原始A 放下未播完      18   1    1   2    0    0    ✅ 播完整 Buildup（观感最好）
+    #   I  完全还原坏值对照   18   1    1   2    0    0    ✅（= 原始A 逐字节 0 差异）
+    #   H  原始值 + 6E4=1    18   1    1   2    0    1    ✅ 播完整 Buildup（观感最好）
+    #   原始B 播放完成         5   0  100   0    1    1    ✅ 完成图
+    #   C  全部还原           5   0  100   0    1    1    ✅ 正常
+    #   E  A + {6E4=1}        5   1    1   0    1    1    ✅ 正常      ← 6E4 足以救 stuck
+    #   F  A + {BC,6E4}       5   0    1   0    1    1    ✅ 正常      ← D0 不必需
+    #   G  工具默认(旧)        5   0  100   0    1    1    ✅ 正常
+    #   A {AC=5,10C=0,534=1}  5   1    1   0    1    0    ❌ 显示不全
+    #   B  A + {D0=100}       5   1  100   0    1    0    ❌ 显示不全
+    #   D  A + {BC=0}         5   0    1   0    1    0    ❌ 显示不全  ← BC 无用
+    #   J  只撤 534           5   1    1   0    0    1    ❌ 显示不全
+    #   K  撤 534 + 10C=2     5   1    1   2    0    1    ❌ **一直播放建造动画**
+    #   L  D0=100 撤 534      5   0  100   0    0    1    ❌ 显示不全
+    #   ───────────────────────────────────────────────────────────────
+    # ⇒ ★★模型（十四档零例外，五态）：
+    #     if 534 == 1:                       // 「建造已完成」
+    #         if 6E4 == 1: done              // 完成图（C/E/F/G/原始B）
+    #         else:        stuck             // 矛盾态 ⇒ 显示不全（A/B/D）
+    #     else:                              // 「还在建造」
+    #         if 10C == 0:   frozen          // 根本不播 ⇒ 显示不全（J/L）
+    #         elif AC == 5:  loop            // 播不完 ⇒ 一直播（K）
+    #         else:          buildup         // 播一遍就停（原始A/I/H）
+    #   ⇒ 「动画未播完」是**合法中间态**，重载会自愈并播完整动画，**不该修**。
+    #   ⇒ `+0xD0` 与渲染无关（F 档），且**随类型变**（GAPOWR 100 / ATESLA 16 / TESLA 15 /
+    #      CAPARS01 14），默认不要改写 —— 只有同类众数才有意义（`anim_phase_default`）。
+    BLD_ANIM_PHASE_HINT = {'GAPOWR': 100}   # 仅显式传 phase= 时才用，默认不写
+    BLD_VTABLE = 0x7E3EBC         # BuildingClass vtable（写在 base-52）
+    MAPSIZE_OFF = 0x348E          # ★存档自带地图尺寸 (W,H) 小端 u16 对（2026-10-15 定案，24 档自洽）
+    TYPE_GUID_TAIL = bytes.fromhex('aca4006008055bb5')
+    # 「两个 u32 锚点坐标」的快速匹配（低字节 0x80、高字节 0 ⇒ cell×256+128 形态）
+    COORD_RE = re.compile(rb'\x80[\x00-\xff][\x00-\x03]\x00'
+                          rb'\x80[\x00-\xff][\x00-\x03]\x00', re.DOTALL)
+
+    def building_types(self):
+        """存档里的类型对象 → {类型ID: 自键}（含建筑/单位/动画等全部 TypeClass）"""
+        if getattr(self, '_btypes', None) is not None:
+            return self._btypes
+        pl = self.plain
+        out, q = {}, 0
+        while True:
+            i = pl.find(self.TYPE_GUID_TAIL, q)
+            if i < 0:
+                break
+            q = i + 1
+            if i + 80 > len(pl):
+                continue
+            s = pl[i + 48:i + 80].split(b'\x00')[0]
+            if 2 <= len(s) <= 20 and all(32 < c < 127 for c in s):
+                key = struct.unpack_from('<I', pl, i + 8)[0]
+                if key:
+                    out.setdefault(s.decode('ascii'), key)
+        self._btypes = out
+        return out
+
+    # ---------- 单位（步兵/载具）★2026-10-17 新定位 ----------
+    def unit_types(self):
+        """类型空间（步兵/载具/建筑通用）：{类型键: 'E1'|'MTNK'|…}。
+
+        类型对象布局（实测）：`+0` GUID、`+16` 自键、`+20..+35` 四条类常量、
+        `+56` 类型名（16B ASCII，如 `E1`/`MTNK`）、`+80` `"Name:E1"`、`+120` 显示名（"G.I."）。
+        定位法：全文找 `"Name:XXX"` → 往前就近找 GUID（`????11d2|11d1` + `00 60 08 05 5B B5` 尾），
+        且要求 `+56` 的 16B 名字与 `Name:` 后的一致（防误认）。
+        """
+        cached = getattr(self, '_utypes', None)
+        if cached is not None:
+            return cached
+        pl = self.plain
+        n = len(pl)
+        tail = b'\x00\x60\x08\x05\x5b\xb5'
+        out, offs = {}, {}
+        i = 0
+        while True:
+            j = pl.find(b'Name:', i)
+            if j < 0:
+                break
+            i = j + 1
+            o = None
+            for k in range(j - 40, j - 140, -1):
+                if k >= 0 and pl[k + 6:k + 8] == b'\xd2\x11' \
+                        and bytes(pl[k + 10:k + 16]) == tail:
+                    o = k
+                    break
+            if o is None:
+                continue
+            nm = bytes(pl[o + 56:o + 72]).split(b'\x00')[0]
+            nm2 = bytes(pl[j + 5:j + 21]).split(b'\x00')[0]
+            if not nm or nm != nm2:
+                continue
+            _k = struct.unpack_from('<I', pl, o + 16)[0]
+            out.setdefault(_k, nm.decode('ascii', 'ignore'))
+            offs.setdefault(_k, o)
+        self._utypes = out
+        self._utypes_off = offs
+        return out
+
+    def house_placements(self, house=None, skip_special=True):
+        """读出各阵营的「对象布置表」→ [{'type','x','y','house','off'}]（**建筑与单位混排**）。
+
+        ★结构（2026-10-17 在 SAVE4823 上定位，三条独立证据）：
+          `House 块内：[u32 n][(u32 类型键, u16 y, u16 x) × n]`
+          ① 该表给出 E1→(75,73)、MTNK→(68,80)；
+          ② 格对象 `(75,73)` 的自键 0x132B0820 出现在 **E1 实例簇**里（6913498）；
+          ③ 格对象 `(68,80)` 的自键 0x1325EC10 出现在 **灰熊实例簇**里（6241329）。
+          ⇒ 表里的 (y,x) 就是单位当前所在格（与格对象 `+56` 同序：y 在前）。
+        只收「全部类型键都能在本档类型空间里查到、且坐标在本档坐标范围内」的表 —— 宁缺勿滥。
+        """
+        pl = self.plain
+        types = self.unit_types()
+        lim = self.coord_limit()
+        want = None if house is None else self.house_label(house)
+        res = []
+        name_of = {h['key']: h['short'] for h in self.houses()}
+        for a, k, b in self._house_blocks():
+            short = name_of.get(k, '?%08x' % k)
+            if skip_special and short in ('Special', 'Neutral'):
+                continue
+            if want and short != want and short not in str(house):
+                continue
+            b = min(b, len(pl))
+            hit = None
+            for o in range(a, max(a, b - 12)):
+                cnt = struct.unpack_from('<I', pl, o)[0]
+                if not (1 <= cnt <= 256) or o + 4 + 8 * cnt > b:
+                    continue
+                p = o + 4
+                items = []
+                ok = True
+                for _ in range(cnt):
+                    k = struct.unpack_from('<I', pl, p)[0]
+                    if k not in types:
+                        ok = False
+                        break
+                    y, x = struct.unpack_from('<HH', pl, p + 4)
+                    # ★宽上界：别拿 [Map] Size 当界（实测有 y=80 正好压线/超声明图幅的单位）
+                    if not (0 <= x < 512 and 0 <= y < 512):
+                        ok = False
+                        break
+                    items.append((types[k], x, y, p))
+                    p += 8
+                if ok and items:
+                    hit = (o, items)
+                    break
+            if hit:
+                for t, x, y, p in hit[1]:
+                    res.append({'type': t, 'x': x, 'y': y, 'house': short, 'off': p})
+        return res
+
+    def units(self, house=None, exclude=()):
+        """只取**单位**（步兵/载具）：`house_placements` 里剔掉 `exclude` 中的类型名。
+
+        ⚠这张表是"建筑+单位混排"的布置表，**必须**把本档的建筑类型名传进 `exclude`
+        才能只留单位（GUI 侧可传 rules/art 的建筑名单）。不传则等于全部返回。
+        """
+        ex = {str(t).upper() for t in exclude}
+        return [u for u in self.house_placements(house=house)
+                if u['type'].upper() not in ex]
+
+    # ---------- 单位（步兵/载具）实例记录：读取 + 克隆放置（2026-10-17 实装） ----------
+    UNIT_CLASSES = (
+        (b'\xc4\x2d\x27\x0e\x0f\x9c\xd1\x11', b'\x44\x27\x58\x4a\x39\x98\xd1\x11', 'infantry'),
+        (b'\xca\x2d\x27\x0e\x0f\x9c\xd1\x11', b'\x41\x27\x58\x4a\x39\x98\xd1\x11', 'vehicle'),
+    )
+    # 已知的「伴随对象」类 GUID —— 每个都对应一种 **Locomotor（移动方式）**：
+    #   4A582744 步兵（Walk）/ 4A582741 地面载具（Drive）/ 92612C46 空中（Fly）
+    #   规则里 `Locomotor={...}` 的 GUID 与这里是同一个东西。
+    UNIT_COMP_GUIDS = (
+        bytes.fromhex('4427584a3998d111b70900a024ddafd1'),   # 步兵
+        bytes.fromhex('4127584a3998d111b70900a024ddafd1'),   # 地面载具
+        bytes.fromhex('462c61921ff7d111ac9f006008055bb5'),   # 空中（92612C46）
+        bytes.fromhex('4727584a3998d111b70900a024ddafd1'),   # 超时空（4A582747）
+        bytes.fromhex('4627584a3998d111b70900a024ddafd1'),   # 飞机（4A582746）
+        bytes.fromhex('4227584a3998d111b70900a024ddafd1'),   # 悬浮/气垫（4A582742）
+        bytes.fromhex('e174ea2bcc7ad311be140010 4b62a16c'.replace(' ', '')),  # 船（2BEA74E1）
+        bytes.fromhex('6697b4b776e5d3119bd900104b972fe8'),   # 导弹（B7B49766）
+    )
+    COMP_GUID_LOCO = {
+        bytes.fromhex('4427584a3998d111b70900a024ddafd1'): 'Walk',
+        bytes.fromhex('4127584a3998d111b70900a024ddafd1'): 'Drive',
+        bytes.fromhex('462c61921ff7d111ac9f006008055bb5'): 'Fly',
+        bytes.fromhex('4727584a3998d111b70900a024ddafd1'): 'Chrono',
+        bytes.fromhex('4627584a3998d111b70900a024ddafd1'): 'Aircraft',
+        bytes.fromhex('4227584a3998d111b70900a024ddafd1'): 'Hover',
+        bytes.fromhex('e174ea2bcc7ad311be1400104b62a16c'): 'Ship',
+        bytes.fromhex('6697b4b776e5d3119bd900104b972fe8'): 'Missile',
+    }
+    # 血量（满血 = 规则里的 Strength；两份同改）
+    UNIT_HP_OFF = (128, 132)
+    # ★2026-10-18 21:4x：**等级（Veterancy）** = 一对孪生字段
+    #   `+0x150` = int（0 新兵 / 1 老兵 / 2 精英；-1 见下）,
+    #   `+0x164` = float(2 − 等级)（0→2.0 / 1→1.0 / 2→0.0）。
+    #   证据（1394 个单位的全档不变量，**0 例违例**）：
+    #     +150=0 → +164=2.0f ×1100、+150=1 → 1.0f ×38、+150=2 → 0.0f ×245、
+    #     +150=-1 → 0.0f ×11（SLAV 等，疑似"未初始化/不参与"）。
+    #   为什么判定它是等级：整档 1394 条记录里，**只有这两列出现 0/1/2 三级取值且严格配对**
+    #   （E1 55 条里除它俩外没有任何字段呈 3 值分布）。
+    #   ⚠ 改等级必须**两个一起改**（引擎载入可能按其中之一重算另一个）。
+    #   ★★2026-10-18 21:43 **游戏内验收通过**（样本 `E:\YURI\等级矩阵_4个大兵.SAV`，
+    #     同一个档里 4 个大兵只有这两列不同）：玩家判读 =「0级一个、1级一个、三级二个」。
+    #     ⇒ ① **`+0x150` 就是 Veterancy**（0/1/2 依次对应 无星/一级/三级）；
+    #        ② **故意错配的那一个（150=2 但 164=2.0）照样显示三级** ⇒ 显示只看 `+0x150`，
+    #           `+0x164` 是引擎自己维护的镜像，写它与否都不影响显示（但仍保持同步，避免脏状态）。
+    UNIT_VET_OFF = (0x150, 0x164)
+    VET_NAMES = {0: '新兵', 1: '老兵', 2: '精英'}
+    CELL_GUID = bytes.fromhex('ce99bfc18c1ad2118175006008055bb5')     # CellClass
+
+    def _cell_by_key(self):
+        self._invalidate_if_shifted()
+        """{CellClass 自键: (x, y)} —— 12 720 个格对象，用于把记录里的格键翻译成坐标。"""
+        if getattr(self, '_ckey', None) is not None:
+            return self._ckey
+        pl, out, i = self.plain, {}, 0
+        coff = {}
+        while True:
+            j = pl.find(self.CELL_GUID, i)
+            if j < 0:
+                break
+            # ★2026-10-18 修：+0x38 是 **(x, y)**（与建筑记录 +600/+604 同一口径）。
+            #   原来按 (y, x) 解析 ⇒ 单位坐标整体转置（放置单位时落到对称格上）。
+            x, y = struct.unpack_from('<HH', pl, j + 56)
+            k = struct.unpack_from('<I', pl, j + 16)[0]
+            out[k] = (x, y)
+            coff[j] = (x, y)
+            i = j + 1
+        self._cell_offs = coff
+        self._ckey = out
+        return out
+
+    def cell_offsets(self):
+        self._invalidate_if_shifted()
+        """{(x, y): CellClass 对象起点}（12 720 个；`_cell_by_key()` 的反查）。"""
+        if getattr(self, '_coffs', None) is not None:
+            return self._coffs
+        pl, out, i = self.plain, {}, 0
+        while True:
+            j = pl.find(self.CELL_GUID, i)
+            if j < 0:
+                break
+            x, y = struct.unpack_from('<HH', pl, j + 56)      # ★同上：+0x38 是 (x, y)
+            out.setdefault((x, y), j)
+            i = j + 1
+        self._coffs = out
+        return out
+
+    # ★★★ 2026-10-17 定案：格对象里的「谁站在这一格」登记槽
+    #   `格+248` = 站在该格上的**单位对象键**（建筑不写这里，建筑走另一张 348B 占用表）；
+    #   `格+308` = 占用标记 u32（占用 0x0001FFFF / 空 0x0000FFFF）；
+    #   `格+312` = 占用类型码 u32（步兵 0x08 或 0x10、载具 0x20，**随档不同** ⇒ 从模板格照抄）。
+    #   证据：同一份档里 E1/APOC/HTNK 三个真实单位的格对象都在 +248 有各自的自键；空格全 0。
+    #   ⇒ 克隆放置必须同时登记，否则"对象说自己在格上、格上却没有它"。
+    CELL_OCC_OFF = 248
+    CELL_OCC_FLAG_OFF = 308
+    CELL_OCC_KIND_OFF = 312
+    # 格子占用写法：None=不写 / 'key'=只写格+248（默认）/ 'full'=连标记与类型码一起写
+    # ⚠ 'full' 实测会把载具克隆弄崩（V3 vs H3），别默认开。
+    UNIT_CELL_OCC_MODE = 'key'
+
+    def unit_records(self):
+        self._invalidate_if_shifted()
+        """读出单位**实例记录** → [{'type','class','off','size','comp','comp_size','key','x','y'}]。
+
+        2026-10-17 实测结构（A/B 定案，见 docs §57/§58）：
+          组 = `[u32 n][主体×n]`，每个主体后面紧跟一个**伴随对象**（步兵 4A582744 / 载具 4A582741）。
+          主体：类 GUID 16B | 自键 +16 | … | 坐标 +176/+180（定点 y/x） | 格键 +224 | 类型键在 +1748 附近。
+        """
+        pl = self.plain
+        types = self.unit_types()
+        # ★补全：`unit_types()` 靠 "Name:" 串扫会漏（65 只捞到 32），
+        #   型别组枚举出来的名单更全 ⇒ 两者合并（步兵/载具以索引为准）
+        for nm, v in self.unit_type_index().items():
+            types[v['key']] = nm
+        cells = self._cell_by_key()
+        hname = self._house_key_names()
+        # ★2026-10-17 20:4x 性能：大任务档（1956 单位 / 39MB 明文）原来 **49.5 秒**。
+        #   瓶颈不是解析，而是"每条记录都从 ro+1500 开始 find 一遍伴随 GUID" ——
+        #   1956 × 8 次 `bytes.find`，几乎每次都要扫到档尾 = 上亿次字节比较。
+        #   改成：先把每个伴随 GUID 的**全部出现位置**扫成有序表（一次全档扫描 × 8），
+        #   之后每条记录用 bisect 取"第一个 > ro+1500"的位置 ⇒ O(log n)。
+        _comp_pos = {}
+        for _cg in self.UNIT_COMP_GUIDS:
+            _arr, _i = [], 0
+            while True:
+                _j = pl.find(_cg, _i)
+                if _j < 0:
+                    break
+                _arr.append(_j)
+                _i = _j + 1
+            _comp_pos[_cg] = _arr
+        _bisect = bisect.bisect_right
+        out = []
+        for guid, cguid, cls in self.UNIT_CLASSES:
+            pos, i = [], 0
+            while True:
+                j = pl.find(guid, i)
+                if j < 0:
+                    break
+                pos.append(j)
+                i = j + 1
+            # 同一类的记录连续成组：按间距切段，并要求段首前 4 字节 = 段内记录数
+            runs, cur = [], []
+            for p in pos:
+                if cur and p - cur[-1] > 0x8000:
+                    runs.append(cur)
+                    cur = []
+                cur.append(p)
+            if cur:
+                runs.append(cur)
+            for run in runs:
+                n = struct.unpack_from('<I', pl, run[0] - 4)[0] if run[0] >= 4 else -1
+                if n != len(run):
+                    continue                      # 布局不符 ⇒ 不认（宁可不给）
+                for k, ro in enumerate(run):
+                    nxt = run[k + 1] if k + 1 < len(run) else None
+                    # ★2026-10-17 18:4x：伴随对象的类 = 该单位的 **Locomotor**（移动方式）！
+                    #   地面载具 4A582741(133B) / 步兵 4A582744(81B) /
+                    #   **空中 92612C46(173B)**（= 规则里 ZEP 的 Locomotor GUID）。
+                    #   以前只认本类那一个伴随 GUID ⇒ `十个基洛夫.SAV` 只认出 1/10。
+                    co = None
+                    for _cg in (cguid,) + tuple(g for g in self.UNIT_COMP_GUIDS if g != cguid):
+                        _arr = _comp_pos.get(_cg) or []
+                        _k = _bisect(_arr, ro + 1500)          # 第一个 > ro+1500 的位置
+                        if _k >= len(_arr):
+                            continue
+                        _c = _arr[_k]
+                        if (nxt is None or _c < nxt) and (co is None or _c < co):
+                            co = _c
+                    if co is None:
+                        continue
+                    if nxt is None:
+                        # 组尾 = 下一个对象组计数 = 下一个「类 GUID」前 4 字节
+                        e = None
+                        for q in range(co + 16, co + 0x1000):
+                            if q + 8 > len(pl):
+                                break
+                            if pl[q + 6:q + 8] in (b'\xd2\x11', b'\xd1\x11'):
+                                e = q
+                                break
+                        csize = (e - 4 - co) if e else 0
+                    else:
+                        csize = nxt - co
+                    size = co - ro
+                    # ★2026-10-17 18:2x：型号键有**固定偏移**（步兵 +1748 / 载具 +1752，见 §60），
+                    #   优先直接读；以前只靠"在记录里扫第一个落在类型表里的值"，
+                    #   个别记录会扫到无关的键 ⇒ 型号被标错（`10个大兵.SAV` 里 2 个 E1
+                    #   被误标成 GAPILE / CABUNK01，害得只认出 8 个）。
+                    tk = None
+                    _tk_off = 1748 if cls == 'infantry' else 1752
+                    if size > _tk_off + 4:
+                        _v = struct.unpack_from('<I', pl, ro + _tk_off)[0]
+                        if _v in types:
+                            tk = _v
+                    if tk is None:
+                        for q in range(ro, ro + size - 4):
+                            v = struct.unpack_from('<I', pl, q)[0]
+                            if v in types:
+                                tk = v
+                                break
+                    _vk = struct.unpack_from('<i', pl, ro + self.UNIT_VET_OFF[0])[0] \
+                        if size > self.UNIT_VET_OFF[0] + 4 else -1
+                    out.append({'type': types.get(tk, '?%08x' % (tk or 0)), 'class': cls,
+                                'off': ro, 'size': size, 'comp': co, 'comp_size': csize,
+                                # 等级：-1 / 越界一律给 None（引擎原生档里 SLAV 等出现过 -1）
+                                'veterancy': _vk if _vk in self.VET_NAMES else None,
+                                'comp_guid': bytes(pl[co:co + 16]),
+                                'loco': self.COMP_GUID_LOCO.get(bytes(pl[co:co + 16]), '?'),
+                                'key': struct.unpack_from('<I', pl, ro + 16)[0],
+                                'cell': struct.unpack_from('<I', pl, ro + 224)[0],
+                                'x': cells.get(struct.unpack_from('<I', pl, ro + 224)[0], (None, None))[0],
+                                'y': cells.get(struct.unpack_from('<I', pl, ro + 224)[0], (None, None))[1],
+                                'house_key': struct.unpack_from('<I', pl, ro + self.UNIT_HOUSE_OFF[0])[0]
+                                if size > self.UNIT_HOUSE_OFF[0] + 4 else 0,
+                                'house': hname.get(
+                                    struct.unpack_from('<I', pl, ro + self.UNIT_HOUSE_OFF[0])[0]
+                                    if size > self.UNIT_HOUSE_OFF[0] + 4 else 0)})
+        return out
+
+    # ★★★ 2026-10-17 定案：单位实例的**所属方** = 记录 `+352` / `+560` 两份 House 对象键。
+    #   证据（同一份档内的干净 A/B，`加尤里方天启档.SAV`）：
+    #     玩家 E1  +352/+560 = 0x0EFCFAC0 = Americans
+    #     敌方 APOC +352/+560 = 0x0EEC5178 = YuriCountry
+    #   两张「指针表」是**全局**对象登记表（同一张表里同时含 E1 与 APOC 的键），
+    #   ⇒ 改所属方**不用**动指针表；阵营布置表里本来就没有单位条目（只有建筑/Special）。
+    UNIT_HOUSE_OFF = (352, 560)
+
+    def _unit_group_count_pos(self, off):
+        """给定一条单位主体记录的起点 `off`，返回它所属**组的计数位置**（= 组首 − 4）。
+
+        ★ 2026-10-17 19:3x 修的 bug（连放两个载具后整组丢记录）：
+          旧写法直接用 `模板记录 − 4` 当组计数，**只有模板恰好是组内第一条**时才对。
+          模板是第 2 条以后时 ⇒ 计数没加、还把 +1 写进了**前一条记录的尾部字段**
+          （实测：`多单位存档.SAV` 里 V3 是载具组第 3 条，放完 MTNK 后
+           `unit_records()` 只剩 CLEG/E1 —— 载具组 n=3 但实际 4 条 ⇒ 整组不认）。
+        """
+        pl = self.plain
+        for guid, _cguid, _cls in self.UNIT_CLASSES:
+            # ⚠ UNIT_CLASSES 里存的是类 GUID 的**前缀**（8B），不是 16B 全量
+            if bytes(pl[off:off + len(guid)]) != guid:
+                continue
+            pos, i = [], 0
+            while True:
+                j = pl.find(guid, i)
+                if j < 0:
+                    break
+                pos.append(j)
+                i = j + 1
+            runs, cur = [], []
+            for p in pos:
+                if cur and p - cur[-1] > 0x8000:
+                    runs.append(cur)
+                    cur = []
+                cur.append(p)
+            if cur:
+                runs.append(cur)
+            for run in runs:
+                if off not in run:
+                    continue
+                c = run[0] - 4
+                if c < 0:
+                    return None
+                # 计数必须等于**整组**记录数（不是"到 off 为止"的条数）
+                return c if struct.unpack_from('<I', pl, c)[0] == len(run) else None
+            return None
+        return None
+
+    # ★★★ 2026-10-17 定案：单位记录的「每对象唯一 ID / 基址」（重载崩的真凶）
+    #   判据（与建筑 +20/+972 同一套）：① 该值在整份明文里**只出现 1 次**（指针会出现多次）；
+    #   ② 同一型号跨不同存档**取值不同**（类常量三档相同，如 +0/+20..+36/+988）。
+    #   实测：步兵 (248, 1672, 1828)，载具 (248, 1320, 1672, 2332)；其中 +1672 恒等于基址+4。
+    #   反证：外挂刷的那辆天启 +2332=0x10256030 / +1672=0x10256034 —— **外挂自己分配了全新基址**，
+    #         所以它重载不崩；我们克隆时原样复制模板的基址 ⇒ 两个对象同 ID ⇒
+    #         新开载入正常（不归并），**游戏内重载崩**（拆世界/重建时指针修补归并断言对不上）。
+    UNIT_ID_OFF = {'infantry': (248, 1672, 1828),
+                   'vehicle': (248, 1320, 1672, 2332)}
+    UNIT_BASE_OFF = {'infantry': 1828, 'vehicle': 2332}
+    # 需要换新基址的类 —— 已停用（实测换基址无效、且会把载具克隆弄崩）
+    FRESH_BASE_CLASSES = ()
+    UNIT_INST_ID_OFF = 36          # ★实例 ID（与建筑 +20 载荷帧 = g+36 是同一个字段/同一个计数器）
+
+    def _fresh_unit_inst_id(self, blob, pl):
+        """给克隆体分配**新的实例 ID**（记录 `+36`），原地覆写、零增长。
+
+        引擎原生实测（`10个大兵.SAV`）：8 个 E1 依次 0xfa357…0xfa360，
+        接着的建筑 0xfa361/0xfa364/0xfa367 ⇒ 单位与建筑**共用同一个计数器**，
+        所以新 ID 要取「单位 + 建筑」两侧的最大值再顺延。
+        """
+        off = self.UNIT_INST_ID_OFF
+        if len(blob) < off + 4:
+            return None
+        ids = []
+        for r in self.unit_records():
+            if r['size'] >= off + 4:
+                v = struct.unpack_from('<I', pl, r['off'] + off)[0]
+                if v:
+                    ids.append(v)
+        try:
+            for b in self.buildings():          # 建筑：b 帧 = 载荷+56 = g+72 ⇒ g+36 = b-36
+                g36 = b['base'] - 36
+                if 0 <= g36 < len(pl) - 4:
+                    v = struct.unpack_from('<I', pl, g36)[0]
+                    if 0 < v < 0x1000000:
+                        ids.append(v)
+        except Exception:
+            pass
+        old = struct.unpack_from('<I', blob, off)[0]
+        new = (max(ids) if ids else old) + 0x10
+        for _ in range(65536):
+            if pl.find(struct.pack('<I', new)) < 0 and new not in ids:
+                struct.pack_into('<I', blob, off, new)
+                return {'old': old, 'new': new}
+            new += 0x10
+        return None
+
+    def _fresh_unit_ids(self, blob, cls, rec_size, pl):
+        """给克隆体分配**全新且远离所有既有对象**的基址（身份），返回诊断信息。
+
+        ★ 2026-10-17 17:2x 症状定案：两份同型号步兵里"攻击一个、目标却指向另一个"
+          ⇒ 引擎按**基址（对象地址）**认对象，克隆与模板共用基址 = 同一个身份。
+        建筑侧 `+20` 是计数器 ID（换新即可），单位这边是**地址**：既要换新，又要**不落在
+        任何已有对象的地块里**。上一版用 `max+0x10`，正好压进模板自己的地块
+        （模板 `+248` 就在 `基址+0x50`）⇒ 直接崩。所以这里留 0x10000 的间隔。
+
+        写两处：`伴随+16` = 新基址、记录 `+1672` = 新基址 + 4（这个关系三份档都成立）。
+        `+248` 只在"它本来就在模板自己的地块里"时才跟着平移（否则原样沿用）。
+        """
+        base_off = rec_size + 16                 # 伴随对象 +16 = 对象基址
+        sub_off = 1672                           # = 基址 + 4
+        if len(blob) < base_off + 4 or len(blob) < sub_off + 4:
+            return None
+        old_base = struct.unpack_from('<I', blob, base_off)[0]
+        if not old_base:
+            return None
+        bases = []
+        for r in self.unit_records():
+            if r['size'] >= rec_size:
+                b = struct.unpack_from('<I', pl, r['comp'] + 16)[0]
+                if b:
+                    bases.append(b)
+        gap = 0x10000
+        new_base = (max(bases) if bases else old_base) + gap
+        for _ in range(4096):
+            ok = all(abs(new_base - b) >= gap for b in bases)
+            ok = ok and pl.find(struct.pack('<I', new_base)) < 0 \
+                and pl.find(struct.pack('<I', new_base + 4)) < 0
+            if ok:
+                break
+            new_base += gap
+        else:
+            return None
+        delta = new_base - old_base
+        struct.pack_into('<I', blob, base_off, new_base)
+        struct.pack_into('<I', blob, sub_off, new_base + 4)
+        moved = []
+        v248 = struct.unpack_from('<I', blob, 248)[0]
+        if v248 and abs(v248 - old_base) < 0x1000:      # 本来就在自己地块里 ⇒ 跟着搬
+            struct.pack_into('<I', blob, 248, v248 + delta)
+            moved.append(248)
+        return {'old_base': old_base, 'new_base': new_base, 'delta': delta, 'moved': moved}
+
+    def _house_key_names(self):
+        self._invalidate_if_shifted()
+        """{House 对象键: 阵营短名}（反查用，取不到就空表）。"""
+        out = {}
+        try:
+            for nm, k in self.house_keys().items():
+                if k:
+                    out.setdefault(k, nm)
+        except Exception:
+            pass
+        return out
+
+    def house_key_of(self, house):
+        """阵营短名 / 中文名 / `0x…` 键 → House 对象键；认不出返回 None。"""
+        if house is None or house == '':
+            return None
+        if isinstance(house, int):
+            return house
+        s = str(house).strip()
+        try:
+            if s.lower().startswith('0x'):
+                return int(s, 16)
+        except ValueError:
+            pass
+        hk = self.house_keys()
+        s2 = s[:-6].strip() if s.lower().endswith(' house') else s
+        cn2short = {v: k for k, v in HOUSE_CN.items()}
+        for nm, k in hk.items():
+            if k and (nm.lower() == s2.lower() or s2 == nm or s == HOUSE_CN.get(nm)):
+                return k
+        if s2 in cn2short and hk.get(cn2short[s2]):
+            return hk[cn2short[s2]]
+        try:
+            for h in self.houses():
+                if not h.get('key'):
+                    continue
+                if s in (h.get('short'), h.get('cn'), str(h.get('key'))):
+                    return h['key']
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def guid_bytes(s):
+        """`{92612C46-F71F-11d1-AC9F-006008055BB5}` → 存档里的 16 字节（前三段小端）。"""
+        h = str(s).strip().strip('{}').replace('-', '')
+        if len(h) != 32:
+            return b''
+        try:
+            return (bytes.fromhex(h[0:8])[::-1] + bytes.fromhex(h[8:12])[::-1]
+                    + bytes.fromhex(h[12:16])[::-1] + bytes.fromhex(h[16:32]))
+        except ValueError:
+            return b''
+
+    def _type_strength(self, t):
+        """目标型号的满血值（规则 `Strength=`）；查不到返回 0。"""
+        try:
+            import os
+            import game_ini
+            g = game_ini.get_types(os.path.dirname(getattr(self, 'path', '') or ''))
+            kv = g.rules.get(str(t).lower()) or {}
+            if isinstance(kv, dict) and isinstance(kv.get('kv'), dict):
+                kv = kv['kv']
+            v = str(kv.get('strength') or '').strip()
+            return int(v) if v.isdigit() else 0
+        except Exception:
+            return 0
+
+    def comp_library(self):
+        """内置「伴随对象（移动方式）」模板库 → {Loco: {'bytes','guid','size','sample'}}。"""
+        if getattr(self, '_complib', None) is not None:
+            return self._complib
+        try:
+            import unit_comp_lib
+        except Exception:
+            try:
+                from core import unit_comp_lib
+            except Exception:
+                self._complib = {}
+                return self._complib
+        self._complib = unit_comp_lib.load()
+        return self._complib
+
+    def _type_locomotor(self, t, recs):
+        """目标型号要的**移动方式**（Walk / Drive / Fly）——决定要借哪种伴随对象。
+
+        优先用档内该型号实例的伴随类；档里没有就查规则文件的 `Locomotor={GUID}`
+        （那个 GUID 就是伴随对象的类 GUID）；规则也没有就返回 None（不做约束）。
+        """
+        for r in recs:
+            if r['type'].upper() == t and r.get('loco') not in (None, '?'):
+                return r['loco']
+        try:
+            import os
+            import game_ini
+            g = game_ini.get_types(os.path.dirname(getattr(self, 'path', '') or ''))
+            sec = g.rules.get(str(t).lower()) or {}
+            if isinstance(sec, dict) and isinstance(sec.get('kv'), dict):
+                sec = sec['kv']          # 规则段的真实键值在 'kv' 里
+            loco = (sec.get('locomotor') or '').strip()
+            if loco:
+                return self.COMP_GUID_LOCO.get(self.guid_bytes(loco))
+            if (sec.get('speedtype') or '').strip().lower() == 'foot':
+                return 'Walk'
+        except Exception:
+            pass
+        return None
+
+    def set_unit_house(self, unit, house):
+        """把某个单位实例的**所属方**改成目标阵营（`+352`/`+560` 两份同改）。
+
+        `unit` = `unit_records()` 里的 dict（用其 `off`）或记录自键（int）。
+        返回 {'house','house_key','off','from','changed'}；认不出阵营则抛 ValueError。
+        """
+        tgt = self.house_key_of(house)
+        if not tgt:
+            raise ValueError('认不出所属方 %r（已知：%s）'
+                             % (house, '、'.join(sorted(k for k in self.house_keys() if k))))
+        recs = self.unit_records()
+        if isinstance(unit, dict):
+            off = unit['off']
+        else:
+            cand = [r for r in recs if r['key'] == unit]
+            if not cand:
+                raise ValueError('找不到自键 %#x 的单位记录' % unit)
+            off = cand[0]['off']
+        pl = bytearray(self.plain)
+        old = struct.unpack_from('<I', pl, off + self.UNIT_HOUSE_OFF[0])[0]
+        for o in self.UNIT_HOUSE_OFF:
+            struct.pack_into('<I', pl, off + o, tgt)
+        self.plain = pl
+        self._blds = None
+        nm = self._house_key_names()
+        return {'off': off, 'house': nm.get(tgt, house), 'house_key': tgt,
+                'from': nm.get(old, '0x%08X' % old),
+                'changed': int(old != tgt)}
+
+
+    TYPE_GROUP_INF = bytes.fromhex('d8338bae1c06d211aca4006008055bb5')   # InfantryTypeClass 型别组
+    TYPE_GROUP_UNIT = bytes.fromhex('ea42bddc4605d211aca4006008055bb5')  # UnitTypeClass 型别组
+
+    def unit_type_index(self):
+        """{类型名: {'key','off','class'}} —— 完整类型索引（步兵 / 载具）。
+
+        2026-10-17 定案：**型别组内每个对象都以同一个类 GUID 开头**，且 `+56` 就是类型名
+        ⇒ 直接枚举「该类 GUID 的全部出现位置」即可拿到**完整**名单
+        （`unit_types()` 靠 `Name:` 串扫只能捞到一部分：65 只捞到 32）。
+        """
+        cached = getattr(self, '_utindex', None)
+        if cached is not None:
+            return cached
+        pl = self.plain
+        out = {}
+        for guid, cls in ((self.TYPE_GROUP_INF, 'infantry'), (self.TYPE_GROUP_UNIT, 'vehicle')):
+            i = 0
+            while True:
+                o = pl.find(guid, i)
+                if o < 0:
+                    break
+                i = o + 1
+                nm = bytes(pl[o + 56:o + 72]).split(b'\x00')[0].decode('ascii', 'ignore')
+                if not nm:
+                    continue
+                out.setdefault(nm.upper(), {'key': struct.unpack_from('<I', pl, o + 16)[0],
+                                            'off': o, 'class': cls})
+        self._utindex = out
+        return out
+
+    def unit_type_display(self, name):
+        """存档自带该型号的**显示名**（类型对象 `+120`，运行时已按 CSF 解析过）。
+
+        用途：型号可能在 rules 里找不到（地图里写死的自制单位），那就用存档自带的名字。
+        """
+        v = self.unit_type_index().get(str(name).upper())
+        if not v:
+            return ''
+        pl = self.plain
+        o = v['off']
+        s = bytes(pl[o + 120:o + 160]).split(b'\x00')[0]
+        return s.decode('latin-1', 'ignore').strip()
+
+    def placeable_unit_types(self):
+        """**所有**可放置的单位类型名（步兵 + 载具，按类分组）→ [(名, 'infantry'|'vehicle')]。
+
+        与 `units_placeable()` 不同：这个不看"档里有没有该型号"，
+        只要类型表里有、且能归到步兵/载具类，就能借同类模板 + 换型号键放出来。
+        """
+        idx = self.unit_type_index()
+        return [(nm, v['class']) for nm, v in sorted(idx.items()) if v['class']]
+
+    def units_placeable(self):
+        """本档**能克隆放置**的单位类型（= 档内已经存在的单位类型名，去重）。"""
+        seen, out = set(), []
+        for r in self.unit_records():
+            t = r['type']
+            if t and not t.startswith('?') and t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+
+    def _pick_registered(self, recs, limit=400):
+        """在候选里挑第一条**已进全局登记表**（≥2 张表）的记录。
+
+        ★2026-10-17 21:4x：大任务档里有一部分单位不在任何登记表里（实测 76/1956，
+          例如 15 个 SLAV 全都没登记：多半待在建筑里/待定状态），
+          拿它们当克隆模板会连带继承"未登记"的状态 ⇒ 新单位引擎不认领。
+          ⚠ 上限要够大：按记录顺序取前几条很容易全是没登记的，`limit` 太小会白跑。
+        """
+        for r in recs[:limit]:
+            try:
+                if len(self._key_tables(r['key'])) >= 2:
+                    return r
+            except Exception:
+                continue
+        return None
+
+    def _key_tables(self, key):
+        """包含该对象键的「指针表」→ [{'count_pos','first','n'}]（加载器归并断言要求 A⊆B）。
+
+        结构：`[u32 n][key × n]`。
+
+        ★★ 2026-10-17 21:3x 重写（大任务档终于放行）：
+          旧写法只在"键前面 64 条以内"找计数，等于**只认识表头 64 条**。
+          大任务档的登记表有 **8642 / 5189 条**，绝大多数键落在中间 ⇒ 一张都认不出。
+          改成**先按"连续合法键区"左右扩张出整段，再用段首前 4 字节 == 段长**认定表头：
+          与键在表里的位置无关，见到表头即可；段长/计数不符的一律不认（宁缺勿错）。
+        """
+        pl = self.plain
+        pat = struct.pack('<I', key)
+        out, seen = [], set()
+        i = 0
+        while True:
+            j = pl.find(pat, i)
+            if j < 0:
+                break
+            i = j + 1
+            # 左右扩张：连续"像对象键"的 u32
+            s = j
+            while s - 4 >= 0:
+                v = struct.unpack_from('<I', pl, s - 4)[0]
+                if 0x01000000 <= v <= 0x90000000:
+                    s -= 4
+                else:
+                    break
+            e = j
+            while e + 4 <= len(pl):
+                v = struct.unpack_from('<I', pl, e)[0]
+                if 0x01000000 <= v <= 0x90000000:
+                    e += 4
+                else:
+                    break
+            # 段首附近找"计数 == 段长"的位置（最多回溯 64 条，防止前面粘着别的键数组）
+            for k in range(0, 64):
+                st = s + 4 * k
+                if st - 4 < 0:
+                    break
+                n = (e - st) // 4
+                if n < 2:
+                    break
+                if (st - 4) in seen:
+                    continue
+                if struct.unpack_from('<I', pl, st - 4)[0] == n:
+                    seen.add(st - 4)
+                    out.append({'count_pos': st - 4, 'first': st, 'n': n})
+                    break
+        return out
+
+    def _occupancy(self):
+        """{(x,y)} 已被**建筑地基**或**单位**占用的格（引擎口径，带缓存）。
+
+        与「格 +0xF8」不是一回事：格表里干净、但落在某建筑地基里的格子很常见，
+        往那儿放单位会被引擎挤掉/销毁。建筑地基取自 `foundation_of()`。
+        """
+        memo = getattr(self, '_occ_memo', None)
+        if memo is not None and memo[0] == len(self.plain):
+            return memo[1]
+        occ = set()
+        for b in self.buildings():
+            try:
+                w, h = self.foundation_of(b['type'])
+            except Exception:
+                w, h = 1, 1
+            for i in range(w):
+                for j in range(h):
+                    occ.add((b['x'] + i, b['y'] + j))
+        for u in self.unit_records():
+            if u['x'] is not None:
+                occ.add((u['x'], u['y']))
+        self._occ_memo = (len(self.plain), occ)
+        return occ
+
+    def cell_taken(self, cx, cy):
+        """该格是否被建筑地基/单位占着（O(1)，走 `_occupancy()` 缓存）。"""
+        return (int(cx), int(cy)) in self._occupancy()
+
+    def free_cell_near(self, cx, cy, radius=6, clearance=2):
+        """在 (cx,cy) 附近找一块**引擎认可的空地** → (x,y)；找不到返回 None。
+
+        `clearance` = 四周还要留几格空（避免紧贴建筑，游戏里会被挤）。
+        """
+        co = self.cell_offsets()
+        pl = self.plain
+        occ = self._occupancy()
+        best = None
+        for (x, y), off in co.items():
+            if abs(x - cx) > radius or abs(y - cy) > radius:
+                continue
+            if struct.unpack_from('<I', pl, off + 0xF8)[0]:
+                continue
+            if struct.unpack_from('<I', pl, off + 0xF0)[0]:
+                continue
+            if (x, y) in occ:
+                continue
+            if clearance:
+                if any((x + i, y + j) in occ
+                       for i in range(-clearance, clearance + 1)
+                       for j in range(-clearance, clearance + 1)):
+                    continue
+            d = abs(x - cx) + abs(y - cy)
+            if best is None or d < best[0]:
+                best = (d, x, y)
+        return (best[1], best[2]) if best else None
+
+    def add_unit_by_clone(self, type_name, cx, cy, house=None, veterancy=None):
+        """**克隆放置**一个单位（2026-10-17 玩家 U2 游戏内验收通过）。
+
+        做法 = 拿档内**同类型**单位当模板，克隆「主体 + 伴随」，然后办 7 处手续：
+          ① 组计数 +1；② 自键换新（克隆体内旧键引用全改）；
+          ③ **每对象唯一 ID/基址换新**（+248/+1672/+1828，载具另加 +1320/+2332）
+             —— ★2026-10-17 修「新开载入正常、游戏内重载崩」（同建筑 +20/+972 那个坑）；
+          ④ 坐标 4 处（+176/+180、+616/+620、+224 格键、+1392/+1394）；
+          ⑤ 两张指针表各追加新键（A⊆B 断言）；⑥ 阵营对象表追加 (类型键, y, x)；
+          ⑦ **所属方**：`house=` 指定目标阵营时改记录 `+352`/`+560` 两份 House 键。
+        实测账目：步兵 +1909 B（1893 记录+伴随 / 8 阵营表 / 4+4 指针表）。
+        ⚠ 只能克隆**档内已有**的同类型单位（跨类型会借错子对象，尚未验证）。
+
+        `veterancy`（2026-10-18 新增）：0=新兵 / 1=老兵 / 2=精英；`None` = **沿用模板的等级**
+        （默认行为，等于旧版）。非 None 时把记录 `+0x150`(int) 与 `+0x164`(float 2−n)
+        **成对改写** —— 这两个字段在全档 1394 个单位里严格孪生，必须一起改。
+        """
+        t = str(type_name).strip().upper()
+        if not t:
+            raise ValueError('单位类型不能为空')
+        cx, cy = int(cx), int(cy)
+        lim = self.coord_limit()
+        if not (0 <= cx < lim[0] and 0 <= cy < lim[1]):
+            raise ValueError('格子 (%d,%d) 超出范围（0..%d / 0..%d）'
+                             % (cx, cy, lim[0] - 1, lim[1] - 1))
+        cells = {v: k for k, v in self._cell_by_key().items()}   # (x,y) → 格对象自键
+        if (cx, cy) not in cells:
+            raise RuntimeError('该档没有格 (%d,%d) 的格对象，无法落位' % (cx, cy))
+        recs = self.unit_records()
+        same = [r for r in recs if r['type'].upper() == t]
+        swap_type = False
+        # ★2026-10-17 18:4x：**移动方式（Locomotor）= 伴随对象的类**。
+        #   地面载具借地面模板没问题；但基洛夫（Fly）借地面模板就会**在地上跑**。
+        #   所以先确定目标型号要的移动方式，再优先挑"同移动方式"的模板。
+        tgt_loco = self._type_locomotor(t, recs)
+        src = None
+        if same:
+            src = self._pick_registered(same)
+            # ① 同型号但**全都没进登记表**（大任务档里 15 个 SLAV 就是这样，多半在建筑里/待定）
+            # ② 或挑中的模板移动方式不符 ⇒ 都退到"借同类已登记模板 + 换型号键"
+            if src is None or (tgt_loco and src.get('loco') not in (None, '?', tgt_loco)):
+                src = None
+                same = []
+        if not same:
+            # ★2026-10-17 X1b 验证：型号由记录里的**类型键**决定（引擎载入时按它也重建武器/动画）
+            #   ⇒ 档里没有该型号时，借**同大类**的模板克隆，再把类型键换成目标型号即可。
+            idx = self.unit_type_index().get(t)
+            if not idx or not idx.get('class'):
+                raise UnitUnavailable('类型表里没有 %s（或归不到步兵/载具）' % t)
+            cls = idx['class']
+            pool = [r for r in recs if r['class'] == cls]
+            if tgt_loco:
+                same_loco = [r for r in pool if r.get('loco') == tgt_loco]
+                if same_loco:
+                    pool = same_loco
+                elif tgt_loco in self.comp_library():
+                    # 本档没有同移动方式的单位，但内置库里存了这个移动方式的伴随对象
+                    # ⇒ 记录随便借同类的，伴随对象从库里取（见下面 comp_bytes）
+                    pass
+                else:
+                    raise UnitUnavailable(
+                        '这份存档里没有「%s」移动方式的单位当模板，内置库也还没有这一种。\n'
+                        '办法：① 换一份**本来就含这类单位**的存档当源；'
+                        '② 或用 `--learncomp <存档> <型号>` 把该移动方式学进内置库。'
+                        % tgt_loco)
+            src = self._pick_registered(pool) or pool[0]
+            swap_type = True
+        else:
+            # 同型号模板也要挑"登记表里有的"：大任务档里有 76 个单位不在任何登记表
+            # （多半刚出生/在建筑里/待定），拿它当模板会连带拿到"未登记"的身份。
+            src = self._pick_registered(same) or src
+        pl = bytearray(self.plain)
+        old_key = src['key']
+        # ---- 指针表 ----
+        # ★2026-10-17 21:1x：**少于 2 张表就拒绝写入**。
+        #   加载器的「指针修复归并器」要求 A⊆B（A 表的键必须在 B 表里），
+        #   只往一张表里加键 ⇒ 引擎不认领这个对象（单位在游戏里看不见，或读档弹框）。
+        #   以前只是 warning 仍然照写 —— 大任务档（表有 5189 条）就踩这个坑，改成硬拒绝。
+        tabs = self._key_tables(old_key)
+        if len(tabs) < 2:
+            raise UnitUnavailable(
+                '这份存档里只找到 %d 张全局指针表（正常要 2 张），'
+                '新单位的键无处登记 ⇒ 引擎不会认领它（游戏里看不见 / 读档可能弹框）。\n'
+                '已知情况：超大任务档的指针表条目数远超旧上限，结构可能不止"两张小表"。\n'
+                '安全起见这里**拒绝写入**。要放单位请换一份普通存档，'
+                '或把这份档发给作者排查表结构。' % len(tabs))
+        used = set()
+        for tb in tabs:
+            for k in range(tb['n']):
+                used.add(struct.unpack_from('<I', pl, tb['first'] + 4 * k)[0])
+        new_key = (old_key + 0x8000) & 0xFFFFFFFF
+        while new_key in used or pl.find(struct.pack('<I', new_key)) >= 0:
+            new_key += 4
+        # ---- 伴随对象：优先用本档同移动方式的模板，缺了就取**内置模板库** ----
+        comp_bytes = bytes(pl[src['comp']:src['comp'] + src['comp_size']])
+        comp_src = 'template:%s' % src['type']
+        if tgt_loco and src.get('loco') != tgt_loco:
+            lib = self.comp_library().get(tgt_loco)
+            if lib:
+                comp_bytes = bytearray(lib['bytes'])
+                # 补 +16 = 记录 +1672 − 4（基址）；自键由下面统一替换
+                struct.pack_into('<I', comp_bytes, 16,
+                                 struct.unpack_from('<I', pl, src['off'] + 1672)[0] - 4)
+                # ★库里存的是**样本单位**的伴随对象，它里面还带着样本的自键（+28/+32），
+                #   必须换成新单位的键（否则两个单位又共用一个键）。
+                lib_key = struct.unpack_from('<I', comp_bytes, 28)[0]
+                if lib_key:
+                    _lb, _nb = struct.pack('<I', lib_key), struct.pack('<I', new_key)
+                    _i = 0
+                    while True:
+                        _j = comp_bytes.find(_lb, _i)
+                        if _j < 0:
+                            break
+                        comp_bytes[_j:_j + 4] = _nb
+                        _i = _j + 4
+                comp_src = 'library:%s(%s)' % (tgt_loco, lib.get('sample', '?'))
+            else:
+                warnings.append('本档没有「%s」移动方式的模板、内置库也没有 ⇒ 新单位的移动方式可能不对'
+                                % tgt_loco)
+        # ---- 克隆体 ----
+        blob = bytearray(pl[src['off']:src['comp']] + bytes(comp_bytes))
+        oldb, newb = struct.pack('<I', old_key), struct.pack('<I', new_key)
+        i, nrep = 0, 0
+        while True:
+            j = blob.find(oldb, i)
+            if j < 0:
+                break
+            blob[j:j + 4] = newb
+            nrep += 1
+            i = j + 4
+        # 换型号：把克隆体里**所有**模板型号键替换成目标型号键（载具在 +280/+1752 各一处）
+        target_key = None
+        if swap_type:
+            idx = self.unit_type_index().get(t)
+            target_key = idx['key'] if idx else None
+            tpl_names = [k for k, v in self.unit_types().items() if v == src['type']]
+            if target_key is None or not tpl_names:
+                raise UnitUnavailable('拿不到 %s 或 %s 的类型键' % (t, src['type']))
+            tb_old = struct.pack('<I', tpl_names[0])
+            tb_new = struct.pack('<I', target_key)
+            k = 0
+            while True:
+                j2 = blob.find(tb_old, k)
+                if j2 < 0:
+                    break
+                blob[j2:j2 + 4] = tb_new
+                k = j2 + 4
+                nrep += 1
+        # ★★2026-10-18 修（玩家实测：在 (214,291) 加 FV，进游戏什么都看不到）：
+        #   单位记录里 **+176 是 x、+180 是 y**（与建筑记录 +600/+604 同一口径，
+        #   实测 5 个既有载具：+176=A、+180=B、+616=A、+620=B、+1392=A、+1394=B）。
+        #   原代码把 (cx,cy) 按 (y,x) 写进去 ⇒ 新单位落到**转置**的格子上，
+        #   在 (214,291) 加的东西实际躺在 (291,214)，当然"看不到"。
+        fx = pl[src['off'] + 176] & 0xFF      # 子格偏移也跟着换过来
+        fy = pl[src['off'] + 180] & 0xFF
+        nx, ny = cx * 256 + fx, cy * 256 + fy
+        for off in (176, 616):
+            struct.pack_into('<I', blob, off, nx)
+            struct.pack_into('<I', blob, off + 4, ny)
+        struct.pack_into('<I', blob, 224, cells[(cx, cy)])
+        struct.pack_into('<H', blob, 1392, cx)
+        struct.pack_into('<H', blob, 1394, cy)
+        # ---- 所属方（★2026-10-17 新增：house 参数真正改主人，不再只挑模板）----
+        warnings = []
+        tpl_hkey = struct.unpack_from('<I', pl, src['off'] + self.UNIT_HOUSE_OFF[0])[0]
+        tpl_hname = self._house_key_names().get(tpl_hkey) or src.get('house')
+        tgt_hkey, tgt_hname, house_changed = None, tpl_hname, False
+        if house:
+            tgt_hkey = self.house_key_of(house)
+            if not tgt_hkey:
+                warnings.append('认不出所属方 %r（已知：%s），沿用模板所属方 %s'
+                                % (house, '、'.join(sorted(k for k in self.house_keys() if k)),
+                                   tpl_hname))
+            else:
+                tgt_hname = self._house_key_names().get(tgt_hkey, str(house))
+                if tgt_hkey != tpl_hkey:
+                    for _o in self.UNIT_HOUSE_OFF:
+                        struct.pack_into('<I', blob, _o, tgt_hkey)
+                    house_changed = True
+        # ---- ★★★★★ 实例 ID（记录 +36）：重载崩 + 选中/移动/攻击串到对方的**真凶** ----
+        # 2026-10-17 18:2x 用玩家给的引擎原生样本 `10个大兵.SAV` / `一个大兵.SAV` 定案：
+        #   8 个引擎原生 E1 的 `+36` = 0x0fa357/358/359/35c/35d/35e/35f/360，
+        #   紧接着的建筑是 0x0fa361/364/367 ⇒ **单位与建筑共用同一个实例 ID 计数器**，
+        #   每个值在明文里**只出现 1 次**（= ID，不是指针；建筑侧 `+20` 在载荷帧 = g+36，同一个字段）。
+        #   我们克隆时原样复制 ⇒ 两个对象同 ID ⇒ 选中/移动/攻击解析到对方、重载拆世界对不上。
+        id_info = self._fresh_unit_inst_id(blob, pl)
+        if id_info is None:
+            warnings.append('分配实例 ID 失败 ⇒ 新单位会与模板共用身份（选中/重载都会错乱）')
+        # ---- 格子占用（格+248 = 站在该格上的单位键）----
+        # ★2026-10-17 17:5x 玩家点破：**红警里"攻击单位"实际是"攻击它所在的格子"**，
+        #   引擎按「格 → 占用者」解析目标。克隆体 `+224` 指向新格，但新格的 `+248` 没登记它
+        #   ⇒ 格上没有这个单位 ⇒ 攻击/选中解析落到别人身上（"打一个却指向另一个"）。
+        #   所以必须写 `格+248`。
+        # ⚠ 但**只写键**：上一轮连 `+308/+312`（标记/类型码）一起写，把本来重载正常的
+        #   载具克隆弄崩了（V3 崩 / H3 好）⇒ 那两个字节不碰，交给引擎自己处理。
+        # ★2026-10-18：目标格若落在**某建筑的地基**里，给一条明确警告。
+        #   实测教训（玩家在 (231,172) 放天启，游戏里那里是密集建筑群）：
+        #   格 +0xF8 为空 **不等于** 空地 —— 引擎的占用是拿建筑记录 + 地基算出来的，
+        #   格表里那格可能是干净的。放置前请用 `cell_taken()` 判。
+        if self.cell_taken(cx, cy):
+            warnings.append('目标格 (%d,%d) 已被建筑/单位占用（引擎会把它挤掉或直接销毁）'
+                            % (cx, cy))
+        cell_ops = []
+        if self.UNIT_CELL_OCC_MODE:
+            cofs = self.cell_offsets()
+            tgt_cell = cofs.get((cx, cy))
+            if tgt_cell is not None:
+                old_occ = struct.unpack_from('<I', pl, tgt_cell + self.CELL_OCC_OFF)[0]
+                if old_occ and old_occ != src['key']:
+                    warnings.append('目标格 (%d,%d) 原本已被 %#010x 占用，已覆盖' % (cx, cy, old_occ))
+                cell_ops.append((tgt_cell + self.CELL_OCC_OFF, 'write',
+                                 struct.pack('<I', new_key), '格子占用键'))
+                if self.UNIT_CELL_OCC_MODE == 'full':
+                    src_cell = cofs.get((src['x'], src['y'])) if src.get('x') is not None else None
+                    if src_cell is not None:
+                        flag = pl[src_cell + self.CELL_OCC_FLAG_OFF:src_cell + self.CELL_OCC_FLAG_OFF + 4]
+                        kind = pl[src_cell + self.CELL_OCC_KIND_OFF:src_cell + self.CELL_OCC_KIND_OFF + 4]
+                    else:
+                        flag = struct.pack('<I', 0x0001FFFF)
+                        kind = struct.pack('<I', 0x08 if src['class'] == 'infantry' else 0x20)
+                    cell_ops.append((tgt_cell + self.CELL_OCC_FLAG_OFF, 'write', bytes(flag), '格子占用标记'))
+                    cell_ops.append((tgt_cell + self.CELL_OCC_KIND_OFF, 'write', bytes(kind), '格子占用类型'))
+            else:
+                warnings.append('找不到格 (%d,%d) 的格对象 ⇒ 未写格子占用' % (cx, cy))
+        # ---- 记录 +408 ----
+        # 引擎原生 ≈ 自身键 + 0xC0~0xD8（是个地址，不是 ID）。实测改动它**没有帮助**：
+        #   M1 改成"新键+0xC8"后不再指向原单位，但那个值恰好撞了别的对象 ⇒ 一选就弹框；
+        #   N1 改成唯一值 ⇒ 仍然串。⇒ **保持模板值不动**，真正的身份是 `+36`（见上）。
+        # ---- 血量：换成目标型号的满血值（否则克隆体继承模板的血量）----
+        # ★2026-10-17 19:0x 玩家实测："基洛夫血量很少" —— 因为抄了天启的血量。
+        #   满血单位 `+128`/`+132` 都等于规则里的 `Strength`（灰熊 300 / V3 150 / E1 125）。
+        hp = self._type_strength(t)
+        if hp:
+            for _o in self.UNIT_HP_OFF:
+                struct.pack_into('<I', blob, _o, hp)
+        # ---- 等级（Veterancy）----
+        # 默认 None = **原样继承模板**（旧行为）。指定时成对改 `+0x150`(int) 与 `+0x164`(float)。
+        vet_out = struct.unpack_from('<i', blob, self.UNIT_VET_OFF[0])[0]
+        if veterancy is not None:
+            vet = int(veterancy)
+            if vet not in self.VET_NAMES:
+                raise ValueError('等级只能是 0（新兵）/1（老兵）/2（精英），收到 %r' % (veterancy,))
+            struct.pack_into('<i', blob, self.UNIT_VET_OFF[0], vet)
+            struct.pack_into('<f', blob, self.UNIT_VET_OFF[1], float(2 - vet))
+            vet_out = vet
+            if vet != struct.unpack_from('<i', pl, src['off'] + self.UNIT_VET_OFF[0])[0]:
+                warnings.append('等级已改为 %s（模板是 %s）'
+                                % (self.VET_NAMES[vet],
+                                   self.VET_NAMES.get(
+                                       struct.unpack_from('<i', pl, src['off'] + self.UNIT_VET_OFF[0])[0],
+                                       '未定义')))
+        # ---- 阵营对象表 ----
+        # 2026-10-17 实测：任务图里单位**本来就不在** House 的对象清单里（清单只有建筑/Special），
+        # 所以"找不到条目"是常态、不算错；只有"地图初始布置"式的档里才会命中。
+        hp = self.house_placements()
+        cand = [x for x in hp if x['type'].upper() == src['type'].upper()]
+        if house and not house_changed:
+            h2 = [x for x in cand if x['house'] == house or house in str(x['house'])]
+            cand = h2 or cand
+        roster_ops = None
+        if cand:
+            # 改过所属方 ⇒ 条目必须进**目标阵营**的清单；目标没有清单就不加（宁缺勿错位）
+            roster_house = cand[0]['house']
+            if house_changed:
+                roster_house = tgt_hname if any(x['house'] == tgt_hname for x in hp) else None
+                if roster_house is None:
+                    warnings.append('%s 没有对象清单 ⇒ 未加清单条目（本档单位本来也不在清单里）'
+                                    % tgt_hname)
+            mine = [x for x in hp if x['house'] == roster_house] if roster_house else []
+            if mine:
+                first, last = min(x['off'] for x in mine), max(x['off'] for x in mine)
+                cnt_pos = first - 4
+                if (struct.unpack_from('<I', pl, cnt_pos)[0] == len(mine)
+                        and last + 8 == first + 8 * len(mine)):
+                    roster_ops = (last + 8, cnt_pos)
+                else:
+                    warnings.append('阵营对象表布局不符，未追加条目（可能是"隐形"单位）')
+
+        # ---- 写回：严格从高到低 ----
+        cnt_pos = self._unit_group_count_pos(src['off'])
+        if cnt_pos is None:
+            warnings.append('定位组计数失败（模板可能不在标准组里）⇒ 用模板记录前 4 字节兜底')
+            cnt_pos = src['off'] - 4
+        ops = [(src['comp'] + src['comp_size'], 'insert', bytes(blob), '单位组'),
+               (cnt_pos, 'bump', None, '组计数')]
+        if roster_ops:
+            tkey = None
+            for x in hp:
+                if x['off'] == cand[0]['off']:
+                    tkey = struct.unpack_from('<I', pl, x['off'])[0]
+            if swap_type and target_key:
+                tkey = target_key          # 换型号时，表里也写目标型号键
+            ops.append((roster_ops[0], 'insert',
+                        struct.pack('<I', tkey) + struct.pack('<HH', cy, cx), '阵营表'))
+            ops.append((roster_ops[1], 'bump', None, '阵营表计数'))
+        for tb in tabs:
+            ops.append((tb['first'] + 4 * tb['n'], 'insert', newb, '指针表'))
+            ops.append((tb['count_pos'], 'bump', None, '指针表计数'))
+        ops.extend(cell_ops)
+        if len(tabs) < 2:
+            warnings.append('只找到 %d 张指针表（通常 2 张）——新单位可能不被引擎认领' % len(tabs))
+        ops.sort(key=lambda o: (-o[0], 0 if o[1] == 'bump' else 1))
+        base = len(pl)
+        for pos, kind, data, _nm in ops:
+            if kind == 'insert':
+                pl[pos:pos] = data
+            elif kind == 'write':
+                pl[pos:pos + len(data)] = data
+            else:
+                struct.pack_into('<I', pl, pos, struct.unpack_from('<I', pl, pos)[0] + 1)
+        self.plain = pl
+        self._blds = None
+        self._coffs = None
+        self._ckey = None
+        _sk = [k for k, v in self.unit_types().items() if v == src['type']]
+        src_key_of_t = _sk[0] if _sk else None
+        return {'mode': '克隆放置' if not swap_type else '克隆+换型号',
+                'type': t, 'class': src['class'], 'template_type': src['type'],
+                'type_key': target_key if swap_type else src_key_of_t,
+                'cell': (cx, cy),
+                'key': new_key, 'template_key': old_key,
+                'house': tgt_hname, 'template_house': tpl_hname,
+                'house_changed': house_changed,
+                'veterancy': vet_out if vet_out in self.VET_NAMES else None,
+                'veterancy_name': self.VET_NAMES.get(vet_out, '未定义'),
+                'inst_base': (id_info or {}).get('new'),
+                'inst_id': (id_info or {}).get('new'),
+                'delta': len(pl) - base, 'replaced': nrep, 'tables': len(tabs),
+                'warnings': warnings,
+                'note': '同类型克隆：武器/动画等子对象与模板一致'}
+
+    def buildings(self):
+        self._invalidate_if_shifted()
+        """存档里的全部建筑对象（不依赖地图，也不依赖类型名单）。
+
+        定位法（2026-10-15 v2，**正则找坐标对 → 反推对象**，比逐类型键更快也更全）：
+          1. 正则匹配「两个 u32 坐标（低字节 0x80、高字节 0）」= 锚点像素坐标对 cell×256+128；
+          2. 命中位置 h − 104 = 对象起点；对象 `+0x4EC` 必须是已知类型对象的自键；
+          3. 耐久 `+56` ∈ (0, 0x100000]。
+        返回 [{base,type,type_key,x,y,px,py,hp,house,tag,coord2_ok}]，按 base 排序。
+        """
+        if getattr(self, '_blds', None) is not None:
+            return self._blds
+        pl = self.plain
+        key2name = {}
+        for nm, k in self.building_types().items():
+            key2name.setdefault(k, nm)
+        out = {}
+        cw, ch = self.coord_limit()          # 存档自带尺寸（菱形系 = 2W / 2H）
+        limx, limy = (cw + 8) * 256, (ch + 8) * 256
+        for m in self.COORD_RE.finditer(pl):
+            h = m.start()                       # 命中的"格中心坐标对"（cell×256+128）
+            px, py = struct.unpack_from('<II', pl, h)
+            if not (0 < px < limx and 0 < py < limy):
+                continue
+            # ★两种落点都要试（2026-10-15 游戏自建对象实证）：
+            #   老对象把坐标写在 +160/+600 两份（都=格中心形式）；**引擎新建的对象**在
+            #   +160 写的是 iso 锚点（如 (cx+cy)×128+12），只有 +600 是格中心形式
+            #   ⇒ 只按 +160 反推会漏认新建筑（玩家用外挂加的那栋就漏了）。
+            for back in (self.BLD_COORD_OFF, self.BLD_COORD2_OFF):
+                b = h - back
+                if b < 0 or b in out or b + self.BLD_SIZE > len(pl):
+                    continue
+                key = struct.unpack_from('<I', pl, b + self.BLD_TYPEKEY_OFF)[0]
+                nm = key2name.get(key)
+                if not nm:
+                    continue
+                hp = struct.unpack_from('<I', pl, b + self.BLD_HP_OFF)[0]
+                if not (0 < hp <= 0x100000):
+                    continue
+                px2, py2 = struct.unpack_from('<II', pl, b + self.BLD_COORD2_OFF)
+                out[b] = {'base': b, 'type': nm, 'type_key': key,
+                          'px': px, 'py': py, 'x': (px - 128) // 256,
+                          'y': (py - 128) // 256, 'hp': hp,
+                          'house': struct.unpack_from('<I', pl, b + self.BLD_HOUSE_OFF)[0],
+                          'tag': struct.unpack_from('<I', pl, b)[0],
+                          'coord2_ok': (px2 == px and py2 == py)}
+                break
+        self._blds = sorted(out.values(), key=lambda d: d['base'])
+        return self._blds
+
+    # ---------------- 建筑「生长动画」状态（§170 十四档定稿，2026-10-22） ----------------
+    # 一句话：**"显示不全"有两种成因** ——
+    #   ①`+0x534=1` 但 `+0x6E4=0`（完成标记成立、动画结束标记没写）⇒ 卡住
+    #   ②`+0x534=0` 但 `+0x10C=0`（没建完、动画又不在播）⇒ 干脆不播
+    # 另有 `+0xAC=5` 且 `+0x534=0` 会**一直播**（K 档实测）。
+    # 合法中间态 = `+0x534=0` / `+0x10C≠0` / `+0xAC≠5`（原始档，观感最好）。
+    def building_at(self, x=None, y=None, type_name=None, base=None):
+        """按坐标或 base 精确取一栋建筑（找不到就报错，不返回 None）。"""
+        if base is not None:
+            for b in self.buildings():
+                if b['base'] == base:
+                    return b
+            raise RuntimeError('找不到 base=0x%08X 的建筑' % base)
+        for b in self.buildings():
+            if b['x'] == x and b['y'] == y and (type_name is None or b['type'] == type_name):
+                return b
+        raise RuntimeError('找不到建筑 (%s,%s)%s' % (
+            x, y, (' 类型 ' + type_name) if type_name else ''))
+
+    def building_anim_state(self, base):
+        """读一栋建筑的「建造动画」状态（§170 十四档定稿）→ dict。
+
+        ★`state` 五档（每一种都对应过 in-game 实测）：
+          * `'done'`    = `+0x534==1` 且 `+0x6E4==1` ⇒ 渲染完成图。正常，不用改。
+          * `'buildup'` = `+0x534!=1` 且 `+0x10C!=0` 且 `+0xAC!=5`
+                          ⇒ 引擎判"还在建造"⇒ 重载后**播一遍完整 Buildup 就停**，播完正常。
+                          **合法中间态，观感最好**（原始A / I / H），**不要修**。
+          * `'stuck'`   = `+0x534==1` 但 `+0x6E4==0`
+                          ⇒ 矛盾态：既不接受"已完成"也不重播动画 ⇒ **显示不全**（A/B/D）。
+                          修法 = 写 `+0x6E4=1`（1 字节）跳到完成图。
+          * `'frozen'`  = `+0x534!=1` 但 `+0x10C==0`
+                          ⇒ 建造中却"动画不在播"⇒ 根本不播、停在残缺帧 ⇒ **显示不全**（J/L）。
+                          修法 = 写 `+0x10C=2`（并保证 `+0xAC!=5`）。
+          * `'loop'`    = `+0x534!=1`、`+0x10C!=0` 但 `+0xAC==5`
+                          ⇒ 建造动画**播不完** ⇒ 一直重播（K 档实测）。
+                          修法 = 写 `+0xAC=18`。
+
+        `pending` 为兼容旧调用保留 = `state in ('stuck','frozen','loop')`（= 需要修）。
+        """
+        base = int(base)
+        if base - 52 < 0 or base + max(self.BLD_ANIM_OFF.values()) + 4 > len(self.plain):
+            raise RuntimeError('base=0x%08X 越界' % base)
+        vt = struct.unpack_from('<I', self.plain, base - 52)[0]
+        if vt != self.BLD_VTABLE:
+            raise RuntimeError('base=0x%08X 处不是设施建筑（vtable=%08X，期望 %08X）'
+                               % (base, vt, self.BLD_VTABLE))
+        vals = {}
+        for k, off in self.BLD_ANIM_OFF.items():
+            if k in self.BLD_ANIM_U8:
+                vals[k] = self.plain[base + off]          # ★+0x6E4 是单字节标志
+            else:
+                vals[k] = struct.unpack_from('<I', self.plain, base + off)[0]
+        finished = (vals['+0x534'] == 1)
+        accepted = bool(vals['+0x6E4'])
+        playing = (vals['+0x10C'] != 0)
+        if finished:
+            state = 'done' if accepted else 'stuck'
+        elif not playing:
+            state = 'frozen'
+        elif vals['+0xAC'] == 5:
+            state = 'loop'
+        else:
+            state = 'buildup'
+        # 找类型名（仅用于提示）
+        nm = ''
+        try:
+            for b in self.buildings():
+                if b['base'] == base:
+                    nm = b['type']
+                    break
+        except Exception:
+            pass
+        if state == 'stuck':
+            txt = ('⚠ 卡住（显示不全）：+0x534=1（已完成）但 +0x6E4=0（动画没结束标记），'
+                   '引擎既不播动画也不渲染完成图 ⇒ 这栋在地图上是残缺的。\n'
+                   '   修法：写 1 个字节 +0x6E4=1（跳到完成图），'
+                   '或改成「建造中」形态让它重播一遍建造动画。')
+        elif state == 'frozen':
+            txt = ('⚠ 不会播（显示不全）：+0x534=0（没建完）但 +0x10C=0（动画不在播），'
+                   '引擎既不播建造动画也不给完成图 ⇒ 又是"显示不全"。\n'
+                   '   修法：写 +0x10C=2（并确保 +0xAC≠5）让它重播，或直接写成完成态。')
+        elif state == 'loop':
+            txt = ('⚠ 会一直播（死循环）：+0x534=0、+0x10C=2 但 +0xAC=5，'
+                   '建造动画播不完 ⇒ 无限重播。\n'
+                   '   修法：写 +0xAC=18（GAPOWR 的"建造中"值），或直接写成完成态。')
+        elif state == 'buildup':
+            if vals['+0xD0'] >= self.BLD_D0_REPLAY:
+                txt = ('⚠ 建造中，但 +0xD0=%d（≥2，进度已满）⇒ 进游戏会**播两遍**完整建造动画'
+                       '才正常（P/R 档 in-game 实测）。\n'
+                       '   想只播一遍：把 +0xD0 改成 1（API `make_building_buildup()` 默认就写 1）。'
+                       % vals['+0xD0'])
+            else:
+                txt = ('✅ 建造动画未播完（合法中间态，不是坏档）⇒ 进游戏重载后会自动播一遍'
+                       '完整的 Buildup 然后停住，观感最好。\n'
+                       '   想让它直接显示完成图才用「跳到完成态」；想要动画就什么都别改。')
+        else:
+            txt = '✅ 已完成（+0x534=1 且 +0x6E4=1），直接显示完成图'
+        return {'base': base, 'type': nm, 'vals': vals, 'state': state,
+                'done_mark': finished and accepted, 'accepted': accepted,
+                'pending': state in ('stuck', 'frozen', 'loop'),   # 兼容旧字段 = 需要修
+                # ★§171：buildup 且 +0xD0 过大 ⇒ 会播两遍（不是坏档，但可一键优化成一遍）
+                'replay': state == 'buildup' and vals['+0xD0'] >= self.BLD_D0_REPLAY,
+                'phase': vals['+0xD0'], 'text': txt}
+
+    def anim_phase_default(self, type_key, base=None):
+        """取「同类型建筑」的 `+0xD0` 众数，当完成度缺省值（§169 in-game 定案）。
+
+        为什么不硬编码 100：`+0xD0` 的正常值随建筑类型变 —— GAPOWR=100，ATESLA=14/15/16。
+        唯一可靠的取法是**在同一存档里找同类建筑的众数**（坏的那栋自己是少数派）。
+        → {'phase': int|None, 'src': 'peers'|'whitelist'|'none', 'n': 同类样本数}
+        """
+        import collections
+        cnt = collections.Counter()
+        n = 0
+        try:
+            for b in self.buildings():
+                if b['type'] != type_key or b['base'] == base:
+                    continue
+                off = b['base'] + self.BLD_ANIM_OFF['+0xD0']
+                if off + 4 > len(self.plain):
+                    continue
+                cnt[struct.unpack_from('<I', self.plain, off)[0]] += 1
+                n += 1
+        except Exception:
+            pass
+        if cnt:
+            return {'phase': cnt.most_common(1)[0][0], 'src': 'peers', 'n': n}
+        # 无同类参照：只有"全库已知"的类型才敢给值，其余不写
+        if type_key in self.BLD_ANIM_PHASE_HINT:
+            return {'phase': self.BLD_ANIM_PHASE_HINT[type_key], 'src': 'whitelist', 'n': 0}
+        return {'phase': None, 'src': 'none', 'n': 0}
+
+    def repair_building_anim(self, base, force=False, phase=None, full=False):
+        """把「显示不全 / 一直播」的建筑修好（§170 十四档定稿，in-game 已验）→ dict。
+
+        ★五态语义见 `building_anim_state()`：只有 `stuck / frozen / loop` 需要修。
+          * `'stuck'`   ⇒ 补 `+0x6E4=1`（E 档：A→E 只差这 1 字节，显示正常）
+          * `'frozen'`  ⇒ 写全套完成态 4 字段（`AC=5/10C=0/534=1/6E4=1`）
+          * `'loop'`    ⇒ 同上（直接跳到完成图，不再无限播）
+          * `'buildup'` ⇒ **拒绝**（合法中间态，重载会播完整动画；修了就没动画了）
+          * `'done'`    ⇒ 不用改
+        ⚠ 想让建筑**播一遍建造动画**别用这个函数，用 `make_building_buildup()`。
+
+        `full=True` ⇒ 写全套 `BLD_ANIM_OK`（4 项），彻底对齐"原始好档"。
+        `phase=<int>` ⇒ 额外写 `+0xD0`（默认不写：F 档已证与渲染无关）。
+        `force=True` ⇒ 跳过状态判定，硬写。
+        ⚠ 只改 1~4 个字段（`+0x6E4` 只写 **1 字节**），不动明文长度 ⇒ 不用改记录长度。
+        """
+        st = self.building_anim_state(base)
+        old = dict(st['vals'])
+        state = st['state']
+        if not force and state in ('done', 'buildup'):
+            why = ('这是合法中间态：进游戏会播一遍完整建造动画后自动正常，不要修'
+                   if state == 'buildup' else '已经是完成态，无需修改')
+            return {'old': old, 'new': dict(old), 'changed': False, 'state': state,
+                    'phase_src': 'skip', 'type': st.get('type', ''), 'reason': why}
+        base = int(base)
+        if full:
+            plan = dict(self.BLD_ANIM_OK)
+        elif state == 'stuck':
+            plan = dict(self.BLD_ANIM_MIN_FIX)      # 1 字节就够（A→E 已证）
+        else:                                       # frozen / loop
+            plan = dict(self.BLD_ANIM_OK)           # 直接写成完成态 4 个字段
+        if phase is None:
+            # ★F 档实测：`+0xD0` 保持坏值也显示正常 ⇒ 与渲染无关，**默认不碰**
+            phase_src = 'skip'
+        else:
+            plan['+0xD0'] = int(phase)
+            phase_src = 'explicit'
+        self._apply_anim_plan(base, plan)
+        return {'old': old, 'new': plan, 'changed': True, 'state': state,
+                'phase_src': phase_src, 'type': st.get('type', ''), 'reason': ''}
+
+    def _apply_anim_plan(self, base, plan):
+        """按 {字段: 值} 写动画字段（`+0x6E4` 只写 1 字节）。"""
+        base = int(base)
+        for k, want in plan.items():
+            k = self.BLD_ANIM_OFF_ALIAS.get(k, k)
+            o = base + self.BLD_ANIM_OFF[k]
+            if k in self.BLD_ANIM_U8:
+                self.plain[o] = int(want) & 0xFF      # ★单字节：不碰高 3 字节
+            else:
+                struct.pack_into('<I', self.plain, o, int(want))
+        self._live_len = None
+
+    def make_building_buildup(self, base, full=True, ac=None):
+        """让一栋建筑**重播一遍完整建造动画**（§170 十四档 + §171 四档，in-game 定稿）→ dict。
+
+        工序：完成态（`AC=5, 10C=0, 534=1, 6E4=1`）→ 建造中（`AC=18, BC=1, D0=1, 10C=2, 534=0`）。
+        in-game 已验：M 档（GAPOWR 完成态→建造中）**播一遍建造动画，正常**；
+        N2 档（同上配方写在新加的 ATESLA/光棱塔上）**也播一遍，正常** ⇒ **跨类型通用**。
+
+        ★★`+0xD0` **必须写 1**（§171 P/Q/R 三档单变量）：
+          只改 `D0=100`（P）⇒ 播两遍；只改 `BC=0`（Q）⇒ 播一遍；两项都改（R）⇒ 播两遍
+          ⇒ 「多播一遍」的唯一原因是 `+0xD0 ≠ 1`，`+0xBC` 无关。
+          ⚠ 老 MIN 配方只写 AC/10C/534，会把完成态的 `D0=100` 留下 ⇒ 一定播两遍。
+
+        `full=True`（**默认**，= M 档原样）⇒ 5 个字段，含 `+0xBC=1`。
+        `full=False`            ⇒ 4 个字段（省 `+0xBC`，Q 档证明播放次数不受影响）。
+        `ac=None`   ⇒ 默认 18（跨类型已验证），可显式覆盖。
+        `+0x6E4` **一律不写**（A vs H 已证建造分支无关，H 档 `6E4=1` 也照样播）。
+        """
+        st = self.building_anim_state(base)
+        old = dict(st['vals'])
+        tk = st.get('type', '')
+        plan = dict(self.BLD_ANIM_BUILDUP_FULL if full else self.BLD_ANIM_BUILDUP_MIN)
+        if ac is not None:
+            plan['+0xAC'] = int(ac)
+        elif tk in self.BLD_ANIM_AC_BUILDUP:
+            plan['+0xAC'] = self.BLD_ANIM_AC_BUILDUP[tk]
+        self._apply_anim_plan(base, plan)
+        return {'old': old, 'new': plan, 'changed': True, 'type': tk,
+                'state_before': st['state'],
+                'replay': bool(st['state'] == 'buildup' and old.get('+0xD0', 0) >= self.BLD_D0_REPLAY)}
+
+    # ---------------- 赠送建筑（2026-10-15 定案，游戏内验收：T3"就绪"✅） ----------------
+    # 建筑组：[u32 组计数][ 记录×N ]，记录 = [16B 类 GUID][1844B 载荷] = 1860B
+    BLD_REC_GUID = bytes.fromhex('c62d270e0f9cd111b70900a024ddafd1')
+    FACTORY_GUID = bytes.fromhex('a8d9ec34b00ad211aca7006008055bb5')
+    QUEUE_ANCHOR_GUID = bytes.fromhex('666dbb2e4d0dd2118172006008055bb5')
+    HOUSE_GUID = bytes.fromhex('10a9d4d9c687d111b70700a024ddafd1')
+    # FactoryClass 104B 模板（「电厂就绪未放下.SAV」逐字节照抄；+20 自键按档改写避撞）
+    FACTORY_BLOB = bytes.fromhex(
+        '01000000a8d9ec34b00ad211aca7006008055bb5804f2210d0887e00b4887e00'
+        'ac887e00a4887e007fa30f009899e93f00000000000000000060221036000000'
+        '010000001d0200008bfd620000000000000000000100000034897e0000000000'
+        '000000000100ffff')
+    QUEUE_CONST_PTR = 0x0f8e63e0      # 队列条目固定指针（三档恒在，照抄）
+
+    # ---- rules 解析（可建造判据：TechLevel>=1，用户钦定 2026-10-15）----
+    _RULES_PATHS = [
+        r'E:\YURI\rulesmd.ini',
+        r'E:\YURI\rulesmd - 原版副本.ini',
+        r'C:\Users\zhao5\Desktop\WorkBuddy\红警MOD制作素材工具与教程\rulesmd - 原版副本.ini',
+    ]
+    _rules_cache = None
+    _rules_buildcat = {}          # {类型名: BuildCat}（Combat ⇒ 侧栏防御栏/槽组2）
+    _rules_prereq = {}            # {类型名: Prerequisite 原串}（用于就绪赠送的前置诊断）
+    _rules_image = {}             # {类型名: Image=}（→ artmd 节名，用于查 Foundation）
+    _rules_power = {}             # {类型名: Power=}（正=发电 / 负=耗电；2026-10-17）
+    # rules 前置里的别名 ⇒ 实际类型（判"前置是否满足"用）
+    _PREREQ_ALIAS = {'POWER': ('GAPOWR', 'NAPOWR'), 'PROC': ('GAREFN', 'NAREFN'),
+                     'BARRACKS': ('GAPILE', 'NAHAND'), 'RADAR': ('GAAIRC', 'NARADR'),
+                     'FACTORY': ('GAWEAP', 'NAWEAP'), 'TECH': ('GATECH', 'NATECH')}
+
+    @classmethod
+    def _rules_info(cls):
+        """解析 rules ini → (建筑类型名集合, {类型名: TechLevel})；读不到返回 ({}, {})"""
+        if cls._rules_cache is not None:
+            return cls._rules_cache
+        buildings, tl = set(), {}
+        cls._rules_buildcat = {}
+        cls._rules_prereq = {}
+        cls._rules_image = {}
+        cls._rules_power = {}
+        for p in cls._RULES_PATHS:
+            if not os.path.exists(p):
+                continue
+            try:
+                raw = open(p, 'rb').read()
+                for enc in ('utf-16', 'utf-8', 'gbk'):
+                    try:
+                        txt = raw.decode(enc)
+                        if '[' in txt:
+                            break
+                    except Exception:
+                        continue
+                sec = None
+                for line in txt.splitlines():
+                    line = line.split(';')[0].strip()
+                    if line.startswith('[') and line.endswith(']'):
+                        sec = line[1:-1].strip()
+                        continue
+                    if not sec or '=' not in line:
+                        continue
+                    k, v = line.split('=', 1)
+                    k = k.strip().upper()
+                    v = v.strip()
+                    if sec.upper() == 'BUILDINGTYPES':
+                        nm = v.split(',')[0].split(':')[0].strip().upper()
+                        if nm:
+                            buildings.add(nm)
+                            if not hasattr(cls, '_rules_order'):
+                                cls._rules_order = []
+                            cls._rules_order.append(nm)
+                    elif sec in buildings or k in ('TECHLEVEL', 'BUILDCAT', 'PREREQUISITE',
+                                                   'IMAGE', 'POWER'):
+                        if k == 'TECHLEVEL':
+                            try:
+                                tl[sec.upper()] = int(v)
+                            except ValueError:
+                                pass
+                        elif k == 'BUILDCAT':
+                            # ★BuildCat 决定侧栏归属：Combat ⇒ 「防御」栏（槽组2），
+                            #   其余（Power/Resource/Tech/…）⇒ 「建筑」栏（槽组1）。
+                            cls._rules_buildcat[sec.upper()] = v.strip().upper()
+                        elif k == 'PREREQUISITE':
+                            cls._rules_prereq[sec.upper()] = v.strip().upper()
+                        elif k == 'IMAGE':
+                            # art 节名可与类型名不同（Foundation 表按 art 节名索引）
+                            cls._rules_image[sec.upper()] = v.strip().upper()
+                        elif k == 'POWER':
+                            try:
+                                cls._rules_power[sec.upper()] = int(float(v))
+                            except ValueError:
+                                pass
+                if buildings:
+                    break
+            except Exception:
+                continue
+        cls._rules_cache = (buildings, tl)
+        return cls._rules_cache
+
+    _art_table_cache = None
+
+    @classmethod
+    def _type_sig_table(cls):
+        """类型签名表（core/type_signature.json）：每类型"天然实例间恒定"的
+        dword 字段快照（排除了键/序号/坐标/耐久/所属方/指针值域）。
+        跨类型克隆时整体覆写 —— 只改类型键+美术尺寸不够（ATESLA/GADEPT 显示不全教训）。"""
+        if cls._art_table_cache is not None:
+            return cls._art_table_cache
+        out = {}
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'type_signature.json')
+        if not os.path.exists(p) and getattr(sys, 'frozen', False):
+            p = os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                             '_internal', 'type_signature.json')
+        try:
+            out = json.load(open(p, encoding='utf-8'))
+        except Exception:
+            out = {}
+        cls._art_table_cache = out
+        return out
+
+    _SIG_HANDLED = {0, 20, 112, 116, 1352, 1316, 1608, 1612, 160, 164, 600, 604,
+                    1616, 1620, 208, 1828, 1832, 1836, 1840,
+                    1388, 1392, 1396, 1400}
+
+    @classmethod
+    def _buildable_index(cls, type_name):
+        """类型在 rules [BuildingTypes] 的 **0 基序号**（= 侧栏 strip 槽的 A 值，
+        2026-10-15 实证：GAPOWR 0→0、GAREFN 1→1、GAPILE 3→3、GAWEAP 7→7、GAOREP 73→73）。
+        不可建造（无序号）返回 None。"""
+        buildings, _tl = cls._rules_info()
+        if not buildings:
+            return None
+        order = cls._rules_order
+        try:
+            return order.index(type_name.upper())
+        except (ValueError, AttributeError):
+            return None
+
+    def template_health(self, g):
+        """记录与「类型签名」的吻合度 → `(bad, tot)`；`tot == 0` = 没有该类型签名，无法判断。
+
+        ★§184（2026-10-22）：用来识别"**那栋同类建筑本身就是我们放坏的**"。
+        实测（玩家档 ALL01UMD，6 栋）：
+          GAPOWR ×4 = 6/352、6/352、6/352、**9/352**；GACNST = 2/309；
+          我们早先跨类型放的那栋 ATESLA = **22/313**（带 83 个模板遗留指针）。
+        ⇒ 阈值 `bad < max(8, tot*5%)` 能把"原生/健康"与"被我们放坏"分开。
+        """
+        try:
+            key = struct.unpack_from('<I', self.plain, g + 16 + 1316)[0]
+        except Exception:
+            return 0, 0
+        name = next((n for n, k in self.building_types().items() if k == key), None)
+        info = self._type_sig_table().get((name or '').upper()) or {}
+        sig = info.get('sig') or {}
+        if not sig:
+            return 0, 0
+        bad = tot = 0
+        for off_s, v in sig.items():
+            off = int(off_s)
+            if off in self._SIG_HANDLED or off + 4 > self.BLD_SIZE:
+                continue
+            tot += 1
+            if struct.unpack_from('<I', self.plain, g + 16 + off)[0] != v:
+                bad += 1
+        return bad, tot
+
+    @staticmethod
+    def _health_ok(bad, tot):
+        """健康判据：无签名数据时放行；有签名时允许 < 5% 且 < 8 个字段不符。"""
+        return (tot == 0) or (bad < max(8, tot * 5 // 100))
+
+    def same_type_best(self, type_name):
+        """本档该类型里**最健康**的一栋 → `(g, bad, tot)`；一栋都没有返回 `(None, 0, 0)`。"""
+        tkey = self.building_types().get(str(type_name).upper())
+        if not tkey:
+            return None, 0, 0
+        best = (None, 0, 0)
+        for g in self._bld_group()[0]:
+            if struct.unpack_from('<I', self.plain, g + 16 + 1316)[0] != tkey:
+                continue
+            bad, tot = self.template_health(g)
+            if best[0] is None or (tot and bad < best[1]):
+                best = (g, bad, tot)
+        return best
+
+    def add_placed_readiness(self, type_name=None):
+        """能不能「直接落成」一栋建筑 → `(ok, 给玩家的一句话原因)`。
+
+        2026-10-17：全新开局的对战档里**一栋建筑都没有**（如 `ALL01UMD.sav` / `SAVE4823.SAV`），
+        建筑组 `[u32 n][记录…]` 整组不存在 ⇒ 无处克隆、无处追加。
+        从零造整组（含三张登记表 / 阵营建筑清单 / 格子占用）还没实装 ⇒ 这里诚实说明。
+
+        ★§184（2026-10-22 玩家「还是显示不全」定案）：给了 `type_name` 就再查一层 ——
+          **本档必须有一栋"健康的同类建筑"可当模板**。否则克隆出来就是残缺楼
+          （跨类型会把模板的指针表整块带过来；克隆我们早先放坏的那栋更是直接继承残缺）。
+          ⇒ 这种情况直接劝退，让玩家走「⚡ 触发法」（引擎自己造，模型一定完整）。
+        """
+        try:
+            hs, cnt = self._bld_group()
+        except Exception as ex:
+            return (False, '建筑组结构异常（%s）' % ex)
+        if not hs:
+            return (False, '这份存档里**一栋建筑都没有**（全新开局），没有建筑组可以克隆/追加')
+        if type_name:
+            tn = str(type_name).split('（')[0].strip().upper()
+            g, bad, tot = self.same_type_best(tn)
+            if g is None:
+                return (False,
+                        '本档没有「%s」这种建筑 ⇒ 直接落成得靠"跨类型克隆"，'
+                        '模板的指针表会被整块带过来 ⇒ 新楼会**显示不全**。\n'
+                        '请改用「⚡ 触发法」：由引擎自己造，模型/炮塔一定完整。' % tn)
+            if not self._health_ok(bad, tot):
+                return (False,
+                        '本档那一栋「%s」本身就**不完整**（与类型签名差 %d/%d 个字段，'
+                        '多半是之前用直接落成放坏的）⇒ 拿它当模板克隆，新楼照样残缺。\n'
+                        '请改用「⚡ 触发法」：由引擎自己造，模型/炮塔一定完整。' % (tn, bad, tot))
+        return (True, '')
+
+    def can_add_placed(self):
+        """直接落成是否可用。"""
+        return self.add_placed_readiness()[0]
+
+    def _bld_group(self):
+        """建筑组定位。返回 (guid_offs, count_off)；组计数≠记录数时拒绝（防弹框）。"""
+        pl = self.plain
+        hs, q = [], 0
+        while True:
+            i = pl.find(self.BLD_REC_GUID, q)
+            if i < 0:
+                break
+            hs.append(i)
+            q = i + 1
+        if not hs:
+            return [], None
+        cnt_off = hs[0] - 4
+        n = struct.unpack_from('<I', pl, cnt_off)[0]
+        if n != len(hs):
+            raise RuntimeError('建筑组计数 %d ≠ 记录数 %d（档结构异常，拒绝写入）' % (n, len(hs)))
+        return hs, cnt_off
+
+    @staticmethod
+    def _free_key(pl, start):
+        k = start
+        while pl.find(struct.pack('<I', k)) >= 0:
+            k += 4
+        return k
+
+    def _bld_tail(self, pl, hs):
+        """**建筑组的真实组尾**（新记录必须插在这）。
+
+        建筑组后面固定紧跟一条结构：`0c 00 00 00` + GUID
+        `d9338bae-1c06-11d2-aca4-008008055bb5`（四个母本实测全一致）。
+        ★记录长度**类型特有**（多数 1860；GAAIRC/AMRADR 等载荷 1856 ⇒ 1872），
+        所以**不能**一律按 `hs[-1] + 1860` 算组尾 —— 末栋是长记录时那样会把新记录
+        插进它尾部的 12 字节里，等于破坏那栋建筑（2026-10-16 弹框真因之一）。
+        """
+        p = bytes(pl).find(self.BLD_TAIL_MARK, hs[-1])
+        if 0 < p - hs[-1] < 4096:
+            return p
+        return hs[-1] + self.BLD_SIZE
+
+    # ------------------------------------------------------------------ #
+    # 克隆模板选择（2026-10-17 定案 = 「N27 弹框」的真因修法）
+    # ------------------------------------------------------------------ #
+    INJ_KEY_LO = 0x13963000      # 我们分配新建筑键的起点（_free_key 从这开始递增）
+    INJ_KEY_HI = 0x13968000      # 上限（只放两三栋，留足余量）
+
+    def _is_injected_key(self, k):
+        """该建筑键是否由**我们注入**（而非引擎原生写的记录）。
+
+        两个判据（任一成立即算注入）：
+          ① 键在本次会话的注入表里（最可靠）；
+          ② 键落在我们的键池区间 —— 存档被关掉再打开时注入表会丢，用区间兜底
+             （引擎重存过的新档会**重新分配全部键**，所以区间判据不会长期误伤）。
+        """
+        if k in getattr(self, '_injected_keys', ()):
+            return True
+        return self.INJ_KEY_LO <= k < self.INJ_KEY_HI
+
+    def _pick_bld_template(self, hs, pl, tkey):
+        """选一份"干净"的克隆模板 → `(tpl 偏移, cross 布尔)`。
+
+        ★★★★★ 2026-10-17 定案（`N27_苏俄电厂+塔` 载入弹框的真因）：
+          旧写法跨类型时 `tpl = hs[-1]` = **本档最后一栋**。连着加两栋不同类型时，
+          第一栋刚被我们插在组尾 ⇒ 第二栋就**克隆了我们刚注入的那条记录**（异类型 + 我们的补丁），
+          再把目标类型的签名盖上去 ⇒ **混血记录** ⇒ 引擎载入弹框。
+          实测铁证：N27 的 ATESLA 与能载入的 N20 有 64 处差异，**57 处逐字节等于
+          N27 里那栋 GAPOWR**（`+24=0x1b`、`+80=0x1e`、`+100=0x3c`… 全是电厂记录的
+          动画/实例态值），而 N20 的是本档 GAAIRC 的值。
+        ⇒ 规则（按优先级）：
+          ① 同类型 + **原生** + **已落位**（末栋优先）；
+          ② 同类型 + **已落位**（哪怕是注入的）；
+          ③ 同类型 + 原生（可能是未落位的空壳）；
+          ④ 同类型任意；
+          ⑤ 跨类型：从**原生 + 已落位**的记录里取（末栋优先）；
+          ⑥ 一栋都没有才退回 `hs[-1]`。
+
+        ★★★★★ 2026-10-17 补（玩家档"找不到建筑"暴露）：**"未落位"记录（坐标 = (-1,-1)）是空壳** ——
+          它的动画/实例态字段全 0（`+24=3`、`+80=0`、`+100=0`…），拿它当模板克隆出来的建筑
+          **在游戏里可能根本不出现**。实测：`韩国无任何建筑.SAV` 的**末栋**正好是 `ATESLA @(-1,-1)`，
+          所以 R1/R2 与 GUI 自己放的那栋全都克隆了这个空壳 ⇒ 玩家"找不到建筑"。
+          ⇒ 现在按 **(已落位 > 空壳)** 优先；同组内仍取末栋（保持"只加一栋"的旧行为）。
+        """
+        def placed(g):
+            cx = struct.unpack_from('<I', pl, g + 16 + 600)[0]
+            cy = struct.unpack_from('<I', pl, g + 16 + 604)[0]
+            return ((cx - 128) // 256) >= 0 and ((cy - 128) // 256) >= 0
+
+        same, native = [], []
+        for g in hs:
+            is_same = struct.unpack_from('<I', pl, g + 16 + 1316)[0] == tkey
+            is_native = not self._is_injected_key(struct.unpack_from('<I', pl, g + 16)[0])
+            if is_same:
+                same.append((g, is_native, placed(g)))
+            if is_native:
+                native.append((g, placed(g)))
+        for want_native, want_placed in ((True, True), (False, True), (True, False), (False, False)):
+            grp = [g for g, nv, pv in reversed(same)
+                   if nv == want_native and pv == want_placed]
+            if grp:
+                # ★§184：同类有多栋时取**与类型签名最吻合**的那栋（早先放坏的那栋会被跳过）
+                return min(grp, key=lambda _g: self.template_health(_g)[0]), False
+        # ★§184：跨类型模板要挑「指针表最干净」的那栋 —— 原来固定取"末栋原生建筑"，
+        #   而末栋常常是 **GACNST 建造厂（85 个运行期指针）**，整块指针被克隆进新楼
+        #   ⇒ 新楼渲染残缺（玩家：「显示不全，打一下才正常」）。
+        #   现在按「0x0F000000~0x14000000 段 dword 数」最少来挑（同分取末栋，保持旧行为）。
+        def _ptr_n(g):
+            return sum(1 for off in range(16, self.BLD_SIZE - 4, 4)
+                       if 0x0F000000 <= struct.unpack_from('<I', pl, g + off)[0]
+                       <= 0x14000000)
+
+        _cand = [g for g, pv in native if pv] or [g for g, _pv in native]
+        if _cand:
+            return min(reversed(_cand), key=_ptr_n), True
+        return hs[-1], True
+
+    # ------------------------------------------------------------------ #
+    # 伴随对象（476B，类 GUID c32d270e）—— 定位与"从零构造"
+    # ------------------------------------------------------------------ #
+    def companion_offsets(self, pl=None):
+        """定位本档全部伴随对象 → [(对象起点, 自身键)]。"""
+        pl = bytes(self.plain) if pl is None else bytes(pl)
+        out, q = [], 0
+        while True:
+            i = pl.find(self.COMP_MARK, q)
+            if i < 0:
+                break
+            q = i + 1
+            s = i - 0x10
+            if s < 0 or s + self.COMP_SIZE > len(pl):
+                continue
+            out.append((s, struct.unpack_from('<I', pl, s + self.COMP_KEY_OFF)[0]))
+        return out
+
+    def _find_comp_obj(self, pl, ck):
+        """按伴随键定位**伴随对象起点**（自身键在 对象+0x20，类 GUID 前 4 字节在 对象+0x10）。
+        找不到返回 None。★偏移无关，删字节前后都能用。"""
+        pat, q = struct.pack('<I', ck), 0
+        while True:
+            i = pl.find(pat, q)
+            if i < 0:
+                return None
+            q = i + 1
+            s = i - 0x20
+            if s >= 0 and s + self.COMP_SIZE <= len(pl) \
+                    and pl[s + 0x10:s + 0x14] == self.COMP_MARK:
+                return s
+
+    def _next_inst_id(self, pl, hs, extra=()):
+        """下一个可用的**实例 ID**。
+
+        ★建筑记录的 `+20` 与伴随对象的 `+52` **共用同一个 ID 计数器**：
+        母本 11 栋的 `+20`（0xfa357/0xfa35a/0xfa360/…）与 16 个伴随的 `+52`
+        （0xfa35c~0xfa35f/0xfa362/0xfa365/…）**在同一区间交错、互不重复**。
+        ⇒ 克隆伴随时也必须给它换一个全新 ID，否则重复（这很可能就是
+        `comp_mode='clone'` 当年"游戏卡死"的原因）。
+
+        `extra` = 本次已经分配、但**还没写进 pl** 的 ID（例如同一栋建筑的 `+20`），
+        必须一起避开，否则建筑与伴随会撞 ID。
+        """
+        vals = [struct.unpack_from('<I', pl, g + 16 + 20)[0] for g in hs]
+        vals += [struct.unpack_from('<I', pl, s + 0x34)[0]
+                 for s, _k in self.companion_offsets(pl)]
+        vals += [v for v in extra if v]
+        v = (max(vals) + 0x10) if vals else 0x000FA300
+        while struct.pack('<I', v) in pl or v in extra:
+            v += 4
+        return v
+
+    def companion_const_offsets(self, pl=None):
+        """本档全部伴随对象里**逐 dword 恒定**的偏移集合（= 类常量，改动它们没意义）。"""
+        pl = bytes(self.plain) if pl is None else bytes(pl)
+        comps = self.companion_offsets(pl)
+        if not comps:
+            return set()
+        bodies = [pl[s:s + self.COMP_SIZE] for s, _ in comps]
+        out = set()
+        for off in range(0, self.COMP_SIZE - 3, 4):
+            vals = {struct.unpack_from('<I', b, off)[0] for b in bodies}
+            if len(vals) == 1:
+                out.add(off)
+        return out
+
+    def companion_proto(self, pl=None):
+        """由本档现有伴随对象求「类常量原型」：逐 dword 取**全档恒定**的值，
+        变动字段一律 0。返回 476 字节 body（+0x20/+0xC0/+0xC4 由调用方填），无伴随时 None。
+
+        ★理由：引擎**自己新建**的伴随对象里也带着一堆临时指针（0x02CAxxxx 等），
+        说明加载器不依赖变动字段；而"整份克隆模板伴随"会带走模板的悬空指针 ⇒ 游戏卡死。
+        ⇒ 正确姿势 = 只抄类常量 + 写自身键/格，其余清零。
+        """
+        pl = bytes(self.plain) if pl is None else bytes(pl)
+        comps = self.companion_offsets(pl)
+        if not comps:
+            return None
+        bodies = [pl[s:s + self.COMP_SIZE] for s, _ in comps]
+        body = bytearray(self.COMP_SIZE)
+        for off in range(0, self.COMP_SIZE - 3, 4):
+            vals = [struct.unpack_from('<I', b, off)[0] for b in bodies]
+            if len(set(vals)) == 1:
+                struct.pack_into('<I', body, off, vals[0])
+        body[0x10:0x20] = bodies[0][0x10:0x20]      # 类 GUID 原样
+        struct.pack_into('<I', body, self.COMP_KEY_OFF, 0)
+        struct.pack_into('<I', body, self.COMP_CELLX_OFF, 0)
+        struct.pack_into('<I', body, self.COMP_CELLY_OFF, 0)
+        return bytes(body)
+
+    # ------------------------------------------------------------------ #
+    # 格子占用表（2026-10-16 定案）
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def _foundation_table(cls):
+        """artmd.ini 的 `Foundation=` 表 → {SECTION: (W, H)}（读不到返回 {}）"""
+        if cls._foundation_cache is not None:
+            return cls._foundation_cache
+        out = {}
+        for p in cls._ART_PATHS:
+            if not os.path.exists(p):
+                continue
+            try:
+                raw = open(p, 'rb').read()
+                txt = None
+                for enc in ('utf-16', 'utf-8', 'gbk'):
+                    try:
+                        s = raw.decode(enc)
+                        if '[' in s:
+                            txt = s
+                            break
+                    except Exception:
+                        continue
+                if not txt:
+                    continue
+                sec = None
+                for line in txt.splitlines():
+                    line = line.split(';')[0].strip()
+                    if line.startswith('[') and line.endswith(']'):
+                        sec = line[1:-1].strip().upper()
+                        continue
+                    if sec and '=' in line:
+                        k, v = line.split('=', 1)
+                        if k.strip().upper() == 'FOUNDATION':
+                            fv = v.strip().lower()
+                            if 'x' in fv:
+                                try:
+                                    w, h = fv.split('x')
+                                    out[sec] = (int(w), int(h))
+                                except Exception:
+                                    pass
+                if out:
+                    break
+            except Exception:
+                continue
+        cls._foundation_cache = out
+        return out
+
+    @classmethod
+    def power_of(cls, type_name):
+        """rules 里该建筑类型的 `Power=`（**正 = 发电 / 负 = 耗电**；查不到 = 0）。
+
+        例：GAPOWR +200、GATECH −100、ATESLA −75（本机 rulesmd 实测）。
+        """
+        if not type_name:
+            return 0
+        cls._rules_info()
+        return cls._rules_power.get(str(type_name).upper(), 0)
+
+    @classmethod
+    def foundation_of(cls, type_name):
+        """建筑占地 (W,H)：先按 rules 的 `Image=` 映射，其次同名 art 节；缺省 (1,1)。"""
+        t = (type_name or '').upper()
+        tb = cls._foundation_table()
+        img = (getattr(cls, '_rules_image', None) or {}).get(t, t)
+        return tb.get(img.upper()) or tb.get(t) or (1, 1)
+
+    def cell_offset(self, base, cx, cy):
+        """格条目偏移：base + 348 × (80·cx + 79·cy)"""
+        return base + self.CELL_STRIDE * (self.CELL_XK * cx + self.CELL_YK * cy)
+
+    # ---------- 格对象数组（2026-10-18 新增：与图尺寸无关） ----------
+    def cell_struct_array(self):
+        """定位「格对象」定长槽数组 → (起点, 槽数)；找不到返回 (None, 0)。
+
+        判据：槽 +0 是 16B 类 GUID `ce99bfc1-8c1a-d211-8175-006008055bb5`，
+        连续等距排布（实测 80×80 小图 12720 槽、203×295 大图 61030 槽）。
+        """
+        pl = self.plain
+        first = pl.find(self.CELL_STRUCT_GUID)
+        if first < 0:
+            return None, 0
+        last = pl.rfind(self.CELL_STRUCT_GUID)
+        n = (last - first) // self.CELL_STRUCT_STRIDE + 1
+        if n < self._CELL_STRUCT_MIN:
+            return None, 0
+        step = max(1, n // 64)
+        for i in range(0, n, step):
+            s = first + i * self.CELL_STRUCT_STRIDE
+            if bytes(pl[s:s + 16]) != self.CELL_STRUCT_GUID:
+                return None, 0
+        return first, n
+
+    def cell_struct_slots(self, key):
+        """该对象键占用的全部格槽起点（0 个 = 不占地）。"""
+        first, n = self.cell_struct_array()
+        if first is None or not key:
+            return []
+        pl = self.plain
+        out = []
+        for i in range(n):
+            s = first + i * self.CELL_STRUCT_STRIDE
+            if struct.unpack_from('<I', pl, s + self.CELL_STRUCT_OCC)[0] == key:
+                out.append(s)
+        return out
+
+    def clear_cell_slots(self, key):
+        """把该键占用的格清成"空"（4 个字段全 0）→ 返回清掉的格数。
+
+        为什么是这 4 个字段：逐字段对比引擎"未卖→卖掉"的同一批格，
+        变化的正是 +0xF0(=1→0，绘制标志) / +0xF8(占用键) / +0x114 / +0x138。
+        漏掉 +0xF0 的话格子仍被当成"有建筑"，画面会留在原地。
+        """
+        pl = self.plain
+        slots = self.cell_struct_slots(key)
+        for s in slots:
+            for off in self.CELL_STRUCT_CLEAR:
+                struct.pack_into('<I', pl, s + off, 0)
+        return len(slots)
+
+    def occupy_cells_exact(self, type_name, cx, cy, key, ref_key):
+        """按**真实字段**把 (cx,cy) 起的地基写成 key 占用（零增长）。
+
+        ★2026-10-21（修 #2，放置法卡死的头号嫌疑）：
+          旧的 `occupy_cells()` 把键写进 **格+0**，而格+0 是全档常量 `0xC1BF99CE`（类指针）
+          ⇒ 写下去就是把类指针改坏；更糟的是它常因"定位不到格表"**静默失败**，
+          于是存档变成"建筑记录说占这格、格子上却什么都没有" —— 卡死档就是这么来的
+          （实测：cell(98,130) 的 +F0/+F8/+114/+138 全是 0）。
+          正确做法与删除法对称：写 `CELL_STRUCT_CLEAR = (+0xF0, +0xF8, +0x114, +0x138)`，
+          非 0 值照抄本档一栋同型号建筑那一格的实测值。
+        """
+        pl = self.plain
+        co = self.cell_offsets()
+        if not co:
+            return False, '定位不到格子表'
+        ref_slots = self.cell_struct_slots(ref_key)
+        if not ref_slots:
+            return False, '参照建筑没有格条目'
+        # ★各字段取**同型号已占格的众数**，别只抄一栋 —— 那栋可能在建造中（实测 +F0 有 1/2/512/1024 多种）
+        import collections as _c
+        tmpl = {}
+        try:
+            hs, _cnt = self._bld_group()
+            tk = self.building_types().get(str(type_name).upper())
+            banks = {o: _c.Counter() for o in self.CELL_STRUCT_CLEAR}
+            for g in hs:
+                if struct.unpack_from('<I', pl, g + 16 + 1316)[0] != tk:
+                    continue
+                k2 = struct.unpack_from('<I', pl, g + 16)[0]
+                for s2 in self.cell_struct_slots(k2)[:1]:
+                    if struct.unpack_from('<I', pl, s2 + 0xF8)[0] != k2:
+                        continue
+                    for o in self.CELL_STRUCT_CLEAR:
+                        banks[o][struct.unpack_from('<I', pl, s2 + o)[0]] += 1
+            for o in self.CELL_STRUCT_CLEAR:
+                if banks[o]:
+                    tmpl[o] = banks[o].most_common(1)[0][0]
+            # ★+0xF0 用 **1**：删除法那条硬证据是"卖掉时 +0xF0 1→0（绘制标志）"，
+            #   即 1 = 有建筑。众数会捞到 512/1024 这类"多格建筑的子格掩码"，对 1x1 反而错。
+            tmpl[0xF0] = 1
+        except Exception:
+            tmpl = {}
+        if not tmpl.get(0xF8):
+            s0 = ref_slots[0]
+            tmpl = {off: struct.unpack_from('<I', pl, s0 + off)[0]
+                    for off in self.CELL_STRUCT_CLEAR}
+        if not tmpl.get(0xF8):
+            return False, '参照格本身没写占用键'
+        W, H = self.foundation_of(type_name)
+        n, miss = 0, 0
+        for i in range(W):
+            for j in range(H):
+                off = co.get((cx + i, cy + j))
+                if not off:
+                    miss += 1
+                    continue
+                if struct.unpack_from('<I', pl, off)[0] != 0xC1BF99CE:
+                    # 格+0 不是本档常量 ⇒ 这不是一个"正常格子"，别乱写
+                    miss += 1
+                    continue
+                for fo in self.CELL_STRUCT_CLEAR:
+                    v = key if fo == 0xF8 else tmpl[fo]
+                    struct.pack_into('<I', pl, off + fo, v)
+                n += 1
+        if not n:
+            return False, '地基 %d 格一格都没写上（格表对不上）' % (W * H)
+        note = '占格 %dx%d = %d 格（按 +F0/+F8/+114/+138 写，参照 %08X）' % (
+            W, H, n, ref_key)
+        if miss:
+            note += '；⚠ %d 格没写（越界/非正常格）' % miss
+        return True, note
+
+    def _cell_base(self, pl=None):
+        """定位格子占用表的基准（每档不同）。用本档已有建筑反解 + 互相印证。
+
+        ★2026-10-18：本函数依赖 `CELL_XK/YK = 80/79`，**只对 80×80 小图成立**；
+          203×295 的大任务图上返回 None。删除建筑已改走 `cell_struct_slots()`
+          （与图尺寸无关），本函数仅作老路径兜底保留。
+        ★2026-10-17 修（玩家档 `韩国无任何建筑.SAV` 暴露）：**未落位**的建筑（坐标 = (-1,-1)，
+          本档 35 栋 Neutral/Special 就是）**没有格条目** ⇒ 它们既不能投票也不能计入分母，
+          否则"全中才算成功"的判据永远不成立 ⇒ 整张表定位失败（`occupy_cells` 直接放弃写格）。
+          ⇒ 现在只统计 `cx,cy ≥ 0` 的建筑。
+        """
+        pl = self.plain if pl is None else pl
+        memo = getattr(self, '_cellbase_memo', None)
+        if memo and memo[0] == len(pl):
+            return memo[1]
+        # ★★2026-10-17 22:3x 快路径（39MB 档 21.8s → 0.1s）：
+        #   格对象本身就是那条 348B 步长表里的记录（自键 +16、坐标 +56）⇒
+        #   拿任意一个格对象就能反解 base = 记录偏移 − 348×(80x+79y)，再多取几个交叉验证。
+        #   旧写法对**每栋建筑**都要全档 find 一次（2054 栋 × 39MB ≈ 21 秒）。
+        if pl is self.plain:
+            try:
+                self._cell_by_key()
+                coff = getattr(self, '_cell_offs', None) or {}
+                if len(coff) >= 8:
+                    items = list(coff.items())[:6]
+                    j0, (x0, y0) = items[0]
+                    b0 = j0 - self.CELL_STRIDE * (self.CELL_XK * x0 + self.CELL_YK * y0)
+                    ok = sum(1 for j, (x, y) in items[1:]
+                             if self.cell_offset(b0, x, y) == j)
+                    if ok >= max(1, len(items) - 2):
+                        self._cellbase_memo = (len(pl), b0)
+                        return b0
+            except Exception:
+                pass
+        hs, _ = self._bld_group()
+        votes = {}
+        placed = []                     # 只留"已落位"的建筑
+        for g in hs:
+            o = g + 16
+            k = struct.unpack_from('<I', pl, o)[0]
+            if not k:
+                continue
+            cx = (struct.unpack_from('<I', pl, o + 600)[0] - 128) // 256
+            cy = (struct.unpack_from('<I', pl, o + 604)[0] - 128) // 256
+            if cx < 0 or cy < 0:
+                continue                # 未落位（-1,-1）⇒ 无格条目
+            placed.append((k, cx, cy))
+            idx = self.CELL_XK * cx + self.CELL_YK * cy
+            pat = struct.pack('<I', k)
+            q = 0
+            while True:
+                i = pl.find(pat, q)
+                if i < 0:
+                    break
+                q = i + 1
+                # ★base 是**负锚**（本档可正可负），只做线性锚点，不与 0 比较
+                b = i - self.CELL_STRIDE * idx
+                votes[b] = votes.get(b, 0) + 1
+        best, bestscore, ntot = None, 0, 0
+        ntot = len(placed)
+        for b, _c in sorted(votes.items(), key=lambda kv: -kv[1]):
+            sc = 0
+            for (k, cx, cy) in placed:
+                p = self.cell_offset(b, cx, cy)
+                if 0 <= p <= len(pl) - 4 and struct.unpack_from('<I', pl, p)[0] == k:
+                    sc += 1
+            if sc > bestscore:
+                best, bestscore = b, sc
+            if ntot and sc == ntot:
+                break
+        # ★多数判定：允许"个别建筑没有格条目"（例如工具刚注入还没写格子的那栋）
+        need = max(1, ntot - 1) if ntot > 1 else 1
+        if bestscore < need:
+            best = None
+        self._cellbase_memo = (len(pl), best)
+        return best
+
+    def _cell_pos_map(self):
+        """{(x, y): 格记录偏移} —— 直接来自格对象扫描（`_cell_by_key` 顺手建的偏移表）。
+
+        ★2026-10-17 22:4x：**绕开 `_cell_base` 的线性推算**。
+          格表系数（80x+79y）随地图尺寸/朝向而变（大任务档实测是 179x+180y），
+          硬算 base 会失败，而失败后要"每栋建筑全档 find"来投票（2054 栋 = 21 秒）。
+          既然每个格记录自带坐标(+56)和自键(+16)，直接建 (x,y)→偏移 的字典即可，
+          写占用时用字典查，根本不需要 base。
+        """
+        self._cell_by_key()
+        coff = getattr(self, '_cell_offs', None) or {}
+        out = {}
+        for j, xy in coff.items():
+            out.setdefault(xy, j)
+        return out
+
+    def occupy_cells(self, pl, type_name, cx, cy, key):
+        """把 (cx,cy) 起 WxH 的格子占用写成 key —— **零增长**（只改原地字段）。
+        返回 (ok, note)。检测到格子上已有别的占用者会如实报出（不静默覆盖）。"""
+        pos_map = self._cell_pos_map() if pl is self.plain else None
+        base = None
+        if pos_map is None:
+            base = self._cell_base(pl)
+            if base is None:
+                return False, '未能定位格子占用表（本档无可用参照建筑）'
+        W, H = self.foundation_of(type_name)
+        out, conflict = 0, []
+        for i in range(W):
+            for j in range(H):
+                if pos_map is not None:
+                    p = pos_map.get((cx + i, cy + j))
+                    if p is None:
+                        continue
+                else:
+                    p = self.cell_offset(base, cx + i, cy + j)
+                if p < 8 or p + 4 > len(pl):
+                    continue
+                cur = struct.unpack_from('<I', pl, p)[0]
+                if cur not in (0, key):
+                    conflict.append((cx + i, cy + j, cur))
+                struct.pack_into('<I', pl, p, key)
+                # ★引擎放置时的实测：**同格前后档**（能建 (77,55) 空 → 放下光棱塔 被原生 ATESLA 占用）
+                #   `cell−8` 与 `cell+0x1C` 都从 0 → 1。用 `|= 1` 写（原值已 1 的格子不变，
+                #   可避免误伤同一 dword 上的其它位）。
+                for fo in (self.CELL_FLAG_OFF, self.CELL_FLAG2_OFF):
+                    q = p + fo
+                    if 0 <= q <= len(pl) - 4:
+                        struct.pack_into('<I', pl, q,
+                                         struct.unpack_from('<I', pl, q)[0] | 1)
+                out += 1
+        if not out:
+            return False, '%s 的占格落点越界' % type_name
+        note = '占格 %dx%d = %d 格' % (W, H, out)
+        if conflict:
+            note += '；⚠ %d 格上已有其它占用者（已覆盖）：%s' % (
+                len(conflict), [(x, y, hex(v)) for x, y, v in conflict[:4]])
+        self._cellbase_memo = None
+        return True, note
+
+    def house_keys(self):
+        """{阵营短名: House 对象键}（**防重入**包装，见 find_house_econ 的说明）。"""
+        self._invalidate_if_shifted()
+        memo = getattr(self, '_house_keys_memo', None)
+        if memo is not None and memo[0] == len(self.plain):
+            return memo[1]
+        if getattr(self, '_house_keys_busy', False):
+            return {}
+        self._house_keys_busy = True
+        try:
+            return self._house_keys_impl()
+        finally:
+            self._house_keys_busy = False
+
+    def _house_keys_impl(self):
+        self._invalidate_if_shifted()
+        """{阵营短名: House 对象键}（标准 12 阵营；自定义所属方任务返回自定义名）。
+
+        ★★★ 2026-10-17 定案，两档实测（母本 12/12、大任务档 12/12）：
+          · 明文里有 12 个 `HOUSE_GUID`(D9D4A910…) **对象**，键在 `对象+16`；
+          · 每个 House 对象**内部**带 ASCII 名串 `"<短名> House"`（如 `Americans House`），
+            且该串一定落在「本对象起点 ≤ 串 < 下一个对象起点」区间内
+            （母本 0x4ff935 ∈ [0x4e992d,0x50071d) → Americans ✓ …12/12）；
+          · 名串缺失时退回「文件序 = HOUSE_ORDER」。
+        ⚠ `_player_house_key()` 的"引用最多"启发式**只对 12 阵营对局可靠**：
+          大任务档里 Russians 引用 1057 次而玩家 Americans 只有 67 次 —— **别用它认玩家**，
+          认阵营一律走本方法（名串）。
+        """
+        memo = getattr(self, '_house_keys_memo', None)
+        if memo is not None and memo[0] == len(self.plain):
+            return memo[1]
+        pl = bytes(self.plain)
+        objs, q = [], 0
+        while True:
+            i = pl.find(self.HOUSE_GUID, q)
+            if i < 0:
+                break
+            objs.append((i, struct.unpack_from('<I', pl, i + 16)[0]))
+            q = i + 1
+        out = {}
+        if not objs:
+            self._house_keys_memo = (len(self.plain), out)
+            return out
+        # 自定义所属方任务：名字取自 find_custom_houses()
+        names = list(HOUSE_ORDER)
+        try:
+            cust = self.find_custom_houses()
+            # ★2026-10-18：如果 econ 正在算（说明是它调我们）⇒ **不要反过来再问它**，
+            #   否则就是互相递归（原来正是这样递归了 498 层）。
+            #   此时保持标准 12 阵营名，让 econ 拿到完整的 House 键表去跑它的兜底判据；
+            #   econ 算完后会用同一份名字（它的结果 ≥6 时本函数也走标准名），结论一致。
+            econ_busy = getattr(self, '_house_econ_busy', False)
+            if cust and not econ_busy and \
+                    sum(1 for v in self.find_house_econ().values() if v) < 6:
+                names = [self.norm_house(x['name']) for x in cust]
+        except Exception:
+            pass
+        used = set()
+        for nm in names:
+            for suffix in ('%s House' % nm, nm):
+                pat = suffix.encode('latin1', 'ignore')
+                if not pat:
+                    continue
+                hit = -1
+                q = 0
+                while True:
+                    i = pl.find(pat, q)
+                    if i < 0:
+                        break
+                    q = i + 1
+                    # 落在某个 House 对象之后、下一个 House 对象之前 ⇒ 归它
+                    cand = None
+                    for k, (off, key) in enumerate(objs):
+                        if off <= i:
+                            cand = (k, key)
+                        else:
+                            break
+                    if cand and cand[1] not in used:
+                        hit = cand[1]
+                        break
+                if hit >= 0:
+                    out[nm] = hit
+                    used.add(hit)
+                    break
+        # 名串没覆盖到的：按文件序补
+        rest_obj = [k for _o, k in objs if k not in used]
+        for nm in names:
+            if nm not in out and rest_obj:
+                out[nm] = rest_obj.pop(0)
+        self._house_keys_memo = (len(self.plain), out)
+        return out
+
+    def resolve_house(self, house):
+        """把「阵营短名 / 中文名 / House 对象键(int) / None」统一成 House 对象键。
+
+        None ⇒ 返回 None（= 调用方保持原值不改）。认不出 ⇒ 抛异常（不静默）。"""
+        if house is None:
+            return None
+        if isinstance(house, int):
+            return house
+        s = str(house).strip()
+        if not s:
+            return None
+        if re.fullmatch(r'0[xX][0-9a-fA-F]{1,8}|\d{6,}', s):
+            return int(s, 0)
+        hk = self.house_keys()
+        if s in hk:
+            return hk[s]
+        s2 = self.norm_house(s)                  # 容忍 "Americans House" 这种带后缀写法
+        if s2 in hk:
+            return hk[s2]
+        for short, key in hk.items():                    # 中文名 / 别名
+            if HOUSE_CN.get(short) == s or HOUSE_CN.get(short) == s2:
+                return key
+        low = s2.lower()
+        for short, key in hk.items():
+            if short.lower() == low or HOUSE_CN.get(short, '').lower() == low:
+                return key
+        raise RuntimeError('认不出所属方「%s」；可用：%s'
+                           % (house, '、'.join('%s(%s)' % (k, HOUSE_CN.get(k, '')) for k in hk)))
+
+    def house_label(self, key):
+        """House 键 → 可读标签 '中文名(短名)'；查不到返回 '?xxxx'。"""
+        if not key:
+            return ''
+        for short, k in self.house_keys().items():
+            if k == key:
+                cn = HOUSE_CN.get(short, '')
+                return ('%s(%s)' % (cn, short)) if cn else short
+        return '?%08x' % key
+
+    def house_run_index(self, house):
+        """阵营 → **运行期序号**（= 建筑载荷 `+1344` 的那个小整数）。
+
+        优先**从本档已有建筑反解**（同一主人的建筑里取多数票）—— 这是唯一权威来源；
+        本档没有该阵营的建筑时退回 `HOUSE_RUN_INDEX` 兜底表（10 国 + Neutral 有实测支撑）。
+        认不出返回 None。
+        """
+        key = self.resolve_house(house)
+        if key is None:
+            return None
+        votes = {}
+        try:
+            hs, _c = self._bld_group()
+        except Exception:
+            hs = []
+        pl = bytes(self.plain)
+        for g in hs:
+            o = g + 16
+            if struct.unpack_from('<I', pl, o + self.BLD_OWNER_OFF)[0] != key:
+                continue
+            v = struct.unpack_from('<I', pl, o + self.BLD_OWNER_IDX_OFF)[0]
+            votes[v] = votes.get(v, 0) + 1
+        if votes:
+            return max(votes.items(), key=lambda kv: kv[1])[0]
+        for short, k in self.house_keys().items():
+            if k == key:
+                return HOUSE_RUN_INDEX.get(self.norm_house(short))
+        return None
+
+    def buildings_of_house(self, house=None):
+        """本档某阵营的**全部建筑** → [{idx, base, key, type, x, y}]（house=None ⇒ 全部）。"""
+        want = self.resolve_house(house) if house is not None else None
+        hs, _c = self._bld_group()
+        out = []
+        for i, g in enumerate(hs):
+            o = g + 16
+            k = struct.unpack_from('<I', self.plain, o)[0]
+            ok = struct.unpack_from('<I', self.plain, o + self.BLD_OWNER_OFF)[0]
+            if want is not None and ok != want:
+                continue
+            tkey = struct.unpack_from('<I', self.plain, o + 1316)[0]
+            nm = '?%08x' % tkey
+            for n, kk in sorted(self.building_types().items()):
+                if kk == tkey:
+                    nm = n
+                    break
+            px, py = struct.unpack_from('<II', self.plain, o + 600)
+            out.append({'idx': i, 'base': g, 'key': k, 'type': nm,
+                        'owner': ok, 'x': (px - 128) // 256, 'y': (py - 128) // 256,
+                        'owner_idx': struct.unpack_from('<I', self.plain,
+                                                        o + self.BLD_OWNER_IDX_OFF)[0]})
+        return out
+
+    def set_building_owner(self, house, idx=None, cx=None, cy=None, key=None):
+        """★2026-10-17 新增：改一栋**已有建筑**的所属方（写记录载荷 `+336` 与 `+544`）。
+
+        定位优先级：`key` > `(cx,cy)` > `idx`（0 基，顺序同 `_bld_group()`）。
+        只动这两处（**伴随对象不含 House 键**，不用动）；
+        **不动该阵营自己的建筑清单/占地统计**（这类结构尚未定位，若游戏内出现
+        "改完颜色对但不认领"，就得补写 —— 见 `docs/加建筑_所属方_20261017.md`）。
+        """
+        want = self.resolve_house(house)
+        if want is None:
+            raise RuntimeError('必须指定目标所属方')
+        if want not in self.house_keys().values():
+            raise RuntimeError('目标 House 键 %08x 不在本档 House 对象列表里' % want)
+        pl = self.plain
+        hs, _c = self._bld_group()
+        if not hs:
+            raise RuntimeError('这份存档里一栋建筑都没有（全新开局），没有建筑组可用 —— '
+                               '请先在游戏里放一栋建筑并保存，再用本工具操作')
+        g = None
+        if key is not None:
+            for gg in hs:
+                if struct.unpack_from('<I', pl, gg + 16)[0] == key:
+                    g = gg
+                    break
+        if g is None and cx is not None and cy is not None:
+            hit = [b for b in self.buildings_of_house(None)
+                   if (b['x'], b['y']) == (int(cx), int(cy))]
+            if len(hit) == 1:
+                g = hit[0]['base']
+            elif len(hit) > 1:
+                g = hit[0]['base']
+        if g is None and idx is not None and 0 <= int(idx) < len(hs):
+            g = hs[int(idx)]
+        if g is None:
+            raise RuntimeError('定位不到目标建筑（key/cx,cy/idx 都没命中）')
+        o = g + 16
+        old = struct.unpack_from('<I', pl, o + self.BLD_OWNER_OFF)[0]
+        old_idx = struct.unpack_from('<I', pl, o + self.BLD_OWNER_IDX_OFF)[0]
+        rix = self.house_run_index(want)
+        if rix is None:
+            raise RuntimeError('认不出阵营 %s 的运行期序号（载荷 +1344）'
+                               % self.house_label(want))
+        for off in (self.BLD_OWNER_OFF, self.BLD_OWNER2_OFF):
+            struct.pack_into('<I', pl, o + off, want)
+        struct.pack_into('<I', pl, o + self.BLD_OWNER_IDX_OFF, rix)
+        px, py = struct.unpack_from('<II', pl, o + 600)
+        tkey = struct.unpack_from('<I', pl, o + 1316)[0]
+        nm = '?%08x' % tkey
+        for n, kk in sorted(self.building_types().items()):
+            if kk == tkey:
+                nm = n
+                break
+        # ★电力计数器随所属方搬家（2026-10-17）
+        pwr_note = ''
+        pw = self.power_of(nm)
+        if pw and old != want:
+            dout, ddrain = max(pw, 0), max(-pw, 0)
+            r_old = self.adjust_house_power(old, -dout, -ddrain)
+            r_new = self.adjust_house_power(want, dout, ddrain)
+            if r_old or r_new:
+                pwr_note = '；电力 %s %s→%s / %s %s→%s' % (
+                    self.house_label(old),
+                    r_old[0] if r_old else '?', r_old[1] if r_old else '?',
+                    self.house_label(want),
+                    r_new[0] if r_new else '?', r_new[1] if r_new else '?')
+        self.pending_bld = True
+        self._blds = None
+        return {'mode': '改所属方', 'type': nm, 'key': struct.unpack_from('<I', pl, o)[0],
+                'cell': ((px - 128) // 256, (py - 128) // 256),
+                'old_house': old, 'house': want,
+                'old_house_idx': old_idx, 'house_idx': rix,
+                'old_house_name': self.house_label(old), 'house_name': self.house_label(want),
+                'note': '%s @(%d,%d)：所属方 %s → %s（+336/+544 键、+1344 序号 %d→%d）%s'
+                        % (nm, (px - 128) // 256, (py - 128) // 256,
+                           self.house_label(old), self.house_label(want), old_idx, rix,
+                           pwr_note)}
+
+    # ★★★★★ 2026-10-17 定案：**House 对象 + 0x53B8 = (发电, 耗电) 两个 u32**
+    #   证据（三档逐阵营对账）：把本档该阵营的建筑按 rules `Power=` 求和，
+    #   与存档里这两个数**完全吻合** —— 母本 玩家 (1200, 210) = 6×GAPOWR200 /
+    #   GATECH100+GAREFN50+GAPILE10+GAAIRC50；**无电厂档 玩家 (0, 210)**（发电归零、耗电不变）；
+    #   大任务档 9 个有建筑的阵营里 6 个精确吻合（另 3 个差几百 = 我们按 rules 会把"在建/
+    #   未激活"的建筑也算进去，属正常偏差）。
+    #   ⇒ **"低电力"= 发电机侧的两个数**：`耗电 > 发电` 即低电力（电力建筑停火 / 生产减速）。
+    #   ★这解释了 H1 的怪现象：苏俄/尤里的新塔 +336 写对了、但**该阵营的计数器仍是 (0,0)**
+    #     ⇒ 0 ≥ 0 「不缺电」⇒ 塔照常开火。**加建筑/改所属方/删建筑都必须同步这台计数器。**
+    HOUSE_POWER_REL = 0x53B8
+
+    def _house_obj_off(self, key):
+        """House 键 → 该 House 对象在明文里的偏移（无则 None）。"""
+        pl = bytes(self.plain)
+        q = 0
+        while True:
+            i = pl.find(self.HOUSE_GUID, q)
+            if i < 0:
+                return None
+            if struct.unpack_from('<I', pl, i + 16)[0] == key:
+                return i
+            q = i + 1
+
+    HOUSE_LIST_BASE = 48       # 块尾 − (48 + 12×建筑数) = 「本阵营建筑清单」的 count 位置
+    HOUSE_TRIGOWNER_OFF = 72   # House 块 +72 = 该阵营的「触发所属方对象」键（2026-10-17 定案）
+
+    def _house_blocks(self):
+        """[(对象偏移, House 键, 块尾偏移)]，块尾 = 下一个 House 对象起点（最后一个 = 文件尾）。"""
+        pl = bytes(self.plain)
+        objs, q = [], 0
+        while True:
+            i = pl.find(self.HOUSE_GUID, q)
+            if i < 0:
+                break
+            objs.append((i, struct.unpack_from('<I', pl, i + 16)[0])); q = i + 1
+        out = []
+        for j, (i, k) in enumerate(objs):
+            nxt = objs[j + 1][0] if j + 1 < len(objs) else len(pl)
+            out.append((i, k, nxt))
+        return out
+
+    def _house_bld_keys(self, key):
+        """该阵营在本档的建筑键列表（按建筑组顺序）。"""
+        out = []
+        try:
+            hs, _c = self._bld_group()
+        except Exception:
+            return out
+        pl = bytes(self.plain)
+        for g in hs:
+            o = g + 16
+            if struct.unpack_from('<I', pl, o + self.BLD_OWNER_OFF)[0] == key:
+                out.append(struct.unpack_from('<I', pl, o)[0])
+        return out
+
+    # ---------------- 触发的「所属方（国家）」 ----------------
+    def house_trigger_owner_key(self, house):
+        """该阵营的「触发所属方对象」键 = **House 块 +72**（12 个阵营各一个，独一无二）。
+
+        ★★★★★ 2026-10-17 定案（玩家给的成对档 `刷光棱塔韩国.SAV` / `刷光棱塔德国.SAV`：
+          两份明文**逐字节长度一致、触发记录区段只差 3 字节**）：
+          两条触发里 **`01000002` 的记录 `+128`**：
+            韩国档 = `0x1023ac30`（= Alliance 块 +72），德国档 = `0x1023a8b0`（= Germans 块 +72）
+          ⇒ **触发记录的 `+128` 就是"国家"**，值是目标阵营那个"触发所属方对象"的键；
+          ⇒ 改国家 = 把 `+128` 换成目标阵营 House 块 +72 的值，**不需要动别的任何东西**。
+          该对象本体（类 GUID `1dd43928-11d2046b-…`）里带阵营名 ASCII（如 `Alliance`），
+          它同时被阵营块 +72 引用 ⇒ 不需要新建，直接借用即可。
+        """
+        key = self.resolve_house(house)
+        if key is None:
+            return None
+        pl = bytes(self.plain)
+        for (st, k, en) in self._house_blocks():
+            if k == key:
+                return struct.unpack_from('<I', pl, st + self.HOUSE_TRIGOWNER_OFF)[0]
+        return None
+
+    TRIG_OWNER_OFF = 128       # 触发记录 +128 = 国家（= House 块 +72 的键）
+
+    def trigger_owner_key(self, rec):
+        """读某个触发的国家键（触发记录 +128）。"""
+        return struct.unpack_from('<I', self.plain, rec.off + self.TRIG_OWNER_OFF)[0]
+
+    def trigger_owner_name(self, rec):
+        """读某个触发的国家名（短名）；认不出返回 '?xxxxxxxx'。"""
+        k = self.trigger_owner_key(rec)
+        for house in self.house_keys():
+            if self.house_trigger_owner_key(house) == k:
+                return house
+        return '?%08x' % k
+
+    def set_trigger_owner(self, rec, house):
+        """把触发的「国家」改成目标阵营（写触发记录 `+128`）。
+
+        返回 (旧键, 新键)；认不出阵营抛异常。★只改这 4 个字节，别的字段一律不动。
+        """
+        new = self.house_trigger_owner_key(house)
+        if new is None:
+            raise RuntimeError('认不出阵营 %s 的"触发所属方对象"键（House 块 +72）' % (house,))
+        old = self.trigger_owner_key(rec)
+        struct.pack_into('<I', self.plain, rec.off + self.TRIG_OWNER_OFF, new)
+        return old, new
+
+    def house_build_list(self, house):
+        """定位该阵营 House 块里的**本阵营建筑清单** `[count][建筑键 × count]`
+        → `(count偏移, count, 条目偏移)`；定位不到 → None。
+
+        ★布局规律（2026-10-17 定案）：清单 count 的位置 = **块尾 − (48 + 12×建筑数)**。
+          证据：母本 玩家 n=11 → −180 ✓；SAVE0029 里 n=2..16 的 11 个阵营**全部命中** ✓。
+        定位法：
+          · n ≥ 1：在块内**按内容精确匹配**（`[n]` + 恰好是该阵营的 n 个键）；
+          · n == 0：用上式（块尾 − 48），但**先用本档有建筑的其他阵营验证公式**（全部吻合才采用）。
+        这张清单是**电力归属**与"谁是我的建筑"的依据 —— 新建筑要登记进**主人**这张表
+        （见 `add_placed_building` 的 `reg`），否则引擎会把它的耗电算到别人头上。
+        """
+        key = self.resolve_house(house)
+        if key is None:
+            return None
+        pl = bytes(self.plain)
+        mine = set(self._house_bld_keys(key))
+        blocks = self._house_blocks()
+        me = [b for b in blocks if b[1] == key]
+        if not me:
+            return None
+        st, _k, en = me[0]
+
+        def content_hit(start, end, keys):
+            n = len(keys)
+            q = start
+            while True:
+                i = pl.find(struct.pack('<I', n), q)
+                if i < 0 or i + 4 > end - 4 * n + 4:
+                    return None
+                q = i + 4
+                got = [struct.unpack_from('<I', pl, i + 4 + 4 * j)[0] for j in range(n)]
+                if set(got) == keys:
+                    return i
+        if mine:
+            p = content_hit(st, en, mine)
+            if p is not None:
+                return (p, len(mine), p + 4, True)
+            # ★2026-10-17 22:5x 兜底（大任务档实测：块内精确匹配找不到，但清单其实存在）：
+            #   拿本阵营的建筑键去"按连续键区"找表，再看成员是不是**基本都属于本阵营**
+            #   （≥90% 命中 mine）。SAVE0029 的 812 栋建筑分属 12 个阵营，
+            #   每家的清单就是那 548/450/416/331/252… 条的表。
+            try:
+                cand = self._locate_key_lists(list(mine))
+            except Exception:
+                cand = []
+            for cs, c, ent in cand:
+                step = max(1, c // 200)
+                vals = [struct.unpack_from('<I', pl, ent + 4 * t)[0]
+                        for t in range(0, c, step)][:200]
+                inside = sum(1 for v in vals if v in mine)
+                if inside >= max(1, int(0.9 * len(vals))):
+                    return (cs, c, ent, True)
+            return None
+        # n == 0：先验证公式
+        votes = ok = 0
+        for (s2, k2, e2) in blocks:
+            if k2 == key:
+                continue
+            ks2 = set(self._house_bld_keys(k2))
+            if not ks2:
+                continue
+            p2 = content_hit(s2, e2, ks2)
+            if p2 is None:
+                continue
+            votes += 1
+            if e2 - p2 == self.HOUSE_LIST_BASE + 12 * len(ks2):
+                ok += 1
+        if votes and ok == votes:
+            p = en - self.HOUSE_LIST_BASE
+            if st < p < en and p + 4 <= en:
+                # ⚠ 只有 exact=True 才允许改它：n=0 的槽位是**公式外推**出来的，
+                #   2026-10-17 实测"按公式插进去 ⇒ 载入弹框"（House 块中段结构的长度并非恒定）
+                return (p, 0, p + 4, False)
+        return None
+
+    def house_power(self, house):
+        """该阵营的（发电, 耗电, 偏移）；定位不到返回 (0, 0, None)。
+
+        定位法：House 对象 + `HOUSE_POWER_REL`；若与"按本档建筑 + rules 算出来的值"不符，
+        就在该 House 块内按算出来的那一对回找（更稳），再不行用锚点。
+        """
+        key = self.resolve_house(house)
+        if key is None:
+            return (0, 0, None)
+        off = self._house_obj_off(key)
+        if off is None:
+            return (0, 0, None)
+        pl = bytes(self.plain)
+        p = off + self.HOUSE_POWER_REL
+        if p + 8 > len(pl):
+            return (0, 0, None)
+        out, drain = struct.unpack_from('<II', pl, p)
+        exp = self._house_power_calc(key)
+        if exp is not None and (out, drain) != exp and exp != (0, 0):
+            nxt = pl.find(self.HOUSE_GUID, off + 1)
+            if nxt < 0:
+                nxt = min(len(pl), off + 0x40000)
+            pat = struct.pack('<II', exp[0], exp[1])
+            hits, q = [], pl.find(pat, off)
+            while q >= 0 and q + 8 <= nxt and len(hits) < 2:
+                hits.append(q)
+                q = pl.find(pat, q + 1)
+            if len(hits) == 1:               # ★只在唯一命中时才改锚点（避免误伤）
+                p, out, drain = hits[0], exp[0], exp[1]
+        return (out, drain, p)
+
+    def _house_power_calc(self, key):
+        """按本档建筑（+336 = key）+ rules `Power=` 算出该阵营应有的 (发电, 耗电)。"""
+        try:
+            hs, _c = self._bld_group()
+        except Exception:
+            return None
+        pl = bytes(self.plain)
+        rev = {}
+        for n, kk in self.building_types().items():
+            rev.setdefault(kk, n)
+        out = drain = 0
+        for g in hs:
+            o = g + 16
+            if struct.unpack_from('<I', pl, o + self.BLD_OWNER_OFF)[0] != key:
+                continue
+            pw = self.power_of(rev.get(struct.unpack_from('<I', pl, o + 1316)[0]))
+            if pw > 0:
+                out += pw
+            else:
+                drain += -pw
+        return (out, drain)
+
+    def adjust_house_power(self, house, dout=0, ddrain=0):
+        """把该阵营的（发电, 耗电）就地 ±（返回 ((旧), (新), 偏移) 或 None）。"""
+        if not dout and not ddrain:
+            return None
+        cur = self.house_power(house)
+        if cur[2] is None:
+            return None
+        out, drain, p = cur
+        no, nd = max(out + dout, 0), max(drain + ddrain, 0)
+        struct.pack_into('<II', self.plain, p, no, nd)
+        self._blds = None
+        return ((out, drain), (no, nd), p)
+
+    def house_of_building(self, o):
+        """读某栋建筑的所属方键（载荷帧偏移 `BLD_OWNER_OFF`）。o = 载荷起点（= g+16）。"""
+        return struct.unpack_from('<I', self.plain, o + self.BLD_OWNER_OFF)[0]
+
+    def _player_house_key(self):
+        """玩家 House 对象键：D9D4A910 类 GUID 对象中**引用最多**者（玩家被全场引用）。
+        12 阵营对局实测：玩家 51~63 次、AI 恒 26~27 次，判据稳。找不到返回 None。"""
+        pl = bytes(self.plain)
+        cands, q = [], 0
+        while True:
+            i = pl.find(self.HOUSE_GUID, q)
+            if i < 0:
+                break
+            cands.append(struct.unpack_from('<I', pl, i + 16)[0])
+            q = i + 1
+        if not cands:
+            return None
+        return max(set(cands), key=lambda k: pl.count(struct.pack('<I', k)))
+
+    def _locate_key_lists(self, keys):
+        """定位 [u32 count][键×count] 登记表（U2 配方：成员含 ≥60% 建筑键且 ≥5 个）。
+        种子 = 键的全部出现处（任意对齐）回溯找计数头；返回 [(count_off, count, entries_off)]。"""
+        pl = bytes(self.plain)
+        kset = set(keys)
+        # ★大档（>200 栋）直接走"连续键区"判据：老口径要求"一张表里塞下 60% 建筑键"，
+        #   2054 栋的档不可能满足，跑一遍纯属浪费（39MB 档要 2 秒）。小档保持原行为不变。
+        if len(kset) > 200:
+            return self._locate_key_lists_by_run(keys)
+        # ★种子抽样：老写法对**每个建筑键**都全档 find，2054 栋的档要 39 秒。
+        #   48 个种子足以覆盖所有候选表（表都是含大量建筑键的连续区），结果不变。
+        pats = {struct.pack('<I', k) for k in list(kset)[:48]}
+        seeds = set()
+        for p in pats:
+            q = 0
+            while True:
+                i = pl.find(p, q)
+                if i < 0:
+                    break
+                seeds.add(i)
+                q = i + 1
+        cands = {}
+        for p in sorted(seeds):
+            for i in range(0, 300):
+                cs = p - 4 * i - 4
+                if cs < 0 or cs in cands:
+                    break
+                c = struct.unpack_from('<I', pl, cs)[0]
+                if not (3 <= c <= 4096) or cs + 4 + 4 * c > len(pl) or i >= c:
+                    continue
+                ks = [struct.unpack_from('<I', pl, cs + 4 + 4 * j)[0] for j in range(c)]
+                if not all(0x01000000 <= k <= 0x20000000 for k in ks):
+                    continue
+                same = sum(1 for k in ks if k in kset)
+                if same >= max(4, int(0.6 * len(kset))):
+                    cands[cs] = (c, same)
+                    break
+        out = []
+        for cs, (c, same) in sorted(cands.items(), key=lambda kv: -kv[1][1]):
+            if any(abs(cs - p) < 4 * cc for p, cc, _s in out):
+                continue
+            out.append((cs, c, cs + 4))
+        if out:
+            return out
+        # ★2026-10-17 22:1x：老口径只认 `count ≤ 4096` 的表。
+        #   大任务档的登记表有 8642 / 5189 条 ⇒ 一张都找不到（GUI 报"没找到建筑登记表"）。
+        #   兜底：按"连续合法键区 + 段首计数 == 段长"认表（与键在表里的位置无关）。
+        return self._locate_key_lists_by_run(keys)
+
+    def _locate_key_lists_by_run(self, keys):
+        """找 `[u32 n][键×n]` 登记表（**大表通吃**）。
+
+        ★2026-10-17 22:2x 最终版：直接复用 `_key_tables(key)` 那套"连续键区 + 段首计数"
+          判据（它已经被验证能认出 8642 / 5189 条的大表），这里只多做一步
+          "成员里必须有足够多的建筑键"的过滤。
+          之前的两种写法都不行：①只试表头 64 条 ⇒ 大表全漏；②从种子一路向左扩 ⇒
+          扩过头，真正的表头在 64 条之外 ⇒ 也全漏。
+        """
+        pl = self.plain
+        kset = set(keys)
+        hits = {}                      # cs → 命中它的**不同建筑键**的个数
+        meta = {}
+        for k in list(kset)[:24]:
+            for tb in self._key_tables(k):
+                cs, c, ent = tb['count_pos'], tb['n'], tb['first']
+                meta[cs] = (c, ent)
+                hits[cs] = hits.get(cs, 0) + 1
+        # ★过滤：一张表里要命中 ≥ min(8, 建筑总数) 个**不同**建筑键，才算"建筑登记表"
+        #   （全局登记册/本阵营清单都轻松满足；别的东西偶然含一个键则被滤掉）
+        bar = min(8, len(kset))
+        out = [(cs, meta[cs][0], meta[cs][1]) for cs, n in hits.items() if n >= bar]
+        out.sort(key=lambda t: -t[1])
+        ded = []
+        for cs, c, ent in out:
+            if any(abs(cs - p) < 4 * max(cc, 4) for p, cc, _e in ded):
+                continue
+            ded.append((cs, c, ent))
+        return ded
+
+    def _strip_records(self, pl):
+        """侧栏 strip 槽数组：连续 0x34 步长的 [A][07][Y][F=0] 记录（0x90600-0x90A00 一带，
+        全明文扫描防跨图漂移）。返回 [(记录起点, A, Y)]。★A = rules 建筑序号-1。"""
+        n = len(pl)
+        recs = []
+        i = 0
+        run = []
+        while i + 16 <= n:
+            a, b, c, f = struct.unpack_from('<IIII', pl, i)
+            if b == 7 and a < 0x400 and c < 0x100 and f == 0:
+                run.append((i, a, c))
+                i += 0x34
+                continue
+            if len(run) >= 4:
+                recs.extend(run)
+            run = []
+            i += 4
+        if len(run) >= 4:
+            recs.extend(run)
+        return [(i, a, c) for i, a, c in recs]
+
+    @staticmethod
+    def _slot_entry(pl, off):
+        """off 处是否是侧栏槽**条目**（0x34 步长）。
+
+        条目布局（2026-10-15 逐字节定案，开局档 → 电厂就绪 → 电厂已放下 三档一致）：
+          +0  = A（rules [BuildingTypes] 0 基序号）      +4  = 7（占位标记）
+          +8  = Y（= BuildCat 码：Tech 1 / Resource 2 / Power 3 / Combat 5）
+          +12 = F（工厂键，空态 0）                      +32 = 0x0a（占位态；空槽为 0）
+          +44 = 1（**条目存在标记**，空槽也有）
+        ⇒ 占位 = (+4==7 且 +0<0x400 且 +8<0x100)；空槽 = 前 12B 全 0；两者 +44 都是 1。
+        """
+        if off < 0 or off + 0x34 > len(pl):
+            return False
+        if struct.unpack_from('<I', pl, off + 44)[0] != 1:
+            return False
+        d0, d1, d2 = struct.unpack_from('<III', pl, off)
+        if d1 == 7 and d0 < 0x400 and d2 < 0x100:
+            return True
+        return d0 == 0 and d1 == 0 and d2 == 0
+
+    def _strip_groups(self, pl):
+        """侧栏槽数组，**含空槽**，按组返回。
+
+        返回 [[(off, A, Y, F, occ), …], …]：每组是一条连续的 0x34 条目链
+        （从占位槽锚点向两侧按 _slot_entry 扩展）。**组数 = 侧栏栏数**
+        （第 1 组 = 建筑栏（非 Combat）、第 2 组 = 防御栏（Combat））。
+        每组末尾跟着若干**空槽**（A=0/F=0，+44=1，occ=False）——新增槽应**原地覆写空槽**，
+        不要插字节（插入会把数组之后的全部数据后移 ⇒ 2026-10-15 T12 弹框的疑因）。
+        """
+        seeds = [r[0] for r in self._strip_records(pl)]
+        if not seeds:
+            return []
+        seeds.sort()
+        runs, cur = [], [seeds[0]]
+        for s in seeds[1:]:
+            if s == cur[-1] + 0x34:
+                cur.append(s)
+            else:
+                runs.append(cur)
+                cur = [s]
+        runs.append(cur)
+        out = []
+        for r in runs:
+            lo, hi = r[0], r[-1]
+            while self._slot_entry(pl, lo - 0x34):
+                lo -= 0x34
+            while self._slot_entry(pl, hi + 0x34):
+                hi += 0x34
+            ents = []
+            off = lo
+            while off <= hi:
+                a = struct.unpack_from('<I', pl, off)[0]
+                y = struct.unpack_from('<I', pl, off + 8)[0]
+                f = struct.unpack_from('<I', pl, off + 12)[0]
+                occ = struct.unpack_from('<I', pl, off + 4)[0] == 7
+                ents.append((off, a, y, f, occ))
+                off += 0x34
+            out.append(ents)
+        return out
+
+    def gift_ready_building(self, type_name, slot2_off=None, allow_new_slot=False):
+        """赠送一座「就绪未落地」建筑（侧栏直接"就绪"，玩家自己找位置放）。
+
+        配方（2026-10-15 配对样本拆解 + 游戏内验收）：
+          建筑记录（坐标三副本 0 / +208=0 / 不进三表）+ 生产 blob 148B（替换
+          首个 2EBB6D66 GUID 前的 `00000000 0a000000` 8B）+ House→工厂反引槽。
+        slot2_off：槽 2 偏移（基准明文坐标）。缺省 = 自动定位（玩家经济块 + 0x50B0，
+        跨会话恒定）。★两槽必须同写或同不写（引擎加载校验两槽一致，不等⇒故意除零崩档）。
+        """
+        pl = self.plain
+        base_len = len(pl)
+        hs, cnt_off = self._bld_group()
+        if not hs:
+            raise RuntimeError('这份存档里一栋建筑都没有（全新开局），没有建筑组可用 —— '
+                               '请先在游戏里放一栋建筑并保存，再用本工具操作')
+        tkey = self.building_types().get(type_name)
+        if not tkey:
+            raise RuntimeError('档里没有类型 %s' % type_name)
+        buildings, tl = self._rules_info()
+        if tl.get(type_name.upper(), 1) < 1:
+            raise RuntimeError('%s 不可建造（TechLevel=%s）——「就绪未落地」只能送可生产建筑；'
+                               '建造场等请用「直接放好」' % (type_name, tl.get(type_name.upper())))
+        tpl, cross = self._pick_bld_template(hs, pl, tkey)
+        if cross:
+            # 跨类型模板：档里没有同类型实例 ⇒ 克隆**原生**记录 + 改类型键 + 类型签名整体覆写
+            # ★模板必须"原生"（见 `_pick_bld_template`）：取我们刚注入的记录会产出混血 ⇒ 弹框
+            info = self._type_sig_table().get(type_name.upper())
+            if not info or not info.get('sig'):
+                raise RuntimeError(
+                    '档里没有 %s 的实例，且语料库没有该类型的类型签名数据，无法跨类型赠送'
+                    % type_name)
+        if pl.find(self.FACTORY_GUID) >= 0:
+            raise RuntimeError('本档已有工厂对象（生产正在进行），不支持再送')
+        rec = bytearray(pl[tpl:tpl + self.BLD_SIZE])
+        o = 16
+        old_key = struct.unpack_from('<I', rec, o)[0]
+        for j in range(0, 1844 - 3):
+            if struct.unpack_from('<I', rec, o + j)[0] == old_key:
+                struct.pack_into('<I', rec, o + j, 0)
+        new_key = self._free_key(pl, 0x13963000)
+        self._injected_keys.add(new_key)        # ★标记为"我们注入的" ⇒ 后续不再当模板
+        struct.pack_into('<I', rec, o + 0, new_key)
+        struct.pack_into('<I', rec, o + 208, 0)
+        for xo in (160, 164, 600, 604, 1616, 1620):
+            struct.pack_into('<I', rec, o + xo, 0)
+        if cross:
+            struct.pack_into('<I', rec, o + 1316, tkey)
+            struct.pack_into('<I', rec, o + 1608, info['art_x'])
+            struct.pack_into('<I', rec, o + 1612, info['art_y'])
+            for off in (112, 116, 1352):
+                struct.pack_into('<I', rec, o + off, info['hp'])
+            for off_s, v in info['sig'].items():
+                off = int(off_s)
+                if off in self._SIG_HANDLED or 0x01000000 <= v <= 0x20000000:
+                    continue
+                struct.pack_into('<I', rec, o + off, v)
+        if struct.unpack_from('<I', rec, o + 1828)[0] != 1:
+            struct.pack_into('<I', rec, o + 1828, 1)
+        # ★就绪未落地：视口/相机对（1600/1604/1628/1632）与地形高度（168/608/1624）
+        #   游戏原生 ready 记录全部为 0（实测）——清零，不抄模板的旧值
+        for off in (1600, 1604, 1628, 1632, 168, 608, 1624):
+            struct.pack_into('<I', rec, o + off, 0)
+        assert bytes(rec).count(struct.pack('<I', new_key)) == 1
+
+        blob = bytearray(self.FACTORY_BLOB)
+        fact_self = struct.unpack_from('<I', blob, 20)[0]
+        if pl.find(struct.pack('<I', fact_self)) >= 0:
+            fact_self = self._free_key(pl, 0x10300000)
+            struct.pack_into('<I', blob, 20, fact_self)
+
+        p2 = pl.find(self.QUEUE_ANCHOR_GUID)
+        if p2 <= 0 or pl[p2 - 8:p2] != b'\x00\x00\x00\x00\x0a\x00\x00\x00':
+            raise RuntimeError('生产区锚点不符（00000000 0a000000 + 2EBB6D66）')
+        entry = (struct.pack('<I', new_key) + b'\x00' * 12 + b'\xff\xff\xff\xff'
+                 + struct.pack('<I', self._player_house_key() or self.QUEUE_CONST_PTR)
+                 + bytes.fromhex('01010000') + bytes.fromhex('00000000'))
+        blob148 = bytes(blob) + b'\x00\x00\x00\x00\x0a\x00\x00\x00' + entry \
+            + b'\x0a\x00\x00\x00'
+        assert len(blob148) == 148
+
+        # 侧栏 strip 槽：[A][07][Y][F] 条目，A = rules [BuildingTypes] 0 基序号（2026-10-15 五点全中），
+        # F = 工厂键（空态 0）。★必须写进【目标类型自己的槽】——写进别的类型的槽 =
+        # 加载正常但"就绪"显示成别的建筑（T9 教训）。
+        # ★★栏位归属（2026-10-15 定案）：**两组槽 = 侧栏两栏**，第 1 组 = 建筑栏（BuildCat≠Combat，
+        #   如 GAPOWR/GAREFN/GAPILE/GAWEAP/GAYARD/GAOREP/AMRADR）、第 2 组 = 防御/战斗栏
+        #   （BuildCat=Combat，如 GAWALL/NASAM/GACSPH/GAWEAT/GASPYSAT/GAGAP/GAPILL）——14/14 全中。
+        # ★★★决定性事实（2026-10-15 深夜，玩家样本 `能建光棱塔.sav` 实证 15/15）：
+        #   **侧栏槽数组 = 该玩家「前置全满足」的可建造类型集合**，引擎读档时按科技状态重建。
+        #   ⇒ 目标类型没有槽 = 前置未满足 ⇒ **手写槽无效**（T12c 实测：不弹框但侧栏不显示）、
+        #     而「有记录/blob 却不写槽」⇒ 校验不一致 ⇒ **二次载入弹框**（T12b 实测）。
+        #   ⇒ 就绪赠送必须落在**已存在的槽**上；前置不满足时应拒绝并提示先补前置建筑。
+        a_target = self._buildable_index(type_name)
+        if a_target is None or a_target < 0:
+            raise RuntimeError('%s 不在可建造列表里（TechLevel<1 或 rules 缺失）——'
+                               '「就绪未落地」只能送可生产建筑；建造场等请用「直接放好」'
+                               % type_name)
+        fact_self = struct.unpack_from('<I', blob, 20)[0]
+        groups = self._strip_groups(pl)
+        slots = [(e[0], e[1], e[2]) for g in groups for e in g if e[4] and e[1] == a_target]
+        if len(slots) > 1:
+            raise RuntimeError('类型 %s 的侧栏槽定位到 %d 条（A=%d）' %
+                               (type_name, len(slots), a_target))
+        inplace_strip = None            # (偏移, 52B)：原地覆写空槽（仅 allow_new_slot 时）
+        ins_strip = None                # 兜底：找不到空槽才插一条
+        if not slots:
+            pre = (self._rules_prereq or {}).get(type_name.upper(), '')
+            have = {b['type'].upper() for b in self.buildings()}
+            miss = []
+            for tok in [t.strip() for t in pre.split(',') if t.strip()]:
+                need = self._PREREQ_ALIAS.get(tok, (tok,))
+                if not any(n in have for n in need):
+                    miss.append(tok)
+            msg = ('%s 当前不在侧栏（前置未满足%s）——侧栏槽 = 「前置全满足」的类型集合，'
+                   '引擎读档会按科技状态重建 ⇒ 手写的槽会被丢弃（T12c 实测不显示）。'
+                   '请先让该玩家具备前置建筑（%s），或改送前置已满足的类型。'
+                   % (type_name, ('：缺 ' + '/'.join(miss)) if miss else '',
+                      pre if pre else '该类型无前置但本档仍不可建（可能缺建造厂/阵营不符）'))
+            if not allow_new_slot:
+                raise RuntimeError(msg)
+            self._gift_slot_note = msg + '（已按 allow_new_slot 强制覆写空槽，风险自负）'
+            if not groups:
+                raise RuntimeError('本档没有侧栏槽数组（该玩家无基地/建筑栏为空）——'
+                                   '请改用「直接放好」')
+            cat = (self._rules_buildcat or {}).get(type_name.upper(), '')
+            gsel = (groups[-1] if cat == 'COMBAT' else groups[0]) if len(groups) > 1 \
+                else groups[0]
+            occ = [e for e in gsel if e[4]]                # 占位条目
+            # 空槽 = 该组里 (A=0 且 F=0 且非占位) 的条目，优先取末条占位之后的
+            empty = [e for e in gsel if not e[4] and e[1] == 0 and e[3] == 0
+                     and e[0] > (occ[-1][0] if occ else -1)]
+            if not empty:
+                empty = [e for e in gsel if not e[4] and e[1] == 0 and e[3] == 0]
+            if empty and occ:
+                tpl_e = occ[-1]
+                rec_e = bytearray(pl[tpl_e[0]:tpl_e[0] + 0x34])
+                struct.pack_into('<I', rec_e, 0, a_target)      # A = 目标序号
+                struct.pack_into('<I', rec_e, 12, fact_self)    # F = 工厂键
+                inplace_strip = (empty[0][0], bytes(rec_e))
+            else:
+                # 兜底（该组无空槽）：插一条（**会把后续数据后移 ⇒ 弹框风险**，仅强制模式）
+                last = [e for g in groups for e in g][-1]
+                tpl_rec = bytearray(pl[last[0]:last[0] + 0x34])
+                struct.pack_into('<I', tpl_rec, 0, a_target)
+                struct.pack_into('<I', tpl_rec, 12, fact_self)
+                ins_strip = (last[0] + 0x34, bytes(tpl_rec))
+            slots = []          # 新条目的 F 已自带，不走内联写入
+        if slots:
+            slots = [slots[0][0] + 12]
+        if slot2_off is not None:
+            slots.append(slot2_off)
+        else:
+            me = next((h for h in self.houses() if h['is_player'] and h['verified']), None) \
+                or next((h for h in self.houses() if h['verified']), None)
+            if me and me.get('off'):
+                slots.append(me['off'] + 0x50B0)
+        slots = sorted(set(slots))
+        bad = [s for s in slots
+               if struct.unpack_from('<I', pl, s)[0] not in (0, fact_self)]
+        if bad:
+            # 写不出一致状态 ⇒ 两槽都不写（宁可不显示，也不给校验器崩档机会）
+            self._gift_slot_note = ('⚠ 槽2 定位异常 @%s，两槽均未写（加载安全，'
+                                    '但侧栏可能不显示就绪项）' % [hex(x) for x in bad])
+            slots = []
+        # 新写/新插的 strip 条目自带 F=factory（不走这里的 F 写入）
+        for s in slots:
+            struct.pack_into('<I', pl, s, fact_self)
+
+        # 写入：锚 8B 原地替换为 blob148（净 +140B）+ 记录组尾追加（+1860）+ 计数 +1
+        #       （新槽：原地覆写空槽 = 零增长；仅兜底才 +52B）
+        struct.pack_into('<I', pl, cnt_off, len(hs) + 1)
+        ins = [(p2 - 8, None)]           # 先删除锚 8B（用切片替换实现）
+        if ins_strip is not None:
+            ins.append(ins_strip)
+        ins.append((self._bld_tail(pl, hs), bytes(rec)))
+        for pos, data in sorted(ins, key=lambda t: -t[0]):
+            if data is None:
+                pl[pos:pos + 8] = blob148          # ★替换 8B（净 +140），不是插入！
+            else:
+                pl[pos:pos] = data
+        if inplace_strip is not None:
+            pos, data = inplace_strip
+            pl[pos:pos + 0x34] = data              # ★原地覆写空槽（零增长）
+        grow = self.BLD_SIZE + 140 + (0x34 if ins_strip is not None else 0)
+        assert len(pl) == base_len + grow, \
+            '明文长度异常：%d ≠ %d + %d' % (len(pl), base_len, grow)
+        nk = bytes(pl).count(struct.pack('<I', new_key))
+        if nk != 2 or pl.count(self.FACTORY_GUID) != 1:
+            raise RuntimeError('自证失败：新键 %d 处（应 2）/ 工厂 GUID %d 处（应 1）'
+                               % (nk, pl.count(self.FACTORY_GUID)))
+        self._blds = None
+        return {'mode': '就绪未落地', 'type': type_name, 'key': new_key,
+                'factory_key': fact_self, 'slots': slots,
+                'slot_mode': ('覆写空槽@%#x' % inplace_strip[0]) if inplace_strip
+                             else ('插入新槽@%#x' % ins_strip[0] if ins_strip else '写已有槽'),
+                'note': '侧栏应出现"就绪"的 %s' % type_name}
+
+    def auto_ev_size(self):
+        """事件对象尺寸：能实测就实测；档里只有 1 个事件时按结构推断（都带校验）。
+
+        有 ≥2 个事件 ⇒ 直接用步长（`_newtrig_groups`）。
+        只有 1 个 ⇒ 事件组是 `[u32 n][对象×n][4B 间隙]`，其后紧跟下一组的
+        `[u32 m][对象…]`；所以「下一个对象 GUID 位置 − 8 − 本事件起点」= 对象尺寸
+        （本档实测 108；大任务档 124 同法可推）。
+        """
+        try:
+            return self._newtrig_groups()['ev_size']
+        except Exception:
+            pass
+        evs = self.events()
+        if not evs:
+            raise RuntimeError('档里没有任何事件对象，无法确定事件对象尺寸')
+        o = evs[-1]['obj']
+        pl = self.plain
+        for g in range(o + 64, min(o + 200, len(pl) - 16)):
+            if pl[g + 6:g + 8] != b'\xd2\x11':       # GUID 的 Data3 = 0x11D2（小端 d2 11）
+                continue
+            cnt = struct.unpack_from('<I', pl, g - 4)[0]
+            size = g - 8 - o
+            if 96 <= size <= 160 and 0 < cnt <= 64:
+                return size
+        raise RuntimeError('推断不出事件对象尺寸（可显式传 ev_size='
+                           'SaveDoc.probe_event_size(同族参考档)）')
+
+    def trigger_readiness(self):
+        """能不能在这份档上**新写触发** → `(ok, 给玩家的一句话原因, 开发者诊断)`。
+
+        2026-10-17 玩家实测暴露的两类档：
+          · **正常档**（脚本给了触发器/编辑器以前加过）⇒ 触发集群 + 事件/行为对象组都在，`ok=True`；
+          · **新开局的干净档**（如 `ALL01UMD.sav` / `SAVE4823.SAV`）⇒ 全文 **0 个**触发/标签/
+            TagNode/CellTag 对象，**也没有事件/行为对象**（`events()/actions()` 皆空）。
+            这种档要新写触发，得从「全零」凭空造 6 个对象组（tag/cell/trig/node/event/action）
+            —— 目前**未实装**（需要游戏内逐条验收，硬造会让指针归并器报错）。
+        ⇒ 这里诚实判定并给出原因，让 GUI/CLI 优雅退回「直接落成」。
+        """
+        pl = self.plain
+        tag = pl.find(TRIG_TAGOBJ_GUID) >= 0
+        trig = pl.find(TRIG_INSTANCE_GUID) >= 0
+        try:
+            evs = self.events()
+            acts = self.actions()
+        except Exception:
+            evs = acts = []
+        if not tag or not trig:
+            return (False,
+                    '这份存档里**一个触发器对象都没有**（全文 0 个触发/标签对象，'
+                    '新开局的干净档就是这样）',
+                    'tag=%s trig=%s events=%d actions=%d'
+                    % (tag, trig, len(evs), len(acts)))
+        if not evs and not acts:
+            return (False,
+                    '这份存档里**没有事件/行为对象**，凭空造这两组还没实现',
+                    'tag=%s trig=%s events=0 actions=0' % (tag, trig))
+        # 组成员齐但事件只有 1 个 ⇒ 用结构推断尺寸（已验证 108 / 大任务档 124）
+        try:
+            self.auto_ev_size()
+        except Exception as ex:
+            return (False, '量不出事件对象尺寸（%s）' % ex, 'auto_ev_size 失败：%s' % ex)
+        return (True, '', 'ok')
+
+    def can_place_by_trigger(self):
+        """触发法是否可用（等价于 `trigger_readiness()[0]`）。"""
+        return self.trigger_readiness()[0]
+
+    def place_building_by_trigger(self, type_name, cx, cy, house=None,
+                                  ev_type=13, ev_arg=1, name=None, ev_size=None,
+                                  register=None):
+        """**用「触发法」让引擎自己造一栋建筑**（2026-10-17 玩家定案的主用法）。
+
+        玩家实测的两个好处：
+          ① 引擎走正规建造流程 ⇒ **有建造动画、模型完整**（不会出现"无头"这类半初始化显示错）；
+          ② 落点由引擎判定 ⇒ **不可建造的地形（悬崖边/水面等）会被直接拒绝**，不会刷进不能放的地方。
+        做法（与 T1/T2 完全同一条配方）：
+          · 目标格没有路径点就写一个（`ensure_waypoint_at`，号取最大号+1，≤701）；
+          · 新写触发：**事件 8「任何事件」** → **行为 125「将建筑建于…」** `<类型>` @ 该路径点；
+          · 所属方 = `house`（默认玩家阵营）。
+        ★2026-10-17 三轮实测定案：
+          · **四件套（tag/trig/ev/ac）引擎不执行**（T3）；只有六件套也不够（T4a）；
+          · **必须再登记进「定时触发器激活登记表」**（登记 = 武装开关，T6 事件 8 + 登记才烧）⇒ 这里一律登记；
+          · **引擎判定触发的节拍 = 15 帧（1 逻辑秒）** ⇒ 「任何事件」与「流逝 1 秒」等价，
+            **"读档立即出现"做不到**，最快就是约 1 秒后（玩家实测）。
+          · 结论：默认事件 13 + 1 秒（与任何事件同节拍，但少一层不确定性）。
+        返回 dict（含 waypoint / cell / trigger_id / warnings）。
+        """
+        t = str(type_name).strip().upper()
+        if not t:
+            raise ValueError('建筑类型不能为空')
+        cx, cy = int(cx), int(cy)
+        lim = self.coord_limit()
+        if not (0 <= cx < lim[0] and 0 <= cy < lim[1]):
+            raise ValueError('格子 (%d,%d) 超出范围（0..%d / 0..%d）'
+                             % (cx, cy, lim[0] - 1, lim[1] - 1))
+        if house is None:
+            house = self.info.get('玩家阵营') or None
+        # ★先判「这份档能不能写触发」——**必须在改任何字节之前**（否则会留下半截路径点）
+        ok_trig, why, diag = self.trigger_readiness()
+        if not ok_trig:
+            raise TriggerUnavailable(why, diag)
+        wp = self.ensure_waypoint_at(cx, cy)
+        wp_note = ''
+        if wp is None:
+            # ★地图声明的路径点号已经用满 ⇒ **不越界硬写**（越界引擎不认：玩家实测 511 无效），
+            #   改用离目标格最近的已有路径点，并把实际落点如实报出来。
+            near = self.nearest_waypoint(cx, cy)
+            if near is None:
+                raise RuntimeError('本档既没有空闲路径点号，也没有任何已有路径点可用')
+            wp, (nx, ny) = near
+            wp_note = ('⚠ 地图只声明了 0..%d 号路径点且已全部占用 ⇒ 改用最近的 #%d @(%d,%d)'
+                       '（离目标 (%d,%d) %.0f 格）；建筑会出现在那个格子'
+                       % (self.waypoint_limit(), wp, nx, ny, cx, cy,
+                          ((nx - cx) ** 2 + (ny - cy) ** 2) ** 0.5))
+        if ev_size is None:
+            ev_size = self.auto_ev_size()
+        nm = (name or ('刷' + t))[:16]
+        if register is None:
+            register = True          # ★2026-10-17 T6：登记表就是"武装"开关 —— 一律登记
+        r = self.create_trigger(nm, ev_type, ev_arg, 125, 0, owner=house,
+                                ac_name=t, ac_waypoint=wp, ev_size=ev_size,
+                                pieces=True, register=register)
+        out = dict(r)
+        out.update({'mode': '触发法', 'waypoint': wp, 'cell': (cx, cy),
+                    'type': t, 'house': house, 'ev_size': ev_size,
+                    'ev_type': ev_type, 'ev_arg': ev_arg,
+                    'note': '读档后引擎自己造：有建造动画；不可建造的地形会被引擎拒绝'})
+        if wp_note:
+            out['warnings'] = list(out.get('warnings') or []) + [wp_note]
+            out['waypoint_cell'] = self.waypoint_cell(wp)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # 引擎「新建态」常量表（2026-10-21，黄金样本 SAVE4823 定案 + 静态复核）
+    # ------------------------------------------------------------------ #
+    # 来源：玩家用**触发法**让引擎造一栋 ATESLA 后游戏内存档（E:\YURI\SAVE4823.SAV），
+    #   拿引擎新塔 @(11,178) key=15DD8410 与同档 66 栋同类楼逐字段比 ⇒
+    #   「引擎非 0 而同类全 0」的偏移共 24 个 = 本表 22 个 int + +0x3A8（自引用）
+    #   + +0x528（每栋独占的关联指针，**不可跨档搬**，待查）。
+    # 复核（`_verify_placed_cand4.py`）：22 个值逐偏移全中；黄金塔「≠0 而同类全 0」
+    #   恰好 24 个；同档 66 栋在这 23 个（除 +0x528）偏移上全 0。
+    # ⚠ 下表是**记录绝对偏移**；`add_placed_building` 里 `o=16` 是载荷起点，
+    #   写的时候要 `o + (X - 16)`（见函数内注释，+0x3A8 踩过同一个坑）。
+    # ⚠ 只有**一个**黄金样本（ATESLA）⇒ 是否全型号通用未经游戏验证，默认不写。
+    NEW_STATE_CONSTS = (
+        (0x0D4, 0x1B), (0x114, 0x1B), (0x3A4, 0x1B),
+        (0x17C, 0x19), (0x188, 0x19), (0x1A0, 0x19), (0x1AC, 0x19), (0x1F4, 0x19),
+        (0x200, 0x19), (0x210, 0x19), (0x254, 0x19), (0x300, 0x19), (0x36C, 0x19),
+        (0x38C, 0x19), (0x3BC, 0x19), (0x3D0, 0x19), (0x53C, 0x19), (0x564, 0x19),
+        (0x618, 0x19), (0x6E4, 0x19), (0x6B8, 0x18), (0x42C, 0x01010000),
+    )
+
+    def add_placed_building(self, type_name, cx, cy, z=0, sig_mode='full',
+                            comp_mode='zero', grow_mode='insert', ref_mode='keep',
+                            house=None, require_free=False, new_state=False,
+                            buildup=True, cross_clean=True):
+        """（sig_mode: full=套类型签名 / safe=跳过镜像指针 / none=完全不套，诊断用）
+           （comp_mode: **zero=不建伴随对象 + 把 4 个伴随指针清 0【默认，2026-10-21 游戏内验收】
+                        / none=不建伴随对象，但同类型模板会**保留模板的 4 个指针**
+                              ⇒ 新楼与模板共用同一个伴随对象（★未验收，疑似弹框源，勿用）
+                        / clone=克隆模板伴随（**已修 +52 实例 ID**，2026-10-16 晚）
+                        / clone_clean=克隆但清掉悬空指针（+52 亦已修）
+                              ⇒ ★2026-10-21 实测**读档弹框**（#2~#9 全走这条路，全弹）
+                        / build=只抄类常量【实测"新开即弹框"，勿用】）
+           （grow_mode: insert=登表插字节【默认，已知可用】/ inplace=覆写表预留空位【实验，曾致载入即崩】）
+           （house: **所属方** —— None=保持模板值（默认，= 原来那栋的主人）；
+                   也可给阵营短名 'Russians' / 中文名 '苏俄' / House 对象键 int）
+           （new_state: True=按黄金样本写引擎「新建态」22 个 int 常量【默认 False】，
+                       见 NEW_STATE_CONSTS；候选 #5 起用，游戏内验收后再考虑设默认）
+           （buildup: **默认 True（§188 定案，玩家 T16 实测）** = 新楼进游戏**播一遍建造动画**，
+                       而且**播完模型是完整的**。关键在于配方里必须带 **`+0x6E4 = 0`**：
+                         · `6E4=0` ⇒ 引擎认为"这段建造动画还没播" ⇒ 播一遍 Buildup，
+                           **播的过程会把模型/子对象重建一遍** ⇒ 播完完整（T16 的 A 栋）；
+                         · `6E4=1`（旧版从完成态模板继承来的）⇒ 引擎认为"已播完" ⇒ 不播，
+                           停在"记录里的指针是悬空的"状态 ⇒ **显示不全**（T16 的 B 栋）。
+                       ⚠ 所以 §186 那条"直接落成播不出动画"的结论**作废**：它当时继承了 `6E4=1`。
+                       传 `buildup=False` 才是"立即显示成品"（无动画，且跨类型克隆时可能残缺）。
+           （cross_clean: **默认 True**，仅跨类型时生效 —— 把模板记录里
+                       `0x0F000000~0x14000000` 段的运行期指针一律清 0（§184）。
+                       不清的话，从 GACNST 这类"指针大户"克隆会把整块指针带进新楼
+                       ⇒ 新楼渲染残缺、要打一下才正常。传 False 只做单变量对照用。）"""
+        sig_mode_note_comp = False
+        """凭空放一栋**已落位**建筑（U2 配方 2026-10-15 游戏内验收：记录 + L1/L2/L3 全登）。
+
+        克隆本档同类型记录（无则跨类型：类型键+类型签名）→ 组尾追加、组计数 +1、
+        三张登记表追尾追加。
+        ★+1600/+1604 = 该建筑在当前相机下的**屏幕坐标**（按目标格推算，不是全档共享值）；
+        +1628/+1632 = 相机对（全档共享，抄本档）；Z（168/608/1624）= 地形高度×416，平地 0；
+        +208 = 自身键。**+1388..+1400 = 4 个伴随指针**：★2026-10-21 游戏内验收 ——
+        **一律清 0（不建伴随对象）才稳**；克隆伴随（clone/clone_clean 造 476B 伴随）实测**读档弹框**。
+        同类型保留模板值（'none'）= 与模板共用同一伴随对象，未验收、勿用。
+        """
+        pl = self.plain
+        base_len = len(pl)
+        # ★2026-10-21（修 #1）：**不许覆盖别人的格子**。
+        #   上一份卡死样本落在 (98,130)，而那格本来就有占用者 —— 旧代码只是"提示已覆盖"。
+        #   require_free=True 时直接拒绝，让调用方换一格（或改用触发法）。
+        if require_free and self.cell_taken(cx, cy):
+            raise RuntimeError(
+                '(%d,%d) 这格已经有东西占着（建筑地基 / 单位），不能再往上放。\n\n'
+                '换一个空位，或者改用「触发法」—— 触发法由引擎自己造楼，'
+                '会自动避开悬崖 / 水面 / 占用格。' % (cx, cy))
+        hs, cnt_off = self._bld_group()
+        if not hs:
+            raise RuntimeError('这份存档里一栋建筑都没有（全新开局），没有建筑组可用 —— '
+                               '请先在游戏里放一栋建筑并保存，再用本工具操作')
+        tkey = self.building_types().get(type_name)
+        if not tkey:
+            raise RuntimeError('档里没有类型 %s' % type_name)
+        tpl, cross = self._pick_bld_template(hs, pl, tkey)
+        # ★2026-10-21（修 #1：伴随对象）：comp_mode 需要克隆伴随时，**模板必须自带伴随**。
+        #   本档很多建筑的 +1388（伴随键）是 0，同型号里只有一部分带伴随；
+        #   若模板恰好是 0，克隆路径会静默退化成"新楼没伴随 / 与模板共用" ⇒ 引擎行为不可预期。
+        #   这里换一栋**同型号且 +1388 != 0** 的原生记录当模板（仍排除我们自己注入的）。
+        if comp_mode in ('clone', 'clone_clean', 'build'):
+            def _has_comp(g):
+                return struct.unpack_from('<I', pl, g + 16 + 1388)[0] != 0
+            if not _has_comp(tpl):
+                same = [g for g in hs
+                        if g not in self._injected_keys
+                        and struct.unpack_from('<I', pl, g + 16 + 1316)[0] == tkey
+                        and _has_comp(g)]
+                if same:
+                    tpl = same[0]
+        if cross:
+            # ★模板必须"原生"（见 `_pick_bld_template`）——取刚注入的记录 ⇒ 混血 ⇒ 弹框
+            info = self._type_sig_table().get(type_name.upper())
+            if not info or not info.get('sig'):
+                raise RuntimeError(
+                    '档里没有 %s 的实例，且语料库没有该类型的类型签名数据，无法跨类型赠送'
+                    % type_name)
+        rec = bytearray(pl[tpl:tpl + self.BLD_SIZE])
+        o = 16
+        tpl_key = struct.unpack_from('<I', rec, o)[0]   # 模板自身的键（插字节后偏移会漂，必须现在取）
+        # ★★★★★ 2026-10-17 23:5x：**坐标槽必须按模板记录实测**，不能写死偏移。
+        #   实测所有档（原始/引擎重存）的坐标对都在 `base+104/+108` 与 `base+544/+548`，
+        #   而旧代码按 `o+160/+600`（= base+176/+616）去改 —— 那两处根本不是坐标，
+        #   于是新记录**没有合法坐标**（工具读回来是 (141,411) 这种鬼值），
+        #   引擎只能靠别的线索摆位置，原始档上就干脆不显示。
+        #   做法：在模板记录里搜"成对的 (px,py)"，命中的偏移就是坐标槽（通常两处镜像）。
+        tinfo = next((b for b in self.buildings() if b['base'] == tpl), None)
+        ref = tinfo
+        if ref is None or ref['x'] < 0:
+            # 模板自己没落位（-1,-1）⇒ 借同类型已落位的一栋当"布局参照"
+            cand = [b for b in self.buildings()
+                    if b['x'] >= 0 and b['type'] == str(type_name).upper()]
+            ref = cand[0] if cand else next((b for b in self.buildings() if b['x'] >= 0), None)
+        coord_slots = []
+        if ref is not None:
+            for k in range(0, self.BLD_SIZE - 8, 4):
+                if (struct.unpack_from('<I', rec, k)[0] == ref['px']
+                        and struct.unpack_from('<I', rec, k + 4)[0] == ref['py']):
+                    coord_slots.append(k)
+        if not coord_slots:
+            coord_slots = [self.BLD_COORD_OFF, self.BLD_COORD2_OFF]
+        scx = ref['x'] if ref else cx
+        scy = ref['y'] if ref else cy
+        dx, dy = (cx - scx) * 256, (cy - scy) * 256
+        new_key = self._free_key(pl, 0x13963000)
+        self._injected_keys.add(new_key)        # ★标记为"我们注入的" ⇒ 后续不再当模板
+        struct.pack_into('<I', rec, o + 0, new_key)
+        if cross:
+            struct.pack_into('<I', rec, o + 1316, tkey)
+            struct.pack_into('<I', rec, o + 1608, info['art_x'])
+            struct.pack_into('<I', rec, o + 1612, info['art_y'])
+            for off in (112, 116, 1352):
+                struct.pack_into('<I', rec, o + off, info['hp'])
+            for off_s, v in info['sig'].items():
+                off = int(off_s)
+                if off in self._SIG_HANDLED or 0x01000000 <= v <= 0x20000000:
+                    continue
+                if sig_mode == 'none':
+                    continue        # 诊断用：完全不套签名（只改类型键/美术/耐久）
+                if sig_mode == 'safe' and 0x00400000 <= v < 0x01000000:
+                    continue        # ★安全模式：跳过镜像指针类（0x007Exxxx 等）——跨档抄会变悬空
+                struct.pack_into('<I', rec, o + off, v)
+        # ★★★+208 = **自身键**（2026-10-16 定案，同类型/跨类型都写）：本档 11 栋建筑的 `+208`
+        #   **全部等于自身键**。克隆模板时若留着模板的值 ⇒ 它指向**模板那栋建筑**（本档有真身！）
+        #   ⇒ 游戏"攻击/选中"会解析到模板建筑身上：跨类型（模板=空指部）⇒ 打空指部；同类型
+        #   （模板=另一栋同型建筑）⇒ 打那一栋（B1/B3/B4/B6 实测症状全中）。
+        #   ⚠ 历史教训：引擎"本会话新建"的记录里 +208 是**别的池的键**（放下光棱塔.sav 的 ATESLA
+        #   = 0x130EA2E0，不是本档任何建筑的键），那种值才不会指向别人 ⇒ 写自身键同样安全（本档惯例）。
+        struct.pack_into('<I', rec, o + 208, new_key)        # ★2026-10-21（修 #4，黄金样本 SAVE4823 定案）：**+0x3A8 也写自身键**。
+        #   引擎用触发法造出来的那栋 ATESLA：+0x3A8 = 15DD8410 = 它自己的键；
+        #   而本档同型号 66 栋正常建筑的 +0x3A8 **全是 0** ⇒ 这是"新建时初始化"的**自引用**字段。
+        #   我们一直没写它（克隆模板 ⇒ 要么 0、要么模板的值）⇒ 加载器解析这条自引用时会落到
+        #   别的对象/空上，正是"内部错误弹框"的典型来源。
+        # ⚠ 记录内绝对偏移 0x3A8 = 载荷偏移 0x398（本函数所有 +xxx 都是**载荷**偏移，o = 16）
+        struct.pack_into('<I', rec, o + 0x398, new_key)
+
+        # ★2026-10-21（修 #5，黄金样本 SAVE4823 的「新建态常量表」，§141.1 + 静态复核）：
+        #   引擎放下的那栋 ATESLA 与同档 66 栋同类楼比，「引擎非 0 而同类全 0」的字段共 24 个
+        #   = 22 个 int 常量 + +0x3A8 自引用（修 #4）+ +0x528 关联指针（待查，见 §142）。
+        #   22 个 int 已由 `_verify_placed_cand4.py` 在黄金塔上**逐偏移复核**：
+        #   值全中（0x1B×3 / 0x19×17 / 0x18 / 0x01010000）、66 栋同类在这些偏移上全 0。
+        #   ⚠ 偏移约定（§141.2 的坑）：表里是**记录绝对偏移**；本函数 `o + xxx` 是载荷偏移
+        #     ⇒ 绝对 X 必须写 `o + (X - 16)`。写错位置不报错（非键值，自证断言抓不到）。
+        #   ⚠ 样本只有一个（ATESLA）⇒ 默认关闭，候选 #5 显式开启；游戏内验收后再议默认。
+        if new_state:
+            for _abs, _v in self.NEW_STATE_CONSTS:
+                struct.pack_into('<I', rec, o + (_abs - 16), _v)
+
+        # ★★★+264 = **自身键 + 0x9C**（2026-10-16 定案，**唯一一个"自我引用"字段**）：
+        #   对三份样本（母本 11/11 栋、外挂放置 12/12、手放 12/12）逐 dword 扫描
+        #   "值 == 自身键 + 常量" ⇒ **只有 +264 恒等于 自身键 + 0x9C**（其余 1 栋的命中都是巧合）。
+        #   它是**指向自己内部的指针**（记录载荷 +264，而 key 在载荷 +0）。
+        #   ⚠ 后记（2026-10-16 17:25）：本条**不是**重载崩的原因（真因是下面的 `+20`）。
+        #   而且实测引擎**只是把 +264 原样搬运**（重存档里它 = 上一份存档的旧键+0x9C，那个键早已不存在），
+        #   说明加载器**并不校验** +264 —— 写 `自身键+0x9C` 只是"跟随本档归一化形态"，无害且更一致。
+        struct.pack_into('<I', rec, o + 264, new_key + 0x9C)
+        # ★★★★★ +20 / +972 = **每栋唯一的实例 ID**（2026-10-16 傍晚定案，**重载崩 + "攻击指向模板"的真因**）
+        #   证据链：
+        #   ① 同类型 6 栋 GAPOWR 逐 dword 求"组内每栋都不同" ⇒ 13 个字段，其中 +20/+972 是**非指针**小值；
+        #   ② 这两个值在**整份明文里只出现 1 次**（就在字段本身）⇒ **不是指针，是 ID**；
+        #   ③ **引擎原生放下**的一栋，其 +20 是**全新顺延值**（母本末栋 `0xfa378` → 原生新栋 `0xfa387`），
+        #      全档 +20 **互不重复**；
+        #   ④ 我们克隆模板时**把模板的 +20 原样带过来** ⇒ **两栋共用一个 ID**；
+        #   ⑤ **引擎重存档把这个重复原样保留**（§16）⇒ 所以"引擎自己写一遍"也救不回来（§17.2）。
+        #   ⇒ 症状全部对上：**攻击/选中被解析到"模板那栋"**（跨类型 = 空指部），
+        #      且**拆世界时 ID 表对不上 ⇒ 重载崩**。
+        _ids20 = [struct.unpack_from('<I', pl, g + 16 + 20)[0] for g in hs]
+        new_id20 = self._next_inst_id(pl, hs)
+        struct.pack_into('<I', rec, o + 20, new_id20)
+        _ids972 = {struct.unpack_from('<I', pl, g + 16 + 972)[0] for g in hs}
+        new_id972 = int(hashlib.md5(bytes(rec[:64]) + struct.pack('<I', new_key)).hexdigest()[:8], 16) & 0xFFFF
+        for _ in range(0x10000):
+            if new_id972 and new_id972 not in _ids972:
+                break
+            new_id972 = (new_id972 + 1) & 0xFFFF
+        struct.pack_into('<I', rec, o + 972, new_id972)
+        # ★★★+232 / +1304 = **每栋独有的两个对象指针**（2026-10-16 定案，只有它们"每栋都不同"）。
+        #   实测它们的值**不出现在任何一张键表**里，也不在明文里出现第二次
+        #   ⇒ 指向的**不是独立序列化对象**（加载器不可能靠存档值恢复）。
+        #   我们克隆模板时留着模板的值 ⇒ 疑似"新建筑寄生于模板"（2026-10-16 实测症状：
+        #   **攻击新光棱塔会解析到空指部**，而空指部正是跨类型时用的模板 `hs[-1]`；
+        #   同类型时同理 ⇒ 指向模板那栋）。
+        #   `ref_mode='clear'`：把它们清 0（诊断用单变量；默认 'keep' 保持旧行为）。
+        if ref_mode == 'clear':
+            for off in (232, 1304):
+                struct.pack_into('<I', rec, o + off, 0)
+        if comp_mode == 'zero':
+            # ★★★★★ 2026-10-21 17:40 **游戏内验收：这是唯一可用的伴随策略（现为默认）**。
+            #   玩家实测三档同落点 (14,179)：
+            #     ① 修9  = clone_clean（克隆 476B 伴随）      ⇒ **弹框**
+            #     ② 修11 = zero（不建伴随 + 4 指针清 0）       ⇒ **进游戏，蓝色光棱塔正常出现**
+            #     ③ 触发法（引擎自己造）                      ⇒ 进游戏，红色光棱塔
+            #   ⇒ 弹框的唯一原因 = **伴随对象**（克隆出来的那个），与记录/登记/落点/所属方全无关。
+            #   机理推测：伴随对象内部有一批指向「子对象」的指针（引擎新建的黄金伴随里是
+            #   0x0f4de4xx 一类本档地址），`clone_clean` 把它们一律清 0 ⇒ 加载器按"伴随存在
+            #   就必须修复其内部指针"去处理 ⇒ 撞空 ⇒ 弹框。而**没有伴随**时这一段根本不进。
+            #   ★2026-10-21 19:5x Ghidra 定案（主文档 §151）：这 4 个 dword 是
+            #   **BuildingClass::Anims[3..6]**（对象偏移 0x568/0x56C/0x570/0x574），
+            #   属于 `Load` 里 `lea esi,[edi+0x55C]; ebp=0x15` 那个 21 槽 swizzle 循环。
+            #   载荷偏移 = 对象偏移 + 4（o=16 处还含 4B 自键）⇒ 1388 对应对象 1384。
+            #   合法性依据：母本 1112 栋里 **846 栋 Anims[3] == 0**（不播动画是引擎常态）。
+            #   ⇒ 清 0 = 回到"该槽无对象"的原生形态，绝不新建伴随对象。
+            for off in (1388, 1392, 1396, 1400):
+                struct.pack_into('<I', rec, o + off, 0)
+        if cross:
+            # ★★★跨类型必须清掉 **Anims[3..6]**（载荷 +1388/+1392/+1396/+1400 = 对象 0x568..0x574）：
+            #   这 4 个槽在 `BuildingClass::Load` 的 swizzle 名单里（§151 汇编实证），
+            #   槽里任何非 0 值都必须能在本档的「新地址表」里找到，否则合并器走 `idiv 0` 必弹框。
+            #   留着模板（**异类型**）的值 ⇒ 建筑**不能被攻击**（A1 实测：+1388 指向 GAAIRC 的伴随对象；
+            #   而 A0 同类型克隆指向同类型伴随 → 可攻击）。清 0 ⇒ 显示正常 + 可攻击
+            #   （A3 维修厂 / A4 苏联实验室实测通过 —— 它们的 +1388 恰好被签名表清成了 0）。
+            #   ⇒ 不再依赖"签名表里恰好有 1388 这一项"。
+            for off in (1388, 1392, 1396, 1400):
+                struct.pack_into('<I', rec, o + off, 0)
+            # ⚠ `comp_mode='clone'`（强行克隆模板伴随对象）**实验性**：A2 曾卡死（当时的产物还缺
+            #   +208 自键与格子）。现在允许显式使用以做单变量实验；默认仍是 'none'。
+        # ★★★★★ 2026-10-18 00:3x **两套坐标槽并存**（这是本任务档的真相）：
+        #   作者手放的建筑：坐标对在 base+104/+108 与 base+544/+548；
+        #   引擎运行期新建的建筑（实测那栋 (80,245) 的电厂）：坐标对在 base+176/+180 与 base+616/+620。
+        #   老代码一律写 +176/+616 ⇒ 克隆"作者式"模板时写到了垃圾字段，真坐标仍是模板的位置
+        #   ⇒ 新建筑要么叠在模板身上、要么不显示；而乱扫槽位会命中无关指针 ⇒ 卡死（D 档）。
+        #   ⇒ 正解：**只在这 4 个候选偏移里挑"确实等于模板自身坐标"的那几个**写。
+        tinfo = next((b for b in self.buildings() if b['base'] == tpl), None)
+        npx, npy = cx * 256 + 128, cy * 256 + 128
+        slots = []
+        if tinfo is not None and tinfo['x'] >= 0:
+            pair = struct.pack('<II', tinfo['px'], tinfo['py'])
+            slots = [k for k in (104, 544, 176, 616)
+                     if 0 <= k <= self.BLD_SIZE - 8 and bytes(rec[k:k + 8]) == pair]
+        if not slots:
+            slots = [176, 616]              # 认不出样式 ⇒ 按"引擎式"写（至少不会写坏别的字段）
+        for k in slots:
+            struct.pack_into('<II', rec, k, npx, npy)
+        if struct.unpack_from('<I', rec, o + 1828)[0] != 1:
+            struct.pack_into('<I', rec, o + 1828, 1)
+        # ★★+1600/+1604 = **该建筑在当前相机下的屏幕坐标**（2026-10-15 定案，不是"全档共享视口"）：
+        #     screenX = 30*(cx−cy) + camX、screenY = 15*(cx+cy) + camY
+        #   （K2 的 7 栋 GAPOWR 逐位全中；同类型锚点偏移相同 ⇒ 直接用「模板值 + 格差」推算，
+        #     跨类型退化为用本档第一栋反解，误差 ≤1 格）。**照抄别栋 = 位置错 ⇒ 裁剪/显示异常**。
+        #   +1628/+1632 = 相机对（真·全档共享，抄本档现有建筑）。
+        #   Z（168/608/1624）= 地形高度×416（悬崖层级），平地 0。
+        ref = (tpl if not cross else hs[0]) + 16
+        rpx, rpy = struct.unpack_from('<II', pl, ref + 600)
+        rcx, rcy = (rpx - 128) // 256, (rpy - 128) // 256
+        dcx, dcy = cx - rcx, cy - rcy
+        sx = struct.unpack_from('<i', pl, ref + 1600)[0] + 30 * (dcx - dcy)
+        sy = struct.unpack_from('<i', pl, ref + 1604)[0] + 15 * (dcx + dcy)
+        struct.pack_into('<i', rec, o + 1600, sx)
+        struct.pack_into('<i', rec, o + 1604, sy)
+        for off in (1628, 1632):
+            struct.pack_into('<I', rec, o + off,
+                             struct.unpack_from('<I', pl, hs[0] + 16 + off)[0])
+        for off in (168, 608, 1624):
+            struct.pack_into('<I', rec, o + off, z)
+        # ★★★★★ 所属方（2026-10-17 新增功能）：记录载荷 **+336 与 +544 是同一份 House 对象键的两份副本**
+        #   （大任务档 1143 栋 / 12 阵营实测：两处都写着该栋的主人的 House 键；
+        #   母本 11 栋全部 = 玩家键；伴随对象里 0/637 个含 House 键 ⇒ 不用改伴随）。
+        #   `house=None` ⇒ 保持模板值（= 原来那栋的主人，旧行为不变）。
+        owner_key = self.resolve_house(house)
+        owner_idx = None
+        if owner_key:
+            owner_idx = self.house_run_index(owner_key)
+            if owner_idx is None:
+                raise RuntimeError('认不出阵营 %s 的运行期序号（载荷 +1344）'
+                                   % self.house_label(owner_key))
+            for off in (self.BLD_OWNER_OFF, self.BLD_OWNER2_OFF):
+                struct.pack_into('<I', rec, o + off, owner_key)
+            struct.pack_into('<I', rec, o + self.BLD_OWNER_IDX_OFF, owner_idx)
+        # ★+208 / +920 不动（实测：**非加载必需**）——原生"新放"记录里 +208 是另一池的键
+        #   （放下光棱塔.sav 的 ATESLA +208=0x130EA2E0），而"重新保存过"的档里才归一成自身键；
+        #   模板值 0x6F6E30 / 0 在 T3/T8/T9b 里都通过。既然不确定，就不动。
+
+        # ★★★★★ §184（2026-10-22 玩家「还是显示不全」定案）：**跨类型必须清掉模板的指针表**
+        #   实测（玩家自己的图 ALL01UMD，6 栋建筑）：
+        #     0x0F000000~0x14000000 段（运行期指针/地址）的 dword 数：
+        #       GACNST 建造厂 **85 个** / GAPOWR 3~4 个 / **引擎造的 ATESLA 0 个**
+        #       我们跨类型放出来的 ATESLA **83 个**（全是从 GACNST 模板带过来的）
+        #   ⇒ 这 83 个地址指向的是**模板那栋的子对象**，新楼根本没有 ⇒ 渲染残缺
+        #     （玩家看到的就是"显示不全，打一下才正常"：受击触发重绘才把画面纠正过来）。
+        #   跨类型模板几乎总是"末栋原生建筑"（常是 GACNST），所以必然踩到。
+        #   ⇒ 跨类型时：把这些"本档不可能存在"的指针值一律清 0（白名单里的键/坐标/所属方不动）。
+        #   依据：ATESLA 的类型签名里**一个 0x0F-0x14 段的值都没有** ⇒ 清 0 才是该类型的原生形态。
+        cross_clean_note = ''
+        if cross and cross_clean:
+            _keep = set(self._SIG_HANDLED) | {int(k) for k in (info['sig'] or {})}
+            _keep |= {16, 24, 264, 972, 208, 0x398, 1828, 336, 544, 1344,
+                      1600, 1604, 1628, 1632, 168, 608, 1624}
+            _keep |= set(slots)
+            _nz = 0
+            for _off in range(16, len(rec) - 4, 4):
+                if _off in _keep:
+                    continue
+                _v = struct.unpack_from('<I', rec, _off)[0]
+                # ★新键本身也落在 0x13xxxxxx 段 —— 绝不能把自己的自引用清掉（自证会当场抓到）
+                if _v == new_key or _v == new_key + 0x9C:
+                    continue
+                if 0x0F000000 <= _v <= 0x14000000:
+                    struct.pack_into('<I', rec, _off, 0)
+                    _nz += 1
+            if _nz:
+                cross_clean_note = '；跨类型已清掉 %d 个模板遗留指针（§184）' % _nz
+
+        keys = [struct.unpack_from('<I', pl, g + 16)[0] for g in hs]
+        lists = self._locate_key_lists(keys)
+        if not lists:
+            raise RuntimeError('没找到建筑登记表（L1/L2/L3），无法登记')
+        # ★★★★★ 2026-10-21（修 #6，弹框真因，玩家实测 #4/#5 均弹框后定案）：
+        #   `_locate_key_lists` 在**大档**上会把**别的阵营的「本阵营建筑清单」当成全局登记表** ——
+        #   SAVE0029 实测：它返回的 3 张"全局表"里，第 3 张 count@0x103BE53 其实是
+        #   **YuriCountry 的阵营建筑清单**（536 条），于是新键被同时写进
+        #   「Alliance（=新楼主人，正确）」和「YuriCountry（错误）」两张阵营清单
+        #   ⇒ 引擎读档做「清单成员必须属于该阵营」校验时对不上 ⇒ 弹框。
+        #   **小图为什么没事**：SAVE6784 只有 8 栋建筑，第 3 张表恰好就是
+        #   玩家(=新楼主人)自己的清单 ⇒ 同一张表只登记一次，没有污染。
+        #   ⇒ 正确做法：**先把所有"阵营建筑清单"从全局表里剔除**，再显式把主人的那份加回来。
+        house_lists = {}
+        try:
+            for _hk in set((self.house_keys() or {}).values()):
+                try:
+                    _bl = self.house_build_list(_hk)
+                except Exception:
+                    _bl = None
+                if _bl and _bl[3]:                 # 只要"块内精确匹配"的，公式外推的绝不碰
+                    house_lists[_hk] = _bl
+        except Exception:
+            house_lists = {}
+        house_cs = {bl[0]: hk for hk, bl in house_lists.items()}
+        n_polluted = sum(1 for (cs, _c, _e) in lists if cs in house_cs)
+        lists = [t for t in lists if t[0] not in house_cs]
+        # 登记目标 = **全局对象登记册** + **主人自己的「本阵营建筑清单」**；
+        #   若主人不是玩家，则**不登记进玩家的清单**（依据：玩家实测"敌方塔照样有电"）。
+        eff_owner = owner_key or struct.unpack_from('<I', pl, tpl + 16 + self.BLD_OWNER_OFF)[0]
+        bl_owner = house_lists.get(eff_owner) or self.house_build_list(eff_owner)
+        owner_list_note = ''
+        if not lists:
+            raise RuntimeError('没找到全局建筑登记表（候选全是阵营清单），无法安全登记')
+        if bl_owner and bl_owner[3]:
+            reg = list(lists)
+            if all(cs != bl_owner[0] for cs, _c, _e in reg):
+                reg.append(bl_owner[:3])
+            lists = reg
+        else:
+            # 目标阵营本档**还没有建筑** ⇒ 无法安全定位它的清单
+            #   （n=0 的槽位只能靠公式外推，实测插入后**载入弹框** ⇒ 绝不动它）
+            #   ⇒ 维持旧行为：只登记全局册（+ 顺带找到的玩家清单）；电力会被算到玩家头上。
+            owner_list_note = ('；⚠ 该阵营本档还没有建筑 ⇒ 未写它的建筑清单'
+                               '（引擎可能按玩家的电算；建议先给它放一栋建筑，之后的添加就精确了）')
+        # ★★伴随对象（记录 +1388 指向的 476B 对象，类 GUID c32d270e-…）：引擎放建筑时
+        #   **必定新建一个并登记**（外挂样本实测：+2340 = 记录 1860 + 伴随 476 + 4）。
+        #   我们过去让新记录**共用模板的伴随键** —— 而引擎从不让两栋共用 ⇒ 疑似弹框根因。
+        #   这里按引擎配方克隆模板的伴随对象：改自身键(+0x20) 与格(+0xC0/+0xC4)，
+        #   插到模板伴随对象之后，并把新键登记到「对象表」（计数 > 建筑数的那些表）。
+        comp_key, comp_body, comp_at = None, None, None
+        if comp_mode in ('clone', 'build', 'clone_clean'):
+            tcomp = struct.unpack_from('<I', pl, tpl + 16 + 1388)[0]
+            body = None
+            # ★2026-10-21（修 #3，弹框根因）：**必须从伴随即数组里的"真起点"复制**。
+            #   旧代码用 `pl.find(伴随键)` 再挑 >0x900000 的第一个 —— 实测那个位置
+            #   （0x0F4B11B−0x20）根本不是伴随起点，复制出来的 476B 没有类 GUID
+            #   ⇒ 插进去的东西不是合法伴随对象 ⇒ 读档弹框。
+            #   正确来源：`companion_offsets()` 的 {键: 起点} 映射（官方起点 +0x20 就是该键）。
+            comp_map = {k: o for o, k in self.companion_offsets(pl)}
+            if comp_mode in ('clone', 'clone_clean') and tcomp in comp_map:
+                _cofs = comp_map[tcomp]          # ⚠ 别用 o —— 那个是记录载荷偏移
+                body = bytearray(pl[_cofs:_cofs + self.COMP_SIZE])
+            elif comp_mode == 'build':
+                # ★★新路线（2026-10-16）：**从零构造** —— 只保留本档"全档恒定"的类常量，
+                #   变动字段一律 0，再写自身键(+0x20)与格(+0xC0/+0xC4)。
+                #   依据：引擎**自己新建**的伴随对象里同样带着一堆临时指针（0x02CAxxxx…）
+                #   ⇒ 加载器并不依赖这些变动字段；而"整份克隆"会带走模板的悬空指针 ⇒ 卡死。
+                proto = self.companion_proto(pl)
+                if proto is not None:
+                    body = bytearray(proto)
+            if body is not None:
+                comp_key = self._free_key(pl, 0x02B00000)
+                struct.pack_into('<I', body, 0x20, comp_key)       # 自身键
+                struct.pack_into('<I', body, 0xC0, cx * 256)       # 格 X（×256）
+                struct.pack_into('<I', body, 0xC4, cy * 256)       # 格 Y
+                # ★★★★★ 2026-10-21（修 #8，弹框真因）：伴随对象的 **+0xC8 = 该栋的 Z（地形高度×416）**，
+                #   必须与建筑记录 +168/+608/+1624 **完全相等**。硬证据（SAVE0029 逐个核对）：
+                #     模板 ATESLA@(254,90)：记录 1248 / 伴随 1248 ✔
+                #     原生 ATESLA@(95,130) ：记录  832 / 伴随  832 ✔
+                #     原生 ATESLA@(203,159)：记录 1144 / 伴随 1144 ✔
+                #     引擎黄金塔 SAVE4823  ：记录    0 / 伴随    0 ✔
+                #     ⇒ 266 栋有伴随的建筑**无一例外**（Z=0/416/832/1248 四档全覆盖）。
+                #   我们过去只写 +0xC0/+0xC4（x,y×256）**漏了 +0xC8** ⇒ 克隆模板伴随会带走
+                #   **模板那栋的悬崖高度**：模板在 Z=3 的悬崖上 ⇒ 1248，而新楼落在地面 ⇒ 记录 0
+                #   ⇒ 记录说"地面"、伴随说"第 3 层" ⇒ 读档校验不一致 ⇒ **弹框**。
+                #   这解释了全部观测：#1~#7 全都建伴随（全弹）、#6 修阵营清单/#7 改属主都没碰它（仍弹）、
+                #   而玩家验收过的小图成功档是**跨类型**路径（cross 分支把 4 个伴随指针清 0 ⇒ 根本没有伴随
+                #   ⇒ 不存在这个不一致）⇒ 能进。⚠ 抄**刚写好的记录**而不是抄 z 参数，保证两侧永远相等。
+                struct.pack_into('<I', body, 0xC8,
+                                 struct.unpack_from('<I', rec, o + 168)[0])   # Z（×416，与记录同源）
+                struct.pack_into('<I', rec, o + 1388, comp_key)    # 记录指向新伴随
+                # ★伴随也有自己的实例 ID（+52），与建筑的 +20 **共用同一计数器** ⇒ 必须换新值，
+                #   否则与模板伴随撞 ID（疑似 `comp_mode='clone'` "卡死" 的原因）。
+                struct.pack_into('<I', body, 0x34,
+                                 self._next_inst_id(pl, hs, extra=(new_id20,)))
+                if comp_mode == 'clone_clean':
+                    # ★折中路线（2026-10-16 傍晚）：**克隆模板伴随，但只清掉"悬空指针"** ——
+                    #   「整份克隆」⇒ 带走模板的悬空内部指针 ⇒ 游戏卡死（A2/E1/E2）；
+                    #   「只留类常量、其余清零」⇒ 新开载入即弹框（SR2/SR3/SR4，疑因清掉了必需的非指针字段）。
+                    #   本路线：保留**全部非指针字段**（含类常量与实例态），只把
+                    #   "值 >= 0x01000000（任何堆池）且**不是类常量**"的字段清 0。
+                    consts = self.companion_const_offsets(pl)
+                    for off in range(0, self.COMP_SIZE - 3, 4):
+                        if off in consts or off in (0x20, 0xC0, 0xC4):
+                            continue
+                        if struct.unpack_from('<I', body, off)[0] >= 0x01000000:
+                            struct.pack_into('<I', body, off, 0)
+                comp_body = bytes(body)
+                # 插到伴随对象数组的**末尾**（本档伴随实测是 476B 等距的连续数组）
+                comps = self.companion_offsets(pl)
+                comp_at = (comps[-1][0] + self.COMP_SIZE) if comps else \
+                    (self._bld_tail(pl, hs) + self.BLD_SIZE)
+        struct.pack_into('<I', pl, cnt_off, len(hs) + 1)
+        ins = [(self._bld_tail(pl, hs), bytes(rec), '记录')]
+        if comp_body is not None:
+            ins.append((comp_at, comp_body, '伴随对象'))
+        for cs, c, ent in lists:
+            add = [new_key]
+            if comp_key is not None and c > len(keys):
+                # 该表同时收「对象键」（计数 > 建筑数）⇒ 伴随键也要登记
+                add.append(comp_key)
+            # ★★★登记 = **优先覆写表的"预留空位"（零增长）**（2026-10-16 定案）：
+            #   表的 `count` 之后是一段**预留位**（能建母本实测：表0 有 4 个 0、表2 有 9 个 0，
+            #   表1 没有 —— 它后面紧贴着别的数据）。
+            #   引擎放置建筑时就是**原地覆写预留位 + 把 count +1/+2**（C1 实测：表0 28→30、
+            #   表2 11→12，而**表尾的预留区字节完全没变** ⇒ 零增长）。我们过去一律插字节，
+            #   ⚠ 后记（2026-10-16 17:25）：登记方式**不是**重载崩的原因（真因是 `+20` 实例 ID 重复）。
+            #   `'insert'`（默认）与引擎写法一致，保持即可；`'inplace'` 会写坏别的结构（G1~G4 载入即弹框）。
+            free = 0
+            while free < 64:
+                q = ent + 4 * (c + free)
+                if q + 4 > len(pl) or struct.unpack_from('<I', pl, q)[0] != 0:
+                    break
+                free += 1
+            struct.pack_into('<I', pl, cs, c + len(add))
+            # ⚠⚠ **默认 'insert'（插字节）= 已知可用行为**。'inplace'（覆写预留位）虽然与引擎写法一致，
+            #   但 2026-10-16 03:38 实测 **G1~G4 全部"载入即弹框"**（回归）⇒ 默认关闭，仅在显式实验时使用，
+            #   见 docs/handoff-20261016-033817.md §3。
+            if grow_mode == 'inplace' and free >= len(add):
+                for j, k in enumerate(add):           # 零增长：原地覆写
+                    struct.pack_into('<I', pl, ent + 4 * (c + j), k)
+            else:
+                for k in reversed(add):               # 插字节（默认）
+                    ins.append((ent + 4 * c, struct.pack('<I', k),
+                                '登记表@%#X' % cs))
+        for pos, data, tag in sorted(ins, key=lambda t: -t[0]):
+            pl[pos:pos] = data
+        nk = bytes(pl).count(struct.pack('<I', new_key))
+        # 预期出现处 = 记录+0（自身键） + 各登记目标 + 记录+208（自身键） + 记录+0x3A8（自引用）
+        #   ★2026-10-21：多了 +0x3A8 这一处（黄金样本要求），所以基线从 1+len+1 变成 1+len+2
+        if nk != 1 + len(lists) + 2:
+            raise RuntimeError('自证失败：新键 %d 处 ≠ 1+%d+2' % (nk, len(lists)))
+        # ★★★格子占用表（2026-10-16 定案）：引擎放建筑时会把新键写进**它占的每一格**
+        #   （格偏移 = base + 348×(80cx+79cy)，键在格+0、格−8 写 1）。
+        #   缺这张表 ⇒ 建筑**能显示但点不中/打不着**（鼠标拾取走格子，不走类型→art）。
+        #   零增长：只改原地字段，不动长度。
+        self._cellbase_memo = None
+        cell_note = ''
+        try:
+            okc, note_c = self.occupy_cells_exact(type_name, cx, cy, new_key, tpl_key)
+            cell_note = note_c if okc else ('⚠ 未写格子占用：' + note_c)
+            if okc:
+                nk2 = bytes(pl).count(struct.pack('<I', new_key))
+                if nk2 <= nk:
+                    raise RuntimeError('写格子占用后未观测到新键增加（%d → %d）' % (nk, nk2))
+        except Exception as e:
+            cell_note = '⚠ 写格子占用失败：%s' % e
+        self._blds = None
+        extra = ''
+        if sig_mode_note_comp:
+            extra = '；⚠ 跨类型已忽略"克隆伴随对象"（会卡死），伴随指针清 0'
+        # ★★★★★ 电力计数器（2026-10-17）：新建筑必须计入**主人阵营**的发电/耗电，
+        #   否则"不属于本局阵营"的新建筑会落在 (0,0) 的计数器上 ⇒ 0 ≥ 0「不缺电」
+        #   ⇒ 电力建筑（如光棱塔 Powered=yes）**照常开火**（H1 苏俄/尤里塔的怪现象就是这个）。
+        pw = self.power_of(type_name)
+        if pw:
+            try:
+                eff = None
+                for g2 in self._bld_group()[0]:
+                    if struct.unpack_from('<I', self.plain, g2 + 16)[0] == new_key:
+                        eff = struct.unpack_from('<I', self.plain,
+                                                 g2 + 16 + self.BLD_OWNER_OFF)[0]
+                        break
+                if eff in set(self.house_keys().values()):
+                    r2 = self.adjust_house_power(eff, max(pw, 0), max(-pw, 0))
+                    if r2:
+                        extra = '%s；主人电力 %s→%s' % (extra, r2[0], r2[1])
+            except Exception as e:
+                extra = '%s；⚠ 电力计数器未更新：%s' % (extra, e)
+        owner_name = self.house_label(owner_key)
+        if owner_name:
+            extra = (extra + '；所属方 = %s' % owner_name) if extra else '；所属方 = %s' % owner_name
+        if owner_list_note:
+            extra += owner_list_note
+        if n_polluted:
+            extra += ('；已从全局表里剔除 %d 张「阵营建筑清单」（旧代码会把新键写进别的阵营的清单⇒弹框）'
+                      % n_polluted)
+        # ★★★★★ §171（2026-10-22，in-game 已验 M 档 GAPOWR / N2 档 ATESLA 光棱塔）：
+        #   让新加的楼**自带一遍完整建造动画**。配方 `AC=18/BC=1/D0=1/10C=2/534=0`，
+        #   进游戏播一遍后自动正常；`+0xD0` 若留 100 会播两遍（P/R 档实测）。
+        anim_note = ''
+        if buildup:
+            try:
+                nb_base = None
+                for g2 in self._bld_group()[0]:
+                    if struct.unpack_from('<I', self.plain, g2 + 16)[0] == new_key:
+                        nb_base = g2 + 72        # 记录 = [16B CLSID][4B 键][对象体]，base = 对象体+52
+                        break
+                if nb_base is None:
+                    anim_note = '；⚠ 没定位到新楼记录，未写建造动画'
+                else:
+                    rb = self.make_building_buildup(nb_base)
+                    anim_note = ('；已设为「进游戏播一遍建造动画」（%s）'
+                                 % ' '.join('%s=%d' % (k, v) for k, v in
+                                            sorted(rb['new'].items())))
+            except Exception as e:
+                anim_note = '；⚠ 写建造动画失败：%s' % e
+        if cross_clean_note:
+            extra += cross_clean_note
+        if anim_note:
+            extra += anim_note
+        return {'mode': '直接放好', 'type': type_name, 'key': new_key,
+                'cell': (cx, cy), 'lists': len(lists), 'companion': comp_key,
+                'cross': cross, 'tpl_key': tpl_key, 'polluted_lists': n_polluted,
+                'cells_note': cell_note, 'house': owner_key,
+                'house_idx': owner_idx, 'house_name': owner_name,
+                'buildup': bool(buildup), 'buildup_note': anim_note,
+                'note': '(%d,%d) 应出现一栋 %s（%s%s）' % (
+                    cx, cy, type_name, cell_note, extra)}
+
+    # ------------------------------------------------------------------ #
+    # 删除建筑（2026-10-16）—— 严格反向的 add_placed_building
+    # ------------------------------------------------------------------ #
+    BLD_REC_MIN = 1700          # 记录长度合理区间（实测 1860 / 1872）
+    BLD_REC_MAX = 2000
+
+    def remove_building(self, idx, drop_companion=False, clear_cells=True, orphan_cell='auto',
+                        trim_lists=True):
+        r"""从存档里**删掉第 idx 栋建筑**（0 基，顺序同 `_bld_group()`）。
+
+        四件必做的事（与 `add_placed_building` 严格对称）：
+          ① 删整条记录（长度 = 下一条记录起点 − 本条起点；**末栋用 `_bld_tail` 的真实组尾**
+             —— 记录长度是类型特有的，不能按 1860 硬算）；
+          ② 建筑组计数 −1；
+          ③ 从各登记表剔掉该建筑的键（每张表各自 −1 计数）；
+          ④ 清掉该建筑的全部格子占用（键清 0，并把格−8 / 格+0x1C 的标志位清掉）。
+        ⑤ 伴随对象（0~4 个，键在建筑 `+1388..+1400`）二选一：
+             · `drop_companion=True`  ⇒ **删掉伴随对象**并连登记一起剔 —— **⚠ 会弹框，别用！**
+             · `drop_companion=False`（**默认**）⇒ **保留孤儿伴随**，但把它的格
+               （`+0xC0/+0xC4`）搬到 `orphan_cell`（默认 `(0, 0)`）—— **✅ 实测可用**。
+
+        ★★★★★ **2026-10-16 23:40 玩家实测定案（干净母本 `原存档.SAV`，单变量）**：
+          · `A1 删末位空指部(删伴随)` ❌弹框 ；`A2 删中间电厂(删伴随)` ❌弹框 ；
+            **`A3 删中间电厂(留孤儿伴随)` ✅能进**，但原地留一个"显示不正常"的建筑图像；
+          · **`D1 把孤儿伴随的格搬到 (300,300)` ✅ 建筑彻底消失，完美**；
+            **`D2 搬到 (0,0)` ✅ 同样完美**；
+          · `C3 删伴随对象但**保留**它的登记表键` ❌**仍弹框** ⇒ 致命的是「**删对象本身**」，
+            不是"剔表键"。
+          ⇒ **结论：删伴随对象必然弹框（与被删建筑的位置无关，5 组数据点全中）；
+            但"保留孤儿 + 把它的格搬走"既安全又视觉正确 ⇒ 已定为默认行为。**
+          ⚠ 成因尚未完全解明：引擎自己卖建筑时**是删伴随的，但同时会新建 1 个 `c42d270e`
+            (0x0E272DC4) 类对象**（两次样本都有：键 `136a2808` / `0f352050`，头布局与建筑记录同构、
+            约 1909B、登记进表0/表1 + 12 个所属方记录）—— **疑为"替身对象"，少了它加载器不认**。
+            要改成"引擎原教旨"就必须先能合成它。详见 `docs/卖建筑_引擎配方_20261016.md`。
+
+        ★难点：**删字节会让后面全部偏移前移** ⇒ 每步都重新定位；多张表**从偏移大的往小的删**，
+          且同一张表内**按位置倒序删**（否则表头偏移会漂）。
+        返回 dict；任何一步对不上就抛异常 —— 抛异常时调用方不得保存，存档不会被写坏。
+        """
+        pl = self.plain
+        hs, cnt_off = self._bld_group()
+        n = len(hs)
+        if not (0 <= idx < n):
+            raise RuntimeError('建筑序号越界：idx=%d，本档共 %d 栋' % (idx, n))
+        g = hs[idx]
+        ln = (hs[idx + 1] - g) if idx + 1 < n else (self._bld_tail(pl, hs) - g)
+        if not (self.BLD_REC_MIN <= ln <= self.BLD_REC_MAX):
+            raise RuntimeError('第 %d 栋的记录长度 %d 不在合理区间 [%d,%d]，拒绝删除'
+                               % (idx, ln, self.BLD_REC_MIN, self.BLD_REC_MAX))
+        key = struct.unpack_from('<I', pl, g + 16)[0]
+        tkey = struct.unpack_from('<I', pl, g + 16 + 1316)[0]
+        px, py = struct.unpack_from('<II', pl, g + 16 + 600)
+        cx, cy = (px - 128) // 256, (py - 128) // 256
+        cks = [struct.unpack_from('<I', pl, g + 16 + off)[0]
+               for off in (1388, 1392, 1396, 1400)]
+        cks = [k for k in cks if k]
+        owner_before = struct.unpack_from('<I', pl, g + 16 + self.BLD_OWNER_OFF)[0]
+        tname = None
+        for nm, k in sorted(self.building_types().items()):
+            if k == tkey:
+                tname = nm
+                break
+        out = {'mode': '删除建筑', 'idx': idx, 'type': tname, 'key': key,
+               'cell': (cx, cy), 'rec_len': ln, 'companions': list(cks)}
+        # ---------------- ① 删记录 + ② 组计数 −1 ----------------
+        # 顺序很重要：先删字节再改计数，中间不能调用 _bld_group（它会校验计数==记录数）
+        del pl[g:g + ln]
+        struct.pack_into('<I', pl, cnt_off, n - 1)
+        out['count'] = n - 1
+        # ---------------- ④ 清格子占用（先做：它只读，不影响长度） ----------------
+        # ★2026-10-18：优先走**与图尺寸无关**的格对象数组（cell_struct_slots）。
+        #   老路径 `_cell_base()` 依赖 CELL_XK/YK=80/79，只对 80×80 小图成立；
+        #   大任务图（203×295）上它返回 None，于是清格被**静默跳过** ——
+        #   这就是"小图删建筑正常、大图一删就弹框"的根本原因。
+        cells = 0
+        if clear_cells:
+            cells = self.clear_cell_slots(key)          # 4 个字段：+0xF0/+0xF8/+0x114/+0x138
+        if clear_cells and not cells and tname:
+            # 兜底：老路径（仅小图有效）
+            self._cellbase_memo = None
+            base = self._cell_base(pl)
+            if base is not None:
+                W, H = self.foundation_of(tname)
+                for i in range(W):
+                    for j in range(H):
+                        p = self.cell_offset(base, cx + i, cy + j)
+                        if not (8 <= p <= len(pl) - 4):
+                            continue
+                        if struct.unpack_from('<I', pl, p)[0] == key:
+                            struct.pack_into('<I', pl, p, 0)
+                            for fo in (self.CELL_FLAG_OFF, self.CELL_FLAG2_OFF):
+                                q = p + fo
+                                if 8 <= q <= len(pl) - 4:
+                                    struct.pack_into(
+                                        '<I', pl, q,
+                                        struct.unpack_from('<I', pl, q)[0] & ~1)
+                            cells += 1
+        out['cells_cleared'] = cells
+        self._cellbase_memo = None
+        # ---------------- ⑤ 伴随对象：删（弹框！）或「搬走」（默认，实测可用） ----------------
+        removed_comp, moved_comp = [], []
+        # ★2026-10-18：默认 'auto' = 挪到**地图外**（尺寸 +50 格）。
+        #   原来的 (0,0) 在地图角上：格子清干净后建筑本体已经没了，但伴随对象的画面还在，
+        #   若玩家探索过那个角就会看到一栋"幽灵电厂"。挪出地图就彻底看不见。
+        if orphan_cell == 'auto':
+            _sz = self.map_size()
+            orphan_cell = (_sz[0] + 50, _sz[1] + 50) if _sz else (400, 400)
+        if cks and (drop_companion or orphan_cell is not None):
+            for ck in list(cks):
+                obj = self._find_comp_obj(pl, ck)
+                if obj is None:
+                    continue
+                if drop_companion:
+                    still = False
+                    for gg in self._bld_group()[0]:
+                        for off in (1388, 1392, 1396, 1400):
+                            if struct.unpack_from('<I', pl, gg + 16 + off)[0] == ck:
+                                still = True
+                                break
+                        if still:
+                            break
+                    if still:
+                        continue                    # 还有别的建筑在用它 ⇒ 不能删
+                    del pl[obj:obj + self.COMP_SIZE]
+                    removed_comp.append(ck)
+                else:
+                    # ★★★ 2026-10-16 实测（D1/D2）：把孤儿伴随的格搬走 ⇒ 残影消失、载入正常
+                    struct.pack_into('<II', pl, obj + self.COMP_CELLX_OFF,
+                                     orphan_cell[0] * 256, orphan_cell[1] * 256)
+                    moved_comp.append(ck)
+        out['companions_removed'] = removed_comp
+        out['companions_moved'] = moved_comp
+        # ---------------- ③ 剔登记表里的键 ----------------
+        drop = ({key} | set(removed_comp)) if trim_lists else set()
+        alive = [struct.unpack_from('<I', pl, gg + 16)[0]
+                 for gg in self._bld_group()[0]]
+        lists = self._locate_key_lists(alive) if alive else []
+        trimmed, found_any = 0, set()
+        # 从偏移大的表往小的删（前面表的表头偏移不受影响）
+        # ★每张表都要**各自独立**查找：同一个键在多张表里都登记着，
+        #   剔完一张就把它从待删集合里丢掉 ⇒ 后面的表会漏剔（实测少剔 2 张 ⇒ 多出 8 字节）
+        for (coff, cnt, eoff) in sorted(lists, key=lambda t: -t[0]):
+            hits = [t for t in range(cnt)
+                    if struct.unpack_from('<I', pl, eoff + 4 * t)[0] in drop]
+            for t in sorted(hits, reverse=True):          # 表内按位置倒序删
+                found_any.add(struct.unpack_from('<I', pl, eoff + 4 * t)[0])
+                del pl[eoff + 4 * t:eoff + 4 * t + 4]
+            if hits:
+                struct.pack_into('<I', pl, coff, cnt - len(hits))
+                trimmed += 1
+        out['lists_trimmed'] = trimmed
+        # ★2026-10-18：还有一类「单条键表」`[u32 count=1][key]`（计数就在键前 4 字节）。
+        #   `_locate_key_lists` 的"≥8 个不同建筑键"门槛会把它整张滤掉 ⇒
+        #   大图上就残留一处引用 ⇒ 载入弹框（小图的同类表有 12 条，能过门槛，所以小图不出事）。
+        singles = 0
+        for k in sorted(drop, reverse=True):
+            pat = struct.pack('<I', k)
+            i = pl.find(pat)
+            while i >= 0:
+                if i >= 4 and struct.unpack_from('<I', pl, i - 4)[0] == 1:
+                    struct.pack_into('<I', pl, i - 4, 0)   # 计数 1 → 0
+                    del pl[i:i + 4]                        # 再删掉那 4 字节条目
+                    singles += 1
+                    found_any.add(k)
+                    break
+                i = pl.find(pat, i + 1)
+        out['single_tables_trimmed'] = singles
+        out['untabled_keys'] = sorted(drop - found_any)   # 任何表里都没找到的键（正常应为空）
+        self._blds = None
+        self.pending_bld = True
+        # ★电力计数器：把这栋的 Power 从原主人的发电/耗电里减掉（2026-10-17）
+        pw = self.power_of(tname)
+        if pw:
+            try:
+                r3 = self.adjust_house_power(owner_before, -max(pw, 0), -max(-pw, 0))
+                if r3:
+                    out['power'] = r3
+            except Exception as e:
+                out['power_error'] = str(e)
+        out['note'] = ('已删除第 %d 栋 %s @(%d,%d)：记录 %dB、格 %d 个、'
+                       '伴随删 %d / 搬走 %d / 留 %d、登记表 %d 张' % (
+                           idx, tname, cx, cy, ln, cells,
+                           len(removed_comp), len(moved_comp),
+                           len(cks) - len(removed_comp) - len(moved_comp), trimmed))
+        return out
+
+    def map_tile_size(self):
+        """★2026-10-18 新增：**真正的地图尺寸**（与 FA2「地图参数」的 宽度/高度 同口径）。
+
+        为什么不用 `0x348E`：那组 (W,H) 在自制/任务图上并不等于 `[Map] Size`
+        （实测 180×170 的图它写的是 203×295，玩家用 FA2 核对过）。
+
+        反推依据 —— 格对象数组（348B 定长槽）的索引规律：
+            idx = W·(x + y) − y − W²
+        其中 x,y 是**菱形坐标**（0 .. W+H-2）。于是
+            W = Δ(idx + y) / Δ(x + y)          ← 取 (x+y) 最小 / 最大的两个格样本
+            H = (最大格坐标 + 1) − W
+        校验：槽数 ≈ 2·W·H − H（两个实测档：80×80→12720、180×170→61030，误差 0）。
+        返回 (W, H)；格表缺失或反推不自洽返回 None。
+        """
+        pl = self.plain
+        memo = getattr(self, '_tile_size_memo', None)
+        if memo and memo[0] == len(pl):
+            return memo[1]
+        self._tile_size_memo = (len(pl), None)
+        first, n = self.cell_struct_array()
+        if first is None:
+            return None
+        lo = hi = None
+        mx = 0
+        for i in range(n):                              # 全扫（61030 槽 ≈0.15s，已缓存）
+            x, y = struct.unpack_from('<HH', pl, first + i * self.CELL_STRUCT_STRIDE
+                                      + self.CELL_STRUCT_XY)
+            if x > mx:
+                mx = x
+            if y > mx:
+                mx = y
+            t = x + y
+            if lo is None or t < lo[0]:
+                lo = (t, i, y)
+            if hi is None or t > hi[0]:
+                hi = (t, i, y)
+        if lo is None or hi is None or hi[0] == lo[0]:
+            return None
+        w = ((hi[1] + hi[2]) - (lo[1] + lo[2])) / float(hi[0] - lo[0])
+        if abs(w - round(w)) > 0.02:
+            return None
+        w = int(round(w))
+        h = (mx + 1) - w
+        if not (1 <= w <= self.MAP_TILE_MAX and 1 <= h <= self.MAP_TILE_MAX):
+            return None                      # >200×200 ⇒ 视为读错（见 MAP_TILE_MAX 注释）
+        expect = 2 * w * h - h
+        if abs(expect - n) > max(16, n // 100):
+            return None
+        self._tile_size_memo = (len(pl), (w, h))
+        return (w, h)
+
+    def map_size(self):
+        """★存档自带的**地图尺寸**（2026-10-15 定案）—— 与建筑存活无关的稳定锚点。
+
+        偏移 0x348E 起是一张「(W, H) 小端 u16 对」表（实测重复 8 次）：
+          · E:\\YURI 测试档：80 80 80 80 …              → (80,80)
+          · D:\\233 大任务档：200 200 …                  → (200,200)
+          · SAVE03F9/2E1F/4CA2/5C7B/6811/69D1：260 179 … → (260,179)
+        交叉验证：260×179 的档里建筑最大格 (338,357)，而菱形坐标上限 = 2W-1/2H-1 = 519/357
+        ⇒ 恰好贴边，判据成立（24 档全自洽）。
+        返回 (W, H)；读不出/不可信返回 None。
+        """
+        pl = self.plain
+        try:
+            w, h = (struct.unpack_from('<HH', pl, self.MAPSIZE_OFF))
+        except Exception:
+            return None
+        if not (1 <= w <= self.MAP_TILE_MAX and 1 <= h <= self.MAP_TILE_MAX):
+            # >200×200 ⇒ 按玩家经验判定为**读错**（自制任务图实测 180×170 这里却写 203×295）
+            return None
+        # 该表会重复出现 ⇒ 再验一组，避免偶合
+        try:
+            w2, h2 = struct.unpack_from('<HH', pl, self.MAPSIZE_OFF + 4)
+        except Exception:
+            return None
+        if (w2, h2) != (w, h):
+            return None
+        return (w, h)
+
+    def coord_limit(self):
+        """坐标上限（菱形系）；取几种口径里**最宽松**的那个，绝不因改口径而变小。"""
+        vals = []
+        t = self.map_tile_size()
+        if t:
+            vals += [t[0] + t[1] + 8, 2 * t[0], 2 * t[1]]
+        s = self.map_size()
+        if s:
+            vals += [2 * s[0], 2 * s[1]]
+        if vals:
+            m = max(vals)
+            return (m, m)
+        return (self.MAXPIX // 256, self.MAXPIX // 256)
+
+    def map_match(self, map_path):
+        """「地图 ↔ 存档」匹配判定 —— ★**以不变量为准，不看建筑存活**（2026-10-15 用户要求）。
+
+        用户指出：按建筑匹配不科学（后期档建筑多被摧毁 ⇒ 假不匹配）。
+        **不会变的**是：地图尺寸、地图范围。故判据：
+          ① 主判据（硬）：地图 `[Map] Size` 的 (W,H) == **存档自带尺寸** `map_size()`
+             （「80×80 的图，存档也一定是 80×80」）；
+          ② 辅判据（硬，当 ① 读不到存档尺寸时才当主判据）：存档建筑全部落在
+             地图坐标范围 0..2W-1 / 0..2H-1 内（越界 ⇒ 拿错图）；
+          ③ 建筑重合率：**只作提示**（后期档大量建筑被毁属正常，绝不因此拒绝）。
+        返回 {'ok', 'msg', 'map_size', 'save_size', 'map_n', 'save_n', 'hit',
+              'rate_ms', 'rate_in', 'reason'}
+        """
+        from map_ini import MapIni
+        m = MapIni(map_path) if isinstance(map_path, str) else map_path
+        mw, mh = m.map_size()
+        # ★2026-10-18：优先用**格子表反推**的真实尺寸（与 [Map] Size 同口径）；
+        #   0x348E 那组在自制/任务图上不是这个口径（180×170 的图它写 203×295）。
+        sw, sh = (self.map_tile_size() or self.map_size() or (None, None))
+        ms = m.structures()
+        mcells = {(s['x'], s['y']) for s in ms}
+        blds = self.buildings()
+        lx, ly = 2 * mw, 2 * mh
+        out_of_map = [b for b in blds if not (0 <= b['x'] < lx and 0 <= b['y'] < ly)]
+        rate_in = 1.0 - len(out_of_map) / float(len(blds)) if blds else 1.0
+        hit = len(mcells & {(b['x'], b['y']) for b in blds})
+        rate_ms = hit / float(len(mcells)) if mcells else 0.0
+
+        info = ('地图 %s = %d×%d ｜ 存档自带尺寸 = %s ｜ 建筑重合 %d/%d（%.0f%%，仅供参考）'
+                % (os.path.basename(getattr(m, 'path', '?')), mw, mh,
+                   ('%d×%d' % (sw, sh)) if sw else '未读出',
+                   hit, len(mcells), rate_ms * 100))
+
+        if sw is not None:
+            if (sw, sh) == (mw, mh):
+                return {'ok': True, 'reason': 'size', 'map_size': (mw, mh),
+                        'save_size': (sw, sh), 'map_n': len(mcells),
+                        'save_n': len(blds), 'hit': hit, 'rate_ms': rate_ms,
+                        'rate_in': rate_in,
+                        'msg': '匹配（尺寸一致）：%s' % info}
+            # ★ 2026-10-17 20:3x 玩家实测纠正：**尺寸只是辅助判据，不是铁证**。
+            #   `E:\YURI\SAVE0029.SAV`（任务「救出超时空」）用 all01umd.map（[Map] Size = 180×170）
+            #   被判"不是同一张图"，但**建筑重合 2024/2056 = 98%**，玩家确认就是这一张。
+            #   原因：存档 `0x348E` 那组 (W,H) 在大任务/自制地图档里未必等于地图 INI 的 Size
+            #   （203×295 这种值明显不是 "[Map] Size" 的口径）。
+            #   ⇒ 判据改为：尺寸一致 **或** 建筑高度重合 **或** 建筑全在图上 ⇒ 认同一张图；
+            #     三者都不满足才给"疑似不匹配"，而且**只是提示**（GUI 不再拦人，见 mv_load）。
+            if hit >= 20 and rate_ms >= 0.85:
+                return {'ok': True, 'reason': 'overlap', 'map_size': (mw, mh),
+                        'save_size': (sw, sh), 'map_n': len(mcells),
+                        'save_n': len(blds), 'hit': hit, 'rate_ms': rate_ms,
+                        'rate_in': rate_in,
+                        'msg': ('匹配（建筑重合 %.0f%%，尺寸字段不同：地图 %d×%d / 存档 %d×%d）：%s'
+                                % (rate_ms * 100, mw, mh, sw, sh, info))}
+            if rate_in >= 0.98 and (rate_ms >= 0.4 or hit >= 3):
+                return {'ok': True, 'reason': 'range', 'map_size': (mw, mh),
+                        'save_size': (sw, sh), 'map_n': len(mcells),
+                        'save_n': len(blds), 'hit': hit, 'rate_ms': rate_ms,
+                        'rate_in': rate_in,
+                        'msg': ('匹配（存档建筑 %.0f%% 落在图内，尺寸字段不同）：%s'
+                                % (rate_in * 100, info))}
+            return {'ok': False, 'reason': 'size', 'map_size': (mw, mh),
+                    'save_size': (sw, sh), 'map_n': len(mcells),
+                    'save_n': len(blds), 'hit': hit, 'rate_ms': rate_ms,
+                    'rate_in': rate_in,
+                    'msg': ('疑似不是同一张图（地图尺寸 %d×%d，存档尺寸字段 %d×%d，'
+                            '建筑重合仅 %.0f%%，落在图内 %.0f%%，两张都低）——仅供参考，不阻止使用。\n%s'
+                            % (mw, mh, sw, sh, rate_ms * 100, rate_in * 100, info))}
+        # 读不到存档尺寸 ⇒ 退化为"范围包含 + 建筑率"
+        ok = bool(blds) and rate_in >= 0.98 and (rate_ms >= 0.4 or hit >= 3)
+        return {'ok': ok, 'reason': 'range', 'map_size': (mw, mh),
+                'save_size': None, 'map_n': len(mcells), 'save_n': len(blds),
+                'hit': hit, 'rate_ms': rate_ms, 'rate_in': rate_in,
+                'msg': ('%s：未能读出存档自带尺寸，改用「建筑是否在图上」判定（存档建筑在图上 %.0f%%）。\n%s'
+                        % ('匹配' if ok else '不匹配', rate_in * 100, info))}
+
+    def toggle_trigger(self, rec, on):
+        """启用 / 禁用触发 —— **只写「触发类 GUID 前 8 字节」那 1 个字节**。
+
+        ★ 实测判据（2026-10-13）：
+          · 该字节 = 1 → 读档后触发**执行**（旧图 6692 实测"胜利"）；
+          · 该字节 = 0 → 同一档触发**不执行**（6691 实测"不胜利"；外挂实验 T1 同）；
+          · 两档/三档之间**只差这 1 个字节**，其它字段（含 `+123`、事件、行为）完全一致。
+        ⚠ **不要动 `+123`**（那只是地图级定义的副本，改它不影响行为，实测无效）。
+        ⚠ 定位不到（该处不是 0/1）时**拒绝写入** —— 说明记录布局与本工具预期不同，
+          宁可不给，也不乱写。
+        """
+        if rec.kind != '触发':
+            raise RuntimeError('只有「触发」记录支持启用 / 禁用')
+        off = self._trig_flag_off(rec)
+        if off is None:
+            raise RuntimeError(
+                '这条触发记录的启用位**未定位到**（记录里找不到触发类 GUID，\n'
+                '或 GUID 前 8 字节不是 0/1）—— 记录布局可能与本工具预期不同。\n'
+                '为避免改坏数据，已拒绝写入。\n\n'
+                '可先用「事件」页把它的条件改成永不满足（等效禁用），\n'
+                '或在地编（FA2）里改启用状态后重开新局。')
+        self.plain[rec.off + off] = 1 if on else 0
+        rec.enabled = bool(on)
+        rec.note = '启用位@+%d = %d' % (off, self.plain[rec.off + off])
+        rec.flag_off = rec.off + off
+        self.pending_triggers[rec.sid] = bool(on)
+
+    # ---------- 新写触发（2026-10-14 五轮实验 + V1/V2/V4 游戏内实测通过）----------
+    def can_create_trigger(self):
+        """该档是否支持「新写触发」：对象流须为 [u32 计数][定长对象] 布局
+        （触发实例 200B / 标签 184B，事件对象尺寸可实测）。不满足则诚实拒绝。"""
+        try:
+            self._newtrig_groups()
+            return True
+        except Exception:
+            return False
+
+    def _pick_trigger_template(self, grps):
+        """挑"最干净"的实例对象当克隆骨架，返回 (实例帧偏移, 标签帧偏移)。
+
+        ★2026-10-20（玩家质疑"是不是拿第一个触发当模板"）：
+          实例对象里 `+40/+52/+80..+116/+180` 是**运行期指针**，历史实现克隆时**不清零**
+          （只有事件/行为对象会 blank_runtime）。若模板恰好是"活的"触发，这些指针会被整片抄过去。
+          引擎读档会重算它们（已游戏内验收的"触发法"走的也是这条路），但没必要留着。
+          ⇒ 优先挑 **没有 TagNode 的实例**（引擎已回收 / 从未武装 ⇒ 这些字段多为 0），
+            实在没有才退回组内第一个。
+        """
+        pl = self.plain
+        try:
+            m = self._instance_maps()
+            tobjs = self._tag_objs_by_key()
+        except Exception:
+            return grps['trig'][0], grps['tag'][0]
+        cand = []
+        for k, off in sorted(m['inst'].items(), key=lambda kv: kv[1]):
+            tk = m['tag_of_inst'].get(k)
+            tobj = tobjs.get(tk)
+            live = m['node_of_inst'].get(k) is not None
+            cand.append((live, off, tobj))
+        if not cand:
+            return grps['trig'][0], grps['tag'][0]
+        # ★打分：实例 +72..+108 是**运行期指针数组**（长度随触发的行为链变化），
+        #   克隆时会整片抄过去 ⇒ 挑"这片指针最少"的那条当骨架（实测有全 0 的）。
+        def junk(off):
+            return sum(1 for o in range(64, 120, 4)
+                       if int.from_bytes(pl[off + o:off + o + 4], 'little'))
+        cand.sort(key=lambda c: (junk(c[1]), c[0], c[1]))
+        pick = cand[0]
+        return pick[1], (pick[2] if pick[2] is not None else grps['tag'][0])
+
+    def _newtrig_groups(self, ev_size=None):
+        """定位并校验 触发实例/标签 两组（TagNode/CellTag 为可选）；返回
+        {'trig': [...], 'tag': [...], 'node': [...]|None, 'cell': [...]|None, 'ev_size': n}。
+
+        `ev_size`：档内事件对象 **不足 2 个**时无法实测尺寸（新开局的档很常见），
+        从同族参考档用 `SaveDoc.probe_event_size(ref)` 量一个传进来即可（普通档 108 / 大任务档 124）。
+        """
+        pl = self.plain
+        out = {}
+        for nm, guid, size in (('tag', TRIG_TAGOBJ_GUID, TAG_OBJ_SIZE),
+                               ('trig', TRIG_INSTANCE_GUID, TRIG_OBJ_SIZE),
+                               ('node', TRIG_NODE_GUID, TRIG_NODE_SIZE),
+                               ('cell', TRIG_CELLGUID, TRIG_CELL_SIZE)):
+            pos, q = [], 0
+            while True:
+                i = pl.find(guid, q)
+                if i < 0:
+                    break
+                pos.append(i)
+                q = i + 1
+            if not pos:
+                if nm in ('node', 'cell'):
+                    out[nm] = None          # 可选：老档/未建集群的档允许缺
+                    continue
+                raise RuntimeError('档内没有%s对象组' % nm)
+            cnt = int.from_bytes(pl[pos[0] - 4:pos[0]], 'little') if pos[0] >= 4 else -1
+            if cnt != len(pos) or any(pos[k + 1] - pos[k] != size
+                                      for k in range(len(pos) - 1)):
+                if nm in ('node', 'cell'):
+                    out[nm] = None
+                    continue
+                raise RuntimeError(
+                    '%s对象组布局不符（计数=%d，实际=%d，步长不齐）——'
+                    '该存档格式不支持新写触发' % (nm, cnt, len(pos)))
+            out[nm] = pos
+        # 事件对象尺寸：由事件表实测（大任务档 124、普通档 108，不能写死）
+        _, evs = self._split_tables()
+        if len(evs) < 2:
+            if ev_size is None:
+                raise RuntimeError('档内事件对象不足 2 个，无法实测事件对象尺寸'
+                                   '（可传 ev_size=SaveDoc.probe_event_size(同族参考档)）')
+            if not (64 <= int(ev_size) <= 512):
+                raise RuntimeError('ev_size=%r 不合理' % (ev_size,))
+            out['ev_size'] = int(ev_size)
+            return out
+        ds = set(evs[k + 1]['obj'] - evs[k]['obj'] for k in range(len(evs) - 1))
+        if len(ds) != 1:
+            raise RuntimeError('事件对象尺寸不一致，无法克隆')
+        out['ev_size'] = ds.pop()
+        return out
+
+    @staticmethod
+    def probe_event_size(path):
+        """从「事件对象 ≥2」的**同族参考档**实测事件对象尺寸（普通档 108 / 大任务档 124）。
+
+        用途：新开局的档往往只有 1 个事件，`_newtrig_groups()` 量不出步长，
+        把它传给 `create_trigger(..., ev_size=...)` 就能照常新写触发。
+        """
+        return SaveDoc(path)._newtrig_groups()['ev_size']
+
+    def waypoint_limit(self):
+        """路径点号上限（含）—— **702 个槽，号 0..701**。
+
+        ★2026-10-17 23:2x **修正**：上一版我按"地图 [Waypoints] 最大号"当上限（510），
+          判断 511 越界 —— **错的**。玩家指出并给出历史证据：
+            · `T2`（`刷光棱塔` 配方）当年就是 `set_waypoint(655, 50, 50)` **新写**一个号，
+              游戏内验收通过（玩家原话见文档 §50）⇒ **写地图没有的号是可行的**；
+            · 引擎的路径点数组是定长 702（0..701），地图 `[Waypoints]` 只是"预先定义的"那些，
+              不限制可写范围。
+          ⇒ 上限恒为 701；`map_waypoint_max()` 只用于提示（"这个号地图里没有"）。
+        """
+        return self.WP_COUNT - 1
+
+    def map_waypoint_max(self):
+        """地图 `[Waypoints]` 里声明过的最大号（仅作提示用，不是写入上限）。"""
+        m = getattr(self, '_map', None)
+        if m is not None:
+            try:
+                wp = m.sections.get('waypoints', {}) or {}
+                ids = [int(k) for k in wp if str(k).strip().isdigit()]
+                if ids:
+                    return max(ids)
+            except Exception:
+                pass
+        return None
+
+    def nearest_waypoint(self, x, y):
+        """离 (x,y) 最近的**已有**路径点 → (号, (cx,cy))；没有就 None。"""
+        best = None
+        for n, c in self.waypoints_save().items():
+            if c == (0, 0):
+                continue
+            d = (c[0] - x) ** 2 + (c[1] - y) ** 2
+            if best is None or d < best[0]:
+                best = (d, n, c)
+        return None if best is None else (best[1], best[2])
+
+    def ensure_waypoint_at(self, x, y, prefer=None, limit=None):
+        """确保格子 (x, y) 上有一个路径点，返回其编号（**不改动已有路径点**）。
+
+        2026-10-17：行为 125 的落点 = 路径点号，而路径点表就在存档里（`1586 + 4×号`）
+        ⇒ 「想刷到任意格」只需在该格写一个路径点。策略：
+          ① 该格已经有路径点 ⇒ 直接复用它的号（同格多点时取编号最小的）；
+          ② 否则 `prefer` 优先；再取 **当前最大号 +1**；
+          ③ 上界 = **地图 [Waypoints] 的最大号**（`waypoint_limit()`）——
+             ★写超过地图声明范围的号，引擎不认（2026-10-17 玩家实测 511 无效）；
+          ④ 范围内没有空号 ⇒ 返回 None，让调用方决定（通常改用最近的已有路径点）。
+        """
+        x, y = int(x), int(y)
+        same = sorted(n for n, c in self.waypoints_save().items() if c == (x, y))
+        if same:
+            return same[0]
+        lim = self.waypoint_limit() if limit is None else int(limit)
+        used = set(self.waypoints_save())
+        if prefer is not None:
+            p = int(prefer)
+            if 0 <= p <= lim and p not in used:
+                self.set_waypoint(p, x, y)
+                return p
+        n = (max(used) + 1) if used else 1          # 优先「最大号 +1」：不碰低号的多方起始点
+        if n <= lim and n not in used:
+            self.set_waypoint(n, x, y)
+            return n
+        for n in range(1, lim + 1):                 # 范围内找最小空号
+            if n not in used:
+                self.set_waypoint(n, x, y)
+                return n
+        return None                                 # 范围内没有空号（不越界硬写）
+
+    def _action_runs(self):
+        """算出每条触发的**行为条数**（2026-10-18 实测规则，两份任务档 100% 验证）：
+
+        触发实例 `+0xC4` = 它的**第一条行为对象的键**（行为对象 `+0x10` 存同键）；
+        同一触发的多条行为在动作表里**按序号连续排列**。
+        ⇒ 条数 = **下一条触发的首行为序号 − 本条首行为序号**；排在最后的用
+        「动作总数 − 首行为序号」。
+        （验证：三建筑档 616 条触发、1815 条行为，覆盖 1815、零异常；
+          光棱塔档 616 条触发、1813 条行为，覆盖 1813、零异常。）
+
+        返回 {触发ID: {'start':首序号, 'count':条数}}
+        """
+        pl = self.plain
+        m = self._instance_maps()
+        acts, _evs = self._split_tables()
+        total = len(acts)
+        bykey = {}
+        for a in acts:
+            bykey.setdefault(struct.unpack_from('<I', pl, a['obj'] + 16)[0], a['obj'])
+        ent = {}
+        for k, sid in m['sid'].items():
+            o = m['inst'][k]
+            a0 = bykey.get(struct.unpack_from('<I', pl, o + 0xC4)[0])
+            if a0 is None:
+                continue
+            ent[sid] = struct.unpack_from('<I', pl, a0 + 0x38)[0]
+        starts = sorted(set(ent.values()))
+        out = {}
+        for sid, s in ent.items():
+            nxt = next((x for x in starts if x > s), total)
+            out[sid] = {'start': s, 'count': max(int(nxt) - int(s), 0)}
+        return out
+
+    def trigger_actions(self, trigger_id, limit=32):
+        """列出某触发的**全部行为**（多动作触发也能列）。
+
+        返回 [{ordinal, index, action_off, type, arg, name, waypoint, cell}, ...]
+        """
+        pl = self.plain
+        sid = str(trigger_id).upper()
+        runs = self._action_runs()
+        r = runs.get(sid)
+        if r is None:
+            raise RuntimeError('触发 %s 没有行为对象（或该档结构不支持）' % trigger_id)
+        acts, _evs = self._split_tables()
+        byidx = {}
+        for a in acts:
+            byidx.setdefault(struct.unpack_from('<I', pl, a['obj'] + 0x38)[0], a['obj'])
+        out = []
+        for i in range(min(r['count'], limit)):
+            a = byidx.get(r['start'] + i)
+            if a is None:
+                break
+            wp = struct.unpack_from('<I', pl, a + 88)[0]
+            atp = struct.unpack_from('<I', pl, a + OBJ_TYPE_OFF)[0]
+            argv = struct.unpack_from('<I', pl, a + OBJ_ARG_OFF)[0]
+            if atp in ACTION_VAR_TYPES:          # §175：56/57 的变量号在 +164
+                argv = struct.unpack_from('<I', pl, a + ACT_VAR_OFF)[0]
+            out.append({'ordinal': i + 1,
+                        'index': r['start'] + i,
+                        'action_off': a,
+                        'type': atp,
+                        'arg': argv,
+                        'name': bytes(pl[a + 104:a + 112]).split(b'\x00')[0]
+                                  .decode('ascii', 'ignore').strip(),
+                        'waypoint': wp, 'cell': self.waypoint_cell(wp)})
+        return out
+
+    def trigger_action(self, trigger_id, ac_index=1):
+        """读一条**已有触发**第 `ac_index` 条行为（默认第 1 条）。
+
+        定位链（2026-10-18 修正后）：记录 ID → 实例对象 → `+0xC4` 键 → 行为对象 `+0x10`；
+        条数与后续行为用 `_action_runs()` 的连续序号规则。
+        返回 dict：{trigger_id,index,action_off,count,ordinal,type,arg,name,waypoint,cell}
+        （count = 该触发的行为条数；>1 时用 ac_index 选第几条）
+        """
+        pl = self.plain
+        sid = str(trigger_id).upper()
+        inst = next((r for r in self.records if r.sid == sid), None)
+        if inst is None:
+            raise RuntimeError('找不到触发 %s' % trigger_id)
+        m = self._instance_maps()
+        ks = [k for k, v in m['sid'].items() if v == sid]
+        if not ks:
+            raise RuntimeError('触发 %s 没有实例对象' % trigger_id)
+        o = m['inst'][ks[0]]
+        idx = struct.unpack_from('<I', pl, o + 172)[0]
+        rows = self.trigger_actions(sid)
+        if not rows:
+            raise RuntimeError('触发 %s（序号 %d）没有动作对象，无法改造' % (trigger_id, idx))
+        n = int(ac_index or 1)
+        if not (1 <= n <= len(rows)):
+            raise RuntimeError('触发 %s 只有 %d 条行为，取不到第 %d 条'
+                               % (trigger_id, len(rows), n))
+        r = rows[n - 1]
+        return {'trigger_id': sid, 'index': idx, 'action_off': r['action_off'],
+                'count': len(rows), 'ordinal': n, 'type': r['type'], 'arg': r['arg'],
+                'name': r['name'], 'waypoint': r['waypoint'], 'cell': r['cell']}
+
+    def retarget_trigger(self, trigger_id, ac_type=125, ac_name='GAPOWR',
+                         ac_cell=None, ac_waypoint=None, ac_arg=None, dry_run=False,
+                         ac_index=1):
+        """把**档里已存在的一条触发**的动作改写成「行为 ac_type」（默认 125 建建筑）。
+
+        为什么要有这个方法：本任务档上"**新建**触发"能写进去、能挂进容器，
+        但引擎就是不执行（2026-10-18 内存取证：对象在索引数组里也不跑）；
+        而"**改已有触发**的行为"是游戏内验证通过的（M1）⇒ 这是目前唯一可靠的路子。
+
+        只写动作对象里的 4 处（长度**不变**，不影响容器/索引/7MB 红线）：
+          +64/+60  行为类型 / 参数
+          +104     8 字节 ASCII 建筑类型名（行为 125）
+          +88      路径点编号（行为 125）
+        `ac_cell` 给格子时自动补该格路径点（`ensure_waypoint_at`，不碰已有路径点）。
+
+        dry_run=True 只读不改，返回现状（GUI 用来预览）。
+
+        返回 dict：{trigger_id,index,action_off,waypoint,cell,type,name,arg,
+                    old_type,old_name,old_waypoint,count,warnings}
+        """
+        info = self.trigger_action(trigger_id, ac_index=ac_index)
+        a = info['action_off']
+        info.update({'old_type': info['type'], 'old_name': info['name'],
+                     'old_waypoint': info['waypoint'], 'warnings': []})
+        warnings = info['warnings']
+        if info['count'] > 1:
+            warnings.append('该触发共 %d 条行为，本次改第 %d 条（偏移 %d）'
+                            % (info['count'], info.get('ordinal', 1), a))
+        if dry_run:
+            return info
+        ac_type = int(ac_type)
+        if ac_type == 125:
+            if not ac_name:
+                raise RuntimeError('行为 125「将建筑建于…」必须给 ac_name（建筑类型名）')
+            if ac_waypoint is None:
+                if ac_cell is None:
+                    raise RuntimeError('行为 125 需要 ac_waypoint 或 ac_cell')
+                cx, cy = int(ac_cell[0]), int(ac_cell[1])
+                had = sorted(n for n, cc in self.waypoints_save().items() if cc == (cx, cy))
+                ac_waypoint = self.ensure_waypoint_at(cx, cy)
+                if ac_waypoint is None:
+                    near = self.nearest_waypoint(cx, cy)
+                    if near is None:
+                        raise RuntimeError('路径点号已用满且没有可复用的已有路径点')
+                    ac_waypoint = near[0]
+                    warnings.append('⚠ 路径点号已占满 ⇒ 改用最近的 #%d @(%d,%d)'
+                                    % (near[0], near[1][0], near[1][1]))
+                elif had:
+                    warnings.append('复用该格已有路径点 %d' % ac_waypoint)
+                else:
+                    warnings.append('目标格 (%d,%d) 原来没有路径点 ⇒ 已写路径点 %d'
+                                    % (cx, cy, ac_waypoint))
+            pl = self.plain                    # ensure_waypoint_at 可能动过明文
+            nm = str(ac_name).strip().upper().encode('ascii', 'ignore')[:8].ljust(8, b'\x00')
+            struct.pack_into('<I', pl, a + OBJ_TYPE_OFF, 125)
+            struct.pack_into('<I', pl, a + OBJ_ARG_OFF,
+                             0 if ac_arg is None else int(ac_arg))
+            pl[a + 104:a + 112] = nm
+            struct.pack_into('<I', pl, a + 88, int(ac_waypoint))
+            info.update({'type': 125, 'arg': 0 if ac_arg is None else int(ac_arg),
+                         'name': str(ac_name).strip().upper(),
+                         'waypoint': int(ac_waypoint),
+                         'cell': self.waypoint_cell(int(ac_waypoint))})
+        else:
+            pl = self.plain
+            struct.pack_into('<I', pl, a + OBJ_TYPE_OFF, ac_type)
+            if ac_arg is not None:
+                if ac_type in ACTION_VAR_TYPES:      # §175：56/57 变量号在 +164
+                    struct.pack_into('<I', pl, a + OBJ_ARG_OFF, 0)
+                    struct.pack_into('<I', pl, a + ACT_VAR_OFF, int(ac_arg) & 0xFFFFFFFF)
+                else:
+                    struct.pack_into('<I', pl, a + OBJ_ARG_OFF, int(ac_arg))
+                info['arg'] = int(ac_arg)
+            if ac_name or ac_cell is not None or ac_waypoint is not None:
+                warnings.append('ac_name/ac_cell/ac_waypoint 只对行为 125 有效，已忽略')
+            info['type'] = ac_type
+        info['action_off'] = a
+        self._invalidate_if_shifted()
+        # ★§175：原地改类型/参数时长度不变 ⇒ _invalidate_if_shifted 不会作废缓存，
+        #   但对象里的 type/arg 已经变了（retarget 到 56 后 actions() 还会给旧值）
+        self.invalidate_caches()
+        return info
+
+    def create_trigger(self, name, ev_type, ev_arg, ac_type, ac_arg=0, attach=None,
+                       owner=None, ac_name=None, ac_waypoint=None, ac_cell=None,
+                       ev_size=None, pieces=None, register=None, persistence=0,
+                       hb_warn=True):
+        """在存档里**新写一个触发**（克隆现有对象集群改键，非从零合成）。
+
+        2026-10-14 定案（**游戏内实测通过**：10 秒地图点亮、30 秒胜利）：
+          · 一个可用触发 = **六件套**：标签(184B) + CellTag(76B) + 触发实例(200B)
+            + TagNode(92B) + 事件 + 行为。只写「标签 + 实例 + 事件 + 行为」
+            （V1~V4 版）**写得出、读得进、但不生效** —— 实测只有与建筑绑定的
+            那条（电厂自爆）能动，纯计时/胜利条件一律不触发。
+          · 键用**同区未用地址**：实例/标签 0x02Axxxxx 区、TagNode/CellTag
+            0x13Fxxxxx 区（异区键实测载入崩）；
+          · ★**序号**必须写对：实例/标签对象 `+172`、事件/行为对象 `+56`
+            = 该触发在集群里的 0 基序号（追加到末尾 ⇒ = 原有触发数）。
+            写 0 时能读档但引擎找不到它（实测「加了两个触发不报错也不生效」）；
+          · ★事件/行为对象里**克隆源的运行期指针必须清零**（只留身份+类型+参数+序号），
+            否则继承上一个对象的指针（权威档：13/30 事件 +40/+52/+76..+100 全 0）；
+          · ★TagNode `+80` = 「流逝时间」等待帧数（秒 × 15）、`+88` 最低位 = 启用状态；
+            CellTag `+56` = 标签键、`+60` = TagNode 键、`+64` = 挂接数（无挂接 0）；
+          · 各组**末尾插入**并各自把组计数 +1（明文变长，save() 已支持）；
+          · 可选 `attach=[(格x, 格y), …]`：顺手把新触发挂到这些建筑上 —— 建筑 tag
+            字段 ← 本触发 CellTag 自键、CellTag `+64` = 挂接数。**不动激活登记表**
+            （该表只收计时触发；对象事件触发（如 B = 进入事件）不在表里也照常工作）。
+          · ★行为 125（`ac_type=125`）：`ac_name` = 建筑类型名、`ac_waypoint` = 路径点号，
+            或直接给 **`ac_cell=(x, y)`** —— 该格没有路径点就**自动写一个**（见
+            `ensure_waypoint_at`）⇒ 配合上面的路径点表，触发法可以"刷到任意格"。
+          · `ev_size`：**新开局的档只有 1 个事件**时量不出事件对象步长，
+            传 `ev_size=SaveDoc.probe_event_size(同族参考档)`（普通档 108 / 大任务档 124）即可。
+          · `persistence`（**2026-10-20 新增**）＝**触发类型（重复类型）**，写进
+            **标签对象 `+0xB0`(=+176)**，对应地图 `[Tags]` 第 0 字段：
+            `0` 一次性·任一挂载 / `1` 一次性·挂载清空 / `2` 可重复。
+            ⚠ 该字节以前被注释成"是否参与评估"，其实是同一个位置的两种读法 —— 实测
+            写上 1 会让触发不执行（Z4/Z5 单变量对照），所以**默认 0（游戏内已验证）**；
+            想让新触发"跑完还能再触发"就传 2。
+        返回 {'trigger_id', 'tag_id', 'index', 'ev_off', 'ac_off', 'attached', 'warnings'}。
+        """
+        if not name:
+            raise ValueError('触发名不能为空')
+        name = str(name)[:16]   # 名字区 52B（120..171），之后是序号/难度位，不能覆盖
+        # ★2026-10-20 玩家要求：允许 ac_type=None ⇒ **一条行为都不建**（空触发）。
+        #   这样"新建"不会硬塞一条 21 播放语音让你还得再加一条才能删它。
+        no_action = ac_type is None
+        ev_type, ev_arg = int(ev_type), int(ev_arg)
+        ac_arg = 0 if no_action else int(ac_arg)
+        if ev_type == 0 or ev_type not in EVENT_TYPES:
+            raise ValueError('事件类型 %s 无效（0 是占位项，禁止使用）' % ev_type)
+        if not no_action and (ac_type == 0 or ac_type not in ACTION_TYPES):
+            raise ValueError('行为类型 %s 无效（0 是占位项，禁止使用）' % ac_type)
+        ac_type = 0 if no_action else int(ac_type)
+        if not (0 <= ev_arg <= 0xFFFFFF and 0 <= ac_arg <= 0xFFFFFF):
+            raise ValueError('参数需在 0 ~ 16777215 之间')
+        persistence = int(persistence)
+        if persistence not in (0, 1, 2):
+            raise ValueError('触发类型 persistence 只能是 0/1/2（0 一次性·任一挂载 / '
+                             '1 一次性·挂载清空 / 2 可重复）')
+        grps = self._newtrig_groups(ev_size=ev_size)
+        pl = self.plain
+        ev_size = grps['ev_size']
+        node_pos, cell_pos = grps.get('node'), grps.get('cell')
+        idx = len(grps['trig'])                  # 集群内序号（追加到末尾）
+        ticks = ev_arg * LOGIC_FPS if ev_type == 13 else 0
+        warnings = []
+        # ★§181：事件 36/37 是纯电平查询，没有对象/标签回调 —— 只有进了
+        #   「定时触发器挂接表」（条件：ticks>0，即首个事件是 13）才会被轮询。
+        #   这里只提示、不擅自改事件列表（调用方可能随后还会 add_event 补计时）。
+        if hb_warn and ev_type in POLL_EVENT_TYPES and ticks <= 0:
+            warnings.append(
+                '⚠ 事件 %d 是纯电平查询（局部变量），本触发没有计时事件 ⇒ 不进'
+                '「定时触发器挂接表」，读档后不会被评估。请再补一条「13 流逝时间」。'
+                % ev_type)
+        # ★★2026-10-20 修正（玩家实测反馈）：默认**一律六件套**。
+        #   旧逻辑是「ticks<=0 且没 attach ⇒ 不建 TagNode/CellTag」，结果：
+        #   用编辑器新建一条「事件 8」触发 → 没有运行期节点；之后把它改成
+        #   「13 流逝时间」→ 照样没有节点 ⇒ 引擎根本不执行，列表里立刻显示"已执行/无组件"，
+        #   等于**新建出来就是一条废触发**（玩家一眼就看出来了）。
+        #   而游戏内验收通过的"触发法刷建筑"（place_building_by_trigger）本来就**显式传 pieces=True**，
+        #   §51.2 的结论也是"凡是新写触发，一律补齐六件套"（四件套不执行）。
+        #   ⇒ 默认改成 True；只有显式传 pieces=False 才省（老实验脚本用）。
+        #   注意：ticks<=0 时不登记「定时触发器挂接表」—— 与触发法完全一致（已验证）。
+        need_pieces = True if pieces is None else bool(pieces)
+        # ★2026-10-17 实测：**四件套（只有 tag/trig/ev/ac）的触发引擎不执行** ——
+        #   SAVE0029 上用事件 8 写的"任何事件→125"读档后没刷出建筑（T3）；
+        #   同样条件补上 TagNode/CellTag（T2 事件13）就成功 ⇒ 默认按"需要六件套"处理。
+        synth = None                              # (cell 计数槽, node 计数槽)
+        if not need_pieces:
+            if node_pos or cell_pos:
+                warnings.append('本触发无计时 ⇒ 按参数不建 TagNode/CellTag')
+            else:
+                warnings.append('档内没有 TagNode/CellTag 对象组 —— 按参数跳过')
+            node_pos = cell_pos = None
+        elif not node_pos or not cell_pos:
+            # 组根本不存在 ⇒ 在"组空位"补建（cell 槽 = tag 组末尾，node 槽 = trig 组末尾，
+            # 两处都必须是 u32 0 —— 引擎自己没建过这两组时就是这样）
+            cslot = grps['tag'][-1] + TAG_OBJ_SIZE
+            nslot = grps['trig'][-1] + TRIG_OBJ_SIZE
+            try:
+                zc = struct.unpack_from('<I', pl, cslot)[0]
+                zn = struct.unpack_from('<I', pl, nslot)[0]
+            except Exception:
+                zc = zn = -1
+            if zc == 0 and zn == 0:
+                synth = (cslot, nslot)
+                node_pos = cell_pos = []          # 标记"要建"，插入位置另算
+                warnings.append('档内原本没有 TagNode/CellTag 对象组 —— 已在组空位补建（+168B）')
+            else:
+                node_pos = cell_pos = None
+                warnings.append('档内没有 TagNode/CellTag 对象组，且组空位不是 0（%r/%r）'
+                                '—— 未补建；该触发可能不生效' % (zc, zn))
+
+        # 模板：**优先挑"干净"的实例**（见 _pick_trigger_template）/ 对应标签 /
+        #       最后一个事件 / 最后一个行为
+        tpl_inst, tpl_tag = self._pick_trigger_template(grps)
+        t_tpl = bytes(pl[tpl_inst:tpl_inst + TRIG_OBJ_SIZE])
+        g_tpl = bytes(pl[tpl_tag:tpl_tag + TAG_OBJ_SIZE])
+        _, evs = self._split_tables()
+        acts, _ = self._split_tables()
+        ev_src, ac_src = evs[-1], acts[-1]
+        ev_guid = bytes(pl[ev_src['obj']:ev_src['obj'] + 16])   # ★插入前快照（插入会推移这些字节）
+        ac_guid = bytes(pl[ac_src['obj']:ac_src['obj'] + 16])
+        if node_pos and cell_pos:
+            tpl_node = bytes(pl[node_pos[0]:node_pos[0] + TRIG_NODE_SIZE])
+            tpl_cell = bytes(pl[cell_pos[0]:cell_pos[0] + TRIG_CELL_SIZE])
+        else:                                    # 档里没有可克隆的 ⇒ 用空壳模板
+            tpl_node, tpl_cell = TRIG_NODE_TEMPLATE, TRIG_CELL_TEMPLATE
+        # ★事件/行为组的计数注册字段（组首对象前 4 字节）—— 2026-10-14 读档崩溃归因：
+        #   向导只加了 tag/trig 的计数，事件/行为组仍是旧值 ⇒ 引擎按旧 count 读流，
+        #   多出的对象被当成下一组数据 ⇒ 载入即崩（实测 MD_修改.SAV）。
+        cnt_ev_pos = evs[0]['obj'] - 4
+        cnt_ac_pos = acts[0]['obj'] - 4
+        for nm, p0, n in (('事件', cnt_ev_pos, len(evs)), ('行为', cnt_ac_pos, len(acts))):
+            cur = int.from_bytes(pl[p0:p0 + 4], 'little')
+            if cur != n:
+                raise RuntimeError(
+                    '%s组计数注册字段(%d)与实际对象数(%d)不符 —— '
+                    '该档布局不支持新写触发（为避免写坏已拒绝）' % (nm, cur, n))
+
+        # 同区新键（同类最大键 +0x1000 起，全档查重）
+        used = []
+        def fresh(keys, base):
+            v = ((max(keys) + 0x1000) & 0xFFFFFFFF) if keys else base
+            while pl.find(struct.pack('<I', v)) >= 0 or v in used:
+                v = (v + 0x1000) & 0xFFFFFFFF
+            used.append(v)
+            return v
+        def fresh2(pos_list):
+            return fresh([int.from_bytes(pl[p + 16:p + 20], 'little') for p in pos_list]
+                         + used, 0x02A75020)
+        K_TRIG = fresh2(grps['trig'])
+        K_TAG = fresh2(grps['tag'])
+        obj_pos = [o['obj'] for o in self._objects()]
+        K_EV = fresh2(obj_pos)
+        K_AC = None if no_action else fresh2(obj_pos)
+        K_NODE = K_CELL = None
+        if node_pos is not None:          # 空列表 = 要补建（键从基址起查重）
+            # ★TagNode / CellTag 同属 0x13xxxxxx 区（与实例/标签键**不通用**，异区键载入崩）；
+            #   两份键各按「自己那一类最大键 +0x1000」取，且互查重（fresh 内部查 used）
+            K_NODE = fresh([int.from_bytes(pl[p + 16:p + 20], 'little') for p in node_pos],
+                           NODEGRP_BASE_KEY)
+            K_CELL = fresh([int.from_bytes(pl[p + 16:p + 20], 'little') for p in cell_pos],
+                           NODEGRP_BASE_KEY)
+
+        # 新 ID：现有 触发+标签 ID 的最大值 +1（FA2 两类共用一个顺序计数）
+        sids = []
+        for r in self.records:
+            if r.kind in ('触发', '标签') and len(r.sid) == 8:
+                try:
+                    sids.append(int(r.sid, 16))
+                except ValueError:
+                    pass
+        # ★2026-10-20：AI 三大件（小队/特遣/脚本）也用同一套 8 位 ID 编号空间。
+        #   它们现在被单独分类、不再算进"触发/标签"，若不让它们参与取最大值，
+        #   新分配的 ID 会撞到某条特遣部队/脚本上 ⇒ 新建的触发被当成 AI 记录（自检抓到）。
+        #   ⚠ 只取 **01xxxxxx** 那一段：AI 里还有一堆 GUID 风格的随机 ID
+        #     （如 0ECCF03D），把它们算进最大值会让新 ID 跳到 GUID 区，
+        #     既不符合 FA2 的 01xxxxxx 顺序编号，也会让记录扫描找不到它。
+        for _a in self._ai_ids():
+            if not _a.startswith('01'):
+                continue
+            try:
+                sids.append(int(_a, 16))
+            except Exception:
+                pass
+        nxt = (max(sids) + 1) if sids else 0x01000000
+        sid_t, sid_g = '%08X' % nxt, '%08X' % (nxt + 1)
+
+        def patch(buf, off, data):
+            buf[off:off + len(data)] = data
+        u32v = lambda v: struct.pack('<I', v)
+        def setname(buf, off, span, text):
+            buf[off:off + span] = b'\x00' * span
+            # ★名字在存档里是 **GBK**（`_scan_records` 用 `_decode_txt` 解 +64 起的那段）；
+            #   先 GBK，编不出来再退回 UTF-8。
+            try:
+                b = text.encode('gbk')
+            except Exception:
+                b = text.encode('utf-8', 'ignore')
+            b = b[:span - 1]
+            buf[off:off + len(b)] = b
+        def blank_runtime(buf, size):
+            """清掉克隆源的运行期指针（保留 0..+36：身份签名 + 类常量 + FFFFFFFF）。"""
+            for off in range(40, size, 4):
+                buf[off:off + 4] = b'\x00' * 4
+
+        # ---- 构造对象 ----
+        t = bytearray(t_tpl)
+        patch(t, 16, u32v(K_TRIG))
+        patch(t, 56, sid_t.encode())
+        # ★★2026-10-18 15:0x 重大修正：实例 **+0xB0 是"启用/难度"标志字**（4 个字节）。
+        #   旧版这里**沿用模板**（模板 = 档里第一个触发实例）。若那一代档的模板是"被禁用"的，
+        #   我们克隆出来的触发就**生下来就是禁用的** —— 引擎永远不会评估它。
+        #   实测（Z1_最小复现）：从"所有触发全禁用"的基档克隆 ⇒ 新实例 +0xB0 = 0x00010101，
+        #   而地编自己建、游戏里确实会执行的那条 = 0x01010101 ⇒ 读档一分钟什么都没发生。
+        #   全档统计：能跑的触发全是 0x01010101；0x00010101 全是玩家在地编里勾掉"禁用"的。
+        #   ⇒ 新写触发必须**强制启用**（四字节全 1 = 启用 + 三个难度都开）。
+        patch(t, 0xB0, u32v(0x01010101))
+        # ★名字区：**实例对象 +120..+171**（= ASCII 记录帧的 +64..+115，帧差 56B）
+        #   `_scan_records` 读到名字在记录 +64 ⇒ 这里必须写 +120（旧值是对的，别改）。
+        setname(t, 120, 52, name)
+        patch(t, TRIG_REC_IDX_OFF, u32v(idx))         # ★集群内序号
+        patch(t, 192, u32v(K_EV))
+        patch(t, 196, u32v(K_AC or 0))        # 空触发 ⇒ 行为链头 = 0
+        # ★2026-10-17：触发所属方（国家）= **记录 +128**（= 目标阵营 House 块 +72 的键）。
+        #   `t` 是**实例对象帧**，ASCII 记录帧比它晚 **56 字节**（t+56 就是记录 +0 的 ID）
+        #   ⇒ 在 t 帧上要写 `TRIG_OWNER_OFF + 56`。
+        #   不传 owner ⇒ 保持模板的所属方（旧行为）。
+        TRIG_REC_DELTA = 56
+        # ★★2026-10-18 15:1x 实测（Z7/Z8 单变量对照，同一份大任务档、同一个格子）：
+        #   · 新建触发把建筑建给 **Neutral** ⇒ 建筑**闪一下就消失**（引擎会移除无主/中立建筑）；
+        #   · 建给 **真实阵营**（玩家 Americans）⇒ **稳稳留住**（蓝色、无电状态，正常）。
+        #   地编那条刷电厂能留住，是因为它的动作里带了自己的所属信息；我们克隆的动作没有，
+        #   于是完全依赖触发所属方 ⇒ **新写触发必须给真实阵营**。
+        #   owner 缺省 = 存档当前玩家阵营（存档编辑器里这几乎总是想要的）；
+        #   想保留旧行为（沿用模板所属方）显式传 owner='template'。
+        if owner is None:
+            try:
+                owner = self.player_house()
+            except Exception:
+                owner = None
+        elif str(owner).strip().lower() == 'template':
+            owner = None
+        if owner:
+            _ok = self.house_trigger_owner_key(owner)
+            if _ok is None:
+                raise RuntimeError('认不出阵营 %s 的"触发所属方对象"键（House 块 +72）' % (owner,))
+            patch(t, self.TRIG_OWNER_OFF + TRIG_REC_DELTA, u32v(_ok))
+        g_ = bytearray(g_tpl)
+        patch(g_, 16, u32v(K_TAG))
+        patch(g_, 56, sid_g.encode())
+        # ★★标签对象 **+0xB0(=+176) = 触发类型（标签持久性 / "重复类型"）**。
+        #   ⚠ 2026-10-18 曾把它当成"是否参与评估"标志（Z4/Z5 单变量对照：写 1 就不执行）。
+        #   2026-10-20 定案：这个字节就是地图 `[Tags]` 第 0 字段 PERSISTENCE
+        #   （0 一次性·任一挂载 / 1 一次性·挂载清空 / 2 可重复），
+        #   而记录帧（Rec.off，= 对象帧+56）的 +120 正是它 —— SAVE48DB 82/82 与地图对拍一致。
+        #   ⇒ 写 1 不执行，其实是"半持久"语义；**默认 0**（多年游戏内实测稳定），
+        #     要让触发"跑完还能再触发"才显式传 2。
+        patch(g_, 0xB0, u32v(persistence))
+        setname(g_, 120, 52, name + ' 1')             # 标签：实例 +120..+171（同上，帧差 56B）
+        patch(g_, TRIG_REC_IDX_OFF, u32v(idx))        # ★序号（与实例同值）
+        patch(g_, 180, u32v(K_TRIG))
+        # ★★★★★ 2026-10-18 11:2x：**标签对象里有两处"残留运行期指针"必须清零**。
+        #   实测（内存+存档双证）：FA2 亲手建的标签在 `+40`、`+52` 是 0；
+        #   我们克隆模板时会**继承模板的旧指针**（例：0x147F9AE0 / 0x147F9300），
+        #   这种指向已释放/别的对象的指针会让引擎在"评估触发"阶段把这条跳过。
+        #   ⇒ 克隆后一律置 0（与 FA2 产物一致）。
+        # ★§192（2026-10-22）扩表：82 个标签的实测统计显示脏槽不止这两个 ——
+        #   对象体 **+0x14 / +0x20**（= 帧 +40/+52）与 **+0x2C..+0x5F**（= 帧 +0x40..+0x73）
+        #   在 FA2 产物里全 0，而从模板克隆会带进旧键(0x13xxxxxx)/裸指针(0x10xxxxxx)。
+        #   ⇒ 整段清零（帧 0x28..0x38 与 0x40..0x74），保留 +0x60 的静态常量。
+        patch(g_, 0x28, b'\x00' * 0x10)      # 对象 +0x14..+0x23
+        patch(g_, 0x40, b'\x00' * 0x34)      # 对象 +0x2C..+0x5F
+        e_ = bytearray(pl[ev_src['obj']:ev_src['obj'] + ev_size])
+        blank_runtime(e_, ev_size)
+        patch(e_, 16, u32v(K_EV))
+        patch(e_, 56, u32v(idx))                      # ★所属触发的序号
+        patch(e_, OBJ_TYPE_OFF, u32v(ev_type))
+        patch(e_, OBJ_ARG_OFF, u32v(ev_arg))
+        a_ = None
+        if not no_action:
+            a_ = bytearray(pl[ac_src['obj']:ac_src['obj'] + ACTION_SIZE])
+            blank_runtime(a_, ACTION_SIZE)
+            patch(a_, 16, u32v(K_AC))
+            patch(a_, 56, u32v(idx))
+            patch(a_, OBJ_TYPE_OFF, u32v(ac_type))
+            patch(a_, OBJ_ARG_OFF, u32v(ac_arg))
+            if ac_type in ACTION_VAR_TYPES:      # §175：56/57 的变量号在 +164
+                patch(a_, OBJ_ARG_OFF, u32v(0))
+                patch(a_, ACT_VAR_OFF, u32v(ac_arg & 0xFFFFFFFF))
+        # ★2026-10-17：行为 125「将建筑建于…」的两个专有参数（其它行为不传即不写）：
+        #   +88  = 路径点编号（建筑落在该路径点上）
+        #   +104 = 8 字节 ASCII 建筑类型名（如 b"ATESLA"）
+        ac_note = ''
+        if ac_type == 125:
+            if not ac_name or (ac_waypoint is None and ac_cell is None):
+                raise RuntimeError('行为 125「将建筑建于…」必须同时给 ac_name（建筑类型名）'
+                                   '与 ac_waypoint（路径点编号）或 ac_cell（目标格子 x,y）')
+            if ac_waypoint is None:
+                ac_waypoint = self.ensure_waypoint_at(ac_cell[0], ac_cell[1])
+                if ac_waypoint is None:
+                    near = self.nearest_waypoint(int(ac_cell[0]), int(ac_cell[1]))
+                    if near is None:
+                        raise RuntimeError('路径点号已用满且没有可复用的已有路径点')
+                    ac_waypoint = near[0]
+                    warnings.append('⚠ 地图只声明 0..%d 号路径点且已占满 ⇒ 改用最近的 #%d @(%d,%d)'
+                                    % (self.waypoint_limit(), near[0], near[1][0], near[1][1]))
+                else:
+                    warnings.append('路径点 %d = (%d,%d)（该格原来没有路径点，已写进存档）'
+                                    % (ac_waypoint, int(ac_cell[0]), int(ac_cell[1])))
+            _nm = str(ac_name).upper().encode('ascii', 'ignore')[:8].ljust(8, b'\x00')
+            patch(a_, 104, _nm)
+            patch(a_, 88, u32v(int(ac_waypoint)))
+            ac_note = '行为125：%s @ 路径点 %d' % (ac_name, int(ac_waypoint))
+        elif ac_name or ac_waypoint is not None or ac_cell is not None:
+            warnings.append('ac_name/ac_waypoint/ac_cell 只对行为 125 有效，已忽略')
+        nb = cb = None
+        if node_pos is not None:
+            nb = bytearray(TRIG_NODE_SIZE)
+            patch(nb, 0, TRIG_NODE_GUID)
+            patch(nb, 16, u32v(K_NODE))
+            patch(nb, 20, tpl_node[20:36])            # 类常量（跨档恒定）
+            patch(nb, 36, b'\xff' * 4)
+            patch(nb, NODE_TRIGKEY_OFF, u32v(K_TRIG))
+            patch(nb, 76, u32v(NODE_SPARE76))
+            patch(nb, NODE_TICKS_OFF, u32v(ticks))    # ★流逝时间帧数
+            patch(nb, NODE_FLAG_OFF, u32v(1))         # ★启用状态 = 1
+            cb = bytearray(TRIG_CELL_SIZE)
+            patch(cb, 0, TRIG_CELLGUID)
+            patch(cb, 16, u32v(K_CELL))
+            patch(cb, 20, tpl_cell[20:36])
+            patch(cb, 36, b'\xff' * 4)
+            patch(cb, CELL_TAGKEY_OFF, u32v(K_TAG))
+            patch(cb, CELL_NODEKEY_OFF, u32v(K_NODE))
+            # +64 挂接数保持 0（新触发未挂任何建筑/格子）
+
+        # ★★★「定时触发器挂接表」必须补登记（2026-10-14 定案：**这就是新写触发不生效的那一环**）
+        #   带计时的触发（TagNode 帧数 > 0）除六件套之外，还必须在 [count][CellTag 键…]
+        #   这张表里挂上自己的 CellTag 键；漏了 ⇒ 六件套齐全、序号正确、能读档，
+        #   但计时器不武装 ⇒ **永远不触发**。地图写的档（地编写入）表里有，工具写的没有。
+        timer_ins = None
+        _want_reg = (ticks > 0) if register is None else bool(register)
+        if _want_reg and K_CELL is not None:
+            tl = self.celltag_timer_list()
+            if tl is not None:
+                timer_ins = tl
+            else:
+                # 空表（新开局的档）：用结构指纹定位计数槽，从零建表 + 登记本触发的 cell 键
+                slot = self.timer_table_slot()
+                if slot is not None:
+                    timer_ins = {'count_pos': slot, 'list_pos': slot + 4,
+                                 'keys': [], 'expected': 0, 'n': 0, 'empty': True}
+                    warnings.append('「定时触发器挂接表」原本是空的 —— 已建表并登记本触发的 cell 键')
+                else:
+                    warnings.append('未定位到「定时触发器挂接表」—— 该档里这张表为空或缺席，'
+                                    '新触发可能不触发（请把此档留档以便继续定位）')
+        # 插入位置（各组末尾）+ 降序应用（低位插入会推移高位坐标）
+        ins = [(grps['tag'][-1] + TAG_OBJ_SIZE, bytes(g_)),
+               (grps['trig'][-1] + TRIG_OBJ_SIZE, bytes(t)),
+               (ev_src['obj'] + ev_size, bytes(e_))]
+        if a_ is not None:
+            ins.append((ac_src['obj'] + ACTION_SIZE, bytes(a_)))
+        if node_pos is not None:
+            if synth:
+                ins.append((synth[1] + 4, bytes(nb)))     # node 计数槽之后
+                ins.append((synth[0] + 4, bytes(cb)))     # cell 计数槽之后
+            else:
+                ins.append((node_pos[-1] + TRIG_NODE_SIZE, bytes(nb)))
+                ins.append((cell_pos[-1] + TRIG_CELL_SIZE, bytes(cb)))
+        if timer_ins is not None:
+            # 追加到表尾（与触发序号顺序一致）；表名"变长"，插 4 字节即可，
+            # 其后的数据整体后移（本函数的多点插入已按降序应用，互不干扰）
+            ins.append((timer_ins['list_pos'] + 4 * timer_ins['n'], struct.pack('<I', K_CELL)))
+            # 计数字段在最低位（低于全部插入点）⇒ 位置稳定，可直接 +1
+            patch(pl, timer_ins['count_pos'],
+                  u32v(int.from_bytes(pl[timer_ins['count_pos']:timer_ins['count_pos'] + 4],
+                                      'little') + 1))
+        else:
+            if _want_reg:
+                warnings.append('未登记「定时触发器挂接表」：本档无法定位该表')
+        for pos, data in sorted(ins, key=lambda x: -x[0]):
+            pl[pos:pos] = data
+
+        # 组计数 +1（插入后**重新定位**各组首对象；tag 组尾紧挨 cell 计数字段，必须重定位）
+        for nm, guid in (('tag', TRIG_TAGOBJ_GUID), ('trig', TRIG_INSTANCE_GUID),
+                         ('node', TRIG_NODE_GUID), ('cell', TRIG_CELLGUID)):
+            if nm in ('node', 'cell') and node_pos is None:
+                continue
+            p0 = pl.find(guid)
+            if p0 < 4:
+                continue
+            old = int.from_bytes(pl[p0 - 4:p0], 'little')
+            patch(pl, p0 - 4, u32v(old + 1))
+        # ★事件/行为组计数同样 +1（漏加 = 读档崩溃，2026-10-14 实测归因）。
+        #   ⚠ 必须在插入后**重新定位**组首对象：事件组紧跟行为组，行为组尾部插入
+        #   会把事件计数字段推移 —— 用插入前坐标会写进别的对象（第一次修复就栽在这）。
+        self._objs = None
+        self._events = None
+        self._actions = None
+        acts2, evs2 = self._split_tables()
+        _cnt_items = [('事件', evs2[0]['obj'], len(evs2) - 1)]
+        if not no_action:
+            _cnt_items.append(('行为', acts2[0]['obj'], len(acts2) - 1))
+        for nm, first, n_old in _cnt_items:
+            p0 = first - 4
+            cur = int.from_bytes(pl[p0:p0 + 4], 'little')
+            if cur != n_old:
+                raise RuntimeError('%s组计数注册字段=%d，期望旧值=%d —— 布局异常，已中止'
+                                   % (nm, cur, n_old))
+            patch(pl, p0, u32v(n_old + 1))
+        # 新对象最终位置：降序插入后低位插入会推移高位对象 ⇒ 按「类GUID+自键」回查（最稳；
+        # 单键会撞上触发对象里的 ev/ac 指针字段）
+        def locate(key, guid):
+            i = pl.find(guid + struct.pack('<I', key))
+            if i < 0:
+                raise RuntimeError('新对象回查失败（键 %08X）' % key)
+            return i + OBJ_TYPE_OFF
+        ev_off = locate(K_EV, ev_guid)
+        ac_off = None if no_action else locate(K_AC, ac_guid)
+        # 旧的事件/行为/挂接 pending 偏移若在插入点之后需要平移（簿记一致性）
+        for delta_map, store in (
+                ([(p, len(d)) for p, d in ins], self.pending_events),
+                ([(p, len(d)) for p, d in ins], self.pending_actions)):
+            if store:
+                moved = {}
+                for k, v in store.items():
+                    nk = k + sum(sz for p, sz in delta_map if p <= k)
+                    moved[nk] = v
+                store.clear()
+                store.update(moved)
+        if self.pending_attach:
+            # ★2026-10-22 修 bug：`ins` 的元素是 `(pos, data)`，这里却按 `(p, size)` 解包
+            #   ⇒ `sz` 拿到的是 bytes，`p <= f` 之后 `f + bytes` 直接 TypeError。
+            #   以往只有在「本会话已有 pending_attach（待补挂接）且随后的 create_trigger
+            #   又要插对象」时才会踩到 —— 局部变量配方（先建 N 条挂接触发、再建汇总触发）
+            #   正好踩中，汇总触发直接建不出来。
+            self.pending_attach = [
+                (f + sum(len(d) for p, d in ins if p <= f), old)
+                for f, old in self.pending_attach]
+        # 缓存全部失效 + 重扫
+        self._objs = None
+        self._events = None
+        self._actions = None
+        self._ticks = None
+        self._celltags = None
+        self._ctimerlist = None
+        self._house_econ = None
+        self._custom_houses = None
+        self._house_keys_memo = None
+        self._tagrecs = None            # ★2026-10-20：同上，新建触发的标签也要能被认出
+        self._instmaps = None           # ★2026-10-20：不失效它 ⇒ 新触发"没有运行期实例"，
+        #                                  接着 add_action/copy 全部失败（自检抓到）
+        self.records = self._scan_records()
+        if self._map:
+            self._events = None
+            self._actions = None
+            self._apply_map()
+        self.pending_newtrig = True
+        # ---- 可选：顺带挂到建筑（2026-10-15 定案，与「挂接」页同一套机制）----
+        #   挂接 = ① 建筑对象的 tag 字段 ← 本触发 CellTag 的自键
+        #          ② 本触发 CellTag 的 +64 计数 = 挂接建筑数（0 → N）
+        #   ★不需要动激活登记表（那张表只收「TagNode 帧数 > 0」的计时触发；
+        #     对照：基档 B = 进入事件（无计时）、挂在 NASAM 上，不在表里也照常工作）。
+        attached, fails = [], []
+        if attach:
+            if not K_CELL:
+                warnings.append('该档没有 CellTag 对象组 ⇒ 无法挂接建筑（attach 已忽略）')
+            else:
+                for item in attach:
+                    try:
+                        cx, cy = int(item[0]), int(item[1])
+                    except Exception:
+                        fails.append('坐标 %r 无法解析（应形如 (72, 79)）' % (item,))
+                        continue
+                    f, err = self.locate_building_field(cx, cy, mode='zero')
+                    if f is None:
+                        fails.append('格(%d,%d)：%s' % (cx, cy, err))
+                        continue
+                    self.plain[f:f + 4] = u32v(K_CELL)
+                    attached.append((cx, cy, f))
+                if attached:
+                    self._celltags = None
+                    for nd in self.celltag_nodes():
+                        if nd['x'] == K_CELL:
+                            patch(self.plain, nd['count_pos'], u32v(len(attached)))
+                            break
+                    # ★再失效一次：上面 celltag_nodes() 建的是**改计数之前**的缓存
+                    #   （否则总览会读回 count=0 —— 2026-10-15 自检抓到）
+                    self._celltags = None
+                    self.pending_attach.extend([(f, 0) for _a, _b, f in attached])
+                warnings.extend(fails)
+        return {'trigger_id': sid_t, 'tag_id': sid_g, 'index': idx,
+                'ev_off': ev_off, 'ac_off': ac_off, 'owner': owner,
+                'persistence': persistence,
+                'ac_note': ac_note,
+                'attached': attached, 'warnings': warnings}
+
+    # ---------- FA2 风格：一条触发 = 多事件 + 多行为 ----------
+    def create_trigger_multi(self, name, events, actions=None, **kw):
+        """**像地编那样一次建一条触发：多个事件 + 多个行为**（§174）→ dict。
+
+        `events`  = `[(type, arg), …]` 或 `[{'type':…, 'arg':…}, …]`，至少 1 条
+        `actions` = 同上；行为 125 可给 `{'type':125, 'name':'ATESLA', 'cell':(x,y)}`
+        `**kw`    = 透传 `create_trigger`（`attach` / `owner` / `persistence` / `ev_size` / `pieces`）
+
+        ★语义（§156 已实测）：**同一触发内的多个事件恒为 AND**（全部满足才执行）；
+          想表达 OR 就建多条触发。
+        ★顺序：事件在存档里是**链头插逆序**，本函数按 `events` 的**列表顺序**逐个加
+          ⇒ 列表最后一条 = 链头 = 引擎**最先评估**的那条（§163 短路就是从这里开始的）。
+          行为反之，按列表顺序**依次执行**。
+
+        返回同 `create_trigger`，另加：
+          `events`（链序，链头在前）/ `actions`（执行序）/ `warnings`（含追加失败项）。
+        """
+        def _pair(o):
+            if isinstance(o, dict):
+                return int(o['type']), int(o.get('arg') or 0)
+            seq = list(o)
+            return int(seq[0]), (int(seq[1]) if len(seq) > 1 else 0)
+
+        evs = [_pair(e) for e in (events or [])]
+        if not evs:
+            raise ValueError('至少需要 1 个事件（FA2 里空触发不可评估）')
+        # ★§181：`create_trigger` 只按**第一个**事件算 ticks（13 ⇒ arg×15，其余 ⇒ 0），
+        #   而 ticks>0 才登记「定时触发器挂接表」。调用方把计时事件写在后面时
+        #   （如 [(36,3),(13,6)]）就不登记 ⇒ 整条触发读档后不动。
+        #   ⇒ 只要列表里有计时事件，就把它提到第一位。AND 语义不变（只影响短路顺序）。
+        for _k, (_t, _a) in enumerate(evs):
+            if _t == HEARTBEAT_EVENT:
+                if _k:
+                    evs.insert(0, evs.pop(_k))
+                break
+        _has_tick = any(t == HEARTBEAT_EVENT for t, _ in evs)
+        _hb_warn = ''
+        if not _has_tick and any(t in POLL_EVENT_TYPES for t, _ in evs):
+            _hb_warn = ('⚠ 本触发含事件 36/37（纯电平查询），却没有计时事件 ⇒ 不进'
+                        '「定时触发器挂接表」，读档后**不会被评估**。'
+                        '建议加一条「13 流逝时间」当心跳（如 (13,1)）。')
+        acts = []
+        for a in (actions or []):
+            if isinstance(a, dict):
+                acts.append({'type': int(a['type']), 'arg': int(a.get('arg') or 0),
+                             'name': a.get('name'), 'waypoint': a.get('waypoint'),
+                             'cell': a.get('cell')})
+            else:
+                acts.append({'type': _pair(a)[0], 'arg': _pair(a)[1]})
+
+        first_ac = acts[0] if acts else None
+        info = self.create_trigger(
+            name, evs[0][0], evs[0][1],
+            None if first_ac is None else first_ac['type'],
+            0 if first_ac is None else first_ac['arg'],
+            ac_name=first_ac.get('name') if first_ac else None,
+            ac_waypoint=first_ac.get('waypoint') if first_ac else None,
+            ac_cell=first_ac.get('cell') if first_ac else None,
+            hb_warn=False,          # 多事件版自己按全量事件判断心跳，避免重复提示
+            **kw)
+        sid = info['trigger_id']
+        warns = list(info.get('warnings') or [])
+        if _hb_warn:
+            warns.append(_hb_warn)
+        for t, a in evs[1:]:
+            try:
+                self.add_event(sid, t, a)
+            except Exception as e:
+                warns.append('追加事件失败（类型 %s）：%s' % (t, e))
+        for a in acts[1:]:
+            try:
+                self.add_action(sid, a['type'], a['arg'],
+                                name=a.get('name'), waypoint=a.get('waypoint'),
+                                cell=a.get('cell'))
+            except Exception as e:
+                warns.append('追加行为失败（类型 %s）：%s' % (a['type'], e))
+        # 回读实际结果（以引擎口径的链序为准，别信我们自己的记账）
+        try:
+            ch = self.trigger_event_list(sid)
+        except Exception:
+            ch = []
+        try:
+            acs = [a for a in self.trigger_action_list(sid)]
+        except Exception:
+            acs = []
+        info['events'] = ch
+        info['actions'] = acs
+        info['warnings'] = warns
+        return info
+
+    def make_local_var_recipe(self, targets, result_actions, var_start=0,
+                              result_name='汇总条件', per_name=None, owner=None,
+                              attach_all=True, attach_mode='zero', per_event=1,
+                              per_arg=0, var_name=None, write_map=False,
+                              heartbeat=True, heartbeat_sec=HEARTBEAT_SEC):
+        """**一键「局部变量法」**（§158 配方，社区通行写法）→ dict。
+
+        场景：想让「N 栋建筑**全部**进入/到达」才执行结果。**别**用「持久 1 + 进入事件」
+        ——§159 实测那是引擎 BUG（进入事件摘不掉对象 ⇒ 计数永不减 ⇒ 永不执行）。
+        正解是拆成 N+1 条触发：
+
+          · 每栋一条：`持久 0` · 事件 1（进入事件，挂接该栋）→ 行为 56（设置局部变量 V_i）
+          · 汇总一条：`持久 0` · **N × 事件 36**（局部变量 V_i 被设置，AND 关系）→ 结果行为
+
+        `targets`        = `[(x, y), …]` 建筑格（每栋一个变量）
+        `result_actions` = 汇总触发要执行的行为，格式同 `create_trigger_multi`
+        `var_start`      = 起始变量号，**用引擎索引（0 起）**，默认 0。
+                           ⚠ 地编名称框里显示的是"第 N 个"（1..99）⇒ 引擎索引 = N−1
+        `var_name`       = 变量名模板（`%d` = 地编编号，即 1..99）；不给就补 `V<编号>`
+                           ★§175：**变量必须先有名字**（地编流程：先写局部变量 → 触发里才选得中）
+                           ，本函数会自动把名字写进变量表（已有的名字不动）
+        `per_name`       = 单栋触发名模板（`%d` = 变量号，如 `'到达%d'`）
+        `result_name`    = 汇总触发名
+        `attach_mode`    = 建筑已挂在别的触发上时怎么办，见 `free_attach_slot()`
+                           （默认 `'zero'` = 拒绝并跳过那栋，不建"永不满足"的废触发）
+        `per_event`      = 单栋触发用的**事件类型**，默认 1（进入事件）。常用：
+                           `48` 被任何事物摧毁（摧毁/占领/心控/变卖都算）、
+                           `29` 被摧毁或占领（不含变卖）、`7` 只算摧毁
+                           ⇒ 用 48 就是"每栋被打掉一个变量 + 汇总全掉才算数"，
+                             同样是**持久 0**，绕开 §163 的持久 1 丢账坑。
+
+        ★持久性**强制 0**：§157 实测「持久 1 + 局部变量事件 36/37」永不触发。
+        ★§181（T10 定案）：**汇总触发一定带一条「13 流逝时间」当心跳**（默认 1 秒）。
+          事件 36 是纯电平查询，没有对象回调 —— 只有进了「定时触发器挂接表」（`ticks>0`，
+          即**第一个事件是 13**）才会被轮询。只挂 36 的汇总触发读档后完全不动
+          （工具/FA2 里看着一切正常，进游戏就是不出）。
+          `heartbeat=False` 可关，但会明确警告；`heartbeat_sec` 可改心跳秒数。
+        返回 `{'per_building': [info…], 'result': info, 'vars': [...],
+               'local_vars': [...], 'warnings': [...]}`。
+        """
+        tg = [(int(t[0]), int(t[1])) for t in (targets or [])]
+        if not tg:
+            raise ValueError('targets 不能为空（至少要挂 1 栋建筑）')
+        if len(tg) > 24:
+            raise ValueError('局部变量法一次最多 24 栋（再多请分批，别把触发表撑爆）')
+        out = {'per_building': [], 'result': None, 'vars': [], 'warnings': [],
+               'skipped': [], 'local_vars': []}
+        out['map'] = self.scenario_map_path()
+        if not out['map']:
+            out['warnings'].append(
+                '⚠ 找不到地图文件（' + self.map_lookup_hint() + '）⇒ 变量只能写进存档镜像，'
+                '读档会被地图覆盖（若地图里本来没有这些变量，事件 36 会读不到改变）')
+        for i, (x, y) in enumerate(tg):
+            if attach_all:
+                f, why = self.free_attach_slot(x, y, mode=attach_mode)
+                if f is None:
+                    out['warnings'].append(why)
+                    out['skipped'].append((x, y, why))
+                    continue        # 不建"永远等不到"的废触发
+            v = int(var_start) + len(out['per_building'])
+            if v >= LOCALVAR_COUNT:
+                out['warnings'].append('变量号用尽（引擎只认 0..%d），后面 %d 栋跳过'
+                                       % (LOCALVAR_COUNT - 1, len(tg) - i))
+                break
+            # ★§176：先把变量**定义进地图**（名字 + 默认值 0），再建触发 —— 与地编顺序一致
+            try:
+                nm_var = (str(var_name) % (v + 1)) if var_name else None
+                lv = self.ensure_local_var(v, name=nm_var, value=None,
+                                           write_map=write_map)
+                out['local_vars'].append(lv)
+                if lv.get('source') == 'map' and (lv.get('default') or 0):
+                    out['warnings'].append(
+                        '变量 %d（%s）在地图里的默认值是 %d ⇒ 事件 36 会一读档就成立，'
+                        '汇总触发可能立刻跑；建议换一个默认值为 0 的号'
+                        % (v, lv.get('name') or lv.get('name_map'), lv.get('default')))
+            except Exception as e:
+                out['warnings'].append('变量 %d 定义失败：%s' % (v, e))
+            if per_name:
+                try:
+                    nm = per_name % v
+                except TypeError:
+                    try:
+                        nm = per_name % (i + 1)
+                    except TypeError:
+                        nm = per_name
+            else:
+                nm = '到达%d' % v
+            nm = str(nm)[:12]
+            try:
+                # ★§181：单栋触发通常用回调型事件（1/48/29/7）→ 不需要心跳；
+                #   但若调用方给了 36/37（纯轮询型），同样得挂心跳，否则永不评估。
+                per_evs = [(int(per_event), int(per_arg))]
+                if int(per_event) in POLL_EVENT_TYPES:
+                    per_evs.insert(0, (HEARTBEAT_EVENT, int(heartbeat_sec)))
+                info = self.create_trigger_multi(
+                    nm, per_evs, [(56, v)],
+                    attach=[(x, y)] if attach_all else None,
+                    owner=owner, persistence=0)
+                info['var'] = v
+                info['cell'] = (x, y)
+                info['name'] = nm
+                out['per_building'].append(info)
+                out['vars'].append(v)
+                out['warnings'].extend(info.get('warnings') or [])
+            except Exception as e:
+                out['warnings'].append('第 %d 栋 (%d,%d) 建档失败：%s' % (i + 1, x, y, e))
+                out['skipped'].append((x, y, str(e)))
+        ok_vars = list(out['vars'])
+        if not ok_vars:
+            raise RuntimeError('所有单栋触发都没建成功，已中止（汇总触发未建）：%s'
+                               % '；'.join(out['warnings'][:3]))
+        # ★§181（T10 定案）：事件 36 是**纯电平查询** —— 没有对象回调可依赖，
+        #   只有进了「定时触发器挂接表」才会被轮询；而登记条件只有一个：
+        #   **第一个事件是 13 且 arg > 0**（`ticks = arg × 15`）。
+        #   ⇒ 汇总触发若只有一串 36，读档后**永远不会被评估**（本函数此前的隐性 bug：
+        #     生成的配方在工具里看完全正常，进游戏建筑就是不出）。
+        #   修法：在**列表首位**放一条 13 心跳（create_trigger 正是拿首位算 ticks）。
+        evs = [(36, v) for v in ok_vars]
+        if heartbeat:
+            evs.insert(0, (HEARTBEAT_EVENT, int(heartbeat_sec)))
+        else:
+            out['warnings'].append(
+                '⚠ 已按参数不加心跳：汇总触发只有事件 36 ⇒ 不进「定时触发器挂接表」，'
+                '读档后不会执行（除非另有触发/对象回调带它）。')
+        try:
+            out['result'] = self.create_trigger_multi(
+                str(result_name or '汇总条件')[:12], evs, result_actions,
+                owner=owner, persistence=0)
+            out['warnings'].extend(out['result'].get('warnings') or [])
+        except Exception as e:
+            out['warnings'].append('汇总触发建立失败：%s' % e)
+        if out['skipped']:
+            out['warnings'].append(
+                '有 %d 栋没参与 ⇒ 汇总条件只含 %d 个变量，按"剩下这些全部满足"生效'
+                % (len(out['skipped']), len(ok_vars)))
+        return out
+
+    # ---------- 搜索 ----------
+    def search(self, text, limit=200):
+        try:
+            if re.fullmatch(r'(?:[0-9A-Fa-f]{2}\s*)+', text.strip()):
+                pat = bytes.fromhex(re.sub(r'\s', '', text))
+            else:
+                pat = text.encode('gbk', 'ignore')
+        except Exception:
+            return []
+        if not pat:
+            return []
+        out = []
+        q = 0
+        while len(out) < limit:
+            i = self.plain.find(pat, q)
+            if i < 0:
+                break
+            out.append(i)
+            q = i + 1
+        return out
+
+    # ---------- 保存 ----------
+    def dirty(self):
+        return (self.pending_money is not None or bool(self.pending_houses)
+                or bool(self.pending_triggers) or bool(self.pending_events)
+                or bool(self.pending_actions) or bool(self.pending_attach)
+                or bool(getattr(self, 'pending_bld', False))
+                or getattr(self, 'pending_newtrig', False))
+
+    def diff(self):
+        a, b = self.plain_orig, bytes(self.plain)
+        return [(i, a[i], b[i]) for i in range(len(a)) if a[i] != b[i]]
+
+    def _rechunk(self, new_plain):
+        """按 65536 重切 CONTENTS（**与游戏一致**），返回 (新 CONTENTS, 重编码块数)。
+
+        ★★★ 2026-10-14 玩家游戏内实测定案（**弹框的根因就在这一环**）：
+          · 游戏写任何档都是「明文按 65536 切、块头 unpacked **一律 65536**（末块可短于声明值）」；
+          · 旧写法在明文变长时**多追加一个小块**（157/158 块、unpacked=660/168）
+            ⇒ **进游戏 internal error**；对照实测 Y2/Y4(156 块) 能进图、Y3(158 块) 崩。
+        · 未改动的块**直接沿用原 packed 字节**（既保留游戏自己的 LZO 压缩率，又让物理改动最小）。
+        """
+        cc = self.contents
+        ranges = self.ranges
+        orig = self.plain_orig
+        out = bytearray()
+        n = (len(new_plain) + CONTENTS_CHUNK - 1) // CONTENTS_CHUNK
+        recompressed = 0
+        changed = []            # [(out 内偏移, 明文段)] 供分块回验
+        # 第一遍：定下"哪些块要重压"，把要压的段收集起来（便于并行）
+        plan = []               # [(块号, 段)] 或 ('reuse', packed 字节)
+        todo = []
+        for k in range(n):
+            a = k * CONTENTS_CHUNK
+            seg = new_plain[a:a + CONTENTS_CHUNK]
+            # 与**原明文**逐字节相同 ⇒ 该块没被动过 ⇒ 直接沿用游戏自己的 packed 字节
+            # ★三个条件缺一不可：
+            #   ① 原块起点 == 本块起点（对齐）；
+            #   ② 原块**解出来的长度** == 本块长度（否则原块是「短块」，复用它会把
+            #      本块后半截的明文**静默丢掉** —— 实测踩过：金标准档尾两个 168/660 短块
+            #      ⇒ 少 828 字节）；
+            #   ③ 原块 unpacked 声明 == 65536（旧工具写出的坏块一律不复用）。
+            if k < len(ranges) and ranges[k][0] == a and ranges[k][1] == len(seg) \
+                    and orig[a:a + len(seg)] == seg:
+                cpos = ranges[k][2]
+                pk2, uk2 = struct.unpack_from('<II', cc, cpos)
+                if uk2 == CONTENTS_UNPACKED:
+                    plan.append(('reuse', cc[cpos:cpos + 8 + pk2]))
+                    continue
+            plan.append(('pack', len(todo)))
+            todo.append(bytes(seg))
+        # 第二遍：压缩（有 C 后端就串行调用，它够快；没有才上多进程 + 纯 Python）
+        packed = None
+        try:
+            import lzo_fast
+            fast = lzo_fast.available()
+        except Exception:
+            fast = False
+        if not fast and len(todo) >= 48:
+            packed = _parallel_compress(todo)
+        if packed is None:
+            packed = [compress(s) for s in todo]
+        for item in plan:
+            if item[0] == 'reuse':
+                out += item[1]
+                continue
+            comp = packed[item[1]]
+            changed.append((len(out), todo[item[1]]))
+            out += struct.pack('<II', len(comp), CONTENTS_UNPACKED) + comp
+            recompressed += 1
+        out = bytes(out)
+        # ★自证（2026-10-17 20:5x 改成"只回验重压过的块"）：
+        #   以前把整档 39MB 解一遍做自证 —— 大任务档光这一步就要 2.6 秒。
+        #   未改动的块是**原样拷贝**（且已逐块确认过起点/长度/声明），本来就等于原明文；
+        #   真正需要回验的只有 `compress()` 新写出来的那几块 ⇒ 逐块解回来比对即可，
+        #   保证力度不降（仍然是"压缩→解压→逐字节相等"）。
+        for off, seg in changed:
+            pk, uk = struct.unpack_from('<II', out, off)
+            back, _ = lzo1x_decompress(out[off + 8:off + 8 + pk], uk)   # 带期望长度 ⇒ 走 C 后端
+            if back != seg:
+                raise RuntimeError('重切块自检失败：第 %d 字节起的块解回 %d 字节 ≠ 原文 %d 字节'
+                                   % (off, len(back), len(seg)))
+        if len(out) == 0:
+            raise RuntimeError('重切结果为空')
+        return out, recompressed
+
+    def save(self, out_path, backup=True):
+        """重建 CONTENTS 并写盘（**块布局与游戏一致**：65536 × N，无短尾块）。
+
+        写入容器两条路：先试 `cfb_surgery`（原位改扇区/链，物理改动最小），
+        写完**立即解码回验**；若回验不过（旧档 FAT 不干净会被它截断）则改用
+        `cfb_write.rebuild`（从零重建容器）重写一遍 —— 两条路都回验，不允许静默写坏。
+        """
+        new_plain = bytes(self.plain)
+        if bytes(self.plain) == self.plain_orig:
+            raise RuntimeError('没有任何修改')
+        new_cc, recompressed = self._rechunk(new_plain)
+        if not new_cc:
+            raise RuntimeError('重建 CONTENTS 为空')
+        if backup and os.path.abspath(out_path) == os.path.abspath(self.path):
+            bdir = os.path.join(os.path.dirname(os.path.abspath(self.path)), '_备份存档')
+            os.makedirs(bdir, exist_ok=True)
+            ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+            bak = os.path.join(bdir, os.path.basename(self.path) + '.bak-' + ts)
+            shutil.copy2(self.path, bak)
+        # ★2026-10-17 23:3x：surgery 自带的 read-back 断言在某些"引擎重写过"的档上会失败
+        #   （实测 SAVE0364：插字节后读回不一致）。它是"最小侵入"路线，失败不该中断保存 ——
+        #   下面本来就有 end-to-end 校验 + 从零重建容器（cfb_write.rebuild）的兜底，
+        #   所以这里把异常接住，交给兜底路径。
+        try:
+            cfb_surgery.surgery(self.path, out_path, [('rep', 0, self.contents, new_cc)])
+            surgery_err = None
+        except Exception as e_surg:
+            surgery_err = e_surg
+        # 终验：重新解码并比对明文；不过关则改用「从零重建容器」重写一遍
+        def _verify(p):
+            raw = open(p, 'rb').read()
+            pl2, _ = self._decode(CFB(raw).open('CONTENTS'))
+            return raw, pl2
+
+        writer = 'surgery'
+        try:
+            chk_raw, pl2 = _verify(out_path)
+        except Exception:
+            pl2 = None
+            chk_raw = b''
+        if surgery_err is not None or pl2 != new_plain:
+            # ★surgery 可能已经写了一半（assert 在写完之后才校验）⇒ 先删掉残档再重建
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
+            info = cfb_write.rebuild(self.path, {'CONTENTS': new_cc}, out_path)
+            chk_raw, pl2 = _verify(out_path)
+            writer = 'rebuild(%d 扇区)' % info['sectors']
+            if pl2 != new_plain:
+                raise RuntimeError('保存后校验失败：解码明文不一致（surgery 与 rebuild 都不通过）'
+                                   + ('；surgery 异常：%s' % surgery_err if surgery_err else ''))
+        # 分块自检：块数必须与游戏一致（明文/65536 向上取整），块头 unpacked 恒 65536
+        cc2 = CFB(chk_raw).open('CONTENTS')
+        p, nblocks, bad = 0, 0, []
+        while p + 8 <= len(cc2):
+            pk, uk = struct.unpack_from('<II', cc2, p)
+            if pk == 0:
+                break
+            nblocks += 1
+            if uk != CONTENTS_UNPACKED:
+                bad.append((nblocks, uk))
+            p += 8 + pk
+        expect = (len(new_plain) + CONTENTS_CHUNK - 1) // CONTENTS_CHUNK
+        return {'out': out_path, 'recompressed': recompressed,
+                'contents': (len(self.contents), len(new_cc)),
+                'file': len(chk_raw), 'md5': hashlib.md5(chk_raw).hexdigest(),
+                'blocks': nblocks, 'blocks_expect': expect, 'writer': writer,
+                'bad_declared': bad}
+
+    # ---------- 工具 ----------
+    def hexdump(self, off, length=256):
+        pl = bytes(self.plain)
+        lo = max(0, off - length // 2)
+        rows = []
+        for o in range(lo, min(len(pl), lo + length), 16):
+            seg = pl[o:o + 16]
+            asc = ''.join(chr(x) if 32 <= x < 127 else '.' for x in seg)
+            rows.append('%08X  %-47s  |%s|' % (o, seg.hex(' '), asc))
+        return '\n'.join(rows)
+
+    # ==================== 触发编辑器（仿 FA2「触发编辑器」）· 2026-10-20 ====================
+    # 布局定案（SAVE48DB 逐项对拍，82/82）：
+    #   · 实例对象 200B（GUID 91152dc0）= 记录帧 起点 +56；
+    #   · 记录帧：+0 ID(8 ASCII) / +64 名字(52B,GBK) / +116 序号 / +120..123 标志字 /
+    #     +128 国家(阵营 House 块 +72 的键)；
+    #   · **标志字 4 字节**：[简单, 普通, 困难, 启用]（+120/+121/+122/+123）。
+    #     启用位 = +123 = 实例帧 +179：与地图 `[Triggers]` 第 3 字段 DISABLED **82/82 反相对拍**。
+    #     ⚠ 旧文档说"+123 只是副本、改了无效" —— 那是另一种（老）记录格式；本格式下它就是生效位。
+    #   · 一个触发 = 实例 + 标签 + 1 个事件 + N 条行为（行为是链表，obj+0x3C = 下一条）+ TagNode + CellTag。
+    TRIG_FLAG_REC_OFF = 123
+    TRIG_SEQ_OFF = 172
+    TRIG_FLAG_WORD_OFF = 120       # 记录帧；实例帧为 176
+
+    def invalidate_caches(self, rescan=False):
+        """把"跟着明文偏移走"的缓存全部作废（增删字节后必须调）。"""
+        for a in ('_objs', '_events', '_actions', '_ticks', '_celltags', '_ctimerlist',
+                  '_instmaps', '_house_econ', '_custom_houses', '_house_keys_memo',
+                  '_tagrecs', '_mapm', '_aiids', '_horder'):
+            if hasattr(self, a):
+                setattr(self, a, None)
+        if rescan:
+            self.records = self._scan_records()
+            self.pending_events.clear()
+            self.pending_actions.clear()
+            self.pending_attach.clear()
+
+    @staticmethod
+    def _gbk_name(text, span):
+        """名字写入用的 GBK 编码（超长截断到 span-1 字节）。"""
+        try:
+            b = str(text).encode('gbk')
+        except Exception:
+            b = str(text).encode('utf-8', 'ignore')
+        return b[:span - 1]
+
+    def _read_name_at(self, off, span=52):
+        raw = bytes(self.plain[off:off + span]).split(b'\x00')[0]
+        for code in ('gbk', 'utf-8'):
+            try:
+                return raw.decode(code)
+            except Exception:
+                pass
+        return raw.decode('gbk', 'replace')
+
+    def _write_name_at(self, off, text, span=52):
+        b = self._gbk_name(text, span)
+        self.plain[off:off + span] = b'\x00' * span
+        self.plain[off:off + len(b)] = b
+
+    def trigger_inst_off(self, sid):
+        """sid → 触发实例对象帧偏移；找不到返回 None（只有"定义"没有实例的老格式）。"""
+        m = self._instance_maps()
+        for k, s in m['sid'].items():
+            if s == sid:
+                return m['inst'].get(k)
+        return None
+
+    def _tag_objs_by_key(self):
+        """标签自键 → 标签对象帧偏移。"""
+        pl = self.plain
+        out, q = {}, 0
+        while True:
+            i = pl.find(TRIG_TAGOBJ_GUID, q)
+            if i < 0:
+                break
+            q = i + 1
+            out[int.from_bytes(pl[i + 16:i + 20], 'little')] = i
+        return out
+
+    def trigger_objects(self, sid):
+        """把一条触发牵涉的全部对象偏移一次找齐（详情/复制/删除共用）。
+
+        返回 dict：rec/rec_off/inst/inst_key/tag_key/tag_obj/ev/ev_size/acs/node/cell/cell_key
+        找不到的项为 None（实例缺失 = 只有定义的老格式，本工具不做增删）。
+        """
+        pl = self.plain
+        rec = next((r for r in self.records if r.kind == '触发' and r.sid == sid), None)
+        if rec is None:
+            raise RuntimeError('找不到触发 %s' % sid)
+        out = {'sid': sid, 'name': rec.name, 'rec': rec, 'rec_off': rec.off,
+               'inst': None, 'inst_key': None, 'tag_key': None, 'tag_obj': None,
+               'ev': None, 'ev_size': None, 'acs': [], 'node': None, 'cell': None,
+               'cell_key': None}
+        inst = self.trigger_inst_off(sid)
+        if inst is None:
+            return out
+        out['inst'] = inst
+        out['inst_key'] = int.from_bytes(pl[inst + 16:inst + 20], 'little')
+        m = self._instance_maps()
+        tk = m['tag_of_inst'].get(out['inst_key'])
+        out['tag_key'] = tk
+        out['tag_obj'] = self._tag_objs_by_key().get(tk)
+        evs = self.events()
+        evkey = int.from_bytes(pl[inst + 192:inst + 196], 'little')
+        ev = next((e for e in evs if e.get('key') == evkey), None)
+        if ev is not None:
+            out['ev'] = ev['obj']
+            if len(evs) >= 2:
+                out['ev_size'] = evs[1]['obj'] - evs[0]['obj']
+        ack = int.from_bytes(pl[inst + 196:inst + 200], 'little')
+        byk = {a.get('key'): a for a in self.actions()}
+        for k in self.action_chain(ack):
+            if k in byk:
+                out['acs'].append((byk[k]['obj'], k))
+        out['node'] = m['node_of_inst'].get(out['inst_key'])
+        ck = m['cell_of_tag'].get(tk)
+        out['cell_key'] = ck
+        if ck is not None:
+            for nd in self.celltag_nodes():
+                if nd['x'] == ck:
+                    out['cell'] = nd['node']
+                    break
+        return out
+
+    def trigger_detail(self, sid):
+        """读一条触发的全部可编辑字段 → dict（GUI「触发编辑器」用）。
+
+        {'sid','name','index','owner','owner_key','disabled','easy','normal','hard',
+         'repeat','repeat_text','event',{'type','arg','name','ptype','arg_text','obj','key'},
+         'actions':[…同 event 结构…],'has_node','has_cell','ticks','attached',
+         'editable','note'}
+        """
+        pl = self.plain
+        o = self.trigger_objects(sid)
+        rec = o['rec']
+        d = {'sid': sid, 'name': rec.name, 'index': None, 'rec_off': rec.off,
+             'owner': self.trigger_owner_name(rec), 'disabled': None,
+             'easy': None, 'normal': None, 'hard': None,
+             'repeat': None, 'repeat_text': '', 'event': None, 'actions': [],
+             'has_node': o['node'] is not None, 'has_cell': o['cell'] is not None,
+             'ticks': None, 'attached': 0, 'editable': o['inst'] is not None,
+             'note': ''}
+        p = self.rec_off_word = rec.off + self.TRIG_FLAG_WORD_OFF
+        w = bytes(pl[p:p + 4])
+        if len(w) == 4:
+            d['easy'], d['normal'], d['hard'] = bool(w[0]), bool(w[1]), bool(w[2])
+            d['disabled'] = (w[3] == 0)
+        try:
+            d['repeat'] = self.trigger_repeat_type(sid)
+        except Exception:
+            d['repeat'] = None
+        d['repeat_text'] = (getattr(self, 'REPEAT_TEXT', {}).get(d['repeat'], '')
+                            if d['repeat'] else '')
+        if o['inst'] is not None:
+            d['index'] = int.from_bytes(pl[o['inst'] + self.TRIG_SEQ_OFF:
+                                              o['inst'] + self.TRIG_SEQ_OFF + 4], 'little')
+            if o['node'] is not None:
+                d['ticks'] = int.from_bytes(pl[o['node'] + NODE_TICKS_OFF:
+                                               o['node'] + NODE_TICKS_OFF + 4], 'little')
+        if o['cell_key'] is not None:
+            for b in self.attach_overview() or []:
+                if b.get('x') == o['cell_key']:
+                    d['attached'] = b.get('count') or 0
+                    break
+        evs = self.events()
+        byk = {a.get('key'): a for a in self.actions()}
+        # ★2026-10-20：事件对象 `+0x50..+0x68` 是**运行期指针区**：
+        #   全 0 = 这个事件还没被引擎"接管"（事件驱动型触发本来就不需要 TagNode）；
+        #   非 0 = 引擎已经处理过它（= 执行过）。
+        #   对照实证：sample_AB 的 A（玩家确认开局即执行）无节点但这段非 0；
+        #   SAVE0029 的 01000250（玩家确认**没**执行）无节点且这段全 0。
+        d['ev_live'] = False
+        if o['ev'] is not None:
+            d['ev_live'] = any(pl[o['ev'] + 0x50:o['ev'] + 0x68])
+        if o['inst'] is not None:
+            evkey = int.from_bytes(pl[o['inst'] + 192:o['inst'] + 196], 'little')
+            ev = next((e for e in evs if e.get('key') == evkey), None)
+            if ev is not None:
+                d['event'] = ev
+        for obj, k in o['acs']:
+            a = byk.get(k)
+            if a is not None:
+                d['actions'].append(a)
+        if not d['editable']:
+            d['note'] = '这条记录在本档里只有「触发定义」，没有运行期实例 ⇒ 只能看'
+        return d
+
+    def trigger_event_live(self, sid):
+        """事件对象是否带运行期指针（= 引擎已经处理过这个事件）。
+
+        这是区分「已执行」与「事件驱动型、还没轮到」的关键：
+        后者**本来就没有 TagNode**（被攻击/被摧毁这类事件靠对象回调，不靠计时器）。
+        """
+        try:
+            o = self.trigger_objects(sid)
+        except Exception:
+            return False
+        if o['ev'] is None:
+            return False
+        return any(self.plain[o['ev'] + 0x50:o['ev'] + 0x68])
+
+    def set_trigger_name(self, sid, name):
+        """改触发名（记录帧 +64，52B，GBK）；标签名同步成「<名> N」（沿用原来的序号后缀）。"""
+        name = str(name).strip()
+        if not name:
+            raise ValueError('触发名不能为空')
+        if len(name.encode('gbk', 'ignore')) > 51:
+            raise ValueError('名字太长：GBK 最多 51 字节（约 25 个汉字）')
+        o = self.trigger_objects(sid)
+        if o['inst'] is None:
+            raise RuntimeError('该触发没有运行期实例（只有定义），不能改名')
+        old = o['name']
+        self._write_name_at(o['inst'] + 120, name)
+        tag = o['tag_obj']
+        if tag is not None:
+            tag_old = self._read_name_at(tag + 120)
+            suffix = tag_old[len(old):].strip() if tag_old.startswith(old) else ''
+            if not suffix.isdigit():
+                suffix = '1'
+            self._write_name_at(tag + 120, '%s %s' % (name, suffix))
+        self.invalidate_caches(rescan=True)
+        return {'old': old, 'new': name}
+
+    def set_trigger_flags(self, sid, disabled=None, easy=None, normal=None, hard=None):
+        """禁用 / 简单 / 普通 / 困难 —— 写记录帧 +120..+123 这 4 个字节。
+
+        ★启用位（+123）已与地图 `[Triggers]` DISABLED 字段 **82/82** 反相对拍；
+          +120/+121/+122 按地图字段顺序（EASY, NORMAL, HARD）对应"简单/普通/困难"，
+          ⚠ 这三位的**先后顺序尚未游戏内验证**（现有档全是 1/1/1）。
+        """
+        rec = next((r for r in self.records if r.kind == '触发' and r.sid == sid), None)
+        if rec is None:
+            raise RuntimeError('找不到触发 %s' % sid)
+        p = rec.off + self.TRIG_FLAG_WORD_OFF
+        w = list(self.plain[p:p + 4])
+        nop = self.plain[p:p + 4]
+        if len(w) != 4:
+            raise RuntimeError('标志字越界，已拒绝写入')
+        if easy is not None:
+            w[0] = 1 if easy else 0
+        if normal is not None:
+            w[1] = 1 if normal else 0
+        if hard is not None:
+            w[2] = 1 if hard else 0
+        if disabled is not None:
+            w[3] = 0 if disabled else 1
+        self.plain[p:p + 4] = bytes(w)
+        rec.enabled = bool(w[3])
+        rec.flag_off = p + 3
+        rec.note = '启用位@+%d = %d' % (p + 3 - rec.off, w[3])
+        return {'old': bytes(nop), 'new': bytes(w)}
+
+    # ---------- 行为（可多条，链表） ----------
+    def trigger_action_list(self, sid):
+        """触发的行为链 → [{'type','arg','name','key'}]（按执行序，链头取实例 +196）。"""
+        d = self.runtime_links().get(sid)
+        if not d:
+            return []
+        by_key = {a.get('key'): a for a in self.actions() if a.get('key')}
+        out = []
+        for k in self.action_chain(d.get('ac')):
+            a = by_key.get(k)
+            if a:
+                out.append({'type': a.get('type'), 'arg': a.get('arg'),
+                            'name': a.get('name'), 'key': k})
+        return out
+
+    def add_event(self, sid, etype, arg=0):
+        """给触发**追加一个事件**（§155：事件链是**头插逆序**）→ dict。
+
+        ★为什么是头插：地编里事件列表是"一块一块拼"的，存档里存的却是**逆序链** ——
+          GUI 列表的**最后一条**才是链头（触发实例 `+192`），引擎**按链序短路**（§163：
+          链头不满足时后面的摧毁事件根本没被接管）。所以 `add_event` 必须：
+            新事件.next = 旧链头；实例 `+192` = 新事件键
+          ⇒ 新事件出现在链头 = 地编列表末尾，与 FA2 的观感一致。
+          （行为相反：`add_action` 接**链尾**正序，因为行为是按列表顺序依次执行。）
+
+        `ev_size` 优先按档内实测（`events[1].obj - events[0].obj`，普通档 108 / 大任务档 124），
+        档里只有 1 个事件时退回 `_newtrig_groups()` 的推断值。
+        克隆源 = 档内**最后一个**事件对象；运行期指针（`+40` 起）全部清零，
+        只留身份签名 + 类常量 + 类型 + 参数 + 所属触发序号。
+        """
+        pl = self.plain
+        etype, arg = int(etype), int(arg)
+        if etype == 0 or etype not in EVENT_TYPES:
+            raise ValueError('事件类型 %s 无效（0 是占位项，禁止使用）' % etype)
+        o = self.trigger_objects(sid)
+        inst = o['inst']
+        if inst is None:
+            raise RuntimeError('该触发没有运行期实例，不能加事件')
+        evs = self.events()
+        if not evs:
+            raise RuntimeError('档内没有可克隆的事件对象')
+        ev_size = (evs[1]['obj'] - evs[0]['obj']) if len(evs) >= 2 else None
+        if not ev_size or ev_size < 64:
+            ev_size = self._newtrig_groups()['ev_size']
+        tpl = evs[-1]['obj']
+        if not ev_size or tpl + ev_size > len(pl):
+            raise RuntimeError('量不出事件对象尺寸（本档事件不是连续排放）—— 已拒绝')
+        # 新键：与事件/行为同区，全档查重
+        keys = [e.get('key') for e in evs if e.get('key')] + \
+               [a.get('key') for a in self.actions() if a.get('key')]
+        k = ((max(keys) + 0x1000) if keys else 0x02A75020) & 0xFFFFFFFF
+        while pl.find(struct.pack('<I', k)) >= 0:
+            k = (k + 0x1000) & 0xFFFFFFFF
+        # 旧链头（实例在触发组里，位置低于事件组 ⇒ 插入不会推移它）
+        old_head = int.from_bytes(pl[inst + 192:inst + 196], 'little')
+        seq = int.from_bytes(pl[inst + self.TRIG_SEQ_OFF:
+                                inst + self.TRIG_SEQ_OFF + 4], 'little')
+        buf = bytearray(pl[tpl:tpl + ev_size])
+        for off in range(40, ev_size, 4):            # 清运行期指针（保留 0..+36 身份签名）
+            buf[off:off + 4] = b'\x00' * 4
+        buf[16:20] = struct.pack('<I', k)
+        buf[56:60] = struct.pack('<I', seq)          # 所属触发序号
+        buf[OBJ_TYPE_OFF:OBJ_TYPE_OFF + 4] = struct.pack('<I', etype)
+        buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', arg)
+        buf[self.EVENT_NEXT_OFF:self.EVENT_NEXT_OFF + 4] = struct.pack('<I', old_head)
+        pl[tpl + ev_size:tpl + ev_size] = bytes(buf)
+        pl[inst + 192:inst + 196] = struct.pack('<I', k)   # ★头插：新事件 = 新链头
+        self.invalidate_caches(rescan=True)
+        evs2 = self.events()
+        if evs2:
+            p0 = evs2[0]['obj'] - 4
+            n = int.from_bytes(pl[p0:p0 + 4], 'little')
+            pl[p0:p0 + 4] = struct.pack('<I', n + 1)
+        self.invalidate_caches(rescan=True)
+        return {'key': k, 'obj': tpl + ev_size, 'type': etype, 'arg': arg,
+                'next': old_head, 'chain_head': k, 'ev_size': ev_size}
+
+    def remove_event(self, sid, ev_key):
+        """删掉触发的一个事件（先补链，再删对象字节，最后组计数 −1）。"""
+        pl = self.plain
+        o = self.trigger_objects(sid)
+        inst = o['inst']
+        evs = self.events()
+        byk = {e.get('key'): e for e in evs}
+        e = byk.get(ev_key)
+        if inst is None or e is None:
+            raise RuntimeError('找不到该事件（或该触发没有实例）')
+        ev_size = (evs[1]['obj'] - evs[0]['obj']) if len(evs) >= 2 else None
+        if not ev_size or ev_size < 64:
+            ev_size = self._newtrig_groups()['ev_size']
+        nxt = int.from_bytes(pl[e['obj'] + self.EVENT_NEXT_OFF:
+                                e['obj'] + self.EVENT_NEXT_OFF + 4], 'little')
+        head = int.from_bytes(pl[inst + 192:inst + 196], 'little')
+        if head == ev_key:
+            pl[inst + 192:inst + 196] = struct.pack('<I', nxt)
+        else:
+            prev = None
+            for kk in self.event_chain(head):
+                if kk == ev_key:
+                    break
+                prev = kk
+            if prev is None:
+                raise RuntimeError('该事件不在链上，已拒绝删除')
+            pv = byk.get(prev)
+            pl[pv['obj'] + self.EVENT_NEXT_OFF:
+               pv['obj'] + self.EVENT_NEXT_OFF + 4] = struct.pack('<I', nxt)
+        obj = e['obj']
+        del pl[obj:obj + ev_size]
+        self.invalidate_caches(rescan=True)
+        evs2 = self.events()
+        if evs2:
+            p0 = evs2[0]['obj'] - 4
+            n = int.from_bytes(pl[p0:p0 + 4], 'little')
+            pl[p0:p0 + 4] = struct.pack('<I', max(0, n - 1))
+        self.invalidate_caches(rescan=True)
+        return {'removed': ev_key, 'type': e['type'], 'arg': e['arg']}
+
+    def add_action(self, sid, atype, arg=0, name=None, waypoint=None, cell=None):
+        """给触发**追加一条行为**（克隆档内最后一条行为对象，清运行期指针、换新键、接到链尾）。
+
+        ★行为 125「将建筑建于…」需要 `name`（建筑类型名，8B ASCII 写 `+104`）+
+          `waypoint`（路径点号，写 `+88`）或 `cell=(x,y)`（该格没路径点就自动建一个）。
+        """
+        pl = self.plain
+        atype, arg = int(atype), int(arg)
+        if atype not in ACTION_TYPES:
+            raise ValueError('行为类型 %s 无效' % atype)
+        o = self.trigger_objects(sid)
+        inst = o['inst']
+        if inst is None:
+            raise RuntimeError('该触发没有运行期实例，不能加行为')
+        acts = self.actions()
+        if not acts:
+            raise RuntimeError('档内没有可克隆的行为对象')
+        tpl = acts[-1]['obj']
+        keys = [a.get('key') for a in acts if a.get('key')] + \
+               [e.get('key') for e in self.events() if e.get('key')]
+        k = ((max(keys) + 0x1000) if keys else 0x02A75020) & 0xFFFFFFFF
+        while pl.find(struct.pack('<I', k)) >= 0:
+            k = (k + 0x1000) & 0xFFFFFFFF
+        buf = bytearray(pl[tpl:tpl + ACTION_SIZE])
+        for off in range(40, ACTION_SIZE, 4):        # 清运行期指针（保留 0..36 类签名）
+            buf[off:off + 4] = b'\x00' * 4
+        buf[16:20] = struct.pack('<I', k)
+        buf[56:60] = struct.pack('<I', int.from_bytes(
+            pl[inst + self.TRIG_SEQ_OFF:inst + self.TRIG_SEQ_OFF + 4], 'little'))
+        buf[OBJ_TYPE_OFF:OBJ_TYPE_OFF + 4] = struct.pack('<I', atype)
+        buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', arg)
+        if atype in ACTION_VAR_TYPES:
+            # §175：变量号落 +164（+72 一律 0，与 FA2 产物一致）
+            buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', 0)
+            buf[ACT_VAR_OFF:ACT_VAR_OFF + 4] = struct.pack('<I', arg & 0xFFFFFFFF)
+        if atype == 125:
+            if not name or (waypoint is None and cell is None):
+                raise RuntimeError('行为 125「将建筑建于…」必须同时给 name（建筑类型名）'
+                                   '与 waypoint（路径点号）或 cell（目标格子 x,y）')
+            if waypoint is None:
+                wp = self.ensure_waypoint_at(int(cell[0]), int(cell[1]))
+                if wp is None:
+                    near = self.nearest_waypoint(int(cell[0]), int(cell[1]))
+                    if near is None:
+                        raise RuntimeError('路径点号已用满且没有可复用的已有路径点')
+                    wp = near[0]
+                waypoint = wp
+            buf[104:112] = str(name).upper().encode('ascii', 'ignore')[:8].ljust(8, b'\x00')
+            buf[88:92] = struct.pack('<I', int(waypoint))
+        pl[tpl + ACTION_SIZE:tpl + ACTION_SIZE] = bytes(buf)
+        # 接到链尾
+        head = int.from_bytes(pl[inst + 196:inst + 200], 'little')
+        chain = self.action_chain(head)
+        if not chain:
+            pl[inst + 196:inst + 200] = struct.pack('<I', k)
+        else:
+            byk = {a.get('key'): a for a in self.actions()}
+            last = byk.get(chain[-1])
+            if last is None:
+                raise RuntimeError('行为链异常（链尾对象找不到），已加对象但未链接 —— 请勿保存')
+            pl[last['obj'] + self.ACTION_NEXT_OFF:
+               last['obj'] + self.ACTION_NEXT_OFF + 4] = struct.pack('<I', k)
+        self.invalidate_caches(rescan=True)
+        # 行为组计数 +1（插入后重定位组首）
+        acts2 = self.actions()
+        if acts2:
+            p0 = acts2[0]['obj'] - 4
+            n = int.from_bytes(pl[p0:p0 + 4], 'little')
+            pl[p0:p0 + 4] = struct.pack('<I', n + 1)
+        self.invalidate_caches(rescan=True)
+        return {'key': k, 'obj': tpl + ACTION_SIZE, 'type': atype, 'arg': arg}
+
+    def remove_action(self, sid, ac_key):
+        """删掉触发的一条行为（先补链，再删 168 字节，最后组计数 −1）。"""
+        pl = self.plain
+        o = self.trigger_objects(sid)
+        inst = o['inst']
+        byk = {a.get('key'): a for a in self.actions()}
+        a = byk.get(ac_key)
+        if inst is None or a is None:
+            raise RuntimeError('找不到该行为（或该触发没有实例）')
+        nxt = int.from_bytes(pl[a['obj'] + self.ACTION_NEXT_OFF:
+                                a['obj'] + self.ACTION_NEXT_OFF + 4], 'little')
+        head = int.from_bytes(pl[inst + 196:inst + 200], 'little')
+        if head == ac_key:
+            pl[inst + 196:inst + 200] = struct.pack('<I', nxt)
+        else:
+            prev = None
+            for kk in self.action_chain(head):
+                if kk == ac_key:
+                    break
+                prev = kk
+            if prev is None:
+                raise RuntimeError('该行为不在链上，已拒绝删除')
+            pv = byk.get(prev)
+            pl[pv['obj'] + self.ACTION_NEXT_OFF:
+               pv['obj'] + self.ACTION_NEXT_OFF + 4] = struct.pack('<I', nxt)
+        obj = a['obj']
+        del pl[obj:obj + ACTION_SIZE]
+        self.invalidate_caches(rescan=True)
+        acts2 = self.actions()
+        if acts2:
+            p0 = acts2[0]['obj'] - 4
+            n = int.from_bytes(pl[p0:p0 + 4], 'little')
+            pl[p0:p0 + 4] = struct.pack('<I', max(0, n - 1))
+        self.invalidate_caches(rescan=True)
+        return {'removed': ac_key, 'type': a['type'], 'arg': a['arg']}
+
+    # ---------- 复制 / 删除 ----------
+    def copy_trigger(self, sid, new_name=None):
+        """复制一条触发（新 ID + 新六件套），事件/行为/国家/触发类型/禁用/难度一并照抄。"""
+        d = self.trigger_detail(sid)
+        if not d['editable']:
+            raise RuntimeError('该记录只有触发定义（没有实例），复制它不会生效 —— 已拒绝')
+        ev = d['event']
+        if ev is None:
+            raise RuntimeError('该触发没有事件，无法复制')
+        acs = d['actions'] or []
+        name = (new_name or (d['name'] + '副本'))[:16]
+        info = self.create_trigger(
+            name, ev['type'], ev['arg'],
+            acs[0]['type'] if acs else 8, acs[0]['arg'] if acs else 0,
+            owner=d['owner'] if d['owner'] not in (None, '') else None,
+            persistence=int(d['repeat'] or 0))
+        newsid = info['trigger_id']
+        warns = list(info.get('warnings') or [])
+        for a in acs[1:]:
+            try:
+                self.add_action(newsid, a['type'], a['arg'])
+            except Exception as e:
+                warns.append('复制行为失败（类型 %s）：%s' % (a['type'], e))
+        if d['disabled'] is not None:
+            self.set_trigger_flags(newsid, disabled=d['disabled'], easy=d['easy'],
+                                   normal=d['normal'], hard=d['hard'])
+        self.invalidate_caches(rescan=True)
+        return {'sid': newsid, 'name': name, 'warnings': warns,
+                'actions': len(acs)}
+
+    def remove_trigger(self, sid, clear_attach=True):
+        """删除一条触发：实例 + 标签 + 事件 + 全部行为 + TagNode + CellTag + 计时表条目。
+
+        顺序：① 清建筑挂接字段（否则建筑指向已删的 CellTag）② 摘计时表条目
+              ③ **降序**删对象字节 ④ 四类组计数 −1、事件/行为计数 −1
+              ⑤ 重排剩余触发的**序号**（实例/标签 +172、事件/行为 +56 = 数组位置）
+        ⚠ 只支持"有实例"的触发（老格式只有定义的那种拒绝删除）。
+        """
+        pl = self.plain
+        o = self.trigger_objects(sid)
+        if o['inst'] is None:
+            raise RuntimeError('这条记录在本档里只有「触发定义」，没有实例/标签/事件 —— '
+                               '本工具不做删除（删了也不会改变引擎行为）')
+        spans = [(o['inst'], TRIG_OBJ_SIZE, '实例')]
+        if o['tag_obj'] is not None:
+            spans.append((o['tag_obj'], TAG_OBJ_SIZE, '标签'))
+        if o['ev'] is not None:
+            if not o['ev_size']:
+                raise RuntimeError('档内事件不足 2 个，量不出事件对象尺寸 ⇒ 拒绝删除')
+            spans.append((o['ev'], o['ev_size'], '事件'))
+        for obj, _k in o['acs']:
+            spans.append((obj, ACTION_SIZE, '行为'))
+        if o['node'] is not None:
+            spans.append((o['node'], TRIG_NODE_SIZE, 'TagNode'))
+        if o['cell'] is not None:
+            spans.append((o['cell'], TRIG_CELL_SIZE, 'CellTag'))
+        # ① 建筑挂接
+        detached = []
+        if clear_attach and o['cell_key'] is not None:
+            ck = o['cell_key']
+            try:
+                for b in self.attach_overview() or []:
+                    if b.get('x') != ck:
+                        continue
+                    for bb in (b.get('buildings') or []):
+                        f = bb.get('field')
+                        if f:
+                            pl[f:f + 4] = b'\x00' * 4
+                            detached.append((bb.get('cx'), bb.get('cy')))
+            except Exception:
+                pass
+        # ② 计时表条目
+        timer = False
+        if o['cell_key'] is not None:
+            tl = self.celltag_timer_list()
+            if tl and o['cell_key'] in tl['keys']:
+                i = tl['keys'].index(o['cell_key'])
+                spans.append((tl['list_pos'] + 4 * i, 4, '计时表'))
+                timer = True
+        # ③ 降序删
+        for start, size, _lab in sorted(spans, key=lambda x: -x[0]):
+            if start + size > len(pl):
+                raise RuntimeError('删除区间越界，已中止（未改动存档）')
+            del pl[start:start + size]
+        self.invalidate_caches(rescan=True)
+        # ④ 计时表计数
+        if timer:
+            tl2 = self.celltag_timer_list()
+            if tl2:
+                pl[tl2['count_pos']:tl2['count_pos'] + 4] = struct.pack(
+                    '<I', len(tl2['keys']))
+        # 组计数（tag/trig/node/cell 各 −1）
+        for guid in (TRIG_TAGOBJ_GUID, TRIG_INSTANCE_GUID,
+                     TRIG_NODE_GUID, TRIG_CELLGUID):
+            p0 = pl.find(guid)
+            if p0 >= 4:
+                n = int.from_bytes(pl[p0 - 4:p0], 'little')
+                pl[p0 - 4:p0] = struct.pack('<I', max(0, n - 1))
+        # 事件/行为组计数 −1
+        acts, evs = self._split_tables()
+        for first, cnt in ((acts[0]['obj'] if acts else None, len(o['acs'])),
+                           (evs[0]['obj'] if evs else None, 1 if o['ev'] else 0)):
+            if first is None or not cnt:
+                continue
+            p0 = first - 4
+            n = int.from_bytes(pl[p0:p0 + 4], 'little')
+            pl[p0:p0 + 4] = struct.pack('<I', max(0, n - cnt))
+        self.invalidate_caches(rescan=True)
+        # ⑤ 重排序号
+        self.renumber_triggers()
+        self.invalidate_caches(rescan=True)
+        return {'sid': sid, 'name': o['name'], 'bytes_removed': sum(s[1] for s in spans),
+                'objects': [s[2] for s in spans], 'detached': detached,
+                'timer_entry': timer}
+
+    def renumber_triggers(self):
+        """把「集群内序号」重写成**数组位置**（实例/标签 +172、事件/行为 +56）。
+
+        实测 3 档：序号 == 位置（SAVE48DB 82/82、AB 2/2、SAVE6784 3/3）。
+        删中间一条触发后必须重排，否则引擎按序号找不到对象。
+        """
+        pl = self.plain
+        m = self._instance_maps()
+        insts = sorted(m['inst'].items(), key=lambda kv: kv[1])
+        tobj = self._tag_objs_by_key()
+        byk = {a.get('key'): a for a in self.actions()}
+        evs = {e.get('key'): e for e in self.events()}
+        for i, (k, off) in enumerate(insts):
+            pl[off + self.TRIG_SEQ_OFF:off + self.TRIG_SEQ_OFF + 4] = struct.pack('<I', i)
+            t = tobj.get(m['tag_of_inst'].get(k))
+            if t is not None:
+                pl[t + self.TRIG_SEQ_OFF:t + self.TRIG_SEQ_OFF + 4] = struct.pack('<I', i)
+            ev = evs.get(int.from_bytes(pl[off + 192:off + 196], 'little'))
+            if ev is not None:
+                pl[ev['obj'] + 56:ev['obj'] + 60] = struct.pack('<I', i)
+            for ack in self.action_chain(int.from_bytes(pl[off + 196:off + 200],
+                                                        'little')):
+                a = byk.get(ack)
+                if a is not None:
+                    pl[a['obj'] + 56:a['obj'] + 60] = struct.pack('<I', i)
+        return len(insts)
+
+    # ---------- 软删除（2026-10-20 玩家方案）：不删对象，只把条件改成永不满足 ----------
+    SOFTOFF_TIME_SEC = 0xFFFFFF          # 参数上限 = 16,777,215 秒（≈194 天连续游戏）
+
+    def soft_disable_trigger(self, sid):
+        """把一条触发改成"永不满足"，效果等同删除，但**一个对象都不删**。
+
+        玩家定下的规则（2026-10-20）：
+          · **挂了建筑**的触发 → 事件改「13 流逝时间」+ 参数拉到上限（16,777,215 秒）。
+            理由：挂建筑的那种，事件改成"进入事件"仍会在有单位进楼时满足，不可靠。
+          · **没挂建筑**的触发 → 事件改「1 进入事件」，参数 0 ⇒ 没有东西会"进入"，
+            永远不满足。
+        只改 8 个字节（事件类型 4B + 参数 4B）；计时型触发会顺带把 TagNode 帧数同步成
+        `参数量 × 15`（set_event 本来就这么做），所以耗时会变成 251,658,225 帧 —— 仍在 u32 内。
+        ★完全可逆：想恢复就把事件类型/参数改回去（软删除不改任何结构）。
+
+        返回 {'sid','name','mode','event','arg','attached','ticks','note'}
+        """
+        d = self.trigger_detail(sid)
+        ev = d['event']
+        if ev is None:
+            raise RuntimeError('该触发没有可编辑的事件对象，无法软删除')
+        attached = int(d.get('attached') or 0)
+        if attached or d['has_node']:
+            self.set_event(ev, etype=13, arg=self.SOFTOFF_TIME_SEC)
+            mode = '流逝时间 %d 秒' % self.SOFTOFF_TIME_SEC
+            note = ('挂了 %d 栋建筑/原本就是计时触发 ⇒ 用「流逝时间」拉到参数上限'
+                    '（%d 秒 ≈ 194 天连续游戏），实际上永远不会到点'
+                    % (attached, self.SOFTOFF_TIME_SEC))
+        else:
+            self.set_event(ev, etype=1, arg=0)
+            mode = '进入事件（参数 0）'
+            note = '没挂建筑 ⇒ 改成「进入事件」，没有东西会"进入"它 ⇒ 永远不满足'
+        d2 = self.trigger_detail(sid)
+        self.invalidate_caches(rescan=True)
+        return {'sid': sid, 'name': d['name'], 'mode': mode,
+                'event': (d2['event'] or {}).get('type'),
+                'arg': (d2['event'] or {}).get('arg'),
+                'attached': attached, 'ticks': d2.get('ticks'), 'note': note}

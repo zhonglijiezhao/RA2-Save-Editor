@@ -1,0 +1,27 @@
+{
+  "Chrono": {
+    "guid": "4727584a3998d111b70900a024ddafd1",
+    "sample": "CLEG",
+    "size": 97
+  },
+  "Drive": {
+    "guid": "4127584a3998d111b70900a024ddafd1",
+    "sample": "MTNK",
+    "size": 133
+  },
+  "Fly": {
+    "guid": "462c61921ff7d111ac9f006008055bb5",
+    "sample": "ZEP",
+    "size": 173
+  },
+  "Hover": {
+    "guid": "4227584a3998d111b70900a024ddafd1",
+    "sample": "SAPC",
+    "size": 140
+  },
+  "Walk": {
+    "guid": "4427584a3998d111b70900a024ddafd1",
+    "sample": "E1",
+    "size": 81
+  }
+}

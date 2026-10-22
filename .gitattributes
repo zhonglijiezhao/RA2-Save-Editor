@@ -1,0 +1,17 @@
+# 统一换行处理：仓库里存 LF，检出时按类型还原
+* text=auto
+
+# .bat / .cmd 必须是 CRLF，否则 cmd 会把行切碎（本项目实踩过）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Python / Markdown 保持 LF
+*.py text eol=lf
+*.md text eol=lf
+
+# 二进制，别做任何换行/编码转换
+*.dll binary
+*.bin binary
+*.png binary
+*.ico binary
+*.zip binary
