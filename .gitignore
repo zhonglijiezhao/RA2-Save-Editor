@@ -5,7 +5,10 @@ build_dist_*/
 build_dist_new/
 build_dist_tmp*/
 build_p[0-9]*/
-build_work/
+build_work/*
+# 打包脚本要跟着仓库走（spec 里用 SPECPATH 算绝对路径，放哪都能跑）
+# ★只放行 spec 一个文件：写成 !build_work/ 会把整个目录（1.1GB 中间产物）都放进来
+!build_work/RA2存档编辑器.spec
 _build_bak/
 *.spec.bak
 __pycache__/
