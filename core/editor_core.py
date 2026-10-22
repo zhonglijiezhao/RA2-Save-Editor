@@ -10455,6 +10455,198 @@ class SaveDoc(object):
         return {'sid': newsid, 'name': name, 'warnings': warns,
                 'actions': len(acs)}
 
+    # ================= §193 事件 / 行为「列表化」：排序 + 单条删除 =================
+    # 结构前提（§168 已定案，本节沿用）：
+    #   · 事件 = **键链**：触发实例 +192 = 链头键，每个事件对象 +0x3C = 下一个键
+    #   · 行为 = **键链 + 连续数组**：实例 +196 = 链头键；对象 +0x38 = 序号（0 基，必须连续）
+    #   · 两组的**组计数**都在「组内第一个对象的 obj-4」处（u32）
+    # ★排序用**交换载荷**而不是改链：链是按"键"走的，把两个对象的载荷互换、
+    #   键留在原位 ⇒ 链指向的顺序自然就反过来了，**一个字节的长度都不变**，
+    #   是最安全的做法（改链也行，但要同时改链头 + 每个 next，出错面更大）。
+    def owner_sid_of_event(self, key):
+        """事件**自键** → 所属触发 sid（走运行期键链，不需要地图）。找不到返回 None。"""
+        for sid, d in self.runtime_links().items():
+            if key in self.event_chain(d['ev']):
+                return sid
+        return None
+
+    def owner_sid_of_action(self, action_off):
+        """行为**对象偏移** → 所属触发 sid（行为是按 `+0x38` 序号排的连续数组）。"""
+        for sid in list(self.runtime_links().keys()):
+            try:
+                for a in self.trigger_actions(sid):
+                    if a['action_off'] == action_off:
+                        return sid
+            except Exception:
+                continue
+        return None
+
+    def _obj_size(self, kind, sid):
+        """量出本档该触发的事件/行为对象尺寸（事件尺寸随档变化：108/124）。"""
+        if kind == 'ac':
+            return ACTION_SIZE
+        o = self.trigger_objects(sid)
+        return o.get('ev_size') or 108
+
+    def _swap_payload(self, a, b, size, skip_index=False):
+        """交换两个对象的**载荷**，保留三个"身份/结构"字段：
+            [0,20)   GUID + 自键
+            [0x38,0x40)  序号（行为）/「所属触发序号」（事件） + **next 键**（链就靠它）
+        ⇒ 只换 [20,0x38) 与 [0x40,size)。★next 键必须留在原位，否则链会自环成 1 条
+          （2026-10-22 实踩：只跳过序号时，交换后事件链只剩 1 个）。
+        """
+        pl = self.plain
+        del skip_index          # 两类对象的保护区完全相同，参数保留只为兼容调用
+        for lo, hi in ((20, 56), (64, size)):
+            ba = bytes(pl[a + lo:a + hi])
+            bb = bytes(pl[b + lo:b + hi])
+            pl[a + lo:a + hi] = bb
+            pl[b + lo:b + hi] = ba
+
+    def _chain_objs(self, sid, kind):
+        """→ (inst_off, head_off, [(key, obj)], next_off)（按**链序**）。"""
+        d = self.runtime_links().get(str(sid).upper())
+        if not d:
+            raise RuntimeError('没找到触发 %s 的实例对象' % sid)
+        inst = self._instance_maps()['inst'].get(d['inst_key'])
+        if inst is None:
+            raise RuntimeError('触发 %s 的实例对象定位失败' % sid)
+        if kind == 'ev':
+            head_off, keys = inst + 192, self.event_chain(d['ev'])
+            pool = {e.get('key'): e['obj'] for e in self.events() if e.get('key')}
+            next_off = self.EVENT_NEXT_OFF
+        else:
+            head_off, keys = inst + 196, self.action_chain(d['ac'])
+            pool = {a.get('key'): a['obj'] for a in self.actions() if a.get('key')}
+            next_off = self.ACTION_NEXT_OFF
+        seq = [(k, pool[k]) for k in keys if k in pool]
+        return inst, head_off, seq, next_off
+
+    def move_event(self, sid, index, delta):
+        """把某触发「链序」第 index 个事件上移(-1)/下移(+1)一格。
+
+        ★零长度改动：只交换两个对象体的载荷（GUID/自键留在原位）。
+        ⚠ 含事件 13（流逝时间）时会被搬出首位 ⇒ 返回值里带 `warn`（§175：只有第一位
+          的 13 才算心跳，搬走等于这条触发不再被计时驱动）。
+        """
+        inst, head_off, seq, _nx = self._chain_objs(sid, 'ev')
+        delta = int(delta)
+        if delta not in (-1, 1):
+            raise ValueError('delta 只能是 -1（上移）或 +1（下移）')
+        j = int(index) + delta
+        if not (0 <= int(index) < len(seq) and 0 <= j < len(seq)):
+            raise RuntimeError('事件序号越界（共 %d 条）' % len(seq))
+        size = self._obj_size('ev', sid)
+        a, b = seq[int(index)][1], seq[j][1]
+        ta = struct.unpack_from('<I', self.plain, a + OBJ_TYPE_OFF)[0]
+        tb = struct.unpack_from('<I', self.plain, b + OBJ_TYPE_OFF)[0]
+        self._swap_payload(a, b, size)
+        self.invalidate_caches(rescan=True)
+        warn = ''
+        if ta == 13 or tb == 13:
+            if int(index) == 0 or j == 0:
+                warn = ('⚠ 事件 13「流逝时间」被搬离/搬入首位：引擎**只认第一位**的 13 '
+                        '（心跳，§175）。若这条触发里有 36/37 局部变量事件，搬走后就永不评估。')
+        return {'order': [k for k, _o in seq], 'moved': int(index), 'to': j, 'warn': warn}
+
+    def move_action(self, sid, index, delta):
+        """把某触发第 index 个行为上移/下移一格（★行为按顺序执行，顺序=执行顺序）。
+
+        ★行为**不是**用键链排序的：`trigger_actions()` 是按 `+0x38` 序号排的连续数组，
+          所以这里直接交换两个对象的载荷（序号与 next 键留在原位）。
+        """
+        acts = self.trigger_actions(sid)
+        delta = int(delta)
+        if delta not in (-1, 1):
+            raise ValueError('delta 只能是 -1（上移）或 +1（下移）')
+        j = int(index) + delta
+        if not (0 <= int(index) < len(acts) and 0 <= j < len(acts)):
+            raise RuntimeError('行为序号越界（共 %d 条）' % len(acts))
+        if acts[int(index)]['type'] == acts[j]['type'] == 0:
+            pass
+        a, b = acts[int(index)]['action_off'], acts[j]['action_off']
+        self._swap_payload(a, b, ACTION_SIZE)
+        self.invalidate_caches(rescan=True)
+        return {'order': [x['type'] for x in self.trigger_actions(sid)],
+                'moved': int(index), 'to': j, 'warn': ''}
+
+    def remove_event(self, sid, index):
+        """删除某触发链序第 index 个事件（**最后一个不能删**，否则触发永不成立）。
+
+        步骤：链重连（前驱 +0x3C 或链头 +192 → 被删者 next）→ 删字节 → 事件组计数 −1。
+        """
+        inst, head_off, seq, next_off = self._chain_objs(sid, 'ev')
+        index = int(index)
+        if len(seq) <= 1:
+            raise RuntimeError('这条触发只有 1 个事件，删掉它触发就永远不会成立了 —— 已拒绝')
+        if not (0 <= index < len(seq)):
+            raise RuntimeError('事件序号越界（共 %d 条）' % len(seq))
+        size = self._obj_size('ev', sid)
+        obj = seq[index][1]
+        nxt = struct.unpack_from('<I', self.plain, obj + next_off)[0]
+        pl = self.plain
+        # ① 链重连
+        if index == 0:
+            pl[head_off:head_off + 4] = struct.pack('<I', nxt)
+        else:
+            prev = seq[index - 1][1]
+            pl[prev + next_off:prev + next_off + 4] = struct.pack('<I', nxt)
+        # ② 组计数（在组首 obj−4，位置恒在 obj 之前 ⇒ 删字节不影响它）
+        evs = self.events()
+        cpos = evs[0]['obj'] - 4
+        n = struct.unpack_from('<I', pl, cpos)[0]
+        # ③ 删字节（降序无所谓，只有一个区间）
+        del pl[obj:obj + size]
+        self.invalidate_caches(rescan=True)
+        pl = self.plain
+        pl[cpos:cpos + 4] = struct.pack('<I', max(0, n - 1))
+        self.invalidate_caches(rescan=True)
+        return {'removed': index, 'size': size, 'left': len(seq) - 1,
+                'order': [k for k, _o in seq if k != seq[index][0]]}
+
+    def remove_action(self, sid, index):
+        """删除某触发第 index 个行为（**最后一条不能删**：触发必须有至少一条行为）。
+
+        行为的序号 `+0x38` 必须与位置一致 ⇒ 删完要把后面同触发行为的序号各 −1；
+        删的是第一条时，实例 `+196` 链头要指向新的第一条（键 = 新第一条对象的 +16）。
+        """
+        d = self.runtime_links().get(str(sid).upper())
+        if not d:
+            raise RuntimeError('没找到触发 %s 的实例对象' % sid)
+        inst = self._instance_maps()['inst'].get(d['inst_key'])
+        if inst is None:
+            raise RuntimeError('触发 %s 的实例对象定位失败' % sid)
+        acts = self.trigger_actions(sid)
+        index = int(index)
+        if len(acts) <= 1:
+            raise RuntimeError('这条触发只有 1 条行为，删掉它触发就没有效果了 —— 已拒绝')
+        if not (0 <= index < len(acts)):
+            raise RuntimeError('行为序号越界（共 %d 条）' % len(acts))
+        pl = self.plain
+        obj = acts[index]['action_off']
+        # ① 后面同触发行为的序号 −1（先写，此时偏移还没变）
+        for r in acts[index + 1:]:
+            o2 = r['action_off']
+            v = struct.unpack_from('<I', pl, o2 + 0x38)[0]
+            if v > 0:
+                pl[o2 + 0x38:o2 + 0x3C] = struct.pack('<I', v - 1)
+        # ② 删的是第一条 ⇒ 链头改成新的第一条（用它自己的键）
+        if index == 0:
+            newkey = struct.unpack_from('<I', pl, acts[1]['action_off'] + 16)[0]
+            pl[inst + 196:inst + 200] = struct.pack('<I', newkey)
+        # ③ 组计数
+        first = self.actions()[0]['obj']
+        cpos = first - 4
+        n = struct.unpack_from('<I', pl, cpos)[0]
+        del pl[obj:obj + ACTION_SIZE]
+        self.invalidate_caches(rescan=True)
+        pl = self.plain
+        pl[cpos:cpos + 4] = struct.pack('<I', max(0, n - 1))
+        self.invalidate_caches(rescan=True)
+        rest = self.trigger_actions(sid)
+        return {'removed': index, 'size': ACTION_SIZE, 'left': len(rest),
+                'order': [x['type'] for x in rest]}
+
     def remove_trigger(self, sid, clear_attach=True):
         """删除一条触发：实例 + 标签 + 事件 + 全部行为 + TagNode + CellTag + 计时表条目。
 

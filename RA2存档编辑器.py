@@ -1982,6 +1982,172 @@ class App(tk.Tk):
         ttk.Button(frm, text='关闭', command=dlg.destroy).grid(
             row=3, column=0, columnspan=3, pady=(8, 0))
 
+    # ---------------- §193 事件 / 行为 列表化：上下移 + 单条删除 ----------------
+    def _owner_sids(self):
+        try:
+            return self.doc.runtime_owners()
+        except Exception:
+            return ({}, {})
+
+    def _sel_event(self):
+        sel = self.te.selection() if hasattr(self, 'te') else ()
+        if not sel:
+            messagebox.showwarning('提示', '请先在事件列表里选中一条')
+            return None
+        try:
+            return self._evlist[int(sel[0])]
+        except Exception:
+            return None
+
+    def _sel_action(self):
+        sel = self.ta.selection() if hasattr(self, 'ta') else ()
+        if not sel:
+            messagebox.showwarning('提示', '请先在行为列表里选中一条')
+            return None
+        try:
+            return self._aclist[int(sel[0])]
+        except Exception:
+            return None
+
+    def move_sel_event(self, delta):
+        """把选中事件在**它所属触发内**上移/下移一格（§193）。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        ev = self._sel_event()
+        if not ev:
+            return
+        sid = self.doc.owner_sid_of_event(ev.get('key'))
+        if not sid:
+            messagebox.showwarning('提示', '这条事件没有运行期归属（不属于完整六件套触发），无法排序')
+            return
+        lst = self.doc.trigger_event_list(sid)                    # 链序（引擎看的顺序）
+        idx = next((i for i, e in enumerate(lst) if e.get('key') == ev.get('key')), None)
+        if idx is None:
+            messagebox.showwarning('提示', '在触发 %s 的事件链里没找到这条事件，已放弃' % sid)
+            return
+        # ★按钮要跟着**界面显示的顺序**走：列表是按明文里对象先后填的，而链序可能是反的
+        #   （新建触发是头插）。所以按"显示顺序"找相邻行，再换算成链序的 ±1。
+        shown = sorted([e for e in self.doc.events()
+                        if self.doc.owner_sid_of_event(e.get('key')) == sid],
+                       key=lambda e: e['obj'])
+        pos = next((i for i, e in enumerate(shown) if e.get('key') == ev.get('key')), None)
+        if pos is None or not (0 <= pos + delta < len(shown)):
+            self.status.set('已经是%s了（共 %d 条事件）' % ('第一条' if delta < 0 else '最后一条',
+                                                        len(shown)))
+            return
+        nkey = shown[pos + delta].get('key')
+        nidx = next((i for i, e in enumerate(lst) if e.get('key') == nkey), None)
+        d_chain = 0 if nidx is None else (nidx - idx)
+        if d_chain not in (-1, 1):
+            messagebox.showwarning('提示', '这两条事件在链上不相邻，暂不支持直接交换')
+            return
+        try:
+            r = self.doc.move_event(sid, idx, d_chain)
+        except Exception as e:
+            messagebox.showerror('排序失败', str(e))
+            return
+        self.refresh_events()
+        self.status.set('触发 %s：事件顺序已调整（第 %d 位 → 第 %d 位，尚未保存）'
+                        % (sid, idx + 1, r['to'] + 1))
+        if r.get('warn'):
+            messagebox.showwarning('⚠ 心跳事件被搬动', r['warn'])
+
+    def move_sel_action(self, delta):
+        """把选中行为在该触发内上移/下移一格 —— 行为是按顺序执行的。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        ac = self._sel_action()
+        if not ac:
+            return
+        sid = self.doc.owner_sid_of_action(ac.get('obj'))
+        if not sid:
+            messagebox.showwarning('提示', '这条行为没有运行期归属（不属于完整六件套触发），无法排序')
+            return
+        lst = self.doc.trigger_actions(sid)
+        idx = next((i for i, a in enumerate(lst)
+                    if a['action_off'] == ac.get('obj')), None)
+        if idx is None:
+            messagebox.showwarning('提示', '在触发 %s 的行为表里没找到这一条，已放弃' % sid)
+            return
+        if not (0 <= idx + delta < len(lst)):
+            self.status.set('已经是%s了（共 %d 条行为）' % ('第一条' if delta < 0 else '最后一条',
+                                                        len(lst)))
+            return
+        try:
+            self.doc.move_action(sid, idx, delta)
+        except Exception as e:
+            messagebox.showerror('排序失败', str(e))
+            return
+        self.refresh_actions()
+        self.status.set('触发 %s：第 %d 条行为已%s（尚未保存）'
+                        % (sid, idx + 1, '上移' if delta < 0 else '下移'))
+
+    def remove_sel_event(self):
+        """删除选中的**事件对象**（§193）；最后一个不允许删（触发会永远不成立）。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        ev = self._sel_event()
+        if not ev:
+            return
+        sid = self.doc.owner_sid_of_event(ev.get('key'))
+        if not sid:
+            messagebox.showwarning('提示', '这条事件没有运行期归属，无法删除')
+            return
+        lst = self.doc.trigger_event_list(sid)
+        idx = next((i for i, e in enumerate(lst) if e.get('key') == ev.get('key')), None)
+        if idx is None:
+            messagebox.showwarning('提示', '在这个触发的事件链里没找到它，已放弃')
+            return
+        if not messagebox.askyesno(
+                '删除事件',
+                '要从触发 %s 里删掉这条事件吗？\n\n    %s（类型 %s，参数 %s）\n\n'
+                '会从存档明文里移除一整个事件对象，长度会变短；\n'
+                '建议先「另存为新文件」再改。' % (sid, ev.get('name'), ev.get('type'),
+                                                 ev.get('arg'))):
+            return
+        try:
+            r = self.doc.remove_event(sid, idx)
+        except Exception as e:
+            messagebox.showerror('删除失败', str(e))
+            return
+        self.refresh_events()
+        self.status.set('已删除触发 %s 的 1 个事件（移除 %d 字节，剩 %d 个，尚未保存）'
+                        % (sid, r['size'], r['left']))
+
+    def remove_sel_action(self):
+        """删除选中的**行为对象**（§193）；最后一条不允许删（触发就没效果了）。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        ac = self._sel_action()
+        if not ac:
+            return
+        sid = self.doc.owner_sid_of_action(ac.get('obj'))
+        if not sid:
+            messagebox.showwarning('提示', '这条行为没有运行期归属，无法删除')
+            return
+        lst = self.doc.trigger_actions(sid)
+        idx = next((i for i, a in enumerate(lst) if a['action_off'] == ac.get('obj')), None)
+        if idx is None:
+            messagebox.showwarning('提示', '在这个触发的行为表里没找到它，已放弃')
+            return
+        if not messagebox.askyesno(
+                '删除行为',
+                '要从触发 %s 里删掉这条行为吗？\n\n    %s（类型 %s，参数 %s）\n\n'
+                '会移除 168 字节并把后面行为的序号各减 1。' % (
+                    sid, ac.get('name'), ac.get('type'), ac.get('arg'))):
+            return
+        try:
+            r = self.doc.remove_action(sid, idx)
+        except Exception as e:
+            messagebox.showerror('删除失败', str(e))
+            return
+        self.refresh_actions()
+        self.status.set('已删除触发 %s 的 1 条行为（剩 %d 条，尚未保存）' % (sid, r['left']))
+
     def _tab_events(self, nb):
         f = ttk.Frame(nb, padding=8)
         cols = ('idx', 'type', 'name', 'arg', 'argtext', 'owner', 'off')
@@ -2016,6 +2182,14 @@ class App(tk.Tk):
         ttk.Button(row, text='修改选中事件…', command=self.edit_event).pack(side='left')
         ttk.Button(row, text='设为「永不满足」= 等效禁用',
                    command=self.make_never_satisfied).pack(side='left', padx=6)
+        # ★2026-10-22 §193：列表化 —— 同一触发内的事件**上下移**（事件 13 心跳必须首位，
+        #   搬动时会警告）与**单条删除**（最后一个不允许删）
+        ttk.Button(row, text='↑ 上移', width=7,
+                   command=lambda: self.move_sel_event(-1)).pack(side='left', padx=(10, 2))
+        ttk.Button(row, text='↓ 下移', width=7,
+                   command=lambda: self.move_sel_event(+1)).pack(side='left', padx=2)
+        ttk.Button(row, text='🗑 删除该事件',
+                   command=self.remove_sel_event).pack(side='left', padx=6)
         ttk.Label(row, text='双击一行也可修改', foreground='#6b7280').pack(side='left', padx=10)
         self.lbl_map_ev = ttk.Label(f, text='', foreground='#6b7280', wraplength=880,
                                     justify='left')
@@ -2333,6 +2507,13 @@ class App(tk.Tk):
         row = ttk.Frame(f)
         row.pack(fill='x', pady=(8, 0))
         ttk.Button(row, text='修改选中行为…', command=self.edit_action).pack(side='left')
+        # ★2026-10-22 §193：行为**按顺序执行** ⇒ 上下移就是改执行顺序
+        ttk.Button(row, text='↑ 上移', width=7,
+                   command=lambda: self.move_sel_action(-1)).pack(side='left', padx=(10, 2))
+        ttk.Button(row, text='↓ 下移', width=7,
+                   command=lambda: self.move_sel_action(+1)).pack(side='left', padx=2)
+        ttk.Button(row, text='🗑 删除该行为',
+                   command=self.remove_sel_action).pack(side='left', padx=6)
         ttk.Label(row, text='双击一行也可修改', foreground='#6b7280').pack(side='left', padx=10)
         self.lbl_map_ac = ttk.Label(f, text='', foreground='#6b7280', wraplength=880,
                                     justify='left')
