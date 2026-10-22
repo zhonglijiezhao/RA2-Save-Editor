@@ -1982,6 +1982,89 @@ class App(tk.Tk):
         ttk.Button(frm, text='关闭', command=dlg.destroy).grid(
             row=3, column=0, columnspan=3, pady=(8, 0))
 
+    # ---------------- §193 新增事件 / 行为（需要先在「触发」页选中一条触发）----------------
+    def _target_trigger_sid(self):
+        """新增对象的落点 = 「触发」页当前选中的那条触发。"""
+        sel = self.tt.selection() if hasattr(self, 'tt') else ()
+        if not sel:
+            messagebox.showwarning('提示', '请先在「触发」页选中一条触发，再回来点「添加」')
+            return None
+        try:
+            r = self.doc.records[int(sel[0])]
+        except Exception:
+            return None
+        if r.kind != '触发':
+            messagebox.showwarning('提示', '选中的不是触发行')
+            return None
+        return r.sid
+
+    def _add_obj_dialog(self, kind):
+        """kind='ev' 添加事件 / 'ac' 添加行为：类型下拉 + 参数。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        sid = self._target_trigger_sid()
+        if not sid:
+            return
+        from core import fa2_tables as _ft
+        table = _ft.EVENT_TYPES if kind == 'ev' else _ft.ACTION_TYPES
+        items = sorted(table.items(), key=lambda kv: int(kv[0]))
+        opts = ['%s - %s' % (k, v) for k, v in items if int(k) != 0]
+        dlg = tk.Toplevel(self)
+        dlg.title('添加事件' if kind == 'ev' else '添加行为')
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=12)
+        frm.grid(sticky='nsew')
+        ttk.Label(frm, text='目标触发：%s' % sid).grid(row=0, column=0, columnspan=2, sticky='w')
+        ttk.Label(frm, text='类型').grid(row=1, column=0, sticky='e', padx=(0, 6), pady=(8, 4))
+        cb = ttk.Combobox(frm, width=42, values=opts, state='readonly')
+        cb.current(0)
+        cb.grid(row=1, column=1, sticky='w', pady=(8, 4))
+        ttk.Label(frm, text='参数').grid(row=2, column=0, sticky='e', padx=(0, 6))
+        var = tk.StringVar(value='0')
+        ttk.Spinbox(frm, from_=0, to=9999, textvariable=var, width=12).grid(
+            row=2, column=1, sticky='w')
+        ttk.Label(frm, text='★事件 13「流逝时间」的参数 = 秒数；\n'
+                            '行为 56/57 的参数 = 局部变量号（引擎索引，0 起）。\n'
+                            '新增的事件会接在**链尾**（不会抢走第一位的"心跳"）。',
+                  foreground='#374151', justify='left').grid(
+            row=3, column=0, columnspan=2, sticky='w', pady=(8, 0))
+
+        def ok():
+            try:
+                num = int(str(cb.get()).split(' - ', 1)[0])
+                argv = int(var.get() or 0)
+            except Exception:
+                messagebox.showerror('参数无效', '类型/参数必须是数字', parent=dlg)
+                return
+            try:
+                if kind == 'ev':
+                    r = self.doc.add_event(sid, num, argv)
+                    self.refresh_events()
+                else:
+                    r = self.doc.add_action(sid, num, argv)
+                    self.refresh_actions()
+            except Exception as e:
+                messagebox.showerror('添加失败', str(e), parent=dlg)
+                return
+            self.status.set('已给触发 %s 添加%s（类型 %s，参数 %s；共 %d 个，尚未保存）'
+                            % (sid, '事件' if kind == 'ev' else '一条行为', num, argv,
+                               r['total']))
+            dlg.destroy()
+
+        bf = ttk.Frame(frm)
+        bf.grid(row=4, column=0, columnspan=2, pady=(10, 0))
+        ttk.Button(bf, text='确定', command=ok).pack(side='left', padx=6)
+        ttk.Button(bf, text='取消', command=dlg.destroy).pack(side='left')
+
+    def add_event_dialog(self):
+        self._add_obj_dialog('ev')
+
+    def add_action_dialog(self):
+        self._add_obj_dialog('ac')
+
     # ---------------- §193 事件 / 行为 列表化：上下移 + 单条删除 ----------------
     def _owner_sids(self):
         try:
@@ -2190,6 +2273,8 @@ class App(tk.Tk):
                    command=lambda: self.move_sel_event(+1)).pack(side='left', padx=2)
         ttk.Button(row, text='🗑 删除该事件',
                    command=self.remove_sel_event).pack(side='left', padx=6)
+        ttk.Button(row, text='➕ 添加事件…',
+                   command=self.add_event_dialog).pack(side='left', padx=6)
         ttk.Label(row, text='双击一行也可修改', foreground='#6b7280').pack(side='left', padx=10)
         self.lbl_map_ev = ttk.Label(f, text='', foreground='#6b7280', wraplength=880,
                                     justify='left')
@@ -2514,6 +2599,8 @@ class App(tk.Tk):
                    command=lambda: self.move_sel_action(+1)).pack(side='left', padx=2)
         ttk.Button(row, text='🗑 删除该行为',
                    command=self.remove_sel_action).pack(side='left', padx=6)
+        ttk.Button(row, text='➕ 添加行为…',
+                   command=self.add_action_dialog).pack(side='left', padx=6)
         ttk.Label(row, text='双击一行也可修改', foreground='#6b7280').pack(side='left', padx=10)
         self.lbl_map_ac = ttk.Label(f, text='', foreground='#6b7280', wraplength=880,
                                     justify='left')

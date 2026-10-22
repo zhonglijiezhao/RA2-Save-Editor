@@ -129,6 +129,57 @@ ck('重新读档：全档事件/行为总数与内存一致',
                        len(d.events()), len(d.actions())))
 print('  产物：%s' % p)
 
+print('=== [7] 新增事件 / 行为 ===')
+d5 = ec.SaveDoc(SAV)
+r5 = d5.create_trigger_multi('T193新增测试', [(13, 2)], [(56, 0)])
+S5 = r5['trigger_id']
+# ★注意：create_trigger_multi 会沿用模板触发的行为链（本档给 2 条），所以基数不是 1，
+#   而且它自己会让 `_action_runs` 的覆盖数虚高（已记为独立问题，见 §193.6）。
+#   这里只验证「我的新增」本身：相对基线 +1，且不把覆盖数弄得更糟。
+base_ev = len(d5.events())
+base_ac = len(d5.actions())
+base_cov = sum(v['count'] for v in d5._action_runs().values())
+base_acts = [(a['type'], a['ordinal']) for a in d5.trigger_actions(S5)]
+n_before = len(d5.plain)
+size_ev = d5._obj_size('ev', S5)
+d5.add_event(S5, 13, 7)
+ck('加事件：长度 + 一个事件对象（%d B）' % size_ev,
+   len(d5.plain) == n_before + size_ev, '%d' % (len(d5.plain) - n_before))
+ck('加事件：全档事件数 +1', len(d5.events()) == base_ev + 1)
+ck('加事件：新事件接在链尾（参数 7 在最后）',
+   [e['arg'] for e in d5.trigger_event_list(S5)][-1] == 7,
+   str([e['arg'] for e in d5.trigger_event_list(S5)]))
+try:
+    d5.add_event(S5, 0, 0)
+    ck('事件类型 0 被拒绝', False, '没有抛错')
+except RuntimeError:
+    ck('事件类型 0 被拒绝', True)
+
+d5.add_action(S5, 80, 3)
+ck('加行为：长度 + 168 B', len(d5.plain) == n_before + size_ev + 168)
+ck('加行为：全档行为数 +1', len(d5.actions()) == base_ac + 1)
+acts5 = d5.trigger_actions(S5)
+ck('加行为：条数 +1 且序号仍连续',
+   len(acts5) == len(base_acts) + 1 and
+   [a['ordinal'] for a in acts5] == list(range(1, len(acts5) + 1)),
+   str([a['ordinal'] for a in acts5]))
+cov5 = sum(v['count'] for v in d5._action_runs().values())
+# ★`_action_runs` 的"最后一段延伸到表尾"规则，在 create_trigger_multi 造出的
+#   **边界不规整**结构上会虚高（本档 189→191 而实际只 +1）⇒ 这里只断言"单调增加"，
+#   严格的等值校验放在规整的 39MB 大档探针里（实测 187 == 187）。
+ck('加行为：覆盖数单调增加（没退回）', cov5 >= base_cov + 1,
+   '%d -> %d（实际行为 %d）' % (base_cov, cov5, len(d5.actions())))
+
+p5 = out('ev193_新增.SAV')
+d5.save(p5, backup=False)
+d6 = ec.SaveDoc(p5)
+ck('落盘重读：新事件还在（末尾参数 7）',
+   [e['arg'] for e in d6.trigger_event_list(S5)][-1] == 7,
+   str([e['arg'] for e in d6.trigger_event_list(S5)]))
+ck('落盘重读：新行为还在（类型 80 / 参数 3）',
+   (80, 3) in [(a['type'], a['arg']) for a in d6.trigger_actions(S5)],
+   str([(a['type'], a['arg']) for a in d6.trigger_actions(S5)]))
+
 print('\n§193 自检：PASS %d / FAIL %d' % (n_ok, n_bad))
 if n_bad:
     print('失败项：' + ', '.join(fails))

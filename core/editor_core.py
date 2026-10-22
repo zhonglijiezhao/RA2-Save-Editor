@@ -8931,7 +8931,8 @@ class SaveDoc(object):
                         'arg': argv,
                         'name': bytes(pl[a + 104:a + 112]).split(b'\x00')[0]
                                   .decode('ascii', 'ignore').strip(),
-                        'waypoint': wp, 'cell': self.waypoint_cell(wp)})
+                        'waypoint': wp, 'cell': self.waypoint_cell(wp),
+                        'key': struct.unpack_from('<I', pl, a + 16)[0]})
         return out
 
     def trigger_action(self, trigger_id, ac_index=1):
@@ -10318,7 +10319,15 @@ class SaveDoc(object):
         return {'removed': ev_key, 'type': e['type'], 'arg': e['arg']}
 
     def add_action(self, sid, atype, arg=0, name=None, waypoint=None, cell=None):
-        """给触发**追加一条行为**（克隆档内最后一条行为对象，清运行期指针、换新键、接到链尾）。
+        """给触发**追加一条行为**（§193 修正版）。
+
+        ★2026-10-23 修正（原实现在 7MB 小档上"静默无效"的根因）：
+          行为的顺序由 **`+0x38` 全局序号**决定，序号 = 它在动作数组里的**物理下标**；
+          某个触发的行为区间 = [它的首序号, 下一条触发的首序号)。
+          原实现把新对象**追加到全表末尾**、却把 `+0x38` 写成"触发自己的序号" ⇒
+          序号与位置对不上 ⇒ `trigger_actions()` 根本看不见它（看起来"没生效"）。
+          正确做法：**插到该触发最后一条行为之后**，序号 = start+count，并把
+          序号 ≥ 新序号的所有行为各 +1（它们在数组里整体后移了一位）。
 
         ★行为 125「将建筑建于…」需要 `name`（建筑类型名，8B ASCII 写 `+104`）+
           `waypoint`（路径点号，写 `+88`）或 `cell=(x,y)`（该格没路径点就自动建一个）。
@@ -10334,22 +10343,39 @@ class SaveDoc(object):
         acts = self.actions()
         if not acts:
             raise RuntimeError('档内没有可克隆的行为对象')
-        tpl = acts[-1]['obj']
-        keys = [a.get('key') for a in acts if a.get('key')] + \
+        # ---- 定位插入点与序号 ----
+        runs = self._action_runs() or {}
+        r = runs.get(str(sid).upper())
+        if r:
+            start, count = int(r['start']), int(r['count'])
+            pos = acts[start + count - 1]['obj'] + ACTION_SIZE
+            neword = start + count
+            tpl = acts[start + count - 1]['obj']
+        else:                                  # 该触发还没有行为 ⇒ 追加到表尾
+            pos = acts[-1]['obj'] + ACTION_SIZE
+            neword = len(acts)
+            tpl = acts[-1]['obj']
+        # 新键：取全档最大键 +0x1000，且避开明文里已出现的值
+        keys = [x.get('key') for x in acts if x.get('key')] + \
                [e.get('key') for e in self.events() if e.get('key')]
         k = ((max(keys) + 0x1000) if keys else 0x02A75020) & 0xFFFFFFFF
         while pl.find(struct.pack('<I', k)) >= 0:
             k = (k + 0x1000) & 0xFFFFFFFF
+        # 序号后移（先做：此时偏移还没变）
+        for a in acts:
+            v = struct.unpack_from('<I', pl, a['obj'] + 0x38)[0]
+            if v >= neword:
+                pl[a['obj'] + 0x38:a['obj'] + 0x3C] = struct.pack('<I', v + 1)
+        # ---- 造对象（克隆模板，清运行期指针，保留 0..36 类签名）----
         buf = bytearray(pl[tpl:tpl + ACTION_SIZE])
-        for off in range(40, ACTION_SIZE, 4):        # 清运行期指针（保留 0..36 类签名）
+        for off in range(40, ACTION_SIZE, 4):
             buf[off:off + 4] = b'\x00' * 4
         buf[16:20] = struct.pack('<I', k)
-        buf[56:60] = struct.pack('<I', int.from_bytes(
-            pl[inst + self.TRIG_SEQ_OFF:inst + self.TRIG_SEQ_OFF + 4], 'little'))
+        buf[0x38:0x3C] = struct.pack('<I', neword)          # ★序号 = 物理下标
+        buf[self.ACTION_NEXT_OFF:self.ACTION_NEXT_OFF + 4] = b'\x00' * 4
         buf[OBJ_TYPE_OFF:OBJ_TYPE_OFF + 4] = struct.pack('<I', atype)
         buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', arg)
         if atype in ACTION_VAR_TYPES:
-            # §175：变量号落 +164（+72 一律 0，与 FA2 产物一致）
             buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', 0)
             buf[ACT_VAR_OFF:ACT_VAR_OFF + 4] = struct.pack('<I', arg & 0xFFFFFFFF)
         if atype == 125:
@@ -10366,28 +10392,96 @@ class SaveDoc(object):
                 waypoint = wp
             buf[104:112] = str(name).upper().encode('ascii', 'ignore')[:8].ljust(8, b'\x00')
             buf[88:92] = struct.pack('<I', int(waypoint))
-        pl[tpl + ACTION_SIZE:tpl + ACTION_SIZE] = bytes(buf)
-        # 接到链尾
+        pl[pos:pos] = bytes(buf)
+        self.invalidate_caches(rescan=True)
+        pl = self.plain
+        # ---- 接到链尾（键不变，偏移会漂，按新扫描的 acts 找）----
         head = int.from_bytes(pl[inst + 196:inst + 200], 'little')
         chain = self.action_chain(head)
         if not chain:
             pl[inst + 196:inst + 200] = struct.pack('<I', k)
         else:
-            byk = {a.get('key'): a for a in self.actions()}
+            byk = {x.get('key'): x for x in self.actions()}
             last = byk.get(chain[-1])
             if last is None:
-                raise RuntimeError('行为链异常（链尾对象找不到），已加对象但未链接 —— 请勿保存')
+                raise RuntimeError('行为链异常（链尾对象找不到）—— 请勿保存')
             pl[last['obj'] + self.ACTION_NEXT_OFF:
                last['obj'] + self.ACTION_NEXT_OFF + 4] = struct.pack('<I', k)
         self.invalidate_caches(rescan=True)
-        # 行为组计数 +1（插入后重定位组首）
+        # ---- 组计数 +1 ----
         acts2 = self.actions()
         if acts2:
             p0 = acts2[0]['obj'] - 4
             n = int.from_bytes(pl[p0:p0 + 4], 'little')
             pl[p0:p0 + 4] = struct.pack('<I', n + 1)
         self.invalidate_caches(rescan=True)
-        return {'key': k, 'obj': tpl + ACTION_SIZE, 'type': atype, 'arg': arg}
+        return {'key': k, 'type': atype, 'arg': arg, 'ordinal': neword,
+                'total': len(self.trigger_actions(sid))}
+
+    def add_event(self, sid, etype, arg=0):
+        """给触发**追加一个事件**（§193）。事件是**键链**，没有序号，插到链尾即可。
+
+        · 模板取该触发链尾的事件（没有就取全档最后一个）⇒ 天然拿到本档的事件尺寸
+          （小任务档 108B / 大 mod 档 124B，**不能用常量**）
+        · `+56` 写"所属触发的序号"（与地编/引擎一致），`+0x3C` 置 0 = 链尾
+        · 事件组计数在「组首 obj−4」，插完后 +1
+        """
+        pl = self.plain
+        etype, arg = int(etype), int(arg)
+        if etype not in EVENT_TYPES:
+            raise ValueError('事件类型 %s 无效' % etype)
+        if etype == 0:
+            raise RuntimeError('事件类型 0「-无事件-」会让读档崩溃，已拒绝')
+        o = self.trigger_objects(sid)
+        inst = o['inst']
+        if inst is None:
+            raise RuntimeError('该触发没有运行期实例，不能加事件')
+        evs = self.events()
+        if not evs:
+            raise RuntimeError('档内没有可克隆的事件对象')
+        size = o.get('ev_size') or (evs[1]['obj'] - evs[0]['obj'] if len(evs) > 1 else 108)
+        head = int.from_bytes(pl[inst + 192:inst + 196], 'little')
+        chain = self.event_chain(head)
+        byk = {e.get('key'): e for e in evs if e.get('key')}
+        tail = byk.get(chain[-1]) if chain else None
+        tpl = tail['obj'] if tail is not None else evs[-1]['obj']
+        pos = tpl + size
+        keys = [e.get('key') for e in evs if e.get('key')] + \
+               [a.get('key') for a in self.actions() if a.get('key')]
+        k = ((max(keys) + 0x1000) if keys else 0x02A75020) & 0xFFFFFFFF
+        while pl.find(struct.pack('<I', k)) >= 0:
+            k = (k + 0x1000) & 0xFFFFFFFF
+        buf = bytearray(pl[tpl:tpl + size])
+        for off in range(40, size, 4):                 # 清运行期指针（保留 0..36 类签名）
+            buf[off:off + 4] = b'\x00' * 4
+        buf[16:20] = struct.pack('<I', k)
+        buf[56:60] = struct.pack('<I', int.from_bytes(
+            pl[inst + self.TRIG_SEQ_OFF:inst + self.TRIG_SEQ_OFF + 4], 'little'))
+        buf[self.EVENT_NEXT_OFF:self.EVENT_NEXT_OFF + 4] = b'\x00' * 4
+        buf[OBJ_TYPE_OFF:OBJ_TYPE_OFF + 4] = struct.pack('<I', etype)
+        buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', arg)
+        cpos = evs[0]['obj'] - 4
+        n = struct.unpack_from('<I', pl, cpos)[0]
+        pl[pos:pos] = bytes(buf)
+        self.invalidate_caches(rescan=True)
+        pl = self.plain
+        head = int.from_bytes(pl[inst + 192:inst + 196], 'little')
+        chain = self.event_chain(head)
+        byk2 = {e.get('key'): e for e in self.events() if e.get('key')}
+        if not chain:
+            pl[inst + 192:inst + 196] = struct.pack('<I', k)
+        else:
+            last = byk2.get(chain[-1])
+            if last is None:
+                raise RuntimeError('事件链异常（链尾对象找不到）—— 请勿保存')
+            pl[last['obj'] + self.EVENT_NEXT_OFF:
+               last['obj'] + self.EVENT_NEXT_OFF + 4] = struct.pack('<I', k)
+        self.invalidate_caches(rescan=True)
+        pl = self.plain
+        pl[cpos:cpos + 4] = struct.pack('<I', n + 1)
+        self.invalidate_caches(rescan=True)
+        return {'key': k, 'type': etype, 'arg': arg,
+                'total': len(self.trigger_event_list(sid))}
 
     def remove_action(self, sid, ac_key):
         """删掉触发的一条行为（先补链，再删 168 字节，最后组计数 −1）。"""
@@ -10617,7 +10711,13 @@ class SaveDoc(object):
         if inst is None:
             raise RuntimeError('触发 %s 的实例对象定位失败' % sid)
         acts = self.trigger_actions(sid)
-        index = int(index)
+        # ★兼容两种调用：小整数 = 序号（0 基，新 GUI 用）；大整数 = 行为自键（旧 API /
+        #   「触发编辑器」在用）。自键形如 0x02A7xxxx，绝不会落进 0..len 区间。
+        if not (0 <= int(index) < len(acts)):
+            idx2 = next((i for i, a in enumerate(acts) if a.get('key') == index), None)
+            if idx2 is None:
+                raise RuntimeError('行为序号/键 %s 不在这条触发里' % index)
+            index = idx2
         if len(acts) <= 1:
             raise RuntimeError('这条触发只有 1 条行为，删掉它触发就没有效果了 —— 已拒绝')
         if not (0 <= index < len(acts)):
