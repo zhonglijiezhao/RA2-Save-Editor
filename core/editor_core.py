@@ -5015,15 +5015,32 @@ class SaveDoc(object):
                 'country_key': struct.unpack_from('<I', pl, pos + 0xD8)[0],
                 'script_key': struct.unpack_from('<I', pl, pos + 0xF4)[0]}
 
+    # §218：小队法刷兵支持的两种「援军」行为。二者二进制布局**完全相同**
+    #   （`+0x40` 类型、`+0x44` 小队键、`+0x58` 路径点，`+0x48` 恒 0），
+    #   已用 SAVE0029 的 47 个 80 号 + 250 个 107 号真对象逐一核对。
+    SPAWN_ACTIONS = (80, 107)
+
     def spawn_units_by_trigger(self, type_name, count=1, cell=None, waypoint=None,
                                house=None, trigger_name=None, max_teams=1,
-                               tf_template=None, team_template=None, script_key=None):
-        """**让引擎自己刷兵**：特遣部队 + 作战小队 + 触发「任何事件 + 80 援军@路径点」。
+                               tf_template=None, team_template=None, script_key=None,
+                               action=80):
+        """**让引擎自己刷兵**：特遣部队 + 作战小队 + 触发「任何事件 + 援军行为@路径点」。
 
         为什么需要它（§209）：`SPAWNS=` 单位（V3/无畏/航母）手写记录不显示；
         而这条路上单位是**引擎构造**的，所以完全绕开了那个坑。
-        返回 {'tf','team','trigger_id','waypoint','cell','warnings'}。
+        返回 {'tf','team','trigger_id','action','waypoint','cell','warnings'}。
+
+        `action`（§218）：`80` = 援军(作战小队)[在路径点]；`107` = 超时空传送援军
+        （带时空转移特效）。两者在存档里的布局一样：小队键 `+0x44`、路径点 `+0x58`。
+        ★真地图口径（SAVE0029 实测）：地编**不**同步小队自己的「出现于」路径点
+        （46/47 个 80 号、250/250 个 107 号的小队 `+0xE8` 都是 0），
+        引擎读的是行为里的路径点 ⇒ 这里把新队 `+0xE8` 也置 0，与地编写的援军队完全一致
+        （模板队的 -1 是"未设置"，不带进新队）。
         """
+        action = int(action)
+        if action not in self.SPAWN_ACTIONS:
+            raise ValueError('小队法刷兵只支持行为 %s（援军），收到 %r'
+                             % ('/'.join(str(x) for x in self.SPAWN_ACTIONS), action))
         t = str(type_name).strip().upper()
         warnings = []
         tf = self.clone_taskforce([(t, int(count))], tpl_sid=tf_template)
@@ -5042,6 +5059,10 @@ class SaveDoc(object):
         # 国家：优先用模板队自己的；给了 house 就改成 house 的键
         tm = self.clone_team(tf['key'], tpl_sid=team_template, country_key=ck,
                             veteran=0, max_teams=int(max_teams), script_key=script_key)
+        # ★§218：小队「出现于」路径点 `+0xE8` 置 0 —— 与地编写援军队的习惯一致
+        #   （SAVE0029 里被 80/107 引用的 297 个小队全是 0；引擎读的是行为里的 `+0x58`）。
+        #   必须在 create_trigger 之前写：那之后插入的触发六件套会把小队组整体推移。
+        struct.pack_into('<I', self.plain, tm['off'] + 0xE8, 0)
         wp = waypoint
         if wp is None:
             if not cell:
@@ -5050,7 +5071,7 @@ class SaveDoc(object):
             if wp is None:
                 raise RuntimeError('格 %s 处建不了路径点' % (cell,))
         nm = (trigger_name or ('刷%s%d' % (t, count)))[:16]
-        r = self.create_trigger(nm, 8, 0, 80, 0)
+        r = self.create_trigger(nm, 8, 0, action, 0)
         tid = r.get('trigger_id')
         # ★★`create_trigger()` 返回的 `ac_off` 在它自己后续插入对象之后**已经失效**
         #   （实测：按那个偏移去写，结果打到了别的行为对象上，读出来 type=107）。
@@ -5061,15 +5082,16 @@ class SaveDoc(object):
         ac = acts[0]['action_off']
         pl = self.plain
         n0 = struct.unpack_from('<I', pl, ac + 0x40)[0]
-        # ★行为 80 的两个参数：小队键在 +0x44（不是工具默认的 +0x48！），路径点在 +0x58
+        # ★行为 80/107 的两个参数：小队键在 +0x44（不是工具默认的 +0x48！），路径点在 +0x58
+        #   （§218：107 与 80 布局相同，SAVE0029 的 250 个真 107 对象全是这个模式）
         struct.pack_into('<I', pl, ac + 0x44, tm['key'])
         struct.pack_into('<I', pl, ac + 0x58, int(wp))
-        if n0 != 80:
-            struct.pack_into('<I', pl, ac + 0x40, 80)
-            warnings.append('行为类型原本写成了 %d，已改回 80' % n0)
+        if n0 != action:
+            struct.pack_into('<I', pl, ac + 0x40, action)
+            warnings.append('行为类型原本写成了 %d，已改回 %d' % (n0, action))
         self._invalidate_if_shifted()
         return {'tf': tf, 'team': tm, 'trigger_id': r.get('trigger_id'),
-                'action_off': ac, 'waypoint': wp,
+                'action': action, 'action_off': ac, 'waypoint': wp,
                 'cell': self.waypoint_cell(int(wp)), 'warnings': warnings}
 
     def import_unit_from(self, ref, type_name, cx, cy, house=None, veterancy=None,

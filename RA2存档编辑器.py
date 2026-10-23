@@ -4184,11 +4184,14 @@ class App(tk.Tk):
             self.mv_info.config(text='型号 %s：规则里没有这一项（可能是地图自带的自制单位）' % t)
 
     def mv_spawn_team(self):
-        """🔫 刷单位（小队法）：特遣部队 + 作战小队 + 触发「任何事件 + 80 援军@路径点」。
+        """🔫 刷单位（小队法）：特遣部队 + 作战小队 + 触发「任何事件 + 援军行为@路径点」。
 
         ★§217：这是**让引擎自己造单位**，所以带 `SPAWNS=` 的 V3/无畏/航母也能正常刷出来
           （手写单位记录那条路对它们是走不通的，§209）。
         脚本按你说的留空（写 0）——只刷单位，不需要动作脚本。
+        ★§218：援军行为可选 80（普通援军）/ 107（超时空传送援军，带时空特效），
+          二者在存档里的布局相同（小队键 +0x44、路径点 +0x58），已用 SAVE0029
+          的 47+250 个真对象核对过。
         """
         if not self.doc:
             messagebox.showwarning('提示', '请先打开一个存档')
@@ -4208,6 +4211,12 @@ class App(tk.Tk):
                                     parent=self)
         if not n:
             return
+        chrono = messagebox.askyesno(
+            '刷兵方式',
+            '用哪种援军行为？\n\n'
+            '【否】80 援军(作战小队)——单位直接出现在路径点。\n'
+            '【是】107 超时空传送援军——带时空转移特效出现（更炫）。\n\n'
+            '两者在存档里的写法一样，效果由引擎决定。')
         use_script = messagebox.askyesno(
             '动作脚本',
             '小队要不要挂"动作脚本"？\n\n'
@@ -4218,23 +4227,26 @@ class App(tk.Tk):
                 tname, int(n), cell=(sel[0], sel[1]),
                 trigger_name=('刷%s%d' % (tname, n))[:16],
                 max_teams=1,
-                script_key=None if use_script else 0)
+                script_key=None if use_script else 0,
+                action=107 if chrono else 80)
         except Exception as e:
             self.status.set('刷兵失败')
             messagebox.showerror('刷兵失败', str(e))
             return
-        self.status.set('已刷 %d 个 %s @(%d,%d)：特遣 %s / 小队 %s / 触发 %s（路径点 %s）'
+        self.status.set('已刷 %d 个 %s @(%d,%d)：特遣 %s / 小队 %s / 触发 %s（路径点 %s，行为 %d）'
                         % (n, tname, sel[0], sel[1], r['tf']['sid'], r['team']['sid'],
-                           r['trigger_id'], r['waypoint']))
+                           r['trigger_id'], r['waypoint'], r['action']))
         messagebox.showinfo(
             '刷兵已写入',
             '类型：%s × %d\n位置：(%d,%d) → 路径点 %s\n\n'
-            '特遣部队：%s（单位 %s）\n作战小队：%s（脚本 %s）\n触发器：%s（事件「任何事件」+ 行为 80）\n\n'
+            '特遣部队：%s（单位 %s）\n作战小队：%s（脚本 %s）\n'
+            '触发器：%s（事件「任何事件」+ 行为 %s）\n\n'
             '⭐ 请**另存为**新文件再进游戏验证：读档后单位应出现在该格附近。'
             % (tname, n, sel[0], sel[1], r['waypoint'],
                r['tf']['sid'], r['tf']['units'],
                r['team']['sid'], '空（待命）' if not use_script else '沿用模板',
-               r['trigger_id']))
+               r['trigger_id'],
+               '107 超时空传送援军' if r['action'] == 107 else '80 援军'))
 
     def mv_learn_sig(self):
         """📚 学习模板：从一份（或多份）存档里学出"每型号的移动方式 + 8 个机体参数"。
