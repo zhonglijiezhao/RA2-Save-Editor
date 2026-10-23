@@ -52,7 +52,7 @@ rec = tower['base'] - 72
 ck('补之前这栋楼没有 anim', d.building_anim_key(rec) == 0)
 n_len = len(d.plain)
 n_cnt = struct.unpack_from('<I', d.plain, d.anim_records()[0][0] - 4)[0]
-r = d.add_building_anim(tower['base'])
+r = d.add_building_anim(tower['base'], register=True)
 key = r['key']
 ck('返回 created=True', r['created'] is True, str(r))
 ck('明文长度 +476 + 4×登记表数', len(d.plain) == n_len + 476 + 4 * r['lists'],
@@ -60,7 +60,7 @@ ck('明文长度 +476 + 4×登记表数', len(d.plain) == n_len + 476 + 4 * r['l
 ck('数组 count +1',
    struct.unpack_from('<I', d.plain, d.anim_records()[0][0] - 4)[0] == n_cnt + 1)
 pl = d.plain
-ck('新键全档出现 ≥4 次（2 张对象册 + 楼槽 + 自身）',
+ck('register=True ⇒ 新键出现 ≥4 次（2 张对象册 + 楼槽 + 自身）',
    pl.count(struct.pack('<I', key)) >= 4, '%d 次' % pl.count(struct.pack('<I', key)))
 for off, delta in ec.SaveDoc.ANIM_KREF:
     ck('键组 K+0x%X 也在明文里（内部引用写对）' % delta,
@@ -103,10 +103,16 @@ ck('anim_proto() 长度 476 且带类 GUID',
        ec.SaveDoc(SAV).anim_proto()))
 d3 = ec.SaveDoc(SAV)
 t3 = [b for b in d3.buildings() if b['type'] == 'ATESLA'][0]
-gold = ec.SaveDoc('E:/YURI/光棱塔放下 动画播放完成.SAV')
-gg = dict((k, o) for o, k in gold.anim_records())
+gold_path = None
+for _c in ('E:/YURI/光棱塔放下 动画播放完成.SAV',
+           'E:/YURI/新建文件夹 (28)/光棱塔放下 动画播放完成.SAV'):
+    if os.path.exists(_c):
+        gold_path = _c
+        break
+gg = dict((k, o) for o, k in ec.SaveDoc(gold_path).anim_records()) if gold_path else {}
 if 0x14602B90 in gg:
-    donor = bytes(gold.plain[gg[0x14602B90]:gg[0x14602B90] + 476])
+    _g = ec.SaveDoc(gold_path)
+    donor = bytes(_g.plain[gg[0x14602B90]:gg[0x14602B90] + 476])
     r3 = d3.add_building_anim(t3['base'], donor=donor)
     d3g = dict((k, o) for o, k in d3.anim_records())[r3['key']]
     ck('模板克隆：格/键/Z 都被改写（不沿用模板的）',
@@ -115,6 +121,18 @@ if 0x14602B90 in gg:
        and struct.unpack_from('<I', d3.plain, d3g + 0xB8)[0] == 0)
 else:
     ck('金模板档里能找到 ATESLA 的 anim（跳过）', True)
+
+print('=== [6] register 默认为 False（不碰对象册）===')
+d4 = ec.SaveDoc(SAV)
+t4 = [b for b in d4.buildings() if b['type'] == 'ATESLA'][0]
+n_len = len(d4.plain)
+r4 = d4.add_building_anim(t4['base'])
+ck('默认 lists=0', r4['lists'] == 0, str(r4))
+ck('默认只多 476 字节（没插登记表）', len(d4.plain) == n_len + 476,
+   '%+d' % (len(d4.plain) - n_len))
+ck('默认新键出现 2 次（楼槽 + 自身）',
+   d4.plain.count(struct.pack('<I', r4['key'])) == 2,
+   '%d 次' % d4.plain.count(struct.pack('<I', r4['key'])))
 
 print('\n§195 自检：PASS %d / FAIL %d' % (n_ok, n_bad))
 sys.exit(1 if n_bad else 0)

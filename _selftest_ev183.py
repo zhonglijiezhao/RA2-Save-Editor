@@ -67,16 +67,29 @@ print('=' * 72)
 print('§188 自检：直接落成默认播一遍建造动画（开关 = 6E4=0）')
 
 # ---------- [1] 默认：播一遍 ----------
-i1, s1, a1 = place()
+# ★2026-10-23 §196：默认值已从 `buildup=True` 改成 `buildup='fresh'`（刚放下态）。
+#   [1] 保留对**老配方**（显式 buildup=True）的验证，[1b] 新增对**新默认**的验证。
+i1, s1, a1 = place(buildup=True)
 v1 = s1['vals']
-print('  [1] 默认 → buildup=%s state=%s 六元组=%s'
-      % (i1.get('buildup'), s1['state'],
-         '/'.join('%d' % v1[k] for k in KEYS)))
-ck('默认 buildup=True', i1.get('buildup') is True, repr(i1.get('buildup')))
-ck('默认 六元组 = 18/1/1/2/0/0',
+print('  [1] buildup=True（老配方）→ state=%s 六元组=%s'
+      % (s1['state'], '/'.join('%d' % v1[k] for k in KEYS)))
+ck('显式 buildup=True ⇒ 六元组 18/1/1/2/0/0',
    [v1[k] for k in KEYS] == [18, 1, 1, 2, 0, 0], str([v1[k] for k in KEYS]))
-ck('默认 state = buildup（引擎会播一遍）', s1['state'] == 'buildup', s1['state'])
-ck('默认不播两遍（replay=False）', s1['replay'] is False, str(s1['replay']))
+ck('显式 buildup=True ⇒ state = buildup', s1['state'] == 'buildup', s1['state'])
+ck('不播两遍（replay=False）', s1['replay'] is False, str(s1['replay']))
+
+i1b, s1b, _a1b = place()
+v1b = s1b['vals']
+print('  [1b] 默认（fresh）→ state=%s 六元组=%s'
+      % (s1b['state'], '/'.join('%d' % v1b[k] for k in KEYS)))
+ck('默认 buildup 不是 False（默认写刚放下态）', i1b.get('buildup') is not False,
+   repr(i1b.get('buildup')))
+ck('默认 ⇒ AC=-1（刚放下，引擎读档后自己播）',
+   v1b['+0xAC'] in (-1, 0xFFFFFFFF), str(v1b['+0xAC']))
+ck('默认 ⇒ 534=1（算已落位、吃电）', v1b['+0x534'] == 1, str(v1b['+0x534']))
+ck('默认 ⇒ 6E4=0（没播完 ⇒ 引擎会走建造流程建炮塔）', v1b['+0x6E4'] == 0,
+   str(v1b['+0x6E4']))
+ck('默认 ⇒ state 不是 done（done 会无头）', s1b['state'] != 'done', s1b['state'])
 ck('Anims[3..6] 全 0 —— 播不播不靠伴随对象，靠 6E4', all(a == 0 for a in a1), str(a1))
 
 # ---------- [2] 逃生口 ----------
@@ -88,7 +101,7 @@ ck('buildup=False 时 state = done（立即成品、无动画）', s2['state'] =
 # ---------- [3] GUI 口径 ----------
 src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'RA2存档编辑器.py'), encoding='utf-8').read()
-ck('GUI 放置时传 buildup=True', 'buildup=True)' in src)
+ck('GUI 放置时传 buildup=\'fresh\'', "buildup='fresh'" in src)
 ck('GUI 赠送页默认勾上带建造动画',
    'self.gift_buildup = tk.BooleanVar(value=True)' in src)
 ck('GUI 文案承诺"播一遍建造动画"', '播一遍建造动画' in src)

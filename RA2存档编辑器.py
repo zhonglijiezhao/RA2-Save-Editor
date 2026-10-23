@@ -4058,17 +4058,18 @@ class App(tk.Tk):
             else:
                 # ★2026-10-21 17:40 **放置法已在游戏内验收通过**（蓝色光棱塔正常出现）。
                 #   真因 = 克隆伴随对象 ⇒ 弹框；不建伴随（comp_mode='zero'）⇒ 正常。
-                #   该策略现已设为 add_placed_building 的默认值，这里再显式传一次，
-                #   同时按验收时的配方写「新建态」22 个常量（new_state=True）。
-                # ★2026-10-22 §183：**buildup 一律 True**（原勾选框已删）。
-                #   不播这一遍 ⇒ 带炮塔的新楼缺件/错位，要开火或被打一下才自愈。
-                # ★2026-10-22 §188 定案（玩家 T16 实测）：直接落成**播一遍建造动画、播完模型完整**。
-                #   关键是配方里的 `+0x6E4=0`（引擎认为"还没播完"⇒ 播一遍，播的过程重建模型）；
-                #   继承到 1 就会"不播 + 显示不全"（T16 的 B 栋）。
+                #   该策略现已设为 add_placed_building 的默认值，这里再显式传一次。
+                # ★2026-10-22 §183/§188：以前一律传 buildup=True（写 18/1/1/2/0/0）。
+                # ★★★★★ 2026-10-23 §196 定案（T42/T43 同基档对照，in-game）：
+                #   **`buildup='fresh'` = 写「刚放下」态（AC=-1 / 534=1 / 6E4=0）**。
+                #   · `done`（AC=5 / 6E4=1）      → 引擎认为已建好 ⇒ 不建炮塔子对象 ⇒ **无头**
+                #   · `18/1/1/2/0/0`（正在播）    → 引擎读档后不从头上播 ⇒ 停在半路
+                #   · **`AC=-1 / 534=1 / 6E4=0`** → 读档后自己播一遍、自己建炮塔 ⇒ **完整带棱镜**
+                #   `new_state` 也不再写（T17/T18 的 A/B 已证那 22 个常量无可观察影响）。
                 info = self.doc.add_placed_building(tname, sel[0], sel[1], house=house,
                                                     require_free=True,
-                                                    comp_mode='zero', new_state=True,
-                                                    buildup=True)
+                                                    comp_mode='zero', new_state=False,
+                                                    buildup='fresh')
         except Exception as e:
             self.status.set('放置失败')
             messagebox.showerror('放置失败', str(e))

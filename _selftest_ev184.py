@@ -57,9 +57,13 @@ print('§184 自检：模板健康度 + 跨类型指针清理')
 # ---------- [1] 拒绝条件 ----------
 d = SaveDoc(BAD)
 ok, why = d.add_placed_readiness('ATESLA')
-print('  [1] ATESLA 判定 = %s  %s' % (ok, why.splitlines()[0][:50]))
-ck('本档 ATESLA 本身残缺 ⇒ 拒绝直接落成', ok is False)
-ck('拒绝文案指向触发法', '触发法' in why, why[:60])
+print('  [1] ATESLA 判定 = %s  %s' % (ok, (why.splitlines() or [''])[0][:50]))
+# ★2026-10-23 §196：**签名判据不再阻断同类型克隆**（T43 实测：健康塔被判 33/313，
+#   坏模板反而只有 22/313 ⇒ 与"能否克隆成功"无关）。现在只留一条提示。
+ck('本档 ATESLA 签名不达标时**不再阻断**（§196 起只提示）', ok is True, why[:60])
+_ = d.add_placed_readiness('ATESLA')
+ck('但会给一条提示（写在 _last_readiness_note）',
+   '签名' in getattr(d, '_last_readiness_note', ''), '')
 ok2, why2 = d.add_placed_readiness('GATECH')
 ck('本档没有 GATECH ⇒ 拒绝（不许跨类型克隆）', ok2 is False, why2[:60])
 bad, tot = d.template_health(d.same_type_best('ATESLA')[0])
@@ -77,8 +81,14 @@ np2 = ptr_n(d2, g2)
 print('  [2] 同类直接落成 @%s 指针数=%d（引擎造 0，GACNST 85）' % (str(c), np2))
 ck('同类新楼指针数 <= 15', np2 <= 15, str(np2))
 # §188 定案：默认写"建造中"（配方带 6E4=0）⇒ 进游戏播一遍、播完完整
-ck('同类新楼 = 建造中（§188 默认播一遍动画）',
-   d2.building_anim_state(g2 + 72)['state'] == 'buildup')
+# ★2026-10-23 §196 定案：默认写「刚放下」态（AC=-1 / 534=1 / 6E4=0）
+#   —— `done`（6E4=1）会让引擎认为楼已建好 ⇒ 不建炮塔子对象 ⇒ 无头（T42/T43 对照）
+_st2 = d2.building_anim_state(g2 + 72)
+ck('同类新楼 = 刚放下态（AC=-1 / 534=1 / 6E4=0）',
+   _st2['vals']['+0xAC'] in (-1, 0xFFFFFFFF) and _st2['vals']['+0x534'] == 1
+   and _st2['vals']['+0x6E4'] == 0,
+   '%s %s' % (_st2['state'], {k: _st2['vals'][k] for k in ('+0xAC', '+0x534', '+0x6E4')}))
+ck('同类新楼不是 done（done 会无头）', _st2['state'] != 'done', _st2['state'])
 ck('同类克隆时模板挑的是健康那栋（不是残缺楼）',
    i2['tpl_key'] != 0x13963000, '%08X' % i2['tpl_key'])
 

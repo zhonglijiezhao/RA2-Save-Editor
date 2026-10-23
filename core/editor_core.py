@@ -819,6 +819,8 @@ class SaveDoc(object):
         #   克隆模板绝不能取这些记录 —— 它们本身是"异类型 + 我们的补丁"的产物，
         #   再拿它当模板会产出**混血记录** ⇒ 载入弹框。
         self._injected_keys = set()
+        # §196：签名判据降级为"提示"后，把提示文本放这里供 GUI 显示（不再阻断放置）
+        self._last_readiness_note = ''
         self._btypes = None              # 类型对象索引缓存
         self._bld_tmp = None             # 建筑扫描中间表
         self._bnames = None              # 建筑类型名集合（rulesmd [BuildingTypes] ∪ artmd Foundation）
@@ -4489,7 +4491,10 @@ class SaveDoc(object):
     #      **+0x6E4 是引擎自己在"播完那一刻"置 1 的**（+0x10C 同时 2→0）。
     #   ⚠ base = **对象体起点 + 52**（vtable 0x7E3EBC 在 `base-52`；记录 = [16B CLSID][4B 自键][对象体]）
     #     ⇒ 读写一律用 `base + 偏移`，不要再 ±52。
-    BLD_ANIM_OFF = {'+0xAC': 120, '+0xBC': 136, '+0xD0': 156,
+    #   ★★2026-10-23（§196）补 `+0xC8`：全库 402 档统计，**所有 done 建筑无一例外
+    #     `+0xC8 == -1`**（4294967295）；而"建造中"是 6 / 18 这类**帧号**。
+    #     塔写成 done 但 `+0xC8` 还留在 18 ⇒ 引擎照第 18 帧画 ⇒ **无头**（T25_A 实测）。
+    BLD_ANIM_OFF = {'+0xAC': 120, '+0xC8': 128, '+0xBC': 136, '+0xD0': 156,
                     '+0x10C': 216, '+0x534': 1280, '+0x6E4': 1712}
     BLD_ANIM_OFF_ALIAS = {'+0xFC': '+0x10C', '+0x6E0': '+0x6E4'}   # 旧标签兼容
     # ★★★「动画已完成」标记 = 这两个值同时成立（8989 栋里**各自只有 1 栋**不同）：
@@ -4500,7 +4505,7 @@ class SaveDoc(object):
     BLD_ANIM_DONE_MARK = {'+0x10C': 0, '+0x534': 1}   # 「动画已播完」标记
     # ★★跳到"完成态"用的字段组（E 档 in-game 已验正常）：
     #   `+0xBC`（D 档证明无用）与 `+0xD0`（F 档证明不必需）都不写。
-    BLD_ANIM_OK = {'+0xAC': 5, '+0x10C': 0, '+0x534': 1, '+0x6E4': 1}
+    BLD_ANIM_OK = {'+0xAC': 5, '+0xC8': -1, '+0x10C': 0, '+0x534': 1, '+0x6E4': 1}
     # ★★★跳到完成态其实**只需要 1 个字节**：`+0x6E4 = 1`
     #   （A 档 = 5/1/1/0/1/0 显示不全；E 档 = A + 6E4=1 显示正常 ⇒ A→E 只差这一个字节）
     BLD_ANIM_MIN_FIX = {'+0x6E4': 1}
@@ -4537,6 +4542,17 @@ class SaveDoc(object):
     # 照抄 GAPOWR 原始档的完整「建造中」形态（M 档 in-game 已验："播一遍建造动画，正常"）：
     BLD_ANIM_BUILDUP_FULL = {'+0xAC': 18, '+0xBC': 1, '+0xD0': 1,
                              '+0x10C': 2, '+0x534': 0, '+0x6E4': 0}
+    # ★★★★★ §195（2026-10-23，T42/T43 同基档对照 in-game 定案）：**「刚放下」态**。
+    #   玩家把楼放下去、建造动画还没开始播的那一刻，存档里就是这 5 个值
+    #   （黄金档未播完 / T43 三塔全正常，实测一致）：`AC=-1 / BC=0 / 10C=0 / 534=1 / 6E4=0`。
+    #   `+0xD0`（建造总帧）**不写**，沿用模板 —— 写错会让动画播两遍或一闪而过。
+    #
+    #   ★为什么「完成态」（`AC=5 / 6E4=1`，见 `BLD_ANIM_OK`）反而**无头**：
+    #     引擎看到 `6E4=1/534=1` 就认为这楼**已经建好了** ⇒ 不再走建造流程 ⇒
+    #     **不创建炮塔 / 棱镜这类子对象** ⇒ 模型永远缺一块。
+    #     而「刚放下」等于告诉引擎"还没建完"，读档后它自己播一遍、自己把子对象建出来。
+    #   ⇒ 2026-10-23 之前所有"写成完成态 / 写成 18/1/1/2/0/0"的实验全失败，根因就在这里。
+    BLD_ANIM_FRESH = {'+0xAC': -1, '+0xBC': 0, '+0x10C': 0, '+0x534': 1, '+0x6E4': 0}
     # ★§171：`+0xAC=18` 已证实**跨建筑类型通用**（GAPOWR 与 ATESLA/光棱塔 同档实测都播一遍）。
     #   留在表里只为将来万一遇到特例时覆盖；默认不查表，直接 18。
     BLD_ANIM_AC_BUILDUP = {'GAPOWR': 18, 'ATESLA': 18}
@@ -5972,11 +5988,24 @@ class SaveDoc(object):
             if k in self.BLD_ANIM_U8:
                 self.plain[o] = int(want) & 0xFF      # ★单字节：不碰高 3 字节
             else:
-                struct.pack_into('<I', self.plain, o, int(want))
+                struct.pack_into('<I', self.plain, o, int(want) & 0xFFFFFFFF)
         self._live_len = None
 
-    def make_building_buildup(self, base, full=True, ac=None):
+    def make_building_buildup(self, base, full=True, ac=None, fresh=False):
         """让一栋建筑**重播一遍完整建造动画**（§170 十四档 + §171 四档，in-game 定稿）→ dict。
+
+        `fresh=True`（**2026-10-23 §195 起，「直接落成」走这条**）
+            ⇒ 写「**刚放下**」态 `AC=-1 / BC=0 / 10C=0 / 534=1 / 6E4=0`（`+0xD0` 不写，沿用模板）。
+            这是玩家档里"刚把楼放下去、还没开始播"的真实状态（T43 三塔全正常的那一档）。
+            ★为什么必须用「刚放下」而不是「完成态」：`done` 会让引擎认为楼已建好 ⇒
+              **不再走建造流程 ⇒ 不创建炮塔/棱镜等子对象 ⇒ 永远无头**。
+              「刚放下」等于告诉引擎"这楼还没建完"，读档后它会自己播一遍并把子对象建出来。
+            实测定案（T42/T43 同基档对照）：
+              · `AC=5/6E4=1`（done）的塔 → **无头**；
+              · `AC=-1/534=1/6E4=0`（刚放下）的塔 → **完整带棱镜**。
+
+        `fresh=False`（默认，向后兼容）⇒ 老配方 `AC=18/BC=1/D0=1/10C=2/534=0`
+            = 「**正在播动画**」。§193.20 已证它不等于"刚放下"，引擎读档后**不会从头播**。
 
         工序：完成态（`AC=5, 10C=0, 534=1, 6E4=1`）→ 建造中（`AC=18, BC=1, D0=1, 10C=2, 534=0`）。
         in-game 已验：M 档（GAPOWR 完成态→建造中）**播一遍建造动画，正常**；
@@ -5995,14 +6024,17 @@ class SaveDoc(object):
         st = self.building_anim_state(base)
         old = dict(st['vals'])
         tk = st.get('type', '')
-        plan = dict(self.BLD_ANIM_BUILDUP_FULL if full else self.BLD_ANIM_BUILDUP_MIN)
-        if ac is not None:
-            plan['+0xAC'] = int(ac)
-        elif tk in self.BLD_ANIM_AC_BUILDUP:
-            plan['+0xAC'] = self.BLD_ANIM_AC_BUILDUP[tk]
+        if fresh:
+            plan = dict(self.BLD_ANIM_FRESH)
+        else:
+            plan = dict(self.BLD_ANIM_BUILDUP_FULL if full else self.BLD_ANIM_BUILDUP_MIN)
+            if ac is not None:
+                plan['+0xAC'] = int(ac)
+            elif tk in self.BLD_ANIM_AC_BUILDUP:
+                plan['+0xAC'] = self.BLD_ANIM_AC_BUILDUP[tk]
         self._apply_anim_plan(base, plan)
         return {'old': old, 'new': plan, 'changed': True, 'type': tk,
-                'state_before': st['state'],
+                'state_before': st['state'], 'fresh': bool(fresh),
                 'replay': bool(st['state'] == 'buildup' and old.get('+0xD0', 0) >= self.BLD_D0_REPLAY)}
 
     # ---------------- 赠送建筑（2026-10-15 定案，游戏内验收：T3"就绪"✅） ----------------
@@ -6215,11 +6247,17 @@ class SaveDoc(object):
                         '本档没有「%s」这种建筑 ⇒ 直接落成得靠"跨类型克隆"，'
                         '模板的指针表会被整块带过来 ⇒ 新楼会**显示不全**。\n'
                         '请改用「⚡ 触发法」：由引擎自己造，模型/炮塔一定完整。' % tn)
+            # ★★2026-10-23 §195（T43 实测）：**签名判据不再阻断同类型克隆**。
+            #   证据：T43 里那座"玩家直接放下、进游戏完全正常"的塔，被签名判成 33/313 不符；
+            #   而 T15 那座"当模板克隆出来就无头"的塔，签名反而只有 22/313。
+            #   ⇒ 签名吻合度与"能不能当模板"**没有相关性**（签名表本身把静态表地址、
+            #   键、帧计时器都当成固定值采样了）。拿它拦人只会拦住健康模板。
+            #   现在只把它降级成一条提示，真正的判据交给 `same_type_best()` 的排序 + 实测。
             if not self._health_ok(bad, tot):
-                return (False,
-                        '本档那一栋「%s」本身就**不完整**（与类型签名差 %d/%d 个字段，'
-                        '多半是之前用直接落成放坏的）⇒ 拿它当模板克隆，新楼照样残缺。\n'
-                        '请改用「⚡ 触发法」：由引擎自己造，模型/炮塔一定完整。' % (tn, bad, tot))
+                self._last_readiness_note = (
+                    '提示：本档「%s」与签名差 %d/%d 个字段。签名表不可靠（会把静态地址/键/'
+                    '帧计数当固定值），**不影响克隆**；若进游戏发现新楼残缺，多半是模板本身'
+                    '是我们早先放坏的，换一栋同类楼当模板即可。' % (tn, bad, tot))
         return (True, '')
 
     def can_add_placed(self):
@@ -6518,7 +6556,7 @@ class SaveDoc(object):
                 return v
         return 0
 
-    def add_building_anim(self, base, cell=None, z=None, donor=None):
+    def add_building_anim(self, base, cell=None, z=None, donor=None, register=False):
         """给一栋楼补上**建筑动画对象**（476B）—— §194。
 
         · 已经有就什么都不做（返回 `created=False`）；
@@ -6528,6 +6566,10 @@ class SaveDoc(object):
 
         `donor` = 476 字节模板（一般给"同类型已完成楼"的那条记录）；
         不给就按 `anim_proto()` 的「类常量 + 现场写键/格」构造。
+        `register` = 是否把新键登记进「含动画键的对象册」。**默认 False**：
+        2026-10-23 实测（`T24_试做` 档，count 正确、未登记）进游戏**显示正常**
+        ⇒ 引擎认的是楼 `+0x57C` 那个指针，不需要在对象册里挂号；而对象册是"插字节"，
+        能不碰就不碰（少一处可能写坏的地方）。
         `z` 默认 **0**（全库 60+ 档、上千条原生 anim 的 +0xB8 全是 0，
         楼记录 `+168` 那个 2 不是 Z —— 旧文档这条是错的，2026-10-23 更正）。
 
@@ -6604,7 +6646,7 @@ class SaveDoc(object):
                  for b in self.buildings()]):
             hit = sum(1 for j in range(c)
                       if struct.unpack_from('<I', pl, ent + 4 * j)[0] in akeys)
-            if hit >= 1:                                # 含动画键 ⇒ 这张册子收动画
+            if register and hit >= 1:                   # 含动画键 ⇒ 这张册子收动画
                 tabs.append((cs, c, ent))
         # ---- ② 先做**零增长**的写入（此时还没有任何偏移变动）----
         struct.pack_into('<I', pl, rec + slot, k)                     # 楼 → anim
@@ -7991,7 +8033,7 @@ class SaveDoc(object):
     def add_placed_building(self, type_name, cx, cy, z=0, sig_mode='full',
                             comp_mode='zero', grow_mode='insert', ref_mode='keep',
                             house=None, require_free=False, new_state=False,
-                            buildup=True, cross_clean=True, anim=False):
+                            buildup='fresh', cross_clean=True, anim=False):
         """（sig_mode: full=套类型签名 / safe=跳过镜像指针 / none=完全不套，诊断用）
            （comp_mode: **zero=不建伴随对象 + 把 4 个伴随指针清 0【默认，2026-10-21 游戏内验收】
                         / none=不建伴随对象，但同类型模板会**保留模板的 4 个指针**
@@ -8499,6 +8541,14 @@ class SaveDoc(object):
         # ★★★★★ §171（2026-10-22，in-game 已验 M 档 GAPOWR / N2 档 ATESLA 光棱塔）：
         #   让新加的楼**自带一遍完整建造动画**。配方 `AC=18/BC=1/D0=1/10C=2/534=0`，
         #   进游戏播一遍后自动正常；`+0xD0` 若留 100 会播两遍（P/R 档实测）。
+        #
+        # ★★★★★ §195（2026-10-23，T42/T43 同基档对照）：默认改成 **`'fresh'`（刚放下）**。
+        #   实测对照（同一份档、同一批克隆）：
+        #     · `done`（AC=5/6E4=1）      → **无头**（引擎认为已建好，不再建炮塔子对象）
+        #     · `18/1/1/2/0/0`（正在播）   → 引擎读档后**不会从头播**，也停在半路
+        #     · **`AC=-1/534=1/6E4=0`（刚放下）** → **完整带棱镜、正常旋转** ← 唯一正确
+        #   `buildup='fresh'` 写刚放下态；`buildup=True` 走老"正在播"配方；
+        #   `buildup=False` 完全不碰建造态（保留模板原样）。
         anim_note = ''
         if buildup:
             try:
@@ -8510,10 +8560,13 @@ class SaveDoc(object):
                 if nb_base is None:
                     anim_note = '；⚠ 没定位到新楼记录，未写建造动画'
                 else:
-                    rb = self.make_building_buildup(nb_base)
-                    anim_note = ('；已设为「进游戏播一遍建造动画」（%s）'
-                                 % ' '.join('%s=%d' % (k, v) for k, v in
-                                            sorted(rb['new'].items())))
+                    rb = self.make_building_buildup(
+                        nb_base, fresh=(buildup == 'fresh' or buildup == 'Fresh'))
+                    anim_note = ('；已设为「%s」（%s）'
+                                 % ('刚放下 · 读档后自己播一遍建造动画' if rb.get('fresh')
+                                    else '进游戏播一遍建造动画',
+                                    ' '.join('%s=%d' % (k, v) for k, v in
+                                             sorted(rb['new'].items()))))
             except Exception as e:
                 anim_note = '；⚠ 写建造动画失败：%s' % e
         # ★★★★★ §194（2026-10-23）：**补动画对象**（476B anim）。
