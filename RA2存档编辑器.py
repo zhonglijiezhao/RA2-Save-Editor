@@ -536,7 +536,7 @@ class App(tk.Tk):
         """
         if not sid:
             return False
-        rec = next((r for r in self.doc.records if r.kind == '触发' and r.sid == sid), None)
+        rec = self.doc.trigger_rec(sid)
         if rec is None or not self._is_executed(rec):
             return False
         try:
@@ -7119,8 +7119,7 @@ class TriggerEditor(tk.Toplevel):
         if not self._cur:
             return
         det = self._det
-        rec = next((r for r in self.doc.records if r.kind == '触发' and r.sid == self._cur),
-                   None)
+        rec = self.doc.trigger_rec(self._cur)
         msgs = []
         try:
             owner = self.cb_owner.get()

@@ -8747,6 +8747,32 @@ class SaveDoc(object):
 
     TRIG_OWNER_OFF = 128       # 触发记录 +128 = 国家（= House 块 +72 的键）
 
+    def trigger_rec(self, sid):
+        """按 sid 找触发**定义记录**；同 sid 有多条时优先选**有实例对应**的那条。
+
+        ★§224：SAVE0029 有 22 个 sid 带**两条记录**（一条有实例、一条没有的副本，
+          副本的 owner 键谁都不认，如 01000002 的 0x103b6a60）。
+          旧代码取第一条 ⇒ 22 条触发的 owner/标志全读错（玩家实测：触发编辑器
+          把国家显示成 Neutral 而地图里是别的）。
+          判据：**记录帧 = 实例帧 + 56**（`TRIG_REC_DELTA`），实例侧有 sid 可对。
+        """
+        cands = [r for r in self.records if r.kind == '触发' and r.sid == sid]
+        if not cands:
+            return None
+        if len(cands) == 1:
+            return cands[0]
+        inst = self.trigger_inst_off(sid)
+        if inst is not None:
+            for r in cands:
+                if r.off == inst + 56:      # TRIG_REC_DELTA
+                    return r
+        # 没有实例（或都对不上）：退第一张有"像样 owner 键"的（能翻译出名字的）
+        for r in cands:
+            k = self.trigger_owner_key(r)
+            if any(self.house_trigger_owner_key(h) == k for h in self.house_keys()):
+                return r
+        return cands[0]
+
     def trigger_owner_key(self, rec):
         """读某个触发的国家键（触发记录 +128）。"""
         return struct.unpack_from('<I', self.plain, rec.off + self.TRIG_OWNER_OFF)[0]
@@ -11758,7 +11784,7 @@ class SaveDoc(object):
         找不到的项为 None（实例缺失 = 只有定义的老格式，本工具不做增删）。
         """
         pl = self.plain
-        rec = next((r for r in self.records if r.kind == '触发' and r.sid == sid), None)
+        rec = self.trigger_rec(sid)
         if rec is None:
             raise RuntimeError('找不到触发 %s' % sid)
         out = {'sid': sid, 'name': rec.name, 'rec': rec, 'rec_off': rec.off,
@@ -11925,7 +11951,7 @@ class SaveDoc(object):
           +120/+121/+122 按地图字段顺序（EASY, NORMAL, HARD）对应"简单/普通/困难"，
           ⚠ 这三位的**先后顺序尚未游戏内验证**（现有档全是 1/1/1）。
         """
-        rec = next((r for r in self.records if r.kind == '触发' and r.sid == sid), None)
+        rec = self.trigger_rec(sid)
         if rec is None:
             raise RuntimeError('找不到触发 %s' % sid)
         p = rec.off + self.TRIG_FLAG_WORD_OFF
