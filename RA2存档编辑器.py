@@ -3082,6 +3082,8 @@ class App(tk.Tk):
                    command=self.mv_fix_anim).pack(side='left')
         ttk.Button(rowa, text='🔍 扫描全档卡住的建筑',
                    command=self.mv_scan_anim).pack(side='left', padx=6)
+        ttk.Button(rowa, text='✨ 补齐建筑动画(anim)',
+                   command=self.mv_add_anim).pack(side='left', padx=6)
         ttk.Label(rowa, text='修的是旧楼：存档在 Buildup 播完前保存 ⇒ 重载后显示不全',
                   foreground='#6b7280').pack(side='left', padx=6)
 
@@ -4268,6 +4270,65 @@ class App(tk.Tk):
         self.status.set('✅ 已修复 %d 栋（记得另存为新文件）' % ok)
         self._gift_log('[建造动画] 扫描 %d 栋命中 %d，修复 %d'
                        % (total, len(bad), ok))
+
+    def mv_add_anim(self):
+        """地图页：给建筑补**动画对象**（476B anim）—— §194（2026-10-23）。
+
+        为什么需要它（玩家三档实测闭环）：
+          · 只把字段改成"完成态" ⇒ 电力对，但模型停在**动画第 0 帧**（光棱塔只剩底座）；
+          · 引擎"一栋楼建好"时必定新建一个 476B 动画对象，挂在楼记录 `+0x57C`；
+          · 所以缺了它 = 少了一半，补上才完整。
+
+        选中格有楼 ⇒ 只补那一栋；没选 ⇒ 补全档所有缺动画的楼。
+        """
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        b, _idx, err = self._mv_sel_bld()
+        if b:
+            targets = [b]
+            ask = '给 %s (%d,%d) 补一个动画对象？' % (b['type'], b['x'], b['y'])
+        else:
+            targets = [x for x in self.doc.buildings()
+                       if not self.doc.building_anim_key(x['base'] - 72)]
+            if not targets:
+                messagebox.showinfo('都齐了', '全档每栋楼都已经有动画对象，不用补。')
+                return
+            ask = ('当前没选中格子 —— 要给**全档 %d 栋缺动画的楼**都补上吗？\n\n'
+                   '%s' % (len(targets), '、'.join(
+                       '%s(%d,%d)' % (t['type'], t['x'], t['y']) for t in targets[:8])
+                       + ('……' if len(targets) > 8 else '')))
+        if not messagebox.askyesno('确认', ask + '\n\n（会往存档里插字节，改完记得另存；'
+                                              '建议先备份）'):
+            return
+        ok = fail = 0
+        msgs = []
+        for t in targets:
+            # ★每轮都重新取 buildings()：插字节后旧偏移全部作废
+            cur = [x for x in self.doc.buildings()
+                   if x['type'] == t['type'] and x['x'] == t['x'] and x['y'] == t['y']
+                   and not self.doc.building_anim_key(x['base'] - 72)]
+            if not cur:
+                continue
+            try:
+                r = self.doc.add_building_anim(cur[0]['base'])
+                ok += 1
+                msgs.append('%s(%d,%d)→%08X' % (t['type'], t['x'], t['y'], r['key']))
+            except Exception as e:
+                fail += 1
+                msgs.append('%s(%d,%d) 失败：%s' % (t['type'], t['x'], t['y'], e))
+        for fn in ('refresh_buildings', 'refresh_events'):
+            f = getattr(self, fn, None)
+            if callable(f):
+                try:
+                    f()
+                except Exception:
+                    pass
+        self.status.set('补齐建筑动画：成功 %d，失败 %d（尚未保存）' % (ok, fail))
+        messagebox.showinfo('完成',
+                            '成功 %d 栋，失败 %d 栋。\n\n%s\n\n'
+                            '★还没保存 —— 请用「另存为」写到新文件再进游戏验证。'
+                            % (ok, fail, '\n'.join(msgs[:12])))
 
     def mv_fix_anim(self):
         """地图页：把选中格建筑修成「直接显示完成图」（§170 十四档定稿）。

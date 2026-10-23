@@ -6432,6 +6432,202 @@ class SaveDoc(object):
         return bytes(body)
 
     # ------------------------------------------------------------------ #
+    # 建筑动画对象（476B，类 GUID c32d270e）—— §194（2026-10-23 玩家实测闭环）
+    # ------------------------------------------------------------------ #
+    #   ★为什么必须有它（三档实测，见 docs §193.17 / §193.21 / §194）：
+    #     · 只写"完成态字段"（AC=5/10C=0/534=1/6E4=1）⇒ 电力对、但模型停在
+    #       **动画第 0 帧**（光棱塔只剩底座）；
+    #     · 引擎"一栋楼建好"时**必定新建一个 476B 动画对象**并挂到楼记录 `+0x57C`；
+    #     · 所以"直接落成"= 楼记录 + 建造态字段 + **一个动画对象**，三样齐才完整。
+    #   ★记录布局（GUID 就是记录起点，长度 476，count 在首条 −4）：
+    #     +0x00 CLSID(16) / +0x10 自身键 / +0x14 四个 vtable(16) / +0x24 实例ID
+    #     +0x74/+0x7C/+0xA4/+0xF4/+0xFC/+0x124 = K+0x90 / K+0x70 / K+0x71 / K+0x120 / K+0x100 / K+0x70
+    #     +0xAC = (K & 0xFFFF0000) | 0x0101
+    #     +0xB0/+0xB4 = 格X/格Y **×256** / +0xB8 = Z（地形高度，= 楼记录 +168）
+    ANIM_SIZE = 476
+    ANIM_KEY_OFF = 0x10
+    ANIM_ID_OFF = 0x24
+    ANIM_CELLX_OFF = 0xB0
+    ANIM_CELLY_OFF = 0xB4
+    ANIM_CELLZ_OFF = 0xB8
+    ANIM_KREF = ((0x74, 0x90), (0x7C, 0x70), (0xA4, 0x71),
+                 (0xF4, 0x120), (0xFC, 0x100), (0x124, 0x70))
+    ANIM_KREF_HI = 0xAC
+    #   楼记录里指向动画对象的槽（按序取空位；实测 GACNST/AMRADR 会用 2~3 个，
+    #   普通楼只用 +0x57C）
+    ANIM_SLOTS = (0x57C, 0x580, 0x584, 0x590)
+    BLD_Z_OFF = 168                  # 楼记录的 Z（×416），与动画对象 +0xB8 必须相等
+
+    def anim_records(self, pl=None):
+        """本档全部**建筑动画对象** → [(记录起点, 自身键)]（记录起点 = GUID 起点）。
+
+        ★与 `companion_offsets()` 的区别（§194 实测，2026-10-23）：
+          那个旧函数返回 `GUID − 16`（把上一条记录的尾巴 + 数组 count 也算进"记录"），
+          于是"追加到数组末尾"实际落在最后一条记录的**中间**（GUID+460）⇒ 必然写坏。
+          本函数返回**真正的记录起点**，记录长 476、count 在首条 −4。
+        """
+        pl = bytes(self.plain) if pl is None else bytes(pl)
+        out, q = [], 0
+        while True:
+            i = pl.find(self.COMP_MARK, q)
+            if i < 0:
+                break
+            q = i + 1
+            if i + self.ANIM_SIZE > len(pl):
+                continue
+            v = struct.unpack_from('<I', pl, i + 0x14)[0]
+            if not (0x007E0000 <= v <= 0x00800000):     # vtable[0] = 0x7E3354 一族
+                continue
+            out.append((i, struct.unpack_from('<I', pl, i + self.ANIM_KEY_OFF)[0]))
+        return out
+
+    def anim_proto(self, pl=None):
+        """由本档现有动画对象求「类常量原型」：逐 dword 取全档恒定值，其余清零。
+
+        依据（§194）：引擎**自己新建**这条对象时，那些"每条都不一样"的字段全是 0
+        —— 黄金档第 9 条（= 塔建好时新造的那条）119 个 dword 里 76 个恒定，
+        其余大面积为 0 ⇒ "只抄类常量 + 现场写键/格" 与引擎做法等价；
+        而"整份克隆某条"会把模板的悬空指针一起搬走（历史上 comp_mode='clone' 卡死的原因）。
+        """
+        pl = bytes(self.plain) if pl is None else bytes(pl)
+        recs = self.anim_records(pl)
+        if not recs:
+            return None
+        bodies = [pl[g:g + self.ANIM_SIZE] for g, _k in recs]
+        body = bytearray(self.ANIM_SIZE)
+        for off in range(0, self.ANIM_SIZE - 3, 4):
+            vals = {struct.unpack_from('<I', b, off)[0] for b in bodies}
+            if len(vals) == 1:
+                struct.pack_into('<I', body, off, vals.pop())
+        per = (self.ANIM_KEY_OFF, self.ANIM_ID_OFF, self.ANIM_CELLX_OFF,
+               self.ANIM_CELLY_OFF, self.ANIM_CELLZ_OFF, self.ANIM_KREF_HI) + \
+              tuple(o for o, _d in self.ANIM_KREF)
+        for off in per:                        # 逐实例字段一律清 0，等调用方写
+            struct.pack_into('<I', body, off, 0)
+        return bytes(body)
+
+    def building_anim_key(self, rec):
+        """该楼已挂的动画对象键（没有 = 0）。按 `ANIM_SLOTS` 顺序取第一个有效键。"""
+        pl = self.plain
+        amap = {k for _g, k in self.anim_records(pl)}
+        for off in self.ANIM_SLOTS:
+            if rec + off + 4 > len(pl):
+                break
+            v = struct.unpack_from('<I', pl, rec + off)[0]
+            if v and v in amap:
+                return v
+        return 0
+
+    def add_building_anim(self, base, cell=None, z=None, donor=None):
+        """给一栋楼补上**建筑动画对象**（476B）—— §194。
+
+        · 已经有就什么都不做（返回 `created=False`）；
+        · 键按 `K / K+0x70 / K+0x90 / K+0x71 / K+0x100 / K+0x120` 整组避让后分配；
+        · 追加到动画对象数组末尾、count +1，并把新键登记进「含动画键」的对象册；
+        · 最后挂到楼记录的 `+0x57C`（已被占则顺延 +0x580/+0x584/+0x590）。
+
+        `donor` = 476 字节模板（一般给"同类型已完成楼"的那条记录）；
+        不给就按 `anim_proto()` 的「类常量 + 现场写键/格」构造。
+        `z` 默认 **0**（全库 60+ 档、上千条原生 anim 的 +0xB8 全是 0，
+        楼记录 `+168` 那个 2 不是 Z —— 旧文档这条是错的，2026-10-23 更正）。
+
+        返回 {'key', 'created', 'slot', 'lists', 'total', 'note'}
+        """
+        pl = self.plain
+        rec = base - 72
+        if rec < 0 or rec + 1836 > len(pl):
+            raise RuntimeError('楼记录偏移异常（base=0x%X）' % base)
+        if base not in {b['base'] for b in self.buildings()}:
+            raise RuntimeError('楼记录偏移已过期（本方法会插字节）—— '
+                               '请重新取 `buildings()` 里的 base 再调用')
+        have = self.building_anim_key(rec)
+        if have:
+            return {'key': have, 'created': False, 'slot': 0, 'lists': 0,
+                    'total': len(self.anim_records(pl)),
+                    'note': '该楼已有动画对象 0x%08X' % have}
+        recs = self.anim_records(pl)
+        if not recs:
+            raise RuntimeError('本档没有可作模板的动画对象'
+                               '（至少要有一栋已建成的建筑）—— 无法补')
+        bkey = struct.unpack_from('<I', pl, rec + 16)[0]
+        if cell is None:
+            for b in self.buildings():
+                if b.get('base') == base:
+                    cell = (b['x'], b['y'])
+                    break
+        if cell is None:
+            raise RuntimeError('定位不到这栋楼的坐标，请显式传 cell=(x,y)')
+        cx, cy = int(cell[0]), int(cell[1])
+        if z is None:
+            z = 0
+        slot = 0
+        for off in self.ANIM_SLOTS:
+            if struct.unpack_from('<I', pl, rec + off)[0] == 0:
+                slot = off
+                break
+        if not slot:
+            raise RuntimeError('这栋楼的 %d 个动画槽都被占了（%s）—— 请先清掉旧动画'
+                               % (len(self.ANIM_SLOTS),
+                                  '/'.join('+0x%X' % o for o in self.ANIM_SLOTS)))
+        # ---- 分配键：整组（K 及 K+偏移）都要在明文里没出现过 ----
+        used = {k for _g, k in recs}
+        used |= {struct.unpack_from('<I', pl, b['base'] - 72 + 16)[0]
+                 for b in self.buildings()}
+        k = ((max(used) + 0x1000) & 0xFFFFFFFF) if used else 0x02A75020
+        while True:
+            grp = [k, k + 0x70, k + 0x71, k + 0x90, k + 0x100, k + 0x120,
+                   (k & 0xFFFF0000) | 0x0101]
+            if all(pl.find(struct.pack('<I', x & 0xFFFFFFFF)) < 0 for x in grp):
+                break
+            k = (k + 0x1000) & 0xFFFFFFFF
+        # ---- 造记录 ----
+        if donor is not None:
+            body = bytearray(bytes(donor)[:self.ANIM_SIZE].ljust(self.ANIM_SIZE, b'\x00'))
+        else:
+            body = bytearray(self.anim_proto(pl))
+        if len(body) != self.ANIM_SIZE:
+            raise RuntimeError('模板记录长度不是 %d' % self.ANIM_SIZE)
+        struct.pack_into('<I', body, self.ANIM_KEY_OFF, k)
+        for off, delta in self.ANIM_KREF:
+            struct.pack_into('<I', body, off, (k + delta) & 0xFFFFFFFF)
+        struct.pack_into('<I', body, self.ANIM_KREF_HI, (k & 0xFFFF0000) | 0x0101)
+        struct.pack_into('<I', body, self.ANIM_CELLX_OFF, (cx * 256) & 0xFFFFFFFF)
+        struct.pack_into('<I', body, self.ANIM_CELLY_OFF, (cy * 256) & 0xFFFFFFFF)
+        struct.pack_into('<I', body, self.ANIM_CELLZ_OFF, z & 0xFFFFFFFF)
+        struct.pack_into('<I', body, self.ANIM_ID_OFF,
+                         self._next_inst_id(pl, self._bld_group()[0]))
+        # ---- ① 找「含动画键的对象册」（阵营建筑清单里没有动画键 ⇒ 自动排除）----
+        akeys = {kk for _g, kk in recs}
+        tabs = []
+        for cs, c, ent in self._locate_key_lists(
+                [struct.unpack_from('<I', pl, b['base'] - 72 + 16)[0]
+                 for b in self.buildings()]):
+            hit = sum(1 for j in range(c)
+                      if struct.unpack_from('<I', pl, ent + 4 * j)[0] in akeys)
+            if hit >= 1:                                # 含动画键 ⇒ 这张册子收动画
+                tabs.append((cs, c, ent))
+        # ---- ② 先做**零增长**的写入（此时还没有任何偏移变动）----
+        struct.pack_into('<I', pl, rec + slot, k)                     # 楼 → anim
+        for cs, c, _ent in tabs:
+            struct.pack_into('<I', pl, cs, c + 1)                     # 册子计数 +1
+        first_g = recs[0][0]
+        cnt = struct.unpack_from('<I', pl, first_g - 4)[0]
+        struct.pack_into('<I', pl, first_g - 4, cnt + 1)              # 数组 count +1
+        # ---- ③ 所有**插字节**一次性收集、从后往前落 ----
+        #   ★不能边插边算（2026-10-23 实踩：登记插了 8 字节后用旧偏移插记录体
+        #     ⇒ count 写成 1、最后一条记录被切成两半）
+        ins = [(recs[-1][0] + self.ANIM_SIZE, bytes(body))]
+        for cs, c, ent in tabs:
+            ins.append((ent + 4 * c, struct.pack('<I', k)))
+        for pos, data in sorted(ins, key=lambda t: -t[0]):
+            pl[pos:pos] = data
+        self.invalidate_caches(rescan=True)
+        return {'key': k, 'created': True, 'slot': slot, 'lists': len(tabs),
+                'total': len(self.anim_records()),
+                'note': '已补动画对象 0x%08X（挂到楼 +0x%X，登记 %d 张对象册，格 %d/%d）'
+                        % (k, slot, len(tabs), cx, cy)}
+
+    # ------------------------------------------------------------------ #
     # 格子占用表（2026-10-16 定案）
     # ------------------------------------------------------------------ #
     @classmethod
@@ -7795,7 +7991,7 @@ class SaveDoc(object):
     def add_placed_building(self, type_name, cx, cy, z=0, sig_mode='full',
                             comp_mode='zero', grow_mode='insert', ref_mode='keep',
                             house=None, require_free=False, new_state=False,
-                            buildup=True, cross_clean=True):
+                            buildup=True, cross_clean=True, anim=False):
         """（sig_mode: full=套类型签名 / safe=跳过镜像指针 / none=完全不套，诊断用）
            （comp_mode: **zero=不建伴随对象 + 把 4 个伴随指针清 0【默认，2026-10-21 游戏内验收】
                         / none=不建伴随对象，但同类型模板会**保留模板的 4 个指针**
@@ -7901,6 +8097,12 @@ class SaveDoc(object):
         new_key = self._free_key(pl, 0x13963000)
         self._injected_keys.add(new_key)        # ★标记为"我们注入的" ⇒ 后续不再当模板
         struct.pack_into('<I', rec, o + 0, new_key)
+        # ★★★★★ 2026-10-23 §194：**清掉继承来的动画槽**。
+        #   克隆模板会把 `+0x57C/+0x580/+0x584/+0x590` 一起搬过来 ⇒ 新楼指向**模板那栋的**
+        #   动画对象（两栋共用一个 anim）—— 这正是历史上"克隆伴随必弹框/显示错乱"的味道。
+        #   清 0 之后由 `add_building_anim()` 现场造一个新的挂上去。
+        for _off in self.ANIM_SLOTS:
+            struct.pack_into('<I', rec, o + _off, 0)
         if cross:
             struct.pack_into('<I', rec, o + 1316, tkey)
             struct.pack_into('<I', rec, o + 1608, info['art_x'])
@@ -8314,6 +8516,25 @@ class SaveDoc(object):
                                             sorted(rb['new'].items())))
             except Exception as e:
                 anim_note = '；⚠ 写建造动画失败：%s' % e
+        # ★★★★★ §194（2026-10-23）：**补动画对象**（476B anim）。
+        #   缺它 ⇒ 模型停在动画第 0 帧（光棱塔只剩底座），而且不参与"完整建筑"逻辑。
+        #   ⚠ 默认 False：配方还在等 in-game 判定（T24_A 原型版 / T24_B 金模板版）。
+        anim_key, anim_created = None, None
+        if anim:
+            try:
+                nb = None
+                for _b in self.buildings():
+                    if struct.unpack_from('<I', self.plain, _b['base'] - 72 + 16)[0] == new_key:
+                        nb = _b['base']
+                        break
+                if nb is None:
+                    extra += '；⚠ 没定位到新楼记录，未补动画'
+                else:
+                    ra = self.add_building_anim(nb)
+                    anim_key, anim_created = ra['key'], ra['created']
+                    extra += '；%s' % ra['note']
+            except Exception as e:
+                extra += '；⚠ 补动画失败：%s' % e
         if cross_clean_note:
             extra += cross_clean_note
         if anim_note:
@@ -8324,6 +8545,7 @@ class SaveDoc(object):
                 'cells_note': cell_note, 'house': owner_key,
                 'house_idx': owner_idx, 'house_name': owner_name,
                 'buildup': bool(buildup), 'buildup_note': anim_note,
+                'anim': bool(anim), 'anim_key': anim_key, 'anim_created': anim_created,
                 'note': '(%d,%d) 应出现一栋 %s（%s%s）' % (
                     cx, cy, type_name, cell_note, extra)}
 
