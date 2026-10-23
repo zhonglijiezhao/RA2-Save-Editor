@@ -392,6 +392,62 @@ def clear_taskforce(doc, tf_id, zero_keys=False):
 
 # ==================== 写入第三步：小队所属国家（House 指针 +0xD8） ====================
 TEAM_HOUSE_OFF = 0xD8        # TeamType.House —— **指向 House 对象的键**（223/223 与地图 INI 对上）
+TEAM_SCRIPT_OFF = 0xF4       # TeamType.Script —— **指向 ScriptType 对象的键**（0 = 无脚本）
+
+
+def set_team_script(doc, team_id, script):
+    """改作战小队挂的**动作脚本**（`+0xF4`）→ dict（§226）。
+
+    `script`：
+      · `None` / `''` / `'None'` / `'none'` / `'（空）'` ⇒ **清空**（写 0 = 无脚本，
+        引擎按"无脚本小队"处理 = 原地待命，与地编里脚本留空一致）；
+      · 脚本 ID（如 `'01000079'`）⇒ 挂该脚本（校验本档存在这个 ScriptType，
+        拿它的对象键；不存在直接报错不写，避免悬空指针）。
+
+    ★只写 `+0xF4` 这 4 个字节，长度不变。
+    ★地编显示 None ≠ 存档没有：本图地图的 [ScriptTypes] 只有 ID 索引列表，
+      地编拿不到定义；存档指针有效时引擎读档后会照常执行（§225 实证）。
+      要让"留空"真正生效，用本函数清（或从地图重新开局）。
+    """
+    ai = read_ai(doc)
+    t = next((x for x in ai['teams'] if x['id'] == str(team_id)), None)
+    if t is None:
+        raise KeyError('这份存档里没有 ID 为 %r 的作战小队（共 %d 个）'
+                       % (team_id, len(ai['teams'])))
+    pl = doc.plain
+    if not isinstance(pl, bytearray):
+        raise RuntimeError('doc.plain 不是可写 bytearray')
+    scs = {s['id']: s for s in ai['scripts']}
+    old_key = struct.unpack_from('<I', pl, t['off'] + TEAM_SCRIPT_OFF)[0]
+    old = None
+    for s in ai['scripts']:
+        if s['key'] == old_key:
+            old = s
+            break
+    q = ('' if script is None else str(script)).strip()
+    if q.lower() in ('', 'none', '（空）', '(空)'):
+        new_key, new_desc = 0, '（空）'
+    else:
+        s = scs.get(q)
+        if s is None:
+            raise KeyError('这份存档里没有 ID 为 %r 的动作脚本（共 %d 个；'
+                           '要清空传 None）' % (q, len(scs)))
+        new_key, new_desc = s['key'], '%s「%s」%d 条' % (s['id'], s['name'],
+                                                       len(s['entries']))
+    if new_key == old_key:
+        return {'team_id': t['id'], 'name': t['name'], 'changed': False,
+                'old': old['id'] if old else '（空）', 'new': new_desc}
+    struct.pack_into('<I', pl, t['off'] + TEAM_SCRIPT_OFF, new_key & 0xFFFFFFFF)
+    for attr in ('_ai_cache', '_ai'):
+        if hasattr(doc, attr):
+            try:
+                setattr(doc, attr, None)
+            except Exception:
+                pass
+    return {'team_id': t['id'], 'name': t['name'], 'changed': True,
+            'old': (old['id'] if old else '（空）'),
+            'old_name': (old['name'] if old else ''),
+            'new': new_desc, 'new_key': new_key & 0xFFFFFFFF}
 
 
 def set_team_house(doc, team_id, house):

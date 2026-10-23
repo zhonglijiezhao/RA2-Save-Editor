@@ -5767,6 +5767,13 @@ class App(tk.Tk):
         self.ai_wp = ttk.Combobox(rowE, width=16, state='readonly', values=())
         self.ai_wp.pack(side='left')
         ttk.Button(rowE, text='改出生点', command=self._ai_apply_wp).pack(side='left', padx=4)
+        # ★§226：动作脚本下拉（含「（空）」= 清空 +0xF4）
+        ttk.Label(rowE, text='动作脚本').pack(side='left', padx=(12, 2))
+        self.ai_script = ttk.Combobox(rowE, width=20, state='readonly', values=())
+        self.ai_script.pack(side='left')
+        ttk.Button(rowE, text='改脚本', command=self._ai_apply_script).pack(side='left', padx=4)
+        ttk.Label(rowE, text='（选「（空）」= 与地编「脚本留空」一致：引擎按无脚本小队处理）',
+                  foreground='#6b7280').pack(side='left', padx=2)
         # ★2026-10-19 第五步：预装载（+0xB9，1 字节）
         self.ai_load = tk.BooleanVar(value=False)
         ttk.Checkbutton(rowE, text='预装载', variable=self.ai_load).pack(side='left', padx=(10, 2))
@@ -5855,6 +5862,13 @@ class App(tk.Tk):
             self.ai_wp['values'] = vals
             if vals and self.ai_wp.get() not in vals:
                 self.ai_wp.set(vals[0])
+        # §226：动作脚本下拉 = 「（空）」+ 全部脚本 ID（只列当前过滤可见的更易找，
+        #   但这里给全量 —— 引擎生成的脚本也能挂）
+        if hasattr(self, 'ai_script'):
+            svals = ['（空）'] + [s['id'] for s in ai['scripts']]
+            self.ai_script['values'] = svals
+            if self.ai_script.get() not in svals:
+                self.ai_script.set('（空）')
         self._fill_ai_all()
         n_map = sum(1 for t in ai['teams'] if t.get('is_map'))
         self.status.set('AI：小队 %d（地图定义 %d）　特遣部队 %d　动作脚本 %d'
@@ -5946,6 +5960,10 @@ class App(tk.Tk):
         if hasattr(self, 'ai_load'):
             _t = self._ai_teams.get(team_id) if team_id else None
             self.ai_load.set(bool(_t.get('loadable')) if _t else False)
+        # §226：脚本下拉跟着选中的小队同步（选中谁就显示谁当前的脚本）
+        if hasattr(self, 'ai_script'):
+            _s = self._ai_teams.get(team_id) if team_id else None
+            self.ai_script.set((_s.get('script_id') or '（空）') if _s else '（空）')
         self._ai_detail(kind, team_id, tf_id, sc_id)
 
     def _ai_unsync(self):
@@ -6418,6 +6436,47 @@ class App(tk.Tk):
         self.status.set('已改小队 %s「%s」出现于 路径点 %d → %d（%s，尚未保存）'
                         % (sid, info['name'], info['old'], info['new'],
                            ('(%d,%d)' % info['cell']) if info['cell'] else '未定义'))
+
+    def _ai_apply_script(self):
+        """改选中小队挂的**动作脚本**（+0xF4；选「（空）」= 清空，§226）。"""
+        if not self.doc or not getattr(self, '_ai', None):
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        sel = self.tat.selection()
+        if not sel:
+            messagebox.showwarning('提示', '请先在「作战小队」子页里选中一条')
+            return
+        sid = sel[0]
+        t = self._ai_teams.get(sid)
+        if not t:
+            return
+        txt = (self.ai_script.get() or '').strip()
+        if not txt:
+            messagebox.showwarning('提示', '请先选一个脚本（或「（空）」）')
+            return
+        want = None if txt == '（空）' else txt.split(' ')[0]
+        cur = t.get('script_id') or '（空）'
+        if (want or '（空）') == cur:
+            self.status.set('没变化：小队 %s 的脚本就是 %s' % (sid, cur))
+            return
+        if not messagebox.askyesno(
+                '改小队动作脚本',
+                '小队 %s「%s」\n\n动作脚本 %s → %s\n\n'
+                '只写 +0xF4（脚本对象键），长度不变。\n'
+                '★清空（写 0）= 与地编「脚本留空」一致：引擎按无脚本小队处理，原地待命。\n'
+                '⚠ 已刷出的小队可能仍用旧脚本 ⇒ 建议新开一局验证。'
+                % (sid, t['name'], cur, want or '（空）')):
+            return
+        try:
+            info = ai_objects.set_team_script(self.doc, sid, want)
+        except Exception as e:
+            messagebox.showerror('改不了', str(e))
+            return
+        self.refresh_ai()
+        self._ai_select(self.tat, sid)
+        self._ai_pick('team')
+        self.status.set('已改小队 %s「%s」动作脚本 %s → %s（尚未保存）'
+                        % (sid, info['name'], info['old'], info['new']))
 
     def _ai_apply_loadable(self):
         """开/关选中小队的「预装载」（+0xB9，1 字节）。"""
