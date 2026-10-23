@@ -8052,7 +8052,7 @@ class SaveDoc(object):
     def add_placed_building(self, type_name, cx, cy, z=0, sig_mode='full',
                             comp_mode='zero', grow_mode='insert', ref_mode='keep',
                             house=None, require_free=False, new_state=False,
-                            buildup='fresh', cross_clean=True, anim=False):
+                            buildup='fresh', cross_clean=False, anim=False):
         """（sig_mode: full=套类型签名 / safe=跳过镜像指针 / none=完全不套，诊断用）
            （comp_mode: **zero=不建伴随对象 + 把 4 个伴随指针清 0【默认，2026-10-21 游戏内验收】
                         / none=不建伴随对象，但同类型模板会**保留模板的 4 个指针**
@@ -8074,10 +8074,13 @@ class SaveDoc(object):
                            停在"记录里的指针是悬空的"状态 ⇒ **显示不全**（T16 的 B 栋）。
                        ⚠ 所以 §186 那条"直接落成播不出动画"的结论**作废**：它当时继承了 `6E4=1`。
                        传 `buildup=False` 才是"立即显示成品"（无动画，且跨类型克隆时可能残缺）。
-           （cross_clean: **默认 True**，仅跨类型时生效 —— 把模板记录里
+           （cross_clean: **默认 False**（2026-10-23 §197 改），仅跨类型时生效 —— 把模板记录里
                        `0x0F000000~0x14000000` 段的运行期指针一律清 0（§184）。
-                       不清的话，从 GACNST 这类"指针大户"克隆会把整块指针带进新楼
-                       ⇒ 新楼渲染残缺、要打一下才正常。传 False 只做单变量对照用。）"""
+                       ★★★**实测必须关掉**：玩家 T51（清）/ T54（不清）同基档对照，
+                       清的 ⇒ **读档弹框**（引擎一致性断言失败，主动除零）、
+                       不清的 ⇒ **正常，多出一栋目标建筑**。
+                       原因：那些槽是引擎校验必需的结构键，清 0 = 两份数据对不上。
+                       §184 当时清它是为了修"显示不全"，而那个问题的真因是建造态（§196）。）"""
         sig_mode_note_comp = False
         """凭空放一栋**已落位**建筑（U2 配方 2026-10-15 游戏内验收：记录 + L1/L2/L3 全登）。
 
@@ -8176,6 +8179,13 @@ class SaveDoc(object):
                     continue
                 if sig_mode == 'none':
                     continue        # 诊断用：完全不套签名（只改类型键/美术/耐久）
+                if v == 0 and sig_mode != 'zero':
+                    # ★★★★★ 2026-10-23 §197（玩家 T51/T54 对照定案）：
+                    #   **签名里的 0 不要覆盖模板的值**。签名是"某个真实样本"的快照，
+                    #   它那里是 0 不代表新楼也该是 0 —— 而模板那些槽往往是**引擎校验必需的
+                    #   结构键**（实测：套签名把 9 个非零指针槽压到 6 个 ⇒ 读档一致性断言
+                    #   失败 ⇒ 主动除零崩溃）。只写"非 0"的类常量，模板结构原样保留。
+                    continue
                 if sig_mode == 'safe' and 0x00400000 <= v < 0x01000000:
                     continue        # ★安全模式：跳过镜像指针类（0x007Exxxx 等）——跨档抄会变悬空
                 struct.pack_into('<I', rec, o + off, v)
