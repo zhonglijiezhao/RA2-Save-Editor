@@ -5024,7 +5024,7 @@ class SaveDoc(object):
                                house=None, trigger_name=None, max_teams=1,
                                tf_template=None, team_template=None, script_key=None,
                                action=80):
-        """**让引擎自己刷兵**：特遣部队 + 作战小队 + 触发「任何事件 + 援军行为@路径点」。
+        """**让引擎自己刷兵**：特遣部队 + 作战小队 + 触发「13 流逝时间1秒 + 援军行为@路径点」。
 
         为什么需要它（§209）：`SPAWNS=` 单位（V3/无畏/航母）手写记录不显示；
         而这条路上单位是**引擎构造**的，所以完全绕开了那个坑。
@@ -5036,6 +5036,9 @@ class SaveDoc(object):
         （46/47 个 80 号、250/250 个 107 号的小队 `+0xE8` 都是 0），
         引擎读的是行为里的路径点 ⇒ 这里把新队 `+0xE8` 也置 0，与地编写的援军队完全一致
         （模板队的 -1 是"未设置"，不带进新队）。
+        ★事件为什么用 13 而不是 8（§219.7，T75/T76/T77 三连不出兵的最后一个原因）：
+          「任何事件」虽永真，但 TagNode 帧数=0 且未挂接建筑时**引擎不轮询** ⇒ 永不触发；
+          13「流逝时间 1 秒」⇒ 帧数 15 ⇒ 进「定时触发器挂接表」⇒ 读档约 1 秒后出兵。
         """
         action = int(action)
         if action not in self.SPAWN_ACTIONS:
@@ -5071,7 +5074,14 @@ class SaveDoc(object):
             if wp is None:
                 raise RuntimeError('格 %s 处建不了路径点' % (cell,))
         nm = (trigger_name or ('刷%s%d' % (t, count)))[:16]
-        r = self.create_trigger(nm, 8, 0, action, 0)
+        # ★★§219.7：事件必须用 **13「流逝时间 1 秒」**，不能是 8「任何事件」。
+        #   §181/2026-10-15 实测定案：「任何事件」永远为真，但 **TagNode 帧数=0 且
+        #   未挂接建筑 ⇒ 引擎根本不轮询它 ⇒ 永不触发**（T75/T76/T77 三连不出兵
+        #   的最后一个原因；序号撞号修完仍然不出，就是这条）。
+        #   事件 13 + arg=1 ⇒ TagNode 帧数 = 1×15 = 15 > 0 ⇒ 自动登记
+        #   「定时触发器挂接表」⇒ 读档约 1 秒后评估、立刻刷兵。
+        #   （原图那条"事件 8 能刷兵"是因为它**开局就已执行过**，不是被轮询。）
+        r = self.create_trigger(nm, 13, 1, action, 0)
         tid = r.get('trigger_id')
         # ★★`create_trigger()` 返回的 `ac_off` 在它自己后续插入对象之后**已经失效**
         #   （实测：按那个偏移去写，结果打到了别的行为对象上，读出来 type=107）。
@@ -11744,6 +11754,29 @@ class SaveDoc(object):
         for obj, k in o['acs']:
             a = byk.get(k)
             if a is not None:
+                # ★§219.8：行为 80/107（援军类）的真正参数**不在默认槽**：
+                #   小队键在 `+0x44`、路径点在 `+0x58`（`+0x48` 恒 0）。
+                #   GUI 原来只显示 +0x48 ⇒ 看着"参数 0、什么都没有"，玩家找不到小队/路径点。
+                if a.get('type') in (80, 107):
+                    tk = int.from_bytes(pl[obj + 0x44:obj + 0x48], 'little')
+                    wp = int.from_bytes(pl[obj + 0x58:obj + 0x5C], 'little')
+                    tmn = ''
+                    if tk:
+                        for _t in self.team_types():
+                            if _t['key'] == tk:
+                                tmn = _t['name'] or _t['sid']
+                                break
+                    try:
+                        cell = self.waypoint_cell(wp) if wp else None
+                    except Exception:
+                        cell = None
+                    a = dict(a)
+                    a['team_key'] = tk
+                    a['waypoint'] = wp
+                    a['cell'] = cell
+                    a['arg_text'] = ('小队 %s%s @ 路径点 %s%s'
+                                     % ('%08X' % tk, ('「%s」' % tmn) if tmn else '',
+                                        wp, (' 格%s' % (cell,)) if cell else ''))
                 d['actions'].append(a)
         if not d['editable']:
             d['note'] = '这条记录在本档里只有「触发定义」，没有运行期实例 ⇒ 只能看'

@@ -4236,17 +4236,29 @@ class App(tk.Tk):
         self.status.set('已刷 %d 个 %s @(%d,%d)：特遣 %s / 小队 %s / 触发 %s（路径点 %s，行为 %d）'
                         % (n, tname, sel[0], sel[1], r['tf']['sid'], r['team']['sid'],
                            r['trigger_id'], r['waypoint'], r['action']))
+        # ★§219.9：新小队/特遣的 ID 不是 010 开头（只写进存档、没写地图）⇒
+        #   AI 页默认会把它们当"引擎生成对象"过滤掉。刷完自动勾上并刷新，
+        #   省得玩家在列表里翻不到，还以为没写进去。
+        try:
+            self._ai_all.set(True)
+            self.refresh_ai()
+        except Exception:
+            pass
         messagebox.showinfo(
             '刷兵已写入',
             '类型：%s × %d\n位置：(%d,%d) → 路径点 %s\n\n'
             '特遣部队：%s（单位 %s）\n作战小队：%s（脚本 %s）\n'
-            '触发器：%s（事件「任何事件」+ 行为 %s）\n\n'
-            '⭐ 请**另存为**新文件再进游戏验证：读档后单位应出现在该格附近。'
+            '触发器：%s（事件「13 流逝时间 1 秒」+ 行为 %s）\n\n'
+            '⭐ 请**另存为**新文件再进游戏验证：读档约 1 秒后单位应出现在该格附近。\n\n'
+            '🔍 找这些新对象：本工具「AI」页已自动勾选『含引擎生成/运行期对象』，'
+            '在搜索框输 %s 或 %s 即可。\n'
+            '（地编 FA2 里看不到它们 —— 它们只写进存档，没写进地图 INI，这是正常的。）'
             % (tname, n, sel[0], sel[1], r['waypoint'],
                r['tf']['sid'], r['tf']['units'],
                r['team']['sid'], '空（待命）' if not use_script else '沿用模板',
                r['trigger_id'],
-               '107 超时空传送援军' if r['action'] == 107 else '80 援军'))
+               '107 超时空传送援军' if r['action'] == 107 else '80 援军',
+               r['team']['sid'], r['tf']['sid']))
 
     def mv_learn_sig(self):
         """📚 学习模板：从一份（或多份）存档里学出"每型号的移动方式 + 8 个机体参数"。
@@ -5546,10 +5558,13 @@ class App(tk.Tk):
         ttk.Button(qrow, text='✕', width=3,
                    command=lambda: (self._q_ai.set(''), self._fill_ai_all())
                    ).pack(side='left', padx=(2, 8))
-        self._ai_all = tk.BooleanVar(value=False)
+        self._ai_all = tk.BooleanVar(value=True)
         ttk.Checkbutton(qrow, text='含引擎生成/运行期对象',
                         variable=self._ai_all,
                         command=self._fill_ai_all).pack(side='left')
+        ttk.Label(qrow, text='（工具新写的小队/特遣只进存档、不进地图，ID 不是 010 开头；'
+                             '在地编 FA2 里看不到它们是正常的）',
+                  foreground='#9ca3af').pack(side='left', padx=(4, 0))
         self.lbl_ai_count = ttk.Label(qrow, text='', foreground='#6b7280')
         self.lbl_ai_count.pack(side='left', padx=10)
         ttk.Button(qrow, text='导出 CSV…', command=self._ai_export).pack(side='right')
@@ -6973,8 +6988,13 @@ class TriggerEditor(tk.Toplevel):
                     i, t, action_name(t), a, self.doc._arg_text(action_ptype(t), a)))
             return
         for i, a in enumerate(self._det.get('actions') or [], 1):
+            # ★§219.8：援军行为 80/107 的参数在 +0x44（小队键）/+0x58（路径点），
+            #   不是默认的 +0x48（恒 0）。参数列显示路径点，含义列显示小队+格子。
+            argcol = a['arg']
+            if a.get('type') in (80, 107):
+                argcol = a.get('waypoint', 0)
             self.tv_ac.insert('', 'end', iid=str(i), values=(
-                i, a['type'], a['name'], a['arg'], a['arg_text']))
+                i, a['type'], a['name'], argcol, a['arg_text']))
 
     # ---------------- 触发设置 ----------------
     def apply_name(self):

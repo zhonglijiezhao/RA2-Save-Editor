@@ -146,8 +146,13 @@ if acts:
            '%#x vs %#x' % (_head, struct.unpack_from('<I', pl, a['action_off'] + 16)[0]))
 
 evs = d.trigger_event_list(r['trigger_id'])
-ck('★事件 = 8「任何事件」', len(evs) == 1 and evs[0]['type'] == 8,
-   str([(e['type'], e.get('name')) for e in evs]))
+ck('★§219.7 事件 = 13「流逝时间 1 秒」（不是 8——帧数 0 不会被轮询）',
+   len(evs) == 1 and evs[0]['type'] == 13 and evs[0]['arg'] == 1,
+   str([(e['type'], e['arg']) for e in evs]))
+_to = d.trigger_objects(r['trigger_id'])
+if _to.get('node') is not None:
+    _tk = struct.unpack_from('<I', d.plain, _to['node'] + 80)[0]
+    ck('★§219.7 TagNode 帧数 = 15（1 秒）⇒ 进「定时触发器挂接表」', _tk == 15, str(_tk))
 
 # 小队 +0xE8 = 0（§218：与地编写的援军队一致；引擎实际读行为里的 +0x58）
 ntm = [x for x in d.team_types() if x['sid'] == r['team']['sid']][0]
