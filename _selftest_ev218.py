@@ -90,11 +90,35 @@ ck('找到可刷兵的落点', cell is not None, str(cell))
 # ---------- ② 用 107 刷兵 ----------
 d = SaveDoc(SAV)
 tf0, tm0 = d.taskforces(), d.team_types()
+# ★§219 护栏快照：刷兵前把**所有**行为对象的 (键 → 类型, 小队键, 路径点) 记下来
+snap = {a['key']: (struct.unpack_from('<I', d.plain, a['obj'] + 0x40)[0],
+                   struct.unpack_from('<I', d.plain, a['obj'] + 0x44)[0],
+                   struct.unpack_from('<I', d.plain, a['obj'] + 0x58)[0])
+        for a in d.actions()}
+n_act0, n_ev0 = len(d.actions()), len(d.events())
 r = d.spawn_units_by_trigger('V3', 4, cell=cell, trigger_name='自检107',
                              max_teams=1, script_key=0, action=107)
 ck('返回 action=107', r['action'] == 107, str(r['action']))
 ck('★特遣部队 +1 / 小队 +1',
    len(d.taskforces()) == len(tf0) + 1 and len(d.team_types()) == len(tm0) + 1, '')
+# ★★§219：刷兵后逐一比对 —— **已存在的行为一个都不许被改动**
+snap2 = {a['key']: (struct.unpack_from('<I', d.plain, a['obj'] + 0x40)[0],
+                    struct.unpack_from('<I', d.plain, a['obj'] + 0x44)[0],
+                    struct.unpack_from('<I', d.plain, a['obj'] + 0x58)[0])
+         for a in d.actions()}
+changed = [k for k in snap if k in snap2 and snap[k] != snap2[k]]
+ck('★§219 护栏：原有行为对象零改动（不改写别人的触发）',
+   not changed, '被改的键：%s' % ([hex(k) for k in changed[:3]],))
+ck('★§219 行为表只 +1（追加，不复制）', len(d.actions()) == n_act0 + 1,
+   '%d → %d' % (n_act0, len(d.actions())))
+ck('★§219 事件表只 +1', len(d.events()) == n_ev0 + 1,
+   '%d → %d' % (n_ev0, len(d.events())))
+ords = [struct.unpack_from('<I', d.plain, a['obj'] + 0x38)[0] for a in d.actions()]
+eords = [struct.unpack_from('<I', d.plain, e['obj'] + 0x38)[0] for e in d.events()]
+ck('★§219 行为序号全局唯一（无撞号）', len(set(ords)) == len(ords),
+   '%d 个行为 %d 个不同序号' % (len(ords), len(set(ords))))
+ck('★§219 事件序号全局唯一（无撞号）', len(set(eords)) == len(eords),
+   '%d 个事件 %d 个不同序号' % (len(eords), len(set(eords))))
 
 acts = d.trigger_actions(r['trigger_id'])
 ck('新触发有 1 条行为', len(acts) == 1, str(len(acts)))
@@ -110,6 +134,16 @@ if acts:
     ck('★写出的对象与真 107 同构（其余槽全 0）',
        all(struct.unpack_from('<I', pl, a['action_off'] + x)[0] == 0
            for x in (0x48, 0x4C, 0x50, 0x54, 0x5C, 0x60, 0x64)), '')
+    # ★§219：新行为的序号 = 表内 max+1（原 407 个 ⇒ 407），且实例指针链指向它
+    ck('★§219 新行为的 +0x38 = 追加序号 %d（不是触发序号）' % n_act0,
+       struct.unpack_from('<I', pl, a['action_off'] + 0x38)[0] == n_act0,
+       str(struct.unpack_from('<I', pl, a['action_off'] + 0x38)[0]))
+    _inst = d.trigger_objects(r['trigger_id']).get('inst')
+    if _inst is not None:
+        _head = struct.unpack_from('<I', pl, _inst + 196)[0]
+        ck('★§219 实例指针链指向的正是我们写参数的那个对象',
+           _head == struct.unpack_from('<I', pl, a['action_off'] + 16)[0],
+           '%#x vs %#x' % (_head, struct.unpack_from('<I', pl, a['action_off'] + 16)[0]))
 
 evs = d.trigger_event_list(r['trigger_id'])
 ck('★事件 = 8「任何事件」', len(evs) == 1 and evs[0]['type'] == 8,
@@ -169,6 +203,11 @@ ck('落盘重读：行为仍是 107 且键不变',
    a['type'] == 107
    and struct.unpack_from('<I', d2.plain, a['action_off'] + 0x44)[0] == r['team']['key']
    and a['waypoint'] == r['waypoint'], '')
+ck('★§219 落盘重读：行为/事件序号仍全局唯一',
+   len({struct.unpack_from('<I', d2.plain, x['obj'] + 0x38)[0] for x in d2.actions()})
+   == len(d2.actions())
+   and len({struct.unpack_from('<I', d2.plain, x['obj'] + 0x38)[0] for x in d2.events()})
+   == len(d2.events()), '')
 a = d2.trigger_actions(r3['trigger_id'])[0]
 ck('落盘重读：80 那条也没被带坏',
    a['type'] == 80

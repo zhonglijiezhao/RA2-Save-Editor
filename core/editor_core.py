@@ -5081,6 +5081,18 @@ class SaveDoc(object):
             raise RuntimeError('触发器 %s 建好了，但找不到它的行为对象' % tid)
         ac = acts[0]['action_off']
         pl = self.plain
+        # ★§219 护栏：写参数前必须确认「按序号查到的行为」就是「实例指针链指向的行为」。
+        #   2026-10-23 的 bug（玩家实测刷兵没出来）就是序号撞号让 trigger_actions
+        #   定位到**别人的旧行为**，参数写错对象（还把旧行为 type 107 改成 80）。
+        #   键对不上就拒绝写 —— 宁可报错，不写坏档。
+        _inst = self.trigger_objects(tid).get('inst')
+        if _inst is not None:
+            _head = struct.unpack_from('<I', pl, _inst + 196)[0]
+            _got = struct.unpack_from('<I', pl, ac + 16)[0]
+            if _head != _got:
+                raise RuntimeError(
+                    '定位校验失败：触发器 %s 实例指向的行为键是 %#x，按序号查到的是 %#x'
+                    '（序号撞号？）—— 已拒绝写入，避免改错对象' % (tid, _head, _got))
         n0 = struct.unpack_from('<I', pl, ac + 0x40)[0]
         # ★行为 80/107 的两个参数：小队键在 +0x44（不是工具默认的 +0x48！），路径点在 +0x58
         #   （§218：107 与 80 布局相同，SAVE0029 的 250 个真 107 对象全是这个模式）
@@ -10755,6 +10767,19 @@ class SaveDoc(object):
         _, evs = self._split_tables()
         acts, _ = self._split_tables()
         ev_src, ac_src = evs[-1], acts[-1]
+        # ★★★2026-10-23 §219 修复（玩家实测「刷兵没出来」的根因）：
+        #   事件/行为对象的 `+0x38` **不是"所属触发的序号"，而是它在事件表/行为表里的
+        #   物理序号**（实测：SAVE0029 的 407 个行为 +0x38 严格 = 0..406 且唯一；
+        #   93 个事件 = 0..92）。旧代码写 idx（触发序号 93）⇒ 与表里已有的 93 号
+        #   对象**撞号**：`trigger_actions()` 的 byidx 是 setdefault（同序号取第一个）
+        #   ⇒ 定位到**别人的旧对象**，spawn 把参数写到它身上（还把 type 107→80），
+        #   而实例真正指向的新对象永远没参数 ⇒ 读档不出兵。
+        #   （`add_action` 同日已按"物理下标"修过；create_trigger/add_event 漏修。）
+        #   正确值 = 表内 max+1（追加到组尾 ⇒ 就是 max+1）。
+        ev_ord = max(int.from_bytes(pl[e['obj'] + 56:e['obj'] + 60], 'little')
+                     for e in evs) + 1
+        ac_ord = max(int.from_bytes(pl[a['obj'] + 56:a['obj'] + 60], 'little')
+                     for a in acts) + 1
         ev_guid = bytes(pl[ev_src['obj']:ev_src['obj'] + 16])   # ★插入前快照（插入会推移这些字节）
         ac_guid = bytes(pl[ac_src['obj']:ac_src['obj'] + 16])
         if node_pos and cell_pos:
@@ -10911,7 +10936,7 @@ class SaveDoc(object):
         e_ = bytearray(pl[ev_src['obj']:ev_src['obj'] + ev_size])
         blank_runtime(e_, ev_size)
         patch(e_, 16, u32v(K_EV))
-        patch(e_, 56, u32v(idx))                      # ★所属触发的序号
+        patch(e_, 56, u32v(ev_ord))                    # ★事件表内序号（max+1，§219）
         patch(e_, OBJ_TYPE_OFF, u32v(ev_type))
         patch(e_, OBJ_ARG_OFF, u32v(ev_arg))
         a_ = None
@@ -10919,7 +10944,7 @@ class SaveDoc(object):
             a_ = bytearray(pl[ac_src['obj']:ac_src['obj'] + ACTION_SIZE])
             blank_runtime(a_, ACTION_SIZE)
             patch(a_, 16, u32v(K_AC))
-            patch(a_, 56, u32v(idx))
+            patch(a_, 56, u32v(ac_ord))                # ★行为表内序号（max+1，§219）
             patch(a_, OBJ_TYPE_OFF, u32v(ac_type))
             patch(a_, OBJ_ARG_OFF, u32v(ac_arg))
             if ac_type in ACTION_VAR_TYPES:      # §175：56/57 的变量号在 +164
@@ -11844,13 +11869,15 @@ class SaveDoc(object):
             k = (k + 0x1000) & 0xFFFFFFFF
         # 旧链头（实例在触发组里，位置低于事件组 ⇒ 插入不会推移它）
         old_head = int.from_bytes(pl[inst + 192:inst + 196], 'little')
-        seq = int.from_bytes(pl[inst + self.TRIG_SEQ_OFF:
-                                inst + self.TRIG_SEQ_OFF + 4], 'little')
+        # ★§219：`+0x38` 是**事件表内物理序号**（不是触发序号）—— 追加到组尾 ⇒ max+1。
+        #   旧代码写触发序号会与表里同号旧事件撞号（SAVE0029 实测 0..92 连续唯一）。
+        ev_ord = max(int.from_bytes(pl[e['obj'] + 56:e['obj'] + 60], 'little')
+                     for e in evs) + 1
         buf = bytearray(pl[tpl:tpl + ev_size])
         for off in range(40, ev_size, 4):            # 清运行期指针（保留 0..+36 身份签名）
             buf[off:off + 4] = b'\x00' * 4
         buf[16:20] = struct.pack('<I', k)
-        buf[56:60] = struct.pack('<I', seq)          # 所属触发序号
+        buf[56:60] = struct.pack('<I', ev_ord)       # ★事件表内序号（max+1，§219）
         buf[OBJ_TYPE_OFF:OBJ_TYPE_OFF + 4] = struct.pack('<I', etype)
         buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', arg)
         buf[self.EVENT_NEXT_OFF:self.EVENT_NEXT_OFF + 4] = struct.pack('<I', old_head)

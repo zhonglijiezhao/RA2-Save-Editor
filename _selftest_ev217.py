@@ -93,8 +93,25 @@ for xy in ((20, 178), (20, 179), (24, 180), (28, 180), (18, 182)):
         break
 ck('找到可刷兵的落点', cell is not None, str(cell))
 
+# ★§219 护栏快照：原有行为/事件对象一个都不许被改写（2026-10-23 序号撞号 bug 的回归）
+snap = {a['key']: (struct.unpack_from('<I', d.plain, a['obj'] + 0x40)[0],
+                   struct.unpack_from('<I', d.plain, a['obj'] + 0x44)[0],
+                   struct.unpack_from('<I', d.plain, a['obj'] + 0x58)[0])
+        for a in d.actions()}
+n_act0, n_ev0 = len(d.actions()), len(d.events())
+
 r = d.spawn_units_by_trigger('V3', 6, cell=cell, trigger_name='自检刷V3',
                              max_teams=1)
+snap2 = {a['key']: (struct.unpack_from('<I', d.plain, a['obj'] + 0x40)[0],
+                    struct.unpack_from('<I', d.plain, a['obj'] + 0x44)[0],
+                    struct.unpack_from('<I', d.plain, a['obj'] + 0x58)[0])
+         for a in d.actions()}
+changed = [k for k in snap if k in snap2 and snap[k] != snap2[k]]
+ck('★§219 护栏：原有行为对象零改动', not changed,
+   '被改的键：%s' % ([hex(k) for k in changed[:3]],))
+ck('★§219 行为/事件表各只 +1',
+   len(d.actions()) == n_act0 + 1 and len(d.events()) == n_ev0 + 1,
+   '%d→%d / %d→%d' % (n_act0, len(d.actions()), n_ev0, len(d.events())))
 ck('刷兵返回了特遣/小队/触发', bool(r['tf']['key'] and r['team']['key'] and r['trigger_id']),
    '%s / %s / %s' % (r['tf']['sid'], r['team']['sid'], r['trigger_id']))
 ck('★特遣部队 +1', len(d.taskforces()) == len(tf0) + 1,
