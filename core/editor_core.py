@@ -5146,6 +5146,28 @@ class SaveDoc(object):
         except ValueError:
             return b''
 
+    def _type_rules(self, t):
+        """读该型号在 rules 里的**全部属性**（大写键）→ dict；读不到返回 {}。
+
+        ★2026-10-23 §198：换型号时必须先看 rules ——
+          目标型号若声明了 `SPAWNS=`（发射出去的是**一个完整单位**，如 V3 的 `V3ROCKET`），
+          克隆换型号会缺那个子单位 ⇒ 引擎读档弹框（玩家实测 V3：`Access address 0x48`、`ecx=0`）。
+        """
+        try:
+            import os
+            import game_ini
+            g = game_ini.get_types(os.path.dirname(getattr(self, 'path', '') or ''))
+            kv = g.rules.get(str(t).lower()) or {}
+            if isinstance(kv, dict) and isinstance(kv.get('kv'), dict):
+                kv = kv['kv']
+            return {str(k).upper(): v for k, v in kv.items()} if isinstance(kv, dict) else {}
+        except Exception:
+            return {}
+
+    def _type_spawns(self, t):
+        """该型号"发射出去的是一个完整单位"时返回那个单位的名字（如 V3 → V3ROCKET），否则 ''。"""
+        return str(self._type_rules(t).get('SPAWNS') or '').strip()
+
     def _type_strength(self, t):
         """目标型号的满血值（规则 `Strength=`）；查不到返回 0。"""
         try:
@@ -5553,6 +5575,18 @@ class SaveDoc(object):
             tpl_names = [k for k, v in self.unit_types().items() if v == src['type']]
             if target_key is None or not tpl_names:
                 raise UnitUnavailable('拿不到 %s 或 %s 的类型键' % (t, src['type']))
+            # ★★2026-10-23 §198（玩家实测 V3 弹框）：这类单位"发射出去的是一个完整单位"
+            #   （`SPAWNS=` 声明了子单位，V3 → V3ROCKET）。克隆换型号只会换类型键，
+            #   那个子单位在档里根本没有对应对象 ⇒ 引擎读档时遍历它的列表拿到空指针
+            #   （except.txt: `Access address 0x48` / `Eip 006B7D51` / `ecx=0`）。
+            #   ⇒ 直接拒绝，并说清原因（要放它请用「⚡ 触发法」，让引擎自己造）。
+            _sp = self._type_spawns(t)
+            if _sp:
+                raise UnitUnavailable(
+                    '「%s」不能跨型号克隆：它在规则里声明了 `SPAWNS=%s` —— '
+                    '开火打出去的是**一个完整单位**，而不是普通弹药。\n'
+                    '克隆只能复制"一辆车"，造不出那个子单位，引擎读档会报内部错误。\n'
+                    '要放它请用「⚡ 触发法」（由引擎自己造，子单位一并生成）。' % (t, _sp))
             tb_old = struct.pack('<I', tpl_names[0])
             tb_new = struct.pack('<I', target_key)
             k = 0

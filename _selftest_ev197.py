@@ -24,7 +24,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cor
 import editor_core as ec                                    # noqa: E402
 from _paths import need_sav                                 # noqa: E402
 
-SAV = need_sav('SAVE0029.SAV')          # 3 电厂 + 建造厂 + 4 单位、0 触发（玩家指定基档）
+# ★2026-10-23 修正：原用 SAVE0029，但那份大档**本来就有 GATECH**（120 种类型），
+#   于是这里走成"同类型克隆"，跨类型断言全错。改用黄金档（8 栋楼、无 GATECH、0 触发）。
+import glob as _glob
+_c = _glob.glob('E:/YURI/**/光棱塔放下 动画播放完成.SAV', recursive=True)
+SAV = _c[0] if _c else need_sav('SAVE0029.SAV')
 TYPE = 'GATECH'                          # 本档没有的类型（作战实验室）
 SPOT = (76, 92)
 
