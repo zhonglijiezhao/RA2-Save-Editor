@@ -7,7 +7,7 @@
 - 平台：Windows（Python + tkinter，纯标准库，**不需要装任何第三方库**）
 - 语言：界面与文档为中文
 - 许可：**MIT**（见 [LICENSE](LICENSE)；游戏素材声明见 [NOTICE.md](NOTICE.md)）
-- 当前版本：**v1.0.0**（内部构建 `p146`）
+- 当前版本：**v1.0.0**（内部构建 `p148`）
 - **下载**：https://github.com/zhonglijiezhao/RA2-Save-Editor/releases/latest
 
 ---
