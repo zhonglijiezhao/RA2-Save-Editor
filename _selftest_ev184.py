@@ -65,7 +65,12 @@ _ = d.add_placed_readiness('ATESLA')
 ck('但会给一条提示（写在 _last_readiness_note）',
    '签名' in getattr(d, '_last_readiness_note', ''), '')
 ok2, why2 = d.add_placed_readiness('GATECH')
-ck('本档没有 GATECH ⇒ 拒绝（不许跨类型克隆）', ok2 is False, why2[:60])
+# ★2026-10-23 §197：跨类型放置已**放开**（借骨架 + 套类型签名 + 刚放下态）
+ck('本档没有 GATECH ⇒ 允许跨类型放置（§197 放开）', ok2 is True, why2[:60])
+ck('跨类型时给出"先备份、进游戏确认"的提示',
+   '跨类型' in (getattr(d, '_last_readiness_note', '') or ''), '')
+ok3, why3 = d.add_placed_readiness('XXXNOPE')
+ck('语料库也没有的类型 ⇒ 仍然拒绝', ok3 is False, why3[:50])
 bad, tot = d.template_health(d.same_type_best('ATESLA')[0])
 ck('残缺模板健康度确实超标（bad=%d / tot=%d）' % (bad, tot),
    not d._health_ok(bad, tot), '%d/%d' % (bad, tot))
