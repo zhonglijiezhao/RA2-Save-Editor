@@ -4183,15 +4183,103 @@ class App(tk.Tk):
         else:
             self.mv_info.config(text='型号 %s：规则里没有这一项（可能是地图自带的自制单位）' % t)
 
+    def _cell_brief(self, cx, cy):
+        """落点体检（§221）：占用 / 地形 / 离边缘距离，返回多行文本。"""
+        d = self.doc
+        L = []
+        try:
+            if d.cell_taken(cx, cy):
+                L.append('⚠ 该格已被占用（建筑地基或单位站着）')
+        except Exception:
+            pass
+        try:
+            w = d.terrain_warning(cx, cy)
+            if w:
+                L.append(w)
+        except Exception:
+            pass
+        try:
+            mk = d.map_cells() or {}
+            if mk:
+                xs = [k[0] for k in mk]
+                ys = [k[1] for k in mk]
+                edge = min(cx - min(xs), max(xs) - cx,
+                           cy - min(ys), max(ys) - cy)
+                L.append('离地图边缘 %d 格%s' % (
+                    edge, '（⚠ 不足 12 格：空军单位可能不显示，§212 实测）' if edge < 12 else ''))
+        except Exception:
+            pass
+        return '\n'.join(L) if L else '✓ 该格看起来可用（地形通行、无占用、离边缘够远）'
+
+    def _spawn_dialog(self, tname, cell):
+        """刷兵一屏对话框（§221）：数量 / 援军行为 / 动作脚本。
+
+        返回 {'n','action','script'} 或 None（取消）。
+        抽成方法是为了 UI 自检能直接驱动，不必连点三个模态窗。
+        """
+        dlg = tk.Toplevel(self)
+        dlg.title('刷单位（小队法）')
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=12)
+        frm.grid(sticky='nsew')
+        ttk.Label(frm, text='在 (%d,%d) 刷 %s（引擎自己造，SPAWNS 单位也能刷）'
+                  % (cell[0], cell[1], tname),
+                  font='', wraplength=440, justify='left'
+                  ).grid(row=0, column=0, columnspan=2, sticky='w')
+        ttk.Label(frm, text=self._cell_brief(cell[0], cell[1]),
+                  wraplength=440, justify='left', foreground='#b45309'
+                  ).grid(row=1, column=0, columnspan=2, sticky='w', pady=(2, 8))
+        ttk.Label(frm, text='数量：').grid(row=2, column=0, sticky='w')
+        sp = ttk.Spinbox(frm, from_=1, to=60, width=6)
+        sp.set(4)
+        sp.grid(row=2, column=1, sticky='w', pady=2)
+        act = tk.IntVar(value=80)
+        ttk.Label(frm, text='援军行为：').grid(row=3, column=0, sticky='w', pady=(8, 0))
+        ttk.Radiobutton(frm, text='80 援军（直接出现在路径点）',
+                        variable=act, value=80
+                        ).grid(row=3, column=1, sticky='w')
+        ttk.Radiobutton(frm, text='107 超时空传送援军（带时空特效）',
+                        variable=act, value=107
+                        ).grid(row=4, column=1, sticky='w')
+        scr = tk.BooleanVar(value=False)
+        ttk.Label(frm, text='动作脚本：').grid(row=5, column=0, sticky='w', pady=(8, 0))
+        ttk.Radiobutton(frm, text='留空（原地待命，推荐）',
+                        variable=scr, value=False
+                        ).grid(row=5, column=1, sticky='w')
+        ttk.Radiobutton(frm, text='沿用模板队的脚本（可能自己行动）',
+                        variable=scr, value=True
+                        ).grid(row=6, column=1, sticky='w')
+        ttk.Label(frm, text='触发器用「13 流逝时间 1 秒」⇒ 读档约 1 秒后出兵。',
+                  foreground='#6b7280'
+                  ).grid(row=7, column=0, columnspan=2, sticky='w', pady=(8, 0))
+        ret = {}
+        row = ttk.Frame(frm)
+        row.grid(row=8, column=0, columnspan=2, sticky='e', pady=(10, 0))
+
+        def _ok():
+            try:
+                ret['n'] = int(sp.get())
+            except Exception:
+                ret['n'] = 4
+            ret['action'] = int(act.get())
+            ret['script'] = bool(scr.get())
+            dlg.destroy()
+
+        ttk.Button(row, text='取消', command=dlg.destroy).pack(side='right', padx=(6, 0))
+        ttk.Button(row, text='写入', command=_ok).pack(side='right')
+        dlg.wait_window()
+        return ret or None
+
     def mv_spawn_team(self):
-        """🔫 刷单位（小队法）：特遣部队 + 作战小队 + 触发「任何事件 + 援军行为@路径点」。
+        """🔫 刷单位（小队法）：特遣部队 + 作战小队 + 触发「13 流逝时间1秒 + 援军行为@路径点」。
 
         ★§217：这是**让引擎自己造单位**，所以带 `SPAWNS=` 的 V3/无畏/航母也能正常刷出来
           （手写单位记录那条路对它们是走不通的，§209）。
-        脚本按你说的留空（写 0）——只刷单位，不需要动作脚本。
         ★§218：援军行为可选 80（普通援军）/ 107（超时空传送援军，带时空特效），
-          二者在存档里的布局相同（小队键 +0x44、路径点 +0x58），已用 SAVE0029
-          的 47+250 个真对象核对过。
+          二者在存档里的布局相同（小队键 +0x44、路径点 +0x58）。
+        ★§221：参数合并成一屏对话框（落点体检 + 数量 + 行为 + 脚本）。
         """
         if not self.doc:
             messagebox.showwarning('提示', '请先打开一个存档')
@@ -4206,22 +4294,10 @@ class App(tk.Tk):
             messagebox.showwarning('提示', '请先在上面选一个单位类型')
             return
         tname = cur.split('（')[0].strip().upper()
-        n = simpledialog.askinteger('刷几个？', '要刷几个 %s？' % tname,
-                                    initialvalue=4, minvalue=1, maxvalue=60,
-                                    parent=self)
-        if not n:
+        ans = self._spawn_dialog(tname, (sel[0], sel[1]))
+        if not ans:
             return
-        chrono = messagebox.askyesno(
-            '刷兵方式',
-            '用哪种援军行为？\n\n'
-            '【否】80 援军(作战小队)——单位直接出现在路径点。\n'
-            '【是】107 超时空传送援军——带时空转移特效出现（更炫）。\n\n'
-            '两者在存档里的写法一样，效果由引擎决定。')
-        use_script = messagebox.askyesno(
-            '动作脚本',
-            '小队要不要挂"动作脚本"？\n\n'
-            '【否】（推荐）脚本留空 ⇒ 单位**原地待命**，不会自己跑去打别人。\n'
-            '【是】沿用模板小队的脚本（可能会自己行动）。')
+        n, chrono, use_script = ans['n'], (ans['action'] == 107), ans['script']
         try:
             r = self.doc.spawn_units_by_trigger(
                 tname, int(n), cell=(sel[0], sel[1]),
@@ -4236,12 +4312,13 @@ class App(tk.Tk):
         self.status.set('已刷 %d 个 %s @(%d,%d)：特遣 %s / 小队 %s / 触发 %s（路径点 %s，行为 %d）'
                         % (n, tname, sel[0], sel[1], r['tf']['sid'], r['team']['sid'],
                            r['trigger_id'], r['waypoint'], r['action']))
-        # ★§219.9：新小队/特遣的 ID 不是 010 开头（只写进存档、没写地图）⇒
-        #   AI 页默认会把它们当"引擎生成对象"过滤掉。刷完自动勾上并刷新，
-        #   省得玩家在列表里翻不到，还以为没写进去。
+        # ★§219.9/§221：新小队/特遣的 ID 不是 010 开头（只写进存档、没写地图）⇒
+        #   AI 页默认会把它们当"引擎生成对象"过滤掉。刷完自动勾上、刷新，
+        #   并**直接选中**新小队（三页联动会顺带高亮它的特遣/脚本）。
         try:
             self._ai_all.set(True)
             self.refresh_ai()
+            self._ai_select(self.tat, r['team']['sid'])
         except Exception:
             pass
         messagebox.showinfo(
@@ -4250,8 +4327,7 @@ class App(tk.Tk):
             '特遣部队：%s（单位 %s）\n作战小队：%s（脚本 %s）\n'
             '触发器：%s（事件「13 流逝时间 1 秒」+ 行为 %s）\n\n'
             '⭐ 请**另存为**新文件再进游戏验证：读档约 1 秒后单位应出现在该格附近。\n\n'
-            '🔍 找这些新对象：本工具「AI」页已自动勾选『含引擎生成/运行期对象』，'
-            '在搜索框输 %s 或 %s 即可。\n'
+            '🔍 AI 页已自动刷新并选中新小队；搜索框输 %s 或 %s 可随时找回。\n'
             '（地编 FA2 里看不到它们 —— 它们只写进存档，没写进地图 INI，这是正常的。）'
             % (tname, n, sel[0], sel[1], r['waypoint'],
                r['tf']['sid'], r['tf']['units'],
