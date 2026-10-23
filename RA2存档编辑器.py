@@ -4243,14 +4243,17 @@ class App(tk.Tk):
         ttk.Radiobutton(frm, text='107 超时空传送援军（带时空特效）',
                         variable=act, value=107
                         ).grid(row=4, column=1, sticky='w')
-        scr = tk.BooleanVar(value=False)
+        scr = tk.IntVar(value=0)
         ttk.Label(frm, text='动作脚本：').grid(row=5, column=0, sticky='w', pady=(8, 0))
         ttk.Radiobutton(frm, text='留空（原地待命，推荐）',
-                        variable=scr, value=False
+                        variable=scr, value=0
                         ).grid(row=5, column=1, sticky='w')
         ttk.Radiobutton(frm, text='沿用模板队的脚本（可能自己行动）',
-                        variable=scr, value=True
+                        variable=scr, value=1
                         ).grid(row=6, column=1, sticky='w')
+        ttk.Radiobutton(frm, text='★新建一段「原地警戒」脚本（警戒 10 秒循环，不乱跑）',
+                        variable=scr, value=2
+                        ).grid(row=7, column=1, sticky='w')
         ttk.Label(frm, text='触发器用「13 流逝时间 1 秒」⇒ 读档约 1 秒后出兵。',
                   foreground='#6b7280'
                   ).grid(row=7, column=0, columnspan=2, sticky='w', pady=(8, 0))
@@ -4264,7 +4267,7 @@ class App(tk.Tk):
             except Exception:
                 ret['n'] = 4
             ret['action'] = int(act.get())
-            ret['script'] = bool(scr.get())
+            ret['script'] = int(scr.get())
             dlg.destroy()
 
         ttk.Button(row, text='取消', command=dlg.destroy).pack(side='right', padx=(6, 0))
@@ -4297,13 +4300,17 @@ class App(tk.Tk):
         ans = self._spawn_dialog(tname, (sel[0], sel[1]))
         if not ans:
             return
-        n, chrono, use_script = ans['n'], (ans['action'] == 107), ans['script']
+        n, chrono, scr = ans['n'], (ans['action'] == 107), ans['script']
+        # 脚本三选（§222）：0 留空 / 1 沿用模板 / 2 新建一段「原地警戒」
+        script_key = 0 if scr == 0 else (None if scr == 1 else 'NEW_IDLE')
+        script_entries = [(5, 10), (6, 0)] if scr == 2 else None
         try:
             r = self.doc.spawn_units_by_trigger(
                 tname, int(n), cell=(sel[0], sel[1]),
                 trigger_name=('刷%s%d' % (tname, n))[:16],
                 max_teams=1,
-                script_key=None if use_script else 0,
+                script_key=script_key,
+                script_entries=script_entries,
                 action=107 if chrono else 80)
         except Exception as e:
             self.status.set('刷兵失败')
@@ -4321,6 +4328,8 @@ class App(tk.Tk):
             self._ai_select(self.tat, r['team']['sid'])
         except Exception:
             pass
+        script_line = '空（待命）' if scr == 0 else (
+            '沿用模板' if scr == 1 else '新建「原地警戒」%s' % r['script']['sid'])
         messagebox.showinfo(
             '刷兵已写入',
             '类型：%s × %d\n位置：(%d,%d) → 路径点 %s\n\n'
@@ -4331,7 +4340,7 @@ class App(tk.Tk):
             '（地编 FA2 里看不到它们 —— 它们只写进存档，没写进地图 INI，这是正常的。）'
             % (tname, n, sel[0], sel[1], r['waypoint'],
                r['tf']['sid'], r['tf']['units'],
-               r['team']['sid'], '空（待命）' if not use_script else '沿用模板',
+               r['team']['sid'], script_line,
                r['trigger_id'],
                '107 超时空传送援军' if r['action'] == 107 else '80 援军',
                r['team']['sid'], r['tf']['sid']))

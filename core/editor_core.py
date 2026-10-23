@@ -4829,6 +4829,7 @@ class SaveDoc(object):
     SCRIPT_CLS = bytes.fromhex('47a6f3428907d211aca5006008055bb5')
     TF_SIZE = 232
     TEAM_SIZE = 268
+    SCRIPT_SIZE = 584          # §222 实测：相邻 ScriptType 对象差全是 584
 
     def _obj_group(self, cls, size, label='对象'):
         """校验 `[count][对象×count]` 连续组 → {'first','count_pos','count','offs'}。
@@ -5015,6 +5016,98 @@ class SaveDoc(object):
                 'country_key': struct.unpack_from('<I', pl, pos + 0xD8)[0],
                 'script_key': struct.unpack_from('<I', pl, pos + 0xF4)[0]}
 
+    def script_types(self):
+        """列出全部动作脚本：[{off,key,sid,name,index,entries:[{action,arg,name}]}]（§222）。"""
+        try:
+            import ai_objects as _aio
+            have = _aio.read_ai(self)
+        except Exception:
+            return []
+        out = []
+        for s in (have.get('scripts') or []):
+            out.append({'off': s['off'], 'key': s.get('key'), 'sid': s['id'],
+                        'name': s.get('name', ''), 'index': None,
+                        'entries': s.get('entries') or []})
+        # 组内下标（+0xAC）补上（read_ai 没解这个槽）
+        try:
+            g = self._obj_group(self.SCRIPT_CLS, self.SCRIPT_SIZE, '动作脚本')
+            pl = self.plain
+            for i, off in enumerate(g['offs']):
+                for o in out:
+                    if o['off'] == off:
+                        o['index'] = struct.unpack_from('<I', pl, off + 0xAC)[0]
+        except Exception:
+            pass
+        return out
+
+    def clone_script(self, entries, tpl_sid=None, name=None, sid=None):
+        """新建一段**动作脚本**（ScriptType 584B，§222）。
+
+        `entries` = `[(action, arg), …]`，arg 是 32 位原样值
+        （如 `(58, 1)` = 移动到己方建筑、`(5, 10)` = 警戒 10、`(6, 1)` = 转到行号 1）；
+        每条 8B「动作, 参数」，最多 50 条。
+
+        布局（SAVE0029 171 个真对象实测 + 与 Team/TF 同构）：
+          `+0x10` 自键 / `+0x38` 8 位 ID / `+0x78` 名称 48B / `+0xAC` **组内下标** /
+          `+0xB0` 标志（沿用模板）/ `+0xB4` 条数 / `+0xB8` 起条目区 ×50。
+        ★克隆时必须清零**运行期残留**（`+0x28`/`+0x34`/`+0x40`/`+0x70`/`+0xA8`
+          以及**超出条数的条目区**）—— 引擎跑过的脚本这些槽有指针/索引残留，
+          不清会带着别人的运行期状态（与事件/行为的 blank_runtime 同一道理）。
+        """
+        if not entries:
+            raise ValueError('脚本至少要有一条动作')
+        if len(entries) > 50:
+            raise ValueError('脚本最多 50 条动作（584B 结构如此），收到 %d 条' % len(entries))
+        try:
+            import ai_objects as _aio
+            have = _aio.read_ai(self)
+        except Exception:
+            have = {'scripts': []}
+        scs = have.get('scripts') or []
+        if not scs:
+            raise RuntimeError('这份存档里解析不出动作脚本对象，写不了新脚本')
+        tpl = None
+        if tpl_sid:
+            tpl = next((x for x in scs if x['id'].upper() == str(tpl_sid).upper()), None)
+        if tpl is None:
+            # 优先挑"已含目标动作"的模板（字段最接近），否则第一个
+            want = {int(a) for a, _b in entries}
+            tpl = next((x for x in scs
+                        if any(e['action'] in want for e in x['entries'])), None)
+        if tpl is None:
+            tpl = scs[0]
+        pos, idx = self._append_group(self.SCRIPT_CLS, self.SCRIPT_SIZE, tpl['off'],
+                                      '动作脚本')
+        pl = self.plain
+        # 新键：与脚本同区（0x134xxxxx），全档查重
+        keys = [x['key'] for x in scs if x.get('key')]
+        k = ((max(keys) + 0x1000) & 0xFFFFFFFF) if keys else 0x13400000
+        while pl.find(struct.pack('<I', k)) >= 0:
+            k = (k + 0x1000) & 0xFFFFFFFF
+        key = k
+        newsid = sid or self._next_sid()
+        struct.pack_into('<I', pl, pos + 0x10, key)
+        pl[pos + 56:pos + 64] = newsid.encode('ascii')[:8].ljust(8, b'\x00')
+        nm = (name or ('脚本-%s' % newsid))[:47]
+        pl[pos + 0x78:pos + 0x78 + 48] = b'\x00' * 48
+        pl[pos + 0x78:pos + 0x78 + len(nm.encode('gbk', 'ignore'))] = \
+            nm.encode('gbk', 'ignore')
+        struct.pack_into('<I', pl, pos + 0xAC, idx)            # ★组内下标（必须=物理下标）
+        struct.pack_into('<i', pl, pos + 0xB4, len(entries))   # 条数
+        # 条目区整体先清零（抹掉模板残留 + 运行期指针），再写前 count 条
+        pl[pos + 0xB8:pos + self.SCRIPT_SIZE] = b'\x00' * (self.SCRIPT_SIZE - 0xB8)
+        for i, e in enumerate(entries):
+            a, arg = int(e[0]), int(e[1])
+            struct.pack_into('<ii', pl, pos + 0xB8 + 8 * i, a, arg & 0xFFFFFFFF)
+        # 运行期残留槽清零（保留 +0x14..+0x24 类常量与 +0x74 常量）
+        for off in (0x28, 0x34, 0x40, 0x70, 0xA8):
+            struct.pack_into('<I', pl, pos + off, 0)
+        self._invalidate_if_shifted()
+        return {'off': pos, 'key': key, 'sid': newsid, 'name': nm,
+                'index': idx, 'count': len(entries),
+                'template': tpl['id'], 'entries': [(int(a), int(b) & 0xFFFFFFFF)
+                                                    for a, b in entries]}
+
     # §218：小队法刷兵支持的两种「援军」行为。二者二进制布局**完全相同**
     #   （`+0x40` 类型、`+0x44` 小队键、`+0x58` 路径点，`+0x48` 恒 0），
     #   已用 SAVE0029 的 47 个 80 号 + 250 个 107 号真对象逐一核对。
@@ -5023,7 +5116,7 @@ class SaveDoc(object):
     def spawn_units_by_trigger(self, type_name, count=1, cell=None, waypoint=None,
                                house=None, trigger_name=None, max_teams=1,
                                tf_template=None, team_template=None, script_key=None,
-                               action=80):
+                               action=80, script_entries=None):
         """**让引擎自己刷兵**：特遣部队 + 作战小队 + 触发「13 流逝时间1秒 + 援军行为@路径点」。
 
         为什么需要它（§209）：`SPAWNS=` 单位（V3/无畏/航母）手写记录不显示；
@@ -5046,6 +5139,12 @@ class SaveDoc(object):
                              % ('/'.join(str(x) for x in self.SPAWN_ACTIONS), action))
         t = str(type_name).strip().upper()
         warnings = []
+        # ★§222：给了 script_entries ⇒ 先建一段新脚本，小队挂它（而不是留空/沿用模板）
+        new_script = None
+        if script_entries:
+            new_script = self.clone_script(list(script_entries),
+                                           name=('刷%s动作' % t)[:16])
+            script_key = new_script['key']
         tf = self.clone_taskforce([(t, int(count))], tpl_sid=tf_template)
         if team_template is None:
             # ★默认拿"引用同一个特遣模板"的那个小队当模板 —— 这样脚本(+0xF4)、国家(+0xD8)、
@@ -5114,6 +5213,7 @@ class SaveDoc(object):
         self._invalidate_if_shifted()
         return {'tf': tf, 'team': tm, 'trigger_id': r.get('trigger_id'),
                 'action': action, 'action_off': ac, 'waypoint': wp,
+                'script': new_script,
                 'cell': self.waypoint_cell(int(wp)), 'warnings': warnings}
 
     def import_unit_from(self, ref, type_name, cx, cy, house=None, veterancy=None,
