@@ -644,6 +644,24 @@ class UnitUnavailable(RuntimeError):
         self.detail = detail
 
 
+class LastAttachRefused(RuntimeError):
+    """这条标签只剩 1 个挂载对象，解除会留下"计数 0"的节点 —— 默认拒绝。
+
+    ★§206：**不是不能解**，是要玩家明确选一种：
+      · `allow_last=True` 直接解除（计数归 0；实测原版档里本来就有 count=0 的节点）；
+      · 或者先 `soft_disable_trigger()` 把触发弄成永不满足，再解除。
+    `persist`：标签持久性 0/1/2 —— **只有 1（挂载清空型）**才把"计数归 0"当执行条件之一，
+    那种情况更建议先禁用。
+    """
+
+    def __init__(self, node, count, persist=None):
+        msg = '该标签只剩 %d 个挂载对象，解除会把它变成"计数 0"的节点' % max(int(count), 0)
+        RuntimeError.__init__(self, msg)
+        self.node = node
+        self.count = count
+        self.persist = persist
+
+
 class Rec(object):
     """一条记录（触发/Tag/其它）"""
     __slots__ = ('sid', 'name', 'off', 'kind', 'enabled', 'can_toggle', 'note', 'flag_off')
@@ -4250,6 +4268,58 @@ class SaveDoc(object):
         smap = {(s['x'], s['y']): s for s in (m.structures() if m else [])}
         t2t = m.tag_trigger_map() if m else {}
         names = {r.sid: r.name for r in self.records}
+        # ★★2026-10-23 §204（玩家实测）：「② 该标签挂接的建筑」里类型显示成 `?` ——
+        #   因为它只按**地图坐标精确命中**取类型，而地图锚点常常和存档差 1 格
+        #   （SAVE1D3F：地图 YACOMD@(181,96)，存档 @(180,96)）。
+        #   改：**先按存档记录认**（`buildings()` 的 base 就是挂接字段），地图只兜底。
+        try:
+            bsave = {b['base']: b for b in self.buildings()}
+        except Exception:
+            bsave = {}
+        _near = ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1))
+
+        def _bld_rec(p):
+            """按挂接字段偏移找存档里的建筑记录（允许 ±8 字节偏移，实测有差 2 字节的情形）。"""
+            b = bsave.get(p)
+            if b:
+                return b
+            for d in (2, 4, 6, 8, -2, -4, -6, -8):
+                b = bsave.get(p + d)
+                if b:
+                    return b
+            return None
+
+        # ★§204b：标签也可能挂在**单位**上（实测触发 01000250「飞碟被攻击」挂的是 DISK×6、
+        #   还有 SNIPE/SCHP/HOWI）。旧实现只认建筑 ⇒ 这些行全显示成 `?`，玩家根本不知道挂的是谁。
+        try:
+            _urecs = sorted(self.unit_records(), key=lambda r: r['off'])
+        except Exception:
+            _urecs = []
+        _uoffs = [r['off'] for r in _urecs]
+
+        def _unit_of(p):
+            import bisect as _bs
+            k = _bs.bisect_right(_uoffs, p) - 1
+            if k < 0:
+                return None
+            r = _urecs[k]
+            if r['off'] <= p < r['comp'] + r['comp_size']:
+                return r
+            return None
+
+        def _map_hit(cx, cy, tname):
+            """地图 [Structures] 里的对应条目（先精确、再同类型邻近 ±1 格兜底）。"""
+            if cx is None or cy is None:
+                return None
+            for dx, dy in _near:
+                s = smap.get((cx + dx, cy + dy))
+                if not s:
+                    continue
+                if dx == 0 and dy == 0:
+                    return s
+                if tname and str(s.get('type', '')).upper() == str(tname).upper():
+                    return s
+            return None
 
         def _index(guid):
             """类 GUID → {自身键: 对象偏移}"""
@@ -4280,9 +4350,23 @@ class SaveDoc(object):
                 if not (0 < px < self.MAXPIX and 0 < py < self.MAXPIX):
                     continue
                 cx, cy = (px - 128) // 256, (py - 128) // 256
-                s = smap.get((cx, cy))
+                # ★先认存档记录（最可靠：type/hp 直接读），地图只补"地图建筑ID"
+                sb = _bld_rec(p)
+                ur = None if sb else _unit_of(p)
+                if not sb and not ur:
+                    # 既不是建筑记录、也不在单位记录里 ⇒ 多半是「指针表里的那个键」
+                    # （实测 X 会出现在全局指针表里，紧随其后的字节凑巧像坐标）
+                    continue
+                if sb:
+                    tname, cx, cy = sb['type'], sb['x'], sb['y']
+                else:
+                    tname, cx, cy = ur['type'], ur['x'], ur['y']
+                s = _map_hit(cx, cy, tname)
                 blds.append({'field': p, 'cx': cx, 'cy': cy,
-                             'type': s['type'] if s else None,
+                             'type': tname or (s['type'] if s else None),
+                             'kind': 'building' if sb else 'unit',
+                             'hp': sb.get('hp') if sb else None,
+                             'in_save': True,
                              'map_idx': s['idx'] if s else None,
                              'tagid': s['tagid'] if s else None})
             # ★键链解析：CellTag → 标签 → 触发（不依赖地图）
@@ -4308,6 +4392,208 @@ class SaveDoc(object):
         out.sort(key=lambda d: (-len(d['buildings']), d['node']))
         return out
 
+    def attach_orphan_tags(self):
+        """**有标签对象、却没有 CellTag 节点**的触发（挂接页看不到的那一类）。
+
+        ★2026-10-23 玩家实测发现：「尤里中心铁幕解白宫铁幕」这条触发在挂接页找不到。
+          查明原因：挂接页是按 **CellTag 节点**建的，而这条触发**一个节点都没有** ——
+          标签 01000438 还在，但 `tag_key` 在全档只出现 1 次（它自己的自键），
+          没有任何 CellTag 指向它 ⇒ `trigger_runtime_state()` 判 `verdict='executed'`
+          （一次性触发执行完，引擎把节点销毁了）。于是它在挂接页"人间蒸发"。
+
+        返回 [{'tag_off','tag_key','tagid','trigger_id','trigger_name','persist',
+               'executed','reason'}]，按 (executed, tagid) 排序。
+        `reason`: 'executed'（节点已销毁=已执行） / 'never'（还挂着定义、从未挂过对象）。
+        """
+        pl = self.plain
+        names = {}
+        try:
+            names = {r.sid: r.name for r in self.records}
+        except Exception:
+            pass
+        # 被节点引用的标签键
+        used = set()
+        for n in self.celltag_nodes():
+            used.add(struct.unpack_from('<I', pl, n['node'] + 56)[0])
+        inst_by_key = {}
+        tags = []
+        q = 0
+        while True:
+            i = pl.find(TRIG_INSTANCE_GUID, q)
+            if i < 0:
+                break
+            q = i + 1
+            inst_by_key[struct.unpack_from('<I', pl, i + 16)[0]] = i
+        q = 0
+        while True:
+            i = pl.find(TRIG_TAGOBJ_GUID, q)
+            if i < 0:
+                break
+            q = i + 1
+            if i + 0xA4 > len(pl):
+                continue
+            k = struct.unpack_from('<I', pl, i + 16)[0]
+            if k in used:
+                continue                      # 有节点 ⇒ 属于挂接页
+            tags.append((i, k))
+        out = []
+        for off, k in tags:
+            tk = struct.unpack_from('<I', pl, off + 180)[0]
+            io = inst_by_key.get(tk)
+            tid = pl[io + 56:io + 64].decode('latin1') if io else None
+            if not tid:
+                continue                      # 标签没指触发（地图标签/孤立对象）⇒ 不列
+            persist = struct.unpack_from('<i', pl, off + 0x9C)[0]
+            ev_fired, ev_types, rep = False, [], None
+            try:
+                st = self.trigger_runtime_state(tid)
+                executed = bool(st.get('executed'))
+                ev_fired = bool(st.get('ev_fired'))
+            except Exception:
+                executed = False
+            try:
+                ev_types = [e.get('type') for e in self.trigger_event_list(tid)]
+            except Exception:
+                ev_types = []
+            try:
+                rep = self.trigger_repeat_type(tid)
+            except Exception:
+                rep = None
+            # ★§203：**别再断言"已执行"**。存档字节只能证明"没有 CellTag 节点"，
+            #   "执行过"与"从来没挂上"在这份数据里同形（触发页早就按 §119 的结论不加断言）。
+            #   计时型（首事件 13 / 轮询 36·37）必须有节点才被评估 ⇒ 没节点就是"不会被评估"；
+            #   回调型（被攻击/被摧毁/进入…）同理 —— 引擎只遍历 CellTag 的实例链。
+            kind = 'timer' if (ev_types and ev_types[0] in (13,) or
+                               any(t in POLL_EVENT_TYPES for t in ev_types)) else 'callback'
+            out.append({'tag_off': off, 'tag_key': k,
+                        'tagid': pl[off + 56:off + 64].decode('latin1'),
+                        'trigger_id': tid,
+                        'trigger_name': names.get(tid, ''),
+                        'persist': persist,
+                        'executed': executed,
+                        'ev_fired': ev_fired,
+                        'ev_types': ev_types,
+                        'kind': kind,
+                        'rep': rep,
+                        'reason': 'executed' if executed else 'never'})
+        out.sort(key=lambda d: (not d['executed'], d['tagid']))
+        return out
+
+    def attach_free_buildings(self):
+        """**存档口径**的「可挂接建筑」→ [{base,type,x,y,hp,map_idx,map_tag}]。
+
+        ★★ 2026-10-23 玩家实测纠错（`SAVE1D3F.SAV` + `all01umd.map`）：
+          地图 `[Structures]` 里 YACOMD 的 Tag 列写着 `01000438`（地图认为它挂着触发），
+          但**存档里那栋 (180,96) 的挂接键 = 0x00000000**（真没挂）。
+          旧实现按**地图的 Tag 列**判断"已挂接"⇒ 直接把它从③里藏起来，玩家没法挂。
+          编辑器改的是**存档** ⇒ 一律**以存档为准**：挂接键为 0 的就是"可挂"，
+          地图只用来补一个"地图建筑ID"（而且地图锚点可能和存档差 1 格，
+          实测 YACOMD 地图 (181,96) / 存档 (180,96)，所以要按同类型邻近格兜底）。
+        """
+        m = getattr(self, '_map', None)
+        smap = {}
+        if m:
+            for s in m.structures():
+                smap.setdefault((s['x'], s['y']), s)
+        near = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1))
+        out = []
+        for b in self.buildings():
+            if b.get('tag'):
+                continue                      # 存档里已挂接 ⇒ 不是"可挂"
+            s = smap.get((b['x'], b['y']))
+            if s is None and smap and b.get('type'):
+                for dx, dy in near:
+                    c = smap.get((b['x'] + dx, b['y'] + dy))
+                    if c and str(c.get('type', '')).upper() == str(b['type']).upper():
+                        s = c
+                        break
+            out.append({'base': b['base'], 'type': b['type'],
+                        'x': b['x'], 'y': b['y'], 'hp': b.get('hp'),
+                        'map_idx': (s or {}).get('idx'),
+                        'map_tag': (s or {}).get('tagid')})
+        out.sort(key=lambda d: (str(d['type']).upper(), d['y'], d['x']))
+        return out
+
+    def ensure_attach_node(self, sid, ticks=0):
+        """给「有标签对象、却没有 CellTag 节点」的触发**补建挂接节点**（TagNode + CellTag）。
+
+        ★2026-10-23 §203（玩家实测驱动）：挂接页原来对这类触发只会说"已执行过、不能挂"，
+          但玩家指出「触发页显示它是好的」。查清后的真相：
+            · 这类触发的**定义完好**（实例/事件/行为都在），只是**存档里没有运行期节点**；
+            · 没有 CellTag ⇒ 引擎根本不会评估它（`0x6E53A0` 只遍历 CellTag 的实例链）；
+            · 到底"执行过"还是"从来没挂上"，存档字节分不清 —— 所以**别断言**，给用户重建的机会。
+        `ticks`：仅计时型（首个事件是 13）需要，`秒 × 15`；回调型（被攻击/被摧毁…）传 0。
+        返回 {'created','node','node_key','cell','cell_key','ticks'}。
+        """
+        o = self.trigger_objects(sid)
+        if not o.get('tag_obj'):
+            raise RuntimeError('这条触发连标签对象都没有（只有定义）⇒ 不能补建挂接节点。\n'
+                               '需要先在「触发」页用「➕ 新建触发」把它重新建一条。')
+        if o.get('cell') is not None:
+            return {'created': False, 'node': o['cell'], 'node_key': None,
+                    'cell': o['cell'], 'cell_key': o['cell_key'], 'ticks': None}
+        grps = self._newtrig_groups()
+        node_pos, cell_pos = grps.get('node'), grps.get('cell')
+        if not node_pos or not cell_pos:
+            raise RuntimeError('这份存档里没有 TagNode/CellTag 对象组（老格式或未建集群）'
+                               '⇒ 暂不支持补建挂接节点。')
+        pl = bytearray(self.plain)
+
+        def patch(buf, off, data):
+            buf[off:off + len(data)] = data
+
+        u32v = lambda v: struct.pack('<I', v & 0xFFFFFFFF)
+        used = []
+
+        def fresh(keys):
+            v = ((max(keys) + 0x1000) & 0xFFFFFFFF) if keys else NODEGRP_BASE_KEY
+            while pl.find(u32v(v)) >= 0 or v in used:
+                v = (v + 0x1000) & 0xFFFFFFFF
+            used.append(v)
+            return v
+
+        K_NODE = fresh([int.from_bytes(pl[p + 16:p + 20], 'little') for p in node_pos])
+        K_CELL = fresh([int.from_bytes(pl[p + 16:p + 20], 'little') for p in cell_pos
+                        if int.from_bytes(pl[p + 16:p + 20], 'little') != K_NODE])
+        tpl_node = bytes(pl[node_pos[-1]:node_pos[-1] + TRIG_NODE_SIZE])
+        tpl_cell = bytes(pl[cell_pos[-1]:cell_pos[-1] + TRIG_CELL_SIZE])
+        nb = bytearray(TRIG_NODE_SIZE)
+        patch(nb, 0, TRIG_NODE_GUID)
+        patch(nb, 16, u32v(K_NODE))
+        patch(nb, 20, tpl_node[20:36])            # 类常量（跨档恒定）
+        patch(nb, 36, b'\xff' * 4)
+        patch(nb, NODE_TRIGKEY_OFF, u32v(o['inst_key']))
+        patch(nb, 76, u32v(NODE_SPARE76))
+        patch(nb, NODE_TICKS_OFF, u32v(int(ticks)))
+        patch(nb, NODE_FLAG_OFF, u32v(1))         # 启用
+        cb = bytearray(TRIG_CELL_SIZE)
+        patch(cb, 0, TRIG_CELLGUID)
+        patch(cb, 16, u32v(K_CELL))
+        patch(cb, 20, tpl_cell[20:36])
+        patch(cb, 36, b'\xff' * 4)
+        patch(cb, CELL_TAGKEY_OFF, u32v(o['tag_key']))
+        patch(cb, CELL_NODEKEY_OFF, u32v(K_NODE))
+        # +0x40 挂接数保持 0（调用方随后 attach 时会 +1）
+        ins = [(node_pos[-1] + TRIG_NODE_SIZE, bytes(nb)),
+               (cell_pos[-1] + TRIG_CELL_SIZE, bytes(cb))]
+        for pos, data in sorted(ins, key=lambda x: -x[0]):
+            pl[pos:pos] = data
+        # 组计数 +1（插入后重新定位组首对象）
+        for guid in (TRIG_NODE_GUID, TRIG_CELLGUID):
+            p0 = pl.find(guid)
+            if p0 >= 4:
+                old = int.from_bytes(pl[p0 - 4:p0], 'little')
+                patch(pl, p0 - 4, u32v(old + 1))
+        self.plain = pl
+        for attr in ('_objs', '_events', '_actions', '_ticks', '_celltags', '_ctimerlist',
+                     '_instmaps', '_tagobjs', '_tagrecs', '_blds', '_house_econ',
+                     '_custom_houses', '_house_keys_memo'):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        o2 = self.trigger_objects(sid)
+        return {'created': True, 'node': o2.get('cell'), 'node_key': K_NODE,
+                'cell': o2.get('cell'), 'cell_key': K_CELL, 'ticks': int(ticks)}
+
     def attach_trigger_to_building(self, node_off, field_off):
         """把 node 的标签挂到指定建筑（字段写 X + 计数+1）。返回字段旧值。"""
         nd = [n for n in self.celltag_nodes() if n['node'] == node_off]
@@ -4324,11 +4610,41 @@ class SaveDoc(object):
             struct.pack('<I', nd['count'] + 1)
         self.pending_attach.append((field_off, old))
         self._celltags = None
+        # ★§202：`buildings()` 有缓存，不改这里 ⇒ 挂上后列表里那栋的挂接键还是 0
+        #   （玩家会以为没挂成功；自检也正是这么抓到它的）
+        self._blds = None
         return old
 
-    def detach_building(self, node_off, field_off):
-        """解除建筑的挂接（字段清 0 + 计数−1）。计数为 1 时拒绝（防清空成悬空节点），
-        请改用「禁用触发」。返回字段旧值。"""
+    def celltag_persist(self, node_off):
+        """该 CellTag 指向的**标签持久性**（0 一次性·任一挂载 / 1 一次性·挂载清空 / 2 可重复）。
+
+        用途：只剩 1 个挂载时提醒"计数归 0 会不会直接触发"——只有 **持久 1** 才把
+        "挂载清空"当执行条件；持久 0 没有对象就永远不会满足，解除到 0 是安全的。
+        """
+        nd = [n for n in self.celltag_nodes() if n['node'] == node_off]
+        if not nd:
+            return None
+        k_tag = struct.unpack_from('<I', self.plain, nd[0]['node'] + 56)[0]
+        off = self._tag_objs_by_key().get(k_tag)
+        if off is None:
+            return None
+        try:
+            return struct.unpack_from('<i', self.plain, off + 0x9C)[0]
+        except Exception:
+            return None
+
+    def detach_building(self, node_off, field_off, allow_last=True):
+        """解除挂接（字段清 0 + 计数−1）。返回字段旧值。
+
+        ★2026-10-23 §207（玩家定案）：
+          · 旧实现 `count<=1` 一律拒绝，理由"怕留下空挂接节点" —— **这个理由不成立**：
+            原版 `ALL01UMD.sav` 78 个节点里本来就有 2 个 `count=0`（引擎完全接受）。
+          · 挂在建筑上的触发，**解除之后就没有任何条件能启动它** ⇒ 不需要"顺手禁用"，
+            默认**只做解除这一件事**（`allow_last=True`）：这样
+            ①那栋建筑能马上挂到别的触发（挂接键已清 0，出现在 ③）；
+            ②那条触发也能挂到别的建筑（节点还在、计数 0，①里仍可选）。
+          · `allow_last=False` 只是留给想恢复旧"保护"语义的调用方。
+        """
         nd = [n for n in self.celltag_nodes() if n['node'] == node_off]
         if not nd:
             raise RuntimeError('CellTag 节点未找到（存档已变化？请重新扫描）')
@@ -4336,14 +4652,15 @@ class SaveDoc(object):
         old = struct.unpack_from('<I', self.plain, field_off)[0]
         if old != nd['x']:
             raise RuntimeError('该建筑未挂此标签，无法解除')
-        if nd['count'] <= 1:
-            raise RuntimeError('该标签只剩这一栋建筑——解除会留下空挂接节点。\n'
-                               '如想让触发彻底失效，请改用「触发」页的禁用功能。')
+        if nd['count'] <= 1 and not allow_last:
+            # 只有显式要旧语义的调用方才会走到这里（GUI 默认走 allow_last=True）
+            raise LastAttachRefused(node_off, nd['count'], self.celltag_persist(node_off))
         self.plain[field_off:field_off + 4] = b'\x00' * 4
         self.plain[nd['count_pos']:nd['count_pos'] + 4] = \
             struct.pack('<I', nd['count'] - 1)
         self.pending_attach.append((field_off, old))
         self._celltags = None
+        self._blds = None
         return old
 
     def free_attach_slot(self, cx, cy, mode='zero'):
@@ -4352,7 +4669,7 @@ class SaveDoc(object):
         FA2 里一栋建筑只能挂一个标签，所以这里要处理"已经挂在别的触发上"的情况：
           * `mode='zero'`（默认，保守）⇒ 已挂接就**拒绝**，说明里带上旧 CellTag 键，让玩家自己决定
           * `mode='force'` ⇒ 先把旧挂接**解掉**（旧 CellTag 计数 −1），再返回字段
-            ⚠ 旧标签只剩这一栋时 `detach_building` 会拒（避免留下空挂接节点）——
+            ⚠ 旧标签只剩这一栋时默认也能解除（§207：解除后该标签没有任何启动条件）——
               那种情况请改用"禁用触发"，别硬摘
           * `mode='any'` ⇒ 不看现值，直接返回字段（调用方自己负责计数一致性）
         返回 `(field_off, None)` 表示可用；`(None, 原因)` 表示不可用。
@@ -5197,15 +5514,30 @@ class SaveDoc(object):
         self._complib = unit_comp_lib.load()
         return self._complib
 
-    def _type_locomotor(self, t, recs):
-        """目标型号要的**移动方式**（Walk / Drive / Fly）——决定要借哪种伴随对象。
+    # ★§200：型号 → 存档里**实际使用的伴随类**（覆盖 rules 的 Locomotor）。
+    #   只放"与真实样本逐字节比对过"的型号；加新条目必须有样本依据。
+    #   ★★ 2026-10-23 玩家实测纠错：**表已清空，ZEP 必须 Fly**。
+    #     曾经为了修"基洛夫隐形"把 ZEP 钉成 Drive（依据是一份档里疑似 Drive 的样本），
+    #     结果 T54 里基洛夫**出来了但在地上跑、不起飞**（玩家：移动方式不对）。
+    #     复核 `放V3和ZEP.SAV`（玩家自己在地图上摆的）：真实 ZEP 的伴随 = **Fly / 173 B**
+    #     （`462c6192…`），与同档 60 多架 SCHP 完全一致 ⇒ rules 的 `Locomotor=` 就是对的。
+    #     当初"隐形"的真因是**落点太靠地图边缘**（(15,179)），不是移动方式。
+    _LOCO_OVERRIDE = {}
 
-        优先用档内该型号实例的伴随类；档里没有就查规则文件的 `Locomotor={GUID}`
-        （那个 GUID 就是伴随对象的类 GUID）；规则也没有就返回 None（不做约束）。
+    def _type_locomotor(self, t, recs):
+        """目标型号要的**移动方式**（Walk / Drive / Fly …）——决定要借哪种伴随对象。
+
+        ★★ 2026-10-23 §200 **顺序改了**：**规则文件优先，档内样本只作兜底**。
+          旧顺序（先看档内实例）会被"一个脏样本"绑架：T54 里我们自己用 Drive 放的
+          那个基洛夫，反过来成了下一轮的"权威样本"，于是新放的基洛夫继续在地上跑
+          （玩家实测：「基洛夫出来了，移动方式不对，不起飞」）。
+          实测依据：玩家亲手摆的真基洛夫 = **Fly / 173 B**，与 rules
+          `[ZEP] Locomotor={92612C46…}`（Fly）完全一致 ⇒ **规则才是权威**。
         """
-        for r in recs:
-            if r['type'].upper() == t and r.get('loco') not in (None, '?'):
-                return r['loco']
+        tt = str(t).upper()
+        _ov = self._LOCO_OVERRIDE.get(tt)
+        if _ov:
+            return _ov
         try:
             import os
             import game_ini
@@ -5215,11 +5547,21 @@ class SaveDoc(object):
                 sec = sec['kv']          # 规则段的真实键值在 'kv' 里
             loco = (sec.get('locomotor') or '').strip()
             if loco:
-                return self.COMP_GUID_LOCO.get(self.guid_bytes(loco))
+                _m = self.COMP_GUID_LOCO.get(self.guid_bytes(loco))
+                if _m:
+                    return _m
             if (sec.get('speedtype') or '').strip().lower() == 'foot':
                 return 'Walk'
         except Exception:
             pass
+        # 规则文件读不到（自制单位 / 没有原版 INI）⇒ 退到档内实例，**取多数**
+        # （避免像 T54 那样被单个脏样本带偏）
+        cnt = {}
+        for r in recs:
+            if r['type'].upper() == tt and r.get('loco') not in (None, '?'):
+                cnt[r['loco']] = cnt.get(r['loco'], 0) + 1
+        if cnt:
+            return max(cnt, key=cnt.get)
         return None
 
     def set_unit_house(self, unit, house):
@@ -5294,6 +5636,32 @@ class SaveDoc(object):
         o = v['off']
         s = bytes(pl[o + 120:o + 160]).split(b'\x00')[0]
         return s.decode('latin-1', 'ignore').strip()
+
+    def type_display(self, name):
+        """类型对象的**显示名**（存档里 `+120`，引擎按 UI 文本表解析过）→ str（读不到返回 ''）。
+
+        定位法：明文里找 `Name:XXX\0`，**对象起点 = 该串位置 − 81**（实测：`+56` 的 16B 代码名、
+        `+80` 的 `Name:XXX`、`+120` 的显示名，逐字节对齐后差 81 —— 早先按 −80 取会吃掉首字母）。
+        覆盖**建筑/步兵/载具**全部类型（`unit_type_display()` 只走 infantry/vehicle 两个型别组）。
+        ★2026-10-23 §205：GUI 里那张中文对照表有个别是**猜的**（`YACOMD` 被写成"尤里建造场?"），
+          玩家当场纠正：YACOMD 是**尤里指挥中心**、尤里建造场是 `YACNST`。
+          ⇒ 现在**任何表里没有的类型都能回落到这里的真名**，宁可显示英文名，也不猜中文。
+        """
+        memo = getattr(self, '_typedisp', None)
+        if memo is None:
+            import re as _re
+            memo = {}
+            for mo in _re.finditer(b'Name:([A-Za-z0-9_]{2,24})\x00', self.plain):
+                code = mo.group(1).decode('ascii', 'ignore').upper()
+                off = mo.start() - 81
+                if off < 0 or off + 160 > len(self.plain):
+                    continue
+                s2 = bytes(self.plain[off + 120:off + 160]).split(b'\x00')[0]
+                txt = s2.decode('latin-1', 'ignore').strip()
+                if txt and code not in memo:
+                    memo[code] = txt
+            self._typedisp = memo
+        return memo.get(str(name).upper(), '')
 
     def placeable_unit_types(self):
         """**所有**可放置的单位类型名（步兵 + 载具，按类分组）→ [(名, 'infantry'|'vehicle')]。
@@ -5613,6 +5981,15 @@ class SaveDoc(object):
         struct.pack_into('<H', blob, 1394, cy)
         # ---- 所属方（★2026-10-17 新增：house 参数真正改主人，不再只挑模板）----
         warnings = []
+        # ★§200 2026-10-23 玩家实测：**空中单位落点贴着地图边缘 ⇒ 模型不显示**
+        #   （基洛夫放在 (15,179)，游戏里只看到一个等级徽章、机身不出来；
+        #     改到 (20,179) 就正常）。这条与移动方式无关，是"画不画"的问题。
+        if tgt_loco in ('Fly', 'Aircraft'):
+            _ex = 4
+            if (cx < _ex or cy < _ex or cx >= lim[0] - _ex or cy >= lim[1] - _ex):
+                warnings.append('%s 是空中单位，落点 (%d,%d) 贴着地图边缘（<4 格）⇒ '
+                                '游戏里可能只看到等级徽章、机身不显示，建议往内挪几格'
+                                % (t, cx, cy))
         tpl_hkey = struct.unpack_from('<I', pl, src['off'] + self.UNIT_HOUSE_OFF[0])[0]
         tpl_hname = self._house_key_names().get(tpl_hkey) or src.get('house')
         tgt_hkey, tgt_hname, house_changed = None, tpl_hname, False
@@ -5776,6 +6153,8 @@ class SaveDoc(object):
                 'veterancy_name': self.VET_NAMES.get(vet_out, '未定义'),
                 'inst_base': (id_info or {}).get('new'),
                 'inst_id': (id_info or {}).get('new'),
+                'loco': tgt_loco,            # ★§200：目标移动方式（Fly/Drive/Walk…）
+                'comp_from': comp_src,       # 伴随对象来自哪个模板/库
                 'delta': len(pl) - base, 'replaced': nrep, 'tables': len(tabs),
                 'warnings': warnings,
                 'note': '同类型克隆：武器/动画等子对象与模板一致'}
