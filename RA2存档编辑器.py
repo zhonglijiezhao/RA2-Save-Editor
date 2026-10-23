@@ -4319,11 +4319,14 @@ class App(tk.Tk):
         self.status.set('已刷 %d 个 %s @(%d,%d)：特遣 %s / 小队 %s / 触发 %s（路径点 %s，行为 %d）'
                         % (n, tname, sel[0], sel[1], r['tf']['sid'], r['team']['sid'],
                            r['trigger_id'], r['waypoint'], r['action']))
-        # ★§219.9/§221：新小队/特遣的 ID 不是 010 开头（只写进存档、没写地图）⇒
-        #   AI 页默认会把它们当"引擎生成对象"过滤掉。刷完自动勾上、刷新，
-        #   并**直接选中**新小队（三页联动会顺带高亮它的特遣/脚本）。
+        # ★§219.9/§221/§223：新小队/特遣的 ID 不是 010 开头（只写进存档、没写地图）⇒
+        #   AI 页默认会把它们当"引擎生成对象"过滤掉。登记进 `_ai_ours`（本次会话新建），
+        #   刷新后它们照常显示并自动选中（三页联动顺带高亮它的特遣/脚本）。
         try:
-            self._ai_all.set(True)
+            self._ai_ours.add(r['team']['sid'])
+            self._ai_ours.add(r['tf']['sid'])
+            if r.get('script'):
+                self._ai_ours.add(r['script']['sid'])
             self.refresh_ai()
             self._ai_select(self.tat, r['team']['sid'])
         except Exception:
@@ -5643,12 +5646,13 @@ class App(tk.Tk):
         ttk.Button(qrow, text='✕', width=3,
                    command=lambda: (self._q_ai.set(''), self._fill_ai_all())
                    ).pack(side='left', padx=(2, 8))
-        self._ai_all = tk.BooleanVar(value=True)
-        ttk.Checkbutton(qrow, text='含引擎生成/运行期对象',
+        self._ai_all = tk.BooleanVar(value=False)
+        ttk.Checkbutton(qrow, text='含引擎生成的 AI 小队',
                         variable=self._ai_all,
                         command=self._fill_ai_all).pack(side='left')
-        ttk.Label(qrow, text='（工具新写的小队/特遣只进存档、不进地图，ID 不是 010 开头；'
-                             '在地编 FA2 里看不到它们是正常的）',
+        ttk.Label(qrow, text='（Yuri - Infantry - M2 那批是引擎按 rules 自动生成的，'
+                             '99% 的任务用不到；地图作者写的在 010 开头那批里，'
+                             '本工具新写的也会显示）',
                   foreground='#9ca3af').pack(side='left', padx=(4, 0))
         self.lbl_ai_count = ttk.Label(qrow, text='', foreground='#6b7280')
         self.lbl_ai_count.pack(side='left', padx=10)
@@ -5779,6 +5783,8 @@ class App(tk.Tk):
         self._ai = None
         self._ai_teams, self._ai_tfs, self._ai_scripts = {}, {}, {}
         self._ai_rows = {'team': [], 'tf': [], 'script': []}
+        # ★§223：本工具本次会话新写的小队/特遣/脚本 ID（默认显示，不当"引擎生成"藏掉）
+        self._ai_ours = set()
         sub.bind('<<NotebookTabChanged>>', lambda e: self._ai_reapply())
         return f
 
@@ -5790,6 +5796,7 @@ class App(tk.Tk):
             tv.delete(*tv.get_children())
         self._ai, self._ai_teams, self._ai_tfs, self._ai_scripts = None, {}, {}, {}
         self._ai_rows = {'team': [], 'tf': [], 'script': []}
+        self._ai_ours = set()          # §223：换档清空（sid 空间按档独立）
         self.ai_text.delete('1.0', 'end')
         if not self.doc:
             return
@@ -5860,13 +5867,19 @@ class App(tk.Tk):
             return
         q = ((self._q_ai.get() if hasattr(self, '_q_ai') else '') or '').strip().lower()
         show_all = bool(self._ai_all.get()) if hasattr(self, '_ai_all') else False
+        ours = getattr(self, '_ai_ours', None) or set()
         out = []
+        hidden = 0
         for kind, tv in (('team', self.tat), ('tf', self.tft), ('script', self.tst)):
             tv.delete(*tv.get_children())
             rows = self._ai_rows.get(kind, [])
             shown = 0
             for iid, vals, is_map in rows:
-                if not is_map and not show_all:
+                # ★§223：默认只显示「地图定义的(010 开头) + 本工具本次会话新写的」；
+                #   引擎按 rules 生成的 AI 小队（Yuri - Infantry - M2 那批）默认隐藏 ——
+                #   99% 的任务不用 AI 小队，任务作者用的是自己写的那批。
+                if not is_map and iid not in ours and not show_all:
+                    hidden += 1
                     continue
                 if q and not any(q in str(v).lower() for v in vals):
                     continue
@@ -5875,8 +5888,8 @@ class App(tk.Tk):
             out.append('%s %d/%d' % ({'team': '小队', 'tf': '特遣', 'script': '脚本'}[kind],
                                      shown, len(rows)))
         if hasattr(self, 'lbl_ai_count'):
-            self.lbl_ai_count.config(text='　'.join(out)
-                                     + ('' if show_all else '（已隐藏引擎生成的）'))
+            tip = ('　已隐藏引擎生成的 %d 个（勾选左边可看）' % hidden) if hidden else ''
+            self.lbl_ai_count.config(text='　'.join(out) + tip)
         self._ai_reapply()
 
     # ---- 三个页面的互相关联 ----
