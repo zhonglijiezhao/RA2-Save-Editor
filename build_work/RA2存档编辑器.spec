@@ -7,6 +7,11 @@ import os
 #   现在一律按 spec 自身位置算绝对路径，cwd 无关。
 _ROOT = os.path.abspath(os.path.join(SPECPATH, '..'))
 _CORE = os.path.join(_ROOT, 'core')
+# ★2026-10-24 §227：**打包必用 `build_work/build.py`**（它带 --workpath build_work/_work）。
+#   直接 `-m PyInstaller` 会把中间产物落到 `<cwd>/build/<spec名>/`，那里有个**同名 exe**
+#   （半成品、缺 _internal\python313.dll）—— 玩家在资源管理器里翻到双击 ⇒
+#   "Failed to load Python DLL ... python313.dll"（2026-10-24 01:25 实测中招）。
+#   workpath 是**命令行参数**，spec 里设不了 ⇒ 统一走 build.py。
 
 
 def _c(*parts):
