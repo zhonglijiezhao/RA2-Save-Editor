@@ -1,0 +1,795 @@
+{
+ "slots": [
+  "0x270",
+  "0x51C",
+  "0x940",
+  "0x944",
+  "0x948",
+  "0x94C",
+  "0x954",
+  "0x958"
+ ],
+ "types": {
+  "ADOG": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 416,
+    "0x51C": 20
+   },
+   "size": 1812,
+   "src": "平地三V3.SAV",
+   "votes": 4
+  },
+  "AMBU": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 0,
+    "0x51C": 0,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "平地三V3.SAV",
+   "votes": 4
+  },
+  "APOC": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 40,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 208
+  },
+  "BFRT": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 1248,
+    "0x51C": 40,
+    "0x940": 0,
+    "0x944": 300,
+    "0x948": 1691316,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 19328
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 10
+  },
+  "BORIS": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 1248,
+    "0x51C": 25
+   },
+   "size": 1812,
+   "src": "平地三V3.SAV",
+   "votes": 69
+  },
+  "BRUTE": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 416,
+    "0x51C": 20
+   },
+   "size": 1812,
+   "src": "有空地.SAV",
+   "votes": 3
+  },
+  "CLEG": {
+   "class": "infantry",
+   "comp_guid": "4727584a3998d111b70900a024ddafd1",
+   "comp_size": 97,
+   "loco": "Chrono",
+   "params": {
+    "0x270": 1248,
+    "0x51C": 20
+   },
+   "size": 1812,
+   "src": "有空地.SAV",
+   "votes": 68
+  },
+  "CMIN": {
+   "class": "vehicle",
+   "comp_guid": "4727584a3998d111b70900a024ddafd1",
+   "comp_size": 97,
+   "loco": "Chrono",
+   "params": {
+    "0x270": 416,
+    "0x51C": 0,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 19840,
+    "0x94C": 42880,
+    "0x954": 50331648,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "_修改_修改.SAV",
+   "votes": 1
+  },
+  "DESO": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 1248,
+    "0x51C": 20
+   },
+   "size": 1812,
+   "src": "有空地.SAV",
+   "votes": 21
+  },
+  "DISK": {
+   "class": "vehicle",
+   "comp_guid": "462c61921ff7d111ac9f006008055bb5",
+   "comp_size": 173,
+   "loco": "Fly",
+   "params": {
+    "0x270": 1248,
+    "0x51C": 20,
+    "0x940": 16,
+    "0x944": 1090519040,
+    "0x948": 1097859072,
+    "0x94C": 750,
+    "0x954": 1036831949,
+    "0x958": 15
+   },
+   "size": 2316,
+   "src": "_修改_修改.SAV",
+   "votes": 101
+  },
+  "DOG": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 0,
+    "0x51C": 20
+   },
+   "size": 1812,
+   "src": "有空地.SAV",
+   "votes": 3
+  },
+  "DRON": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 25,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 2
+  },
+  "DTRUCK": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 0,
+    "0x51C": 50,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "平地三V3.SAV",
+   "votes": 1
+  },
+  "E1": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 832,
+    "0x51C": 0
+   },
+   "size": 1812,
+   "src": "有空地.SAV",
+   "votes": 435
+  },
+  "E2": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 0,
+    "0x51C": 5
+   },
+   "size": 1812,
+   "src": "放V3和ZEP.SAV",
+   "votes": 19
+  },
+  "FLAKT": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 416,
+    "0x51C": 5
+   },
+   "size": 1812,
+   "src": "有空地.SAV",
+   "votes": 3
+  },
+  "FV": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 10,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "平地三V3.SAV",
+   "votes": 52
+  },
+  "GGI": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 832,
+    "0x51C": 10
+   },
+   "size": 1812,
+   "src": "有空地.SAV",
+   "votes": 491
+  },
+  "GHOST": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 1248,
+    "0x51C": 25
+   },
+   "size": 1812,
+   "src": "平地三V3.SAV",
+   "votes": 1
+  },
+  "HOWI": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 15,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "平地三V3.SAV",
+   "votes": 17
+  },
+  "HOWIH": {
+   "class": "vehicle",
+   "comp_guid": "4227584a3998d111b70900a024ddafd1",
+   "comp_size": 140,
+   "loco": "Hover",
+   "params": {
+    "0x270": 832,
+    "0x51C": 15,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 0,
+    "0x94C": 0,
+    "0x954": 4259840,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "平地三V3.SAV",
+   "votes": 35
+  },
+  "HTK": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 10,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 35
+  },
+  "HTNK": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 40,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1691316,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 27
+  },
+  "INIT": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 416,
+    "0x51C": 5
+   },
+   "size": 1812,
+   "src": "平地三V3.SAV",
+   "votes": 1
+  },
+  "IVAN": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 0,
+    "0x51C": 15
+   },
+   "size": 1812,
+   "src": "平地三V3.SAV",
+   "votes": 1
+  },
+  "JUMPJET": {
+   "class": "infantry",
+   "comp_guid": "462c61921ff7d111ac9f006008055bb5",
+   "comp_size": 173,
+   "loco": "Fly",
+   "params": {
+    "0x270": 416,
+    "0x51C": 15
+   },
+   "size": 1812,
+   "src": "有空地.SAV",
+   "votes": 30
+  },
+  "LTNK": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 40,
+    "0x940": 0,
+    "0x944": 150,
+    "0x948": 1691316,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 3
+  },
+  "MGTK": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 416,
+    "0x51C": 15,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 12
+  },
+  "MIND": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 40,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 41
+  },
+  "MTNK": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 416,
+    "0x51C": 15,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 13
+  },
+  "PTROOP": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 832,
+    "0x51C": 25
+   },
+   "size": 1812,
+   "src": "平地三V3.SAV",
+   "votes": 11
+  },
+  "ROBO": {
+   "class": "vehicle",
+   "comp_guid": "4227584a3998d111b70900a024ddafd1",
+   "comp_size": 140,
+   "loco": "Hover",
+   "params": {
+    "0x270": 505,
+    "0x51C": 15,
+    "0x940": 416,
+    "0x944": 0,
+    "0x948": 0,
+    "0x94C": 416,
+    "0x954": 65282,
+    "0x958": 1238
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 3
+  },
+  "SCHP": {
+   "class": "vehicle",
+   "comp_guid": "462c61921ff7d111ac9f006008055bb5",
+   "comp_size": 173,
+   "loco": "Fly",
+   "params": {
+    "0x270": 832,
+    "0x51C": 0,
+    "0x940": 30,
+    "0x944": 1092616192,
+    "0x948": 1109393408,
+    "0x94C": 500,
+    "0x954": 1008981770,
+    "0x958": 1
+   },
+   "size": 2316,
+   "src": "T73_最终验收_基洛夫与武直.SAV",
+   "votes": 68
+  },
+  "SHK": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 1248,
+    "0x51C": 20
+   },
+   "size": 1812,
+   "src": "平地三V3.SAV",
+   "votes": 20
+  },
+  "SNIPE": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 832,
+    "0x51C": 10
+   },
+   "size": 1812,
+   "src": "有空地.SAV",
+   "votes": 29
+  },
+  "SREF": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 40,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 157
+  },
+  "TANY": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 0,
+    "0x51C": 15
+   },
+   "size": 1812,
+   "src": "T52_单放_TANY.SAV",
+   "votes": 1
+  },
+  "TELE": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 40,
+    "0x940": 0,
+    "0x944": 225,
+    "0x948": 1691316,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 21
+  },
+  "TELE33": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 1248,
+    "0x51C": 40,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "平地三V3.SAV",
+   "votes": 35
+  },
+  "TNKD": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 15,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 10
+  },
+  "TTNK": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 832,
+    "0x51C": 40,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 4
+  },
+  "V3": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 312,
+    "0x51C": 25,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "平地三V3.SAV",
+   "votes": 3
+  },
+  "VIRUS": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 832,
+    "0x51C": 10
+   },
+   "size": 1812,
+   "src": "平地三V3.SAV",
+   "votes": 17
+  },
+  "YADOG": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 416,
+    "0x51C": 20
+   },
+   "size": 1812,
+   "src": "平地三V3.SAV",
+   "votes": 2
+  },
+  "YDOG": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 0,
+    "0x51C": 20
+   },
+   "size": 1812,
+   "src": "T57_ZEP_Fly对照_40_180.SAV",
+   "votes": 4
+  },
+  "YTNK": {
+   "class": "vehicle",
+   "comp_guid": "4127584a3998d111b70900a024ddafd1",
+   "comp_size": 133,
+   "loco": "Drive",
+   "params": {
+    "0x270": 416,
+    "0x51C": 40,
+    "0x940": 0,
+    "0x944": 0,
+    "0x948": 1690748,
+    "0x94C": 0,
+    "0x954": 0,
+    "0x958": 0
+   },
+   "size": 2316,
+   "src": "有空地.SAV",
+   "votes": 17
+  },
+  "YURI": {
+   "class": "infantry",
+   "comp_guid": "4427584a3998d111b70900a024ddafd1",
+   "comp_size": 81,
+   "loco": "Walk",
+   "params": {
+    "0x270": 832,
+    "0x51C": 15
+   },
+   "size": 1812,
+   "src": "有空地.SAV",
+   "votes": 96
+  },
+  "ZEP": {
+   "class": "vehicle",
+   "comp_guid": "462c61921ff7d111ac9f006008055bb5",
+   "comp_size": 173,
+   "loco": "Fly",
+   "params": {
+    "0x270": 1248,
+    "0x51C": 30,
+    "0x940": 5,
+    "0x944": 1086324736,
+    "0x948": 1094713344,
+    "0x94C": 750,
+    "0x954": 1041865114,
+    "0x958": 40
+   },
+   "size": 2316,
+   "src": "_修改_修改.SAV",
+   "votes": 29
+  }
+ },
+ "version": 1
+}

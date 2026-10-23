@@ -77,8 +77,11 @@ ck('它已从"无节点"名单里消失',
 ck('重复调用只补一次', d2.ensure_attach_node(SID)['created'] is False, '')
 
 # ---- 挂一栋建筑 + 落盘往返 ----
-y = [b for b in d2.buildings() if b['type'].upper() == 'YACOMD']
-ck('档里有 YACOMD 可挂', bool(y), str([(b['x'], b['y']) for b in y][:2]))
+# ★样本档可能已被上一次运行挂过（tag != 0）⇒ 只挑**还没挂接**的建筑
+y = [b for b in d2.buildings() if b['type'].upper() == 'YACOMD' and not b['tag']]
+if not y:
+    y = [b for b in d2.buildings() if not b['tag']]
+ck('档里有可挂的建筑', bool(y), str([(b['type'], b['x'], b['y']) for b in y][:2]))
 if y and ov:
     d2.attach_trigger_to_building(ov[0]['node'], y[0]['base'])
     nb = [b for b in d2.buildings() if b['base'] == y[0]['base']][0]

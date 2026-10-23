@@ -107,10 +107,15 @@ a = bytes(pl[old['off']:old['off'] + old['size'] + old['comp_size']])
 b = bytes(pl[new['off']:new['off'] + new['size'] + new['comp_size']])
 diff = [o for o in range(0, len(a) - 3, 4) if a[o:o + 4] != b[o:o + 4]]
 ck('与真基洛夫逐 dword 差异 ≤ 20（实际 %d）' % len(diff), len(diff) <= 20, str(len(diff)))
-ck('★高度槽 +0xB8 未被带歪（按模板原值）', a[0xB8:0xBC] == b[0xB8:0xBC],
-   '%s vs %s' % (a[0xB8:0xBC][::-1].hex(), b[0xB8:0xBC][::-1].hex()))
-ck('★高度槽 +0x270 未被带歪', a[0x270:0x274] == b[0x270:0x274],
+# ★§212 起：空中单位的"当前高度 +0xB8"会被设成"类型高度 +0x270"（起在巡航高度，不卡地上）
+ck('★类型高度 +0x270 与模板一致', a[0x270:0x274] == b[0x270:0x274],
    '%s vs %s' % (a[0x270:0x274][::-1].hex(), b[0x270:0x274][::-1].hex()))
+ck('★空中单位当前高度 = 类型高度（不卡地上）', b[0xB8:0xBC] == b[0x270:0x274],
+   '%s vs %s' % (b[0xB8:0xBC][::-1].hex(), b[0x270:0x274][::-1].hex()))
+ck('★指令/目的地已清 0（不带攻击目标）',
+   struct.unpack_from('<I', b, 0x198)[0] == 0
+   and struct.unpack_from('<I', b, 0x658)[0] == 0
+   and struct.unpack_from('<I', b, 0x680)[0] == 0, '')
 ck('血量 = 真基洛夫的满血值', a[0x80:0x84] == b[0x80:0x84] and a[0x84:0x88] == b[0x84:0x88],
    '%d' % struct.unpack_from('<I', b, 0x80)[0])
 ck('不报"派生子单位"（ZEP 没有 SPAWNS）', d._type_spawns('ZEP') == '',

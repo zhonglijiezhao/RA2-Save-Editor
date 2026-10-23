@@ -3403,6 +3403,13 @@ class App(tk.Tk):
         self.mv_u_vet.pack(side='left')
         ttk.Button(rowu, text='🪖 放单位到选中格',
                    command=self.mv_putunit).pack(side='left', padx=6)
+        # ★§216：单位模板库（学习 / 查看），跨型号放置不再依赖"手边得有一份含该型号的存档"
+        ttk.Button(rowu, text='🔫 刷单位(小队法)',
+                   command=self.mv_spawn_team).pack(side='left', padx=6)
+        ttk.Button(rowu, text='📚 学习模板',
+                   command=self.mv_learn_sig).pack(side='left', padx=6)
+        ttk.Button(rowu, text='模板库…',
+                   command=self.mv_show_sig).pack(side='left')
         self.mv_urule = ttk.Label(rowu, text='', foreground='#6b7280')
         self.mv_urule.pack(side='left', padx=6)
         ttk.Button(rowu, text='规则目录…',
@@ -4176,6 +4183,143 @@ class App(tk.Tk):
         else:
             self.mv_info.config(text='型号 %s：规则里没有这一项（可能是地图自带的自制单位）' % t)
 
+    def mv_spawn_team(self):
+        """🔫 刷单位（小队法）：特遣部队 + 作战小队 + 触发「任何事件 + 80 援军@路径点」。
+
+        ★§217：这是**让引擎自己造单位**，所以带 `SPAWNS=` 的 V3/无畏/航母也能正常刷出来
+          （手写单位记录那条路对它们是走不通的，§209）。
+        脚本按你说的留空（写 0）——只刷单位，不需要动作脚本。
+        """
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        st = getattr(self, 'mv_state', None) or {}
+        sel = st.get('sel')
+        if not sel or sel[0] is None:
+            messagebox.showwarning('提示', '请先在右侧地图上**点一个格子**作为刷兵位置')
+            return
+        cur = self.mv_unit.get() if hasattr(self, 'mv_unit') else ''
+        if not cur:
+            messagebox.showwarning('提示', '请先在上面选一个单位类型')
+            return
+        tname = cur.split('（')[0].strip().upper()
+        n = simpledialog.askinteger('刷几个？', '要刷几个 %s？' % tname,
+                                    initialvalue=4, minvalue=1, maxvalue=60,
+                                    parent=self)
+        if not n:
+            return
+        use_script = messagebox.askyesno(
+            '动作脚本',
+            '小队要不要挂"动作脚本"？\n\n'
+            '【否】（推荐）脚本留空 ⇒ 单位**原地待命**，不会自己跑去打别人。\n'
+            '【是】沿用模板小队的脚本（可能会自己行动）。')
+        try:
+            r = self.doc.spawn_units_by_trigger(
+                tname, int(n), cell=(sel[0], sel[1]),
+                trigger_name=('刷%s%d' % (tname, n))[:16],
+                max_teams=1,
+                script_key=None if use_script else 0)
+        except Exception as e:
+            self.status.set('刷兵失败')
+            messagebox.showerror('刷兵失败', str(e))
+            return
+        self.status.set('已刷 %d 个 %s @(%d,%d)：特遣 %s / 小队 %s / 触发 %s（路径点 %s）'
+                        % (n, tname, sel[0], sel[1], r['tf']['sid'], r['team']['sid'],
+                           r['trigger_id'], r['waypoint']))
+        messagebox.showinfo(
+            '刷兵已写入',
+            '类型：%s × %d\n位置：(%d,%d) → 路径点 %s\n\n'
+            '特遣部队：%s（单位 %s）\n作战小队：%s（脚本 %s）\n触发器：%s（事件「任何事件」+ 行为 80）\n\n'
+            '⭐ 请**另存为**新文件再进游戏验证：读档后单位应出现在该格附近。'
+            % (tname, n, sel[0], sel[1], r['waypoint'],
+               r['tf']['sid'], r['tf']['units'],
+               r['team']['sid'], '空（待命）' if not use_script else '沿用模板',
+               r['trigger_id']))
+
+    def mv_learn_sig(self):
+        """📚 学习模板：从一份（或多份）存档里学出"每型号的移动方式 + 8 个机体参数"。
+
+        ★§216：为什么学"数值"而不是把整条记录内置进程序？
+          · 整条记录 2316+173 字节，且里面大量是对象指针/键，换一份档就失效；
+          · 实测跨型号放置真正需要的只有 ~40 字节（`+0x270/+0x51C/+0x940..+0x958`）；
+          · 从**你自己的存档**里学，就没有版权问题，也不会因为游戏版本/Mod 变了而错配。
+        """
+        from editor_core import signature_cache_path
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        ans = messagebox.askyesno(
+            '学习单位模板',
+            '从存档里学习"每个型号的移动方式 + 8 个机体参数"，存进模板库。\n\n'
+            '建议选一份**单位种类多、而且该型号确实在场上**的存档（越大越准）。\n\n'
+            '选「是」→ 挑一份存档；选「否」→ 直接用当前打开的这一份。')
+        path = self.doc.path
+        if ans:
+            path = filedialog.askopenfilename(
+                title='选择要学习的存档',
+                filetypes=[('存档', '*.SAV *.sav'), ('全部', '*.*')],
+                initialdir=os.path.dirname(self.doc.path))
+            if not path:
+                return
+        try:
+            from editor_core import SaveDoc as _SD
+            d = self.doc if os.path.abspath(path) == os.path.abspath(self.doc.path) else _SD(path)
+            got = d.learn_unit_signatures()
+            self.doc._sigcache = None
+            self.status.set('已从 %s 学到 %d 个型号 → %s'
+                            % (os.path.basename(path), len(got), signature_cache_path()))
+            messagebox.showinfo(
+                '学习完成',
+                '从「%s」学到 **%d 个型号**的签名。\n\n'
+                '模板库位置：\n%s\n\n'
+                '以后在**没有该型号**的存档里放单位，会优先用模板库直接写入，'
+                '不必再找参考存档。' % (os.path.basename(path), len(got), signature_cache_path()))
+        except Exception as e:
+            messagebox.showerror('学习失败', str(e))
+
+    def mv_show_sig(self):
+        """查看模板库里已有的型号（只读）。"""
+        from editor_core import load_signature_cache, signature_cache_path
+        c = load_signature_cache()
+        ts = c.get('types') or {}
+        dlg = tk.Toplevel(self)
+        dlg.title('单位模板库（%d 个型号）' % len(ts))
+        dlg.geometry('760x460')
+        dlg.transient(self)
+        ttk.Label(dlg, text='文件：%s' % signature_cache_path(),
+                  foreground='#6b7280').pack(anchor='w', padx=8, pady=(8, 2))
+        cols = ('t', 'loco', 'cls', 'votes', 'p270', 'p51c', 'p940', 'p948', 'src')
+        tv = ttk.Treeview(dlg, columns=cols, show='headings')
+        for col, txt, w in (('t', '型号', 90), ('loco', '移动方式', 80), ('cls', '类别', 80),
+                            ('votes', '样本数', 60), ('p270', '0x270', 70), ('p51c', '0x51C', 60),
+                            ('p940', '0x940', 60), ('p948', '0x948(f)', 80), ('src', '来自', 200)):
+            tv.heading(col, text=txt)
+            tv.column(col, width=w, anchor='w')
+        tv.pack(fill='both', expand=True, padx=8, pady=4)
+        for t in sorted(ts):
+            sg = ts[t]
+            p = sg.get('params') or {}
+
+            def g(k):
+                return p.get(k, '')
+
+            def fv(k):
+                v = p.get(k)
+                if v is None:
+                    return ''
+                try:
+                    return '%.3g' % struct.unpack('<f', struct.pack('<I', v))[0]
+                except Exception:
+                    return ''
+
+            tv.insert('', 'end', values=(t, sg.get('loco') or '', sg.get('class') or '',
+                                         sg.get('votes') or '', g('0x270'), g('0x51C'),
+                                         g('0x940'), fv('0x948'), sg.get('src') or ''))
+        ttk.Button(dlg, text='关闭', command=dlg.destroy).pack(pady=6)
+        if not ts:
+            messagebox.showinfo('模板库是空的',
+                                '还没有学到任何型号。点「📚 学习模板」，选一份含单位的存档。')
+
     def mv_putunit(self):
         """地图页：把选中类型的单位**克隆放置**到点选的格子（同类型克隆，U2 已验收）。"""
         if not self.doc:
@@ -4224,8 +4368,46 @@ class App(tk.Tk):
                            ('，等级 %s' % _vl) if vet is not None else ''))
         self.update_idletasks()
         try:
-            info = self.doc.add_unit_by_clone(tname, sel[0], sel[1],
-                                              house=house, veterancy=vet)
+            try:
+                _has = any(r['type'].upper() == tname.upper() for r in self.doc.unit_records())
+            except Exception:
+                _has = True
+            info = None
+            if not _has:
+                # ★§216（玩家提议："是不是应该内置一份单位模板，直接可以写入"）：
+                #   优先级改成 **模板库 → 参考存档 → 硬克隆**。
+                #   模板库只要每型号 ~40 字节（移动方式 + 8 个机体参数），
+                #   不用你每次去找一份含该型号的存档。
+                _sig = None
+                try:
+                    _sig = self.doc.unit_signature(tname)
+                except Exception:
+                    _sig = None
+                if _sig:
+                    info = self.doc.add_unit_by_signature(tname, sel[0], sel[1],
+                                                         house=house, veterancy=vet)
+                    self.status.set('已用「模板库」写入 %s @(%d,%d)（样本 %s 票，参数 %d 个）'
+                                    % (tname, sel[0], sel[1], _sig.get('votes'),
+                                       info.get('params_applied') or 0))
+                elif messagebox.askyesno(
+                        '本档没有这个型号，模板库里也没有',
+                        '这份存档里没有 %s 的真机，模板库里也没有它的签名。\n\n'
+                        '要不要从**含该型号的存档**里导入一台真机记录（只换身份/坐标/所属方）？\n'
+                        '导入时会把该型号的签名一起学进模板库，以后就不必再选了。\n\n'
+                        '选「是」→ 挑一份参考存档；选「否」→ 仍然用克隆法硬放（载具可能"卡在地上"）。'
+                        % tname):
+                    _ref = filedialog.askopenfilename(
+                        title='选择含 %s 的参考存档' % tname,
+                        filetypes=[('存档', '*.SAV *.sav'), ('全部', '*.*')],
+                        initialdir=os.path.dirname(self.doc.path))
+                    if _ref:
+                        info = self.doc.import_unit_from(_ref, tname, sel[0], sel[1],
+                                                         house=house, veterancy=vet)
+                        self.status.set('已用「直接写入法」从 %s 导入 %s @(%d,%d)'
+                                        % (os.path.basename(_ref), tname, sel[0], sel[1]))
+            if info is None:
+                info = self.doc.add_unit_by_clone(tname, sel[0], sel[1],
+                                                  house=house, veterancy=vet)
         except Exception as e:
             self.status.set('放置单位失败')
             messagebox.showerror('放置单位失败', str(e))
@@ -4236,13 +4418,37 @@ class App(tk.Tk):
         _h = info.get('house') or '?'
         _hc = '（改主人：%s → %s）' % (info.get('template_house'), _h) \
             if info.get('house_changed') else '（所属方 %s）' % _h
+        # ★§210：把目标格的地形读数也报出来（水/悬崖是放置失败的头号盲区）
+        try:
+            _t = self.doc.cell_terrain(sel[0], sel[1]) if self.doc else None
+        except Exception:
+            _t = None
+        if _t:
+            _terr = 'tile %d%s' % (_t[0], '' if _t[0] in (self.doc.walkable_tiles() or set()) else '（没被踩过·可疑）')
+        else:
+            _terr = '地图未加载'
         self.mv_info.config(
-            text='✅ 已克隆放置单位 %s @(%d,%d) %s（自键 %#x，等级 %s，移动方式 %s，指针表 %d 张，明文 +%d B）%s'
+            text='✅ 已克隆放置单位 %s @(%d,%d) %s（自键 %#x，等级 %s，移动方式 %s，骨架 %s%s，地形 %s，'
+                 '指针表 %d 张，明文 +%d B）%s'
                  % (tname, sel[0], sel[1], _hc, info['key'],
                     info.get('veterancy_name') or '未定义', info.get('loco') or '未定',
-                    info['tables'], info['delta'],
+                    info.get('scaffold_type') or info.get('template_type') or '?',
+                    '（空闲）' if info.get('scaffold_idle') else '（⚠状态非空闲）',
+                    _terr, info['tables'], info['delta'],
                     ('｜' + '；'.join(_w)) if _w else ''))
         self._gift_log('[放单位] %s @(%d,%d)：%s' % (tname, sel[0], sel[1], info))
+        # ★§215：骨架不是"空闲"状态时明确告警 —— 实测这种骨架会让新单位继承
+        #   "已部署/任务中"（趴在地上，或空中却不能移动、空血不死）。打分已优先挑空闲的，
+        #   这里只是兜底（万一整份档都没有空闲的同类）。
+        if info.get('scaffold_idle') is False:
+            messagebox.showwarning(
+                '骨架状态不理想',
+                '这次用的骨架（%s）**不是空闲状态**（+0x10C/+0x11C/+0x120 有非 0 值）。\n\n'
+                '实测后果：新单位可能一出现就是"已部署/趴在地上"，或者"在空中却不能移动、'
+                '空血只爆一次不死"。\n\n'
+                '这份存档里没有空闲状态的同类单位（正常档一般都有）。建议换一份存档，'
+                '或先在游戏里让那个单位解除部署/结束任务，再存一次档。'
+                % (info.get('scaffold_type') or info.get('template_type') or '?'))
         base = os.path.splitext(os.path.basename(self.doc.path))[0]
         p = filedialog.asksaveasfilename(
             title='放置结果另存为', defaultextension='.SAV',
