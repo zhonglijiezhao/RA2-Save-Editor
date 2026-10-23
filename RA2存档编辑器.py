@@ -5991,6 +5991,14 @@ class App(tk.Tk):
             L.append('  标志：' + '　'.join('%s=%s' % (k, '是' if v else '否')
                                           for k, v in t['flags'].items()))
             L.append('  明文偏移 +%#x（只读）' % t['off'])
+            # ★§225：挂着"非地图定义"的脚本时给一行说明 —— 本图地图的
+            #   [ScriptTypes] 只有 ID 索引列表，地编/第三方工具对这类脚本常显示 None，
+            #   但存档指针有效、引擎读档后照常执行（别被"None"误导）。
+            if t.get('script_id'):
+                _sc = self._ai_scripts.get(t['script_id'])
+                if _sc is not None and not _sc.get('is_map', True):
+                    L.append('  ⚠ 动作脚本 %s 不是地图定义的（引擎生成/经典脚本）—— '
+                             '地编里可能显示 None，但引擎会照常执行它' % _sc['id'])
         tf = self._ai_tfs.get(tf_id)
         if tf:
             L.append('')
