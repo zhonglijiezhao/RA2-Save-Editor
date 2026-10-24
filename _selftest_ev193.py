@@ -12,6 +12,7 @@
   5. 落盘再读回来，结构与顺序都还在（不信内存自证）
 """
 import os
+import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +49,7 @@ def ac_types(doc, sid):
 print('=== 准备：造一条 2 事件 + 2 行为的触发 ===')
 d = ec.SaveDoc(SAV)
 SID = '01000292'
-r = d.create_trigger_multi('T193排序删除测试', [(13, 2), (13, 5)], [(56, 0)])
+r = d.create_trigger_multi('T193排序删除测试', [(13, 2), (13, 5)], [(56, 0), (21, 0)])
 SID = r['trigger_id']
 print('  新触发 %s，事件 %s，行为 %s'
       % (SID, ev_types(d, SID), ac_types(d, SID)))
@@ -142,17 +143,25 @@ base_cov = sum(v['count'] for v in d5._action_runs().values())
 base_acts = [(a['type'], a['ordinal']) for a in d5.trigger_actions(S5)]
 n_before = len(d5.plain)
 size_ev = d5._obj_size('ev', S5)
-d5.add_event(S5, 13, 7)
+r_ev = d5.add_event(S5, 13, 7)
 ck('加事件：长度 + 一个事件对象（%d B）' % size_ev,
    len(d5.plain) == n_before + size_ev, '%d' % (len(d5.plain) - n_before))
 ck('加事件：全档事件数 +1', len(d5.events()) == base_ev + 1)
 ck('加事件：新事件接在链尾（参数 7 在最后）',
    [e['arg'] for e in d5.trigger_event_list(S5)][-1] == 7,
    str([e['arg'] for e in d5.trigger_event_list(S5)]))
+# ★§219 护栏（2026-10-24 补）：事件 `+0x38`(=+56) 必须是**事件表内物理序号**，
+#   全档连续唯一；写成"触发序号"会与旧事件撞号 ⇒ 引擎定位到别人的对象。
+_ords = [struct.unpack_from('<I', d5.plain, e['obj'] + 56)[0] for e in d5.events()]
+ck('加事件：新事件 +0x38 = 表内 max+1',
+   struct.unpack_from('<I', d5.plain, r_ev['obj'] + 56)[0] == max(_ords),
+   '%d / max %d' % (struct.unpack_from('<I', d5.plain, r_ev['obj'] + 56)[0], max(_ords)))
+ck('加事件：+0x38 全档唯一（没撞号）', len(set(_ords)) == len(_ords),
+   '唯一 %d / 共 %d' % (len(set(_ords)), len(_ords)))
 try:
     d5.add_event(S5, 0, 0)
     ck('事件类型 0 被拒绝', False, '没有抛错')
-except RuntimeError:
+except (RuntimeError, ValueError):
     ck('事件类型 0 被拒绝', True)
 
 d5.add_action(S5, 80, 3)

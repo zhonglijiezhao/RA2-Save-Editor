@@ -12,7 +12,7 @@
     doc.actions() / set_action(ac, atype=, arg=)   # 行为（对象签名定位）
     doc.save(out_path)           # 重编码 + CFB 重建落盘
 """
-import sys, os, re, struct, hashlib, datetime, shutil, json, bisect, base64
+import sys, os, re, struct, hashlib, datetime, shutil, json, bisect, base64, collections
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -88,7 +88,8 @@ SCENARIO_EXTS = ('.map', '.mmx', '.yrm', '.mpr')
 
 # ---- §181 ★★★★★「纯电平查询」事件必须挂计时心跳（T10 定案，2026-10-22）----
 # 机制（工具里早就写着、但直到 T10 才在局部变量上闭环验证）：
-#   create_trigger: `ticks = ev_arg * LOGIC_FPS if ev_type == 13 else 0`
+#   create_trigger: `ticks = ev_arg*LOGIC_FPS if ev_type==13 else (15 if ev_type==8 else 0)`
+#     （2026-10-24 玩家定案：事件 8「任何事件」帧数**必须 15**；写 0 肯定不评估）
 #   `ticks > 0` 才把 CellTag 自键**登记进「定时触发器挂接表」**
 #   ⇒ 表外的触发**读档后没有人驱动**，只有靠"对象/标签回调"才会被评估。
 # 事件分两类：
@@ -813,10 +814,14 @@ def save_signature_cache(cache, path=None):
 
 
 def read_isomap(map_path):
-    """解一个 `.MAP` 的 `[IsoMapPack5]` → { (x,y): (tile, sub, z, icr) }；失败返回 {}。
+    """解一个 `.MAP` 的 `[IsoMapPack5]` → { (x,y): (tile, sub, z, level) }；失败返回 {}。
 
     ★2026-10-23 §210：坐标口径与存档的**格对象同一个空间**（实测地图 42449 格全部落在
       存档 43080 个格对象里）⇒ 可以直接拿存档 (x,y) 查地形，不需要任何坐标转换。
+    ★★2026-10-24 §229/§230（实测 ALL01UMD.MAP 42449 格）：元组第 4 个值是**层高**，
+      不是 icr —— `sub`/`z` 在该图里恒为 0，而第 4 个值分布 0..27（72.3% 是 0=地面），
+      且桥面/引桥一路递增（引桥 1..5、桥面 4..15）⇒ 跨层上不了桥/上不了车。
+      **查"单位为什么上不了车/走不过去"时先看这一列。**
     """
     import base64
     import re as _re
@@ -1681,6 +1686,9 @@ class SaveDoc(object):
         self._tagrecs = None
         self._ctimerlist = None
         self._navmemo = None
+        # ★§256：挂接总览 / House 块也按偏移缓存，插入后必须作废
+        self._attov = None
+        self._hblocks = None
 
     def _objects(self):
         self._invalidate_if_shifted()
@@ -3573,13 +3581,32 @@ class SaveDoc(object):
         self.pending_events[ev['off']] = (ev['type'], ev['arg'])
         return ev
 
-    def set_action(self, ac, atype=None, arg=None):
-        """改一条行为的类型 / 参数
+    def set_action(self, ac, atype=None, arg=None, team=None, waypoint=None):
+        """改一条行为的类型 / 参数（**行为 80/107 还能改小队与路径点**）
+
+        `ac` 需要带偏移，两种写法都认（§255 修正）：
+          · `{'off': …}`      —— **类型字段**的位置（= 行为对象起点 + `0x40`），老口径；
+          · `{'action_off': …}` —— **行为对象起点**（`trigger_actions()` 的返回），
+            这里自动 `+0x40` 换成类型字段位置。
+        ⚠ 旧代码直接拿 `ac['off']` 当"类型字段"，把 `action_off`（对象起点）传进来会
+          **写到对象头（CLSID/自键）上**，看起来改成功了，保存后那条行为就"消失"了
+          （`_action_runs()` 找不到它）—— 2026-10-24 就是这样把档写坏的。
+
+        `team` / `waypoint`：援军 / 超时空援军的小队键在对象 **`+0x44`**、路径点在 **`+0x58`**
+        （§218 实证；`+0x48` 不是小队键）。因为 `off` 是"类型字段"，所以：
+          小队 = `off + 4`，路径点 = `off + 0x18`。
 
         ⚠ 同样**禁止改成 0（`-无行为-`）**：地编里是占位项，写成它没有用处只会冒险。
         """
-        if not (0 <= ac['off'] and ac['off'] + 12 <= len(self.plain)):
+        off = ac.get('off')
+        if off is None and ac.get('action_off') is not None:
+            off = int(ac['action_off']) + OBJ_TYPE_OFF
+        if off is None:
+            raise RuntimeError('这条行为没带偏移信息（需要 off 或 action_off）')
+        off = int(off)
+        if not (0 <= off and off + 12 <= len(self.plain)):
             raise RuntimeError('行为偏移越界')
+        ac['off'] = off
         if atype is not None:
             atype = int(atype)
             if atype == 0:
@@ -3589,7 +3616,7 @@ class SaveDoc(object):
                     '要取消一个行为，请在地编里删掉它（存档里数组长度固定）。')
             if atype not in ACTION_TYPES:
                 raise ValueError('未知行为类型 %d' % atype)
-            self.plain[ac['off']:ac['off'] + 4] = atype.to_bytes(4, 'little')
+            self.plain[off:off + 4] = atype.to_bytes(4, 'little')
             ac['type'] = atype
             ac['name'] = action_name(atype)
             ac['ptype'] = action_ptype(atype)
@@ -3597,10 +3624,17 @@ class SaveDoc(object):
             arg = int(arg)
             if not (0 <= arg <= 0xFFFFFF):
                 raise ValueError('参数需在 0 ~ 16777215 之间')
-            self.plain[ac['off'] + 8:ac['off'] + 12] = arg.to_bytes(4, 'little')
+            self.plain[off + 8:off + 12] = arg.to_bytes(4, 'little')
             ac['arg'] = arg
+        # ★§255：行为 80/107 的「小队键」（对象 +0x44 = off+4）与「路径点」（对象 +0x58 = off+0x18）
+        if team is not None:
+            self.plain[off + 4:off + 8] = (int(team) & 0xFFFFFFFF).to_bytes(4, 'little')
+            ac['team'] = int(team) & 0xFFFFFFFF
+        if waypoint is not None:
+            self.plain[off + 0x18:off + 0x1C] = (int(waypoint) & 0xFFFFFFFF).to_bytes(4, 'little')
+            ac['waypoint'] = int(waypoint) & 0xFFFFFFFF
         ac['arg_text'] = self._arg_text(ac['ptype'], ac['arg'])
-        self.pending_actions[ac['off']] = (ac['type'], ac['arg'])
+        self.pending_actions[off] = (ac['type'], ac['arg'])
         return ac
 
     # ---------- 记录 ----------
@@ -4397,7 +4431,18 @@ class SaveDoc(object):
         好处：**未挂接任何建筑的 CellTag 也能报出它属于哪个触发**（新建的触发
         挂接数为 0 时依然可选中并挂到建筑上）；建筑列表仍按 X 在全档的出现点
         （+104/+108 像素坐标）反查，命中地图 [Structures] 时补类型。
+
+        ★★§256 性能（玩家 2026-10-25：「触发编辑器每点一个操作都会小卡一下」）：
+          本函数对**每个** CellTag 节点都做一次全档 `find`（本档 200 个节点 × 28MB
+          ≈ 5.7 万次 find / 1.7 秒）。而 `trigger_detail()` 每次都要调它
+          ⇒ 编辑器里改个名字都要卡好几秒。
+          现在按 `(明文长度, 触发名指纹)` 缓存整张表；`_invalidate_if_shifted()`
+          会清掉它（插入/删除对象后长度变）。
         """
+        _key = self._attach_ov_key()
+        _c = getattr(self, '_attov', None)
+        if _c is not None and _c[0] == _key:
+            return _c[1]
         pl = self.plain          # ★ 工作副本
         m = getattr(self, '_map', None)
         smap = {(s['x'], s['y']): s for s in (m.structures() if m else [])}
@@ -4525,6 +4570,7 @@ class SaveDoc(object):
                         'trigger_name': names.get(tid, '') if tid else '',
                         'buildings': blds})
         out.sort(key=lambda d: (-len(d['buildings']), d['node']))
+        self._attov = (_key, out)
         return out
 
     def attach_orphan_tags(self):
@@ -4767,7 +4813,8 @@ class SaveDoc(object):
             self._sigcache = c
         return (c.get('types') or {}).get(str(t).upper())
 
-    def add_unit_by_signature(self, t, cx, cy, house=None, veterancy=None, params=True):
+    def add_unit_by_signature(self, t, cx, cy, house=None, veterancy=None, params=True,
+                              auto_nudge=False):
         """**用模板库直接写入**：档里没有该型号、也没有参考存档时，靠签名表放置。
 
         与 `import_unit_from()` 的区别：那边要一份"含真机的存档"抄内容；
@@ -4781,7 +4828,8 @@ class SaveDoc(object):
                 '① 在「放置单位」页点「📚 学习模板」，选一份**含该型号**的存档；\n'
                 '② 或者直接选一份含该型号的参考存档导入（直接写入法）。' % t)
         # 脚手架：档内有同型号就同型号克隆；没有就按签名里的移动方式借同类骨架
-        info = self.add_unit_by_clone(t, cx, cy, house=house, veterancy=veterancy)
+        info = self.add_unit_by_clone(t, cx, cy, house=house, veterancy=veterancy,
+                                      auto_nudge=auto_nudge)
         rec = [r for r in self.unit_records() if r['key'] == info['key']][0]
         n = 0
         if params:
@@ -4819,7 +4867,7 @@ class SaveDoc(object):
     #   │                 +0xB0 单位**种类数** / 从 +0xB8 起每 8B 一组「数量, 类型键」×6
     #   ├ Team      268B：+0x10 键 / +0x38 ID / +0x78 名称 / +0xAC **组内下标**
     #   │                 +0xC8 优先级 / +0xCC 最大同时存在 / +0xD8 国家(所属方键)
-    #   │                 +0xF0 星级 / +0xF4 脚本键 / +0xF8 **特遣部队键**
+    #   │                 **+0xB4 星级**（§252.17 对账地编定案）/ +0xF4 脚本键 / +0xF8 **特遣部队键**
     #   └ 行为 80：+0x40=80 / **+0x44 = 小队键**（不是工具默认的 +0x48！）/ +0x58 = 路径点
     #
     #   ★"任何事件"(事件 8) 型触发**不需要 CellTag 节点**：实测 47 条 80 行为里，
@@ -4830,6 +4878,24 @@ class SaveDoc(object):
     TF_SIZE = 232
     TEAM_SIZE = 268
     SCRIPT_SIZE = 584          # §222 实测：相邻 ScriptType 对象差全是 584
+
+    # ★§254（p201）：特遣/小队有两类来源，靠 **ID 格式**区分（T85 实测 100%/100% 互不混）
+    #   · **地图定义**（地编里能看见、能编辑）：ID 是 `01000000 + 序号`，形如 `01000241`
+    #     —— T85 里 100 个特遣 / 125 个小队属此类，序号 38..1170
+    #   · **AI 运行期生成**（AITrigger 实例化出来的，地编里看不到、改了也没用）：
+    #     ID 是 8 位随机十六进制，形如 `05C60C4C` / `0D082CFC`；名字是「数量 + 单位名」自动拼的
+    #     （"3 GIs, 3 Guards"、"Allied Base Guard - Refine"）
+    #   交叉验证：163 个 AI 小队**全部**只引用 AI 特遣、125 个地图小队**全部**只引用地图特遣，0 例外。
+    #   ⇒ 建小队/看列表时应默认只显示「地图定义」的那批。
+    MAP_SID_RE = re.compile(r'^0100[0-9A-Fa-f]{4}$')
+
+    @classmethod
+    def is_map_sid(cls, sid):
+        """这个 ID 是不是「地图定义」的（地编里可见）？否则 = AI 运行期生成。"""
+        try:
+            return bool(cls.MAP_SID_RE.match(str(sid or '').strip()))
+        except Exception:
+            return False
 
     def _obj_group(self, cls, size, label='对象'):
         """校验 `[count][对象×count]` 连续组 → {'first','count_pos','count','offs'}。
@@ -4868,27 +4934,79 @@ class SaveDoc(object):
             k = (k + 0x1000) & 0xFFFFFFFF
         return k
 
-    def _next_sid(self):
-        """下一个空闲的 8 位十六进制 ID（小队/特遣/触发共用这一套编号）。"""
+    def _next_sid(self, count=1):
+        """下一个（或接下来 `count` 个**连续**）空闲场景对象 ID —— `0100xxxx` 格式。
+
+        ★§254 修两个 bug：
+        1. 旧实现是"全档最大 ID + 1"，而档里存在**引擎 AI 运行期生成**的特遣/小队/脚本，
+           它们的 ID 是 8 位随机十六进制（`0ECCF03C` 这种）。于是我们新建的对象会拿到
+           `0ECCF03D` —— **长得和 AI 生成的一模一样**：地编里看不见、本工具
+           「地图定义」过滤器也会把它隐藏（玩家 2026-10-24 实测：新建的特遣在下拉里找不到）。
+        2. `create_trigger` 自己另有一套取号逻辑（靠 `_ai_ids()` 的**缓存**），
+           而我新建特遣后缓存没刷新 ⇒ 触发拿到同一个 `01000494`，**ID 撞车**。
+           现在两处统一走这里，并且**直接现扫明文**，不读任何缓存。
+
+        实测 T85 里 特遣 39..1170 / 小队 38..1169 / 触发到 `01000494` ⇒ 三类**共享同一序列**。
+        `count>1` 时返回 list（触发要"触发ID + 标签ID"两个连号）。
+        """
         pl = bytes(self.plain)
-        best = 0
-        for cls, sz in ((self.TF_CLS, self.TF_SIZE), (self.TEAM_CLS, self.TEAM_SIZE)):
+        used = set()
+
+        def _take(s):
+            s = str(s or '').strip()
+            if self.MAP_SID_RE.match(s):
+                used.add(int(s[4:], 16))
+
+        for cls, sz in ((self.TF_CLS, self.TF_SIZE), (self.TEAM_CLS, self.TEAM_SIZE),
+                        (self.SCRIPT_CLS, self.SCRIPT_SIZE)):
             try:
                 g = self._obj_group(cls, sz)
             except Exception:
                 continue
             for o in g['offs']:
                 try:
-                    v = int(pl[o + 56:o + 64].decode('latin1'), 16)
+                    _take(pl[o + 56:o + 64].decode('latin1'))
+                except Exception:
+                    pass
+        # 兜底：脚本组校验失败时用解析结果补（宁可多扫一遍，也不能撞号）
+        try:
+            for x in self.script_types():
+                _take(x.get('sid'))
+        except Exception:
+            pass
+        for r in getattr(self, 'records', []):
+            _take(getattr(r, 'sid', ''))
+
+        if not used:
+            # 老档一件 `0100xxxx` 都没有（极罕见）⇒ 退回旧的"全局最大 +1"
+            best = 0
+            for cls, sz in ((self.TF_CLS, self.TF_SIZE), (self.TEAM_CLS, self.TEAM_SIZE)):
+                try:
+                    g = self._obj_group(cls, sz)
                 except Exception:
                     continue
-                best = max(best, v)
-        for r in getattr(self, 'records', []):
-            try:
-                best = max(best, int(str(r.sid), 16))
-            except Exception:
-                continue
-        return '%08X' % (best + 1)
+                for o in g['offs']:
+                    try:
+                        best = max(best, int(pl[o + 56:o + 64].decode('latin1'), 16))
+                    except Exception:
+                        pass
+            for r in getattr(self, 'records', []):
+                try:
+                    best = max(best, int(str(r.sid), 16))
+                except Exception:
+                    pass
+            out = ['%08X' % (best + 1 + i) for i in range(max(1, int(count)))]
+            return out if count > 1 else out[0]
+
+        n = max(1, int(count))
+        got, v = [], max(used) + 1
+        while len(got) < n:
+            if v > 0xFFFF:
+                raise RuntimeError('场景对象编号已用尽（0100FFFF 已存在），无法再新建对象')
+            if v not in used:
+                got.append('0100%04X' % v)
+            v += 1
+        return got if count > 1 else got[0]
 
     def _append_group(self, cls, size, tpl_off, label='对象'):
         """把模板对象复制一份**追加到组尾**，并把组计数 +1 → 新对象偏移。"""
@@ -4899,6 +5017,9 @@ class SaveDoc(object):
         struct.pack_into('<I', pl, g['count_pos'], g['count'] + 1)
         self.plain = pl
         self._invalidate_if_shifted()
+        # ★§254：`_ai_ids()` 是缓存 —— 新建完必须让它重扫，否则"先建特遣、再建触发"
+        #   会拿到与特遣相同的 `0100xxxx`（ID 撞车）。
+        self._aiids = None
         return pos, g['count']
 
     def taskforces(self):
@@ -4917,9 +5038,11 @@ class SaveDoc(object):
                 cnt = struct.unpack_from('<I', pl, off + 0xB8 + 8 * i)[0]
                 tk = struct.unpack_from('<I', pl, off + 0xBC + 8 * i)[0]
                 units.append({'type': tmap.get(tk, ''), 'count': cnt, 'type_key': tk})
+            sid = bytes(pl[off + 56:off + 64]).decode('latin1', 'ignore')
             out.append({'off': off,
                         'key': struct.unpack_from('<I', pl, off + 0x10)[0],
-                        'sid': bytes(pl[off + 56:off + 64]).decode('latin1', 'ignore'),
+                        'sid': sid,
+                        'defined': self.is_map_sid(sid),     # ★§254：False = AI 运行期生成
                         'name': bytes(pl[off + 0x78:off + 0x78 + 48]).split(b'\x00')[0]
                                 .decode('gbk', 'ignore'),
                         'n_types': n, 'units': units})
@@ -4932,13 +5055,19 @@ class SaveDoc(object):
         out = []
         for off in g['offs']:
             u = lambda x: struct.unpack_from('<I', pl, off + x)[0]
+            sid = bytes(pl[off + 56:off + 64]).decode('latin1', 'ignore')
             out.append({'off': off, 'key': u(0x10),
-                        'sid': bytes(pl[off + 56:off + 64]).decode('latin1', 'ignore'),
+                        'sid': sid,
+                        'defined': self.is_map_sid(sid),     # ★§254：False = AI 运行期生成
                         'name': bytes(pl[off + 0x78:off + 0x78 + 48]).split(b'\x00')[0]
                                 .decode('gbk', 'ignore'),
                         'index': u(0xAC), 'group': u(0xB0),
                         'priority': u(0xC8), 'max': u(0xCC),
-                        'country_key': u(0xD8), 'veteran': u(0xF0),
+                        'country_key': u(0xD8),
+                        # ★§252.17：星级是 **+0xB4**（旧代码这里读 +0xF0，与"写"一起错，所以
+                        #   自检一直自洽、游戏里却从不生效）。FA2 对账：星级3/优先级5/最大5
+                        #   ↔ `+0xB4=3 / +0xC8=5 / +0xCC=5`。
+                        'veteran': u(0xB4),
                         'script_key': u(0xF4), 'tf_key': u(0xF8)})
         return out
 
@@ -4960,11 +5089,13 @@ class SaveDoc(object):
         if tpl_sid:
             tpl = next((x for x in tfs if x['sid'].upper() == str(tpl_sid).upper()), None)
         if tpl is None:
-            # 优先挑"已经含目标型号"的模板（脚步/参数最接近），否则第一个
+            # 优先挑"已经含目标型号"的地图定义特遣（脚步/参数最接近），否则任意地图定义的，
+            # 最后才退到 AI 生成的那批（§254：AI 的那批没有地编语义，只拿来抄布局）
             want = {str(t).upper() for t, _ in units}
-            tpl = next((x for x in tfs if any(u['type'].upper() in want for u in x['units'])), None)
+            pool = [x for x in tfs if x.get('defined', True)] or tfs
+            tpl = next((x for x in pool if any(u['type'].upper() in want for u in x['units'])), None)
         if tpl is None:
-            tpl = tfs[0]
+            tpl = (pool or tfs)[0]
         pos, idx = self._append_group(self.TF_CLS, self.TF_SIZE, tpl['off'], '特遣部队')
         pl = self.plain
         key = self._free_group_key([x['key'] for x in tfs])
@@ -4980,11 +5111,19 @@ class SaveDoc(object):
             c, tk = pairs[i] if i < len(pairs) else (0, 0)
             struct.pack_into('<II', pl, pos + 0xB8 + 8 * i, c, tk)
         return {'off': pos, 'key': key, 'sid': newsid, 'name': nm, 'units': pairs,
+                'defined': self.is_map_sid(newsid),      # ★§254：True = 地编里可见
                 'template': tpl['sid'], 'template_key': tpl['key']}
 
     def clone_team(self, tf_key, tpl_sid=None, name=None, sid=None,
-                   country_key=None, veteran=0, max_teams=1, script_key=None):
-        """新建一个作战小队（引用 `tf_key` 那个特遣部队）。"""
+                   country_key=None, veteran=0, max_teams=1, script_key=None,
+                   priority=None):
+        """新建一个作战小队（引用 `tf_key` 那个特遣部队）。
+
+        ★★§252.17（2026-10-24 定案）：**星级 = `+0xB4`**。
+          旧代码把 `veteran` 写到 `+0xF0`，那是**另一个字段**（本档实测 0x2E 之类），
+          所以"新建小队时指定星级"一直**静默无效**（`read_ai`/界面读的是 `+0xB4`，永远拿到 0/1）。
+          已用玩家地编对话框对账：星级 3 / 优先级 5 / 最大 5 ↔ `+0xB4=3 / +0xC8=5 / +0xCC=5`。
+        """
         teams = self.team_types()
         tpl = None
         if tpl_sid:
@@ -5003,7 +5142,12 @@ class SaveDoc(object):
         pl[pos + 0x78:pos + 0x78 + len(nm.encode('gbk', 'ignore'))] = nm.encode('gbk', 'ignore')
         struct.pack_into('<I', pl, pos + 0xAC, idx)            # ★组内下标（必须=物理下标）
         struct.pack_into('<I', pl, pos + 0xCC, int(max_teams))
-        struct.pack_into('<I', pl, pos + 0xF0, int(veteran))
+        if priority is not None:
+            # 地编「优先级」——`team_types()` 口径 `+0xC8`（与 FA2 对话框 星级/优先级/最大 的顺序一致）
+            struct.pack_into('<I', pl, pos + 0xC8, int(priority))
+        # ★§252.17：星级是 **+0xB4**（旧代码写到 +0xF0 ⇒ 指定星级一直没生效）。
+        #   FA2 的星级取值 1=新兵 / 2=老兵 / 3=精英；允许 0（=引擎默认）。
+        struct.pack_into('<I', pl, pos + 0xB4, int(veteran))
         struct.pack_into('<I', pl, pos + 0xF8, tf_key)          # 特遣部队键
         if country_key:
             struct.pack_into('<I', pl, pos + 0xD8, country_key)
@@ -5011,10 +5155,138 @@ class SaveDoc(object):
         if script_key is not None:
             struct.pack_into('<I', pl, pos + 0xF4, int(script_key) & 0xFFFFFFFF)
         return {'off': pos, 'key': key, 'sid': newsid, 'name': nm,
+                'defined': self.is_map_sid(newsid),      # ★§254：True = 地编里可见
                 'tf_key': tf_key, 'index': idx, 'template': tpl['sid'],
-                'max': int(max_teams),
+                'max': int(max_teams), 'veteran': int(veteran),
                 'country_key': struct.unpack_from('<I', pl, pos + 0xD8)[0],
                 'script_key': struct.unpack_from('<I', pl, pos + 0xF4)[0]}
+
+    # ---------------- ★§253 单独新建「特遣 / 脚本 / 小队」+ 触发挂小队 ----------------
+    def team_key_of(self, ident):
+        """小队标识 → 小队对象键。`ident` 可以是键(int / '0x1A2B3C4D')、小队 ID('01000241')、名称。"""
+        if ident is None:
+            return None
+        if isinstance(ident, int):
+            return ident & 0xFFFFFFFF
+        s = str(ident).strip()
+        if not s:
+            return None
+        if s.lower().startswith('0x'):
+            try:
+                return int(s, 16) & 0xFFFFFFFF
+            except ValueError:
+                return None
+        teams = self.team_types()
+        for t in teams:
+            if str(t['sid']).upper() == s.upper():
+                return t['key']
+        for t in teams:
+            if str(t['name']).strip() == s:
+                return t['key']
+        for t in teams:
+            if s.upper() in str(t['name']).upper():
+                return t['key']
+        return None
+
+    def create_ai_team(self, units, name=None, sid=None, veteran=3, priority=None,
+                       max_teams=5, house=None, script_entries=None, script_key=None,
+                       tf_template=None, team_template=None, tf_name=None,
+                       script_name=None):
+        """★§253 新建「特遣部队 + （可选）动作脚本 + 作战小队」，**不建触发**。
+
+        这是把昨天刷兵三件套（§217/§222）拆开单独用：
+          · `units`   = `[(型号, 数量), …]`，最多 6 种（写进特遣部队）
+          · `veteran` = 1 新兵 / 2 老兵 / 3 精英（写 `+0xB4`，与地编「星级」同口径）
+          · `script_entries` = `[(动作, 参数), …]`；`None` 且 `script_key` 也为 None ⇒ 沿用模板
+            （想要"原地待命"请显式 `script_key=0`）
+        返回 `{'tf':…, 'script':…, 'team':…}`。
+        """
+        units = [(str(t).strip().upper(), int(n)) for t, n in (units or []) if int(n) > 0]
+        if not units:
+            raise ValueError('至少要有一个单位（型号, 数量）')
+        warnings = []
+        tf = self.clone_taskforce(units, tpl_sid=tf_template, name=tf_name)
+        new_script = None
+        if script_entries:
+            new_script = self.clone_script(list(script_entries),
+                                          name=(script_name or ('动作-%s' % name or ''))[:47])
+            script_key = new_script['key']
+        if team_template is None:
+            same = [x for x in self.team_types() if x['tf_key'] == tf.get('template_key')]
+            if same:
+                team_template = same[0]['sid']
+        try:
+            ck = self.house_key_of(house or self.player_house())
+        except Exception:
+            ck = None
+            warnings.append('认不出所属方，国家字段沿用模板')
+        mt = int(max_teams)
+        tm = self.clone_team(tf['key'], tpl_sid=team_template, name=name, sid=sid,
+                            country_key=ck, veteran=int(veteran), max_teams=mt,
+                            script_key=script_key)
+        # 「出现于」路径点：与地编/§218 口径一致，先置 0（引擎读行为里的 `+0x58`）
+        struct.pack_into('<I', self.plain, tm['off'] + 0xE8, 0)
+        if priority is not None:
+            # ★§252.17 已用 FA2 对话框对账定案：**优先级 = `+0xC8`、最大 = `+0xCC`**
+            #   （星级3/优先级5/最大5 ↔ `+0xB4=3 / +0xC8=5 / +0xCC=5`）。
+            #   旧代码这里写 `+0xCC`（写到了"最大"上），已改。
+            struct.pack_into('<I', self.plain, tm['off'] + 0xC8, int(priority))
+        self._invalidate_if_shifted()
+        return {'tf': tf, 'script': new_script, 'team': tm, 'warnings': warnings}
+
+    def attach_team_to_trigger(self, trigger_id, team, waypoint=None, cell=None,
+                               action=80, reuse=True):
+        """★§253 把一支作战小队挂到**已有触发**上（行为 80「援军」/107「超时空传送援军」）。
+
+        · `team` 可以给小队键、小队 ID（如 `01000241`）或名称（走 `team_key_of`）
+        · `reuse=True`：该触发已有 80/107 行为就**改写那条**（改小队/路径点），不新增；
+          否则 `add_action()` 追加一条。
+        · 行为布局（§218 实测，80/107 相同）：`+0x40` 类型、`+0x44` **小队键**、`+0x58` 路径点。
+        """
+        action = int(action)
+        if action not in self.SPAWN_ACTIONS:
+            raise ValueError('挂小队只支持行为 %s，收到 %r'
+                             % ('/'.join(str(x) for x in self.SPAWN_ACTIONS), action))
+        tkey = self.team_key_of(team)
+        if not tkey:
+            raise RuntimeError('认不出小队 %r（可用小队 ID / 名称 / 键）' % (team,))
+        if waypoint is None:
+            if cell is None:
+                raise RuntimeError('要么给 waypoint（路径点号），要么给 cell=(x,y)')
+            wp = self.ensure_waypoint_at(int(cell[0]), int(cell[1]))
+            if wp is None:
+                raise RuntimeError('格 %s 处建不了路径点（号段用满且无近点可复用）' % (cell,))
+        else:
+            wp = int(waypoint)
+        acts = []
+        try:
+            acts = self.trigger_actions(trigger_id) or []
+        except RuntimeError:
+            # 该触发**还没有任何行为**（新建/空触发）→ 直接走"追加一条"
+            acts = []
+        target = next((a for a in acts if int(a.get('type') or 0) in self.SPAWN_ACTIONS), None) \
+            if reuse else None
+        if target is not None:
+            pl = self.plain
+            off = target['action_off']
+            struct.pack_into('<I', pl, off + 0x44, tkey)      # 小队键
+            struct.pack_into('<I', pl, off + 0x58, wp)        # 路径点
+            struct.pack_into('<I', pl, off + 0x48, 0)         # §218：这槽恒 0
+            struct.pack_into('<I', pl, off + 0x40, action)    # 顺便纠正类型
+            self._invalidate_if_shifted()
+            return {'mode': 'reuse', 'trigger_id': trigger_id, 'team_key': tkey,
+                    'waypoint': wp, 'action': action, 'action_off': off}
+        try:
+            r = self.add_action(trigger_id, action, 0, waypoint=wp, team=tkey)
+        except RuntimeError as e:
+            if '找不到触发' in str(e):
+                raise RuntimeError(
+                    '触发 %s 没有运行期实例（只有定义，改不了）。'
+                    '请在触发器页换一条可编辑的触发（灰/红那种不行）。' % trigger_id)
+            raise
+        return {'mode': 'add', 'trigger_id': trigger_id, 'team_key': tkey,
+                'waypoint': wp, 'action': action, 'action_off': r.get('obj'),
+                'action_key': r.get('key')}
 
     def script_types(self):
         """列出全部动作脚本：[{off,key,sid,name,index,entries:[{action,arg,name}]}]（§222）。"""
@@ -5025,7 +5297,9 @@ class SaveDoc(object):
             return []
         out = []
         for s in (have.get('scripts') or []):
-            out.append({'off': s['off'], 'key': s.get('key'), 'sid': s['id'],
+            _sid = s['id']
+            out.append({'off': s['off'], 'key': s.get('key'), 'sid': _sid,
+                        'defined': self.is_map_sid(_sid),      # ★§254：False = AI 运行期生成
                         'name': s.get('name', ''), 'index': None,
                         'entries': s.get('entries') or []})
         # 组内下标（+0xAC）补上（read_ai 没解这个槽）
@@ -5104,6 +5378,7 @@ class SaveDoc(object):
             struct.pack_into('<I', pl, pos + off, 0)
         self._invalidate_if_shifted()
         return {'off': pos, 'key': key, 'sid': newsid, 'name': nm,
+                'defined': self.is_map_sid(newsid),      # ★§254：True = 地编里可见
                 'index': idx, 'count': len(entries),
                 'template': tpl['id'], 'entries': [(int(a), int(b) & 0xFFFFFFFF)
                                                     for a, b in entries]}
@@ -5217,7 +5492,7 @@ class SaveDoc(object):
                 'cell': self.waypoint_cell(int(wp)), 'warnings': warnings}
 
     def import_unit_from(self, ref, type_name, cx, cy, house=None, veterancy=None,
-                         slots='safe'):
+                         slots='safe', exact_cell=True, auto_nudge=False):
         """**直接写入法**：把 `ref`（另一份存档的路径或 SaveDoc）里一台 `type_name` 真机
         的记录内容搬进本档，只保留本档脚手架的身份字段。
 
@@ -5237,7 +5512,8 @@ class SaveDoc(object):
             raise UnitUnavailable('参考档里没有 %s 的真机 ⇒ 没法直接写入' % t)
         rr = self._pick_registered(cands) or cands[0]
         # 脚手架按本档"能拿到的同大类"自动挑（本档可能根本没有该型号），内容随后整体替换
-        info = self.add_unit_by_clone(t, cx, cy, house=house, veterancy=veterancy)
+        info = self.add_unit_by_clone(t, cx, cy, house=house, veterancy=veterancy,
+                                      exact_cell=exact_cell, auto_nudge=auto_nudge)
         info['warnings'] = [w for w in info.get('warnings') or [] if '隐形' not in w]
         rec = [r for r in self.unit_records() if r['key'] == info['key']][0]
         if rec['size'] != rr['size'] or rec['comp_size'] != rr['comp_size']:
@@ -5250,13 +5526,56 @@ class SaveDoc(object):
         #   含 `+0x270` 类型高度、`+0x51C`、`+0x940..0x958` 机体参数、`+0x6D8` 类型键）。
         # `slots='safe'`（默认）：只抄"机体参数"这几个槽 —— 最小改动，先保证不崩。
         #   实测 7 架真基洛夫之间这些槽完全一致：`+0x270` 类型高度(1248)、`+0x51C`、`+0x940..+0x958`。
-        # `slots='full'`：抄全部型号常量（540 个，实测 T69 读档会弹框，风险高）。
+        # `slots='full'`：抄全部「档内各实例都相同」的 dword（实测 260~310 个，旧注释写 540）。
+        # ★★2026-10-24 §234：旧 full 会弹框，根因找到了（`_probe_540.py` 跨档比对）：
+        #   "档内各实例都相同" ≠ "型号常量"，里面混了两类**不能抄**的东西：
+        #     ① **键**（0x01000000..0x17FFFFFF，典型 `+0x6D8` 类型键 / `+0x6D4`）——
+        #        同一型号在两份存档里的键**不同**（实测 GGI 0x0EF43FD0 vs 0x14F4B7B8），
+        #        抄过去目标档没有这个键 ⇒ 引擎按键解引用 ⇒ **读档弹框**。
+        #        脚手架自己的类型键本来就是对的，根本不用抄。
+        #     ② **存档级全局指针**（典型 `+0x1BC/+0x1C8/+0x240 = 0x0017AD12`）——
+        #        在参考档里 **1774/1775 个单位**（不分型号）都是这个值 ⇒ 它跟型号无关，
+        #        是本次运行/本档的全局状态；抄进别的档 = 写一个野指针。
+        #   ⇒ full 的判据改成「档内一致 **且** 跨型号不通用 **且** 不是键」。
         SAFE_SLOTS = [0x270, 0x51C, 0x940, 0x944, 0x948, 0x94C, 0x954, 0x958]
         insts = [r for r in ref.unit_records() if r['type'].upper() == t]
         same_size = [r for r in insts
                      if r['size'] == rr['size'] and r['comp_size'] == rr['comp_size']]
         n_all = rr['size'] + rr['comp_size']
         blobs = [bytes(ref.plain[x['off']:x['off'] + n_all]) for x in same_size]
+
+        def universal_slots(doc):
+            """该档「与型号无关」的槽 → {偏移: 4 字节值}。
+
+            判据：**拿别的型号**来比 —— 同记录长度、但类型 ≠ 当前型号的对象里，
+            ≥30%（且至少 3 个）在同一偏移取同一个**非零值**。
+            这种值不分型号（实测 `+0x1BC/+0x1C8/+0x240` 在玩家档里 1774/1775 个单位
+            都是 `0x0017AD12`）⇒ 是**存档级全局状态 / 全局指针**，不是型号常量。
+            零值不算（0 = 默认/空，任何档都一堆，判它没意义）。
+
+            ★★2026-10-24 修正（自检实踩）：**不能拿"同长度全部对象"当分母**。
+              DISK 那一档长度（2489）在本档里只有 DISK 自己 ⇒ 任何型号常量都会
+              100% 一致 ⇒ 全被判成"全局"跳过 ⇒ `full` 退化成"什么都不抄"
+              （实测：full 导入的结果与纯克隆逐字段只差身份/坐标，等于白导）。
+              分母只留**别的型号**，型号常量/turbo 全局才分得开。
+            """
+            probe = [x for x in doc.unit_records()
+                     if x['size'] + x['comp_size'] == n_all
+                     and x['type'].upper() != t.upper()]
+            out = {}
+            if len(probe) < 3:
+                return out
+            need = max(3, int(len(probe) * 0.3))
+            for o in range(0, n_all - 3, 4):
+                cnt = collections.Counter(
+                    bytes(doc.plain[x['off'] + o:x['off'] + o + 4]) for x in probe)
+                b, c = cnt.most_common(1)[0]
+                if c >= need and b != b'\x00' * 4:
+                    out[o] = b
+            return out
+
+        # 参考档的全局槽：一个都不抄（抄 `0x0017AD12` = 写野指针进目标档）
+        glob_vals = universal_slots(ref) if slots != 'safe' else {}
         if slots == 'safe':
             const = [o for o in SAFE_SLOTS if o + 4 <= n_all]
         elif len(blobs) >= 2:
@@ -5266,34 +5585,58 @@ class SaveDoc(object):
             # 参考档里只有 1 架 ⇒ 没有"跨实例比较"的依据，退回按块白名单（保守）
             const = [o for o in range(0, min(n_all, 0x960) - 3, 4)]
         keep = set(self.IMPORT_KEEP_LOCAL)
-        refkeys = ref.object_keys()
+        # ★类型键/次类型键：脚手架已经是目标档的正确值，绝不能被参考档覆盖
+        keep |= {0x6D4, 0x6D8}
+        # ★目标档自己的全局槽也要保住：参考档这些槽多半是 0，抄过来会把目标档的
+        #   全局值（新单位从同型号脚手架继承的正确值）冲成 0 —— 等于制造"跟同伴有差异"的怪单位。
+        if slots != 'safe':
+            keep |= set(universal_slots(self))
         n = 0
         skipped_ptr = 0
+        skipped_glob = 0
         for o in const:
             if o in keep:
                 continue
             v = blobs[0][o:o + 4]
             iv = struct.unpack('<I', v)[0]
-            # 键一定在 0x01000000..0x17FFFFFF；不加范围判断会把 `0` 当成键（实测误杀 419 个）
-            if 0x01000000 <= iv <= 0x17FFFFFF and iv in refkeys:
+            # ① 键一律不抄（§234）：跨档键不同，抄了引擎解引用到不存在的对象
+            if 0x01000000 <= iv <= 0x17FFFFFF:
                 skipped_ptr += 1
+                continue
+            # ② 参考档里"跨型号通用"的全局状态（如 +0x1BC=0x0017AD12）不抄
+            if glob_vals.get(o) == v:
+                skipped_glob += 1
                 continue
             self.plain[rec['off'] + o:rec['off'] + o + 4] = v
             n += 1
-        # 抄完再压一次"清指令 + 空中单位起在类型高度"
-        for o in self.UNIT_ORDER_CLEAR:
-            if rec['off'] + o + 4 <= len(self.plain):
-                self.plain[rec['off'] + o:rec['off'] + o + 4] = b'\x00' * 4
+        # 抄完再压一次「任务整组 = 空闲态 + 空中单位起在类型高度」（§252：
+        # 目的地/指令组不再清 0 —— 清 0 = 目的地 (0,0) = 往地图角飞 + 空指令对象打掉弹框）
+        rec_xy = (rec.get('x'), rec.get('y'))
+        self._apply_idle_order_state(self.plain, self.plain, rec['off'],
+                                     rec_xy[0], rec_xy[1])
         if info.get('loco') in ('Fly', 'Aircraft'):
             alt = struct.unpack_from('<I', self.plain, rec['off'] + 0x270)[0]
             if alt:
                 self.plain[rec['off'] + 0xB8:rec['off'] + 0xB8 + 4] = struct.pack('<I', alt)
+        # ★2026-10-24：`veterancy` 必须**在抄完之后**再写一次。
+        #   等级 `+0x150/+0x164` 属于"同型号各实例一致"的槽（参考档里可能全是新兵）
+        #   ⇒ full 抄写会把它覆盖回参考档的值，调用方传的 veterancy 就白传了
+        #   （自检实踩：传 2 进来，落地仍是 0）。
+        if veterancy is not None:
+            vv = int(veterancy)
+            if vv in (0, 1, 2):
+                struct.pack_into('<i', self.plain, rec['off'] + 0x150, vv)
+                struct.pack_into('<f', self.plain, rec['off'] + 0x164, float(2 - vv))
+                info = dict(info)
+                info['veterancy'] = vv
         for attr in ('_urecs', '_uoffs', '_occ', '_blds'):
             if hasattr(self, attr):
                 setattr(self, attr, None)
         info = dict(info)
         info['imported'] = n
         info['skipped_ptr'] = skipped_ptr
+        info['skipped_glob'] = skipped_glob
+        info['slots'] = slots
         info['ref'] = getattr(ref, 'path', '?')
         info['ref_key'] = rr['key']
         return info
@@ -5932,7 +6275,99 @@ class SaveDoc(object):
     # ⚠ 'full' 实测会把载具克隆弄崩（V3 vs H3），别默认开。
     UNIT_CELL_OCC_MODE = 'key'
     # ★§212：放置时**必须清零**的"指令/目的地"槽（否则新单位会带着模板的攻击命令乱跑）
-    UNIT_ORDER_CLEAR = (0x198, 0x658, 0x680, 0x960, 0x964)
+    # ★★2026-10-24 晚 回退（T72/T73 是昨天验收通过的档，今天改成"多清 4+2 个槽"结果打掉必崩）：
+    #   实测对照（同一台飞碟克隆）：
+    #     T72（通）  +0x270/+0xB8=1248/1248  +0x298=60  +0x3A4=+0x3BC=118（**保留骨架值**）
+    #     T92（崩）  +0x270/+0xB8=416/416    +0x298=0   +0x3A4=+0x3BC=0（被我们清成 0）
+    #   ⇒ `+0x298` 与 `+0x3A4/+0x3BC` **不能清 0**：
+    #     `+0x3A4/+0x3BC` 是"当前指令对象"的引用，引擎**不检查是否为 0**，
+    #     照样按"有指令"去解引用 ⇒ 调到空/失效对象 ⇒ 跳到垃圾地址（except.txt 15:04，Eax=0）。
+    #     `+0x298` 是任务/状态号（T72 那台是 60），清 0 反而让"任务还在、目标却没了"⇒ 奔地图角。
+    #   ⇒ 恢复成"只清 0x198/0x658/0x680/0x960/0x964"（昨天 p168 的口径）。
+    # ★2026-10-24 §248.8：`+0x198` **不清**（从 §212 起一直在清，是错的）。
+    #   实测 T85：原生 98/99 架飞碟这一项 = `0x7093df`；玩家地编放进去、引擎亲手造的新单位
+    #   **也是** `0x7093df`（DISK/TELE33/MIND/YTNK/HTNK 这类心灵/传送单位都有）——
+    #   两份基准一致，只有我们清成 0。当年 T72/T73 能通，是因为平地三V3 的原生这一项本来就是 0，
+    #   "匹配同档原生"这条不变律恰好被满足了。
+    #   语义（反汇编 0x41E777/0x41E809）：它是个**小枚举索引**（与 1、2 比较），不是目标指针；
+    #   §13552 把它当"目标指针"是早期误判。
+    # ★★★§252（2026-10-24 夜，玩家第 7 轮）——**清零路线被数据推翻**。
+    #   症状：飞碟"有目标、目标在地图外/不知道要去哪"、"打掉弹框"。
+    #   数据（`T106_平地落点.SAV`，同档 98 台原生 DISK 做基准，逐字段 0/98 扫描）：
+    #   我们的克隆是**全场唯一**在这 6 个槽上是 0 的单位：
+    #     `+0x960/+0x964` = 伴随段（Fly locomotor）+0x54/+0x58 = **目的地格 lepton**
+    #        98/98 原生都是合法格（如 164.5/175.5）；我们 = **0 = 格 (0,0) = 地图角**
+    #        ⇒ 玩家反复说的"目标在地图外"就是它。**这是"有目标、往外飞"的真身。**
+    #     `+0x658/+0x680` = 目的地的 Y（实测恒等于 +0x964，98/98 一致）
+    #     `+0x3A4/+0x3BC` = 全档统一的**共享指令对象** `0x17B2DC`（98/98 同一个值）
+    #        我们清成 0 ⇒ "有指令槽、里面是空对象" ⇒ §243 当年实测的"打掉弹框"正是这条
+    #        （那次误判成"外来指针"，真凶另有其物，但零值本身确实是错的）
+    #   ★同时推翻 §248 的依据：那份"地编干净档"里这些槽也是 0，但那是**另一张地图、
+    #   单位从未入队**的状态；而**本档**原生一律非 0。判据要跟**本档原生**比（§234 铁律）。
+    #   ★地面载具（Drive 伴随段）实测 157/157 原生这几项**本来就是 0** ⇒ 规则必须
+    #   "骨架是 0 就保持 0"，不能无脑写坐标，否则光棱反而变成异类（它的克隆现在是 0 差异）。
+    UNIT_ORDER_CLEAR = (
+                        # 任务号 + 目标点：空闲原生（及地编新放的单位）本来就是 0
+                        0x298, 0x29C, 0x2A0, 0x2A4,
+                        # ★§245：`+0x5EC` 存的是**另一台单位的键**（野链），克隆会继承成
+                        #   指向一台无关单位。T72/T97（验收通过）那台是 0 ⇒ 写 0。
+                        0x5EC)
+    # 这几项**不抄 0，抄骨架**（§252）：共享指令对象，全档同一个值。
+    UNIT_ORDER_KEEP = (0x3A4, 0x3BC)
+    # 目的地：`0x960`=x、`0x964`=y（伴随段 +0x54/+0x58）；`0x658/0x680` 恒等于 y。
+    UNIT_DEST_X = 0x960
+    UNIT_DEST_Y = 0x964
+    UNIT_DEST_Y_COPY = (0x658, 0x680)
+
+    # ★2026-10-24 §232：单位记录里的「位置副本槽」——被清零会导致"永远上不了车"
+    #   `+0x56C` / `+0x570` = 两个 u16 (x,y) 位置副本。正常单位**至少有一个等于自己所在格**：
+    #   实测 1775 个单位 → (空, 自己坐标) 1090、(自己坐标, 别的) 78、(自己坐标, 自己坐标) 54、
+    #   (别的, 自己坐标) 78、(别的, 别的) 61、(空, 别的) 122。
+    #   **只有 1 个是 (自己坐标, 空)** —— 就是那个"怎么都上不了车"的工程师，`+0x570` 被固化成 (0,0)，
+    #   而且跨 3 份存档（位置从 (110,205) 变到 (116,208)）一直是 (0,0) ⇒ 游戏内移动不会刷新它。
+    #   ⇒ 判"位置状态是否固化"就看这两个槽有没有一个是自己坐标。
+    POS_SLOTS = (0x56C, 0x570)
+
+    def unit_pos_slots(self, rec):
+        """该单位的两个位置副本槽 → {'0x56C','0x570','xy','ok'}；`ok=False` 即位置状态异常。"""
+        pl, o = self.plain, rec['off']
+        xy = (rec.get('x'), rec.get('y'))
+        a = struct.unpack_from('<2H', pl, o + 0x56C)
+        b = struct.unpack_from('<2H', pl, o + 0x570)
+        return {'0x56C': a, '0x570': b, 'xy': xy, 'ok': (a == xy) or (b == xy)}
+
+    def broken_position_units(self, strict=True):
+        """[(rec, slots)] —— 位置副本槽异常的单位。
+
+        · `strict=True`（默认）：只报 **`+0x570` 为 (0,0)** 的。实测全场仅 1 个，
+          正是"怎么都上不了车"的那个工程师 ⇒ 这是最可疑的固化标记。
+        · `strict=False`：再加报"两个槽都不等于自己所在格"的（实测 183 个，
+          多为**正在移动中**或**在建筑/运输工具里**，属正常，别乱修）。
+        """
+        out = []
+        for r in self.unit_records():
+            if not isinstance(r.get('x'), int):
+                continue
+            s = self.unit_pos_slots(r)
+            if s['0x570'] == (0, 0):
+                out.append((r, s))
+            elif not strict and not s['ok']:
+                out.append((r, s))
+        return out
+
+    def fix_unit_position_slots(self, rec):
+        """把该单位的两个位置副本槽都对齐到记录里的 (x,y)。返回改动的**字节数**。
+
+        ★这是"上不了车 / 站在原地不执行命令"的最小修复：不动身份、不动指令、不动坐标本身。
+        """
+        pl, o = self.plain, rec['off']
+        xy = (rec['x'], rec['y'])
+        n = 0
+        for off in self.POS_SLOTS:
+            if struct.unpack_from('<2H', pl, o + off) != xy:
+                struct.pack_into('<2H', pl, o + off, xy[0], xy[1])
+                n += 4
+        return n
 
     def unit_records(self):
         self._invalidate_if_shifted()
@@ -6565,7 +7000,10 @@ class SaveDoc(object):
     #   挪到最近的合法格（玩家看到的就是"位置偏了几格 + 那个地方是悬崖"），甚至干脆不画。
     #   下面三个接口把地图地形读进来（lzo 解压，一次缓存），供放置前校验/GUI 提示。
     def map_cells(self, map_path=None):
-        """{ (x,y): (tile, sub, z, icr) } —— 场景地图的地形（带缓存，见 `read_isomap`）。"""
+        """{ (x,y): (tile, sub, z, level) } —— 场景地图的地形（带缓存，见 `read_isomap`）。
+
+        ★`level` = **层高**（0=地面，1..27=高处/坡/桥面）。判定"能不能走过去"必须看它。
+        """
         key = map_path or getattr(self, '_mapterr_path', None)
         if key is None:
             try:
@@ -6581,8 +7019,47 @@ class SaveDoc(object):
         return d
 
     def cell_terrain(self, cx, cy):
-        """(tile, sub, z, icr) 或 None（地图里没有这一格 / 没找到地图）。"""
+        """(tile, sub, z, level) 或 None（地图里没有这一格 / 没找到地图）。"""
         return self.map_cells().get((int(cx), int(cy)))
+
+    # ★2026-10-24 §231：存档的**格对象自带一份层高**
+    #   `格+0x12E` 的 u16 = `level | (X << 8)`，低字节就是层高；X 取 0/4/8/12（2 bit 结构标志）。
+    #   与地图 `IsoMapPack5` 的 level 实测一致率 98.22%（43080 格里 41695 一致），
+    #   不一致的全是 tile=0 的空白格（地图本来就没数据，存档给了引擎填充值）。
+    #   ⇒ 判"这一格地面在第几层"优先用这个（引擎读档时用的就是它），地图值作交叉校验。
+    CELL_LEVEL_OFF = 0x12E
+
+    def cell_level(self, cx, cy):
+        """存档格对象里的层高（`格+0x12E` 低字节）；没有这格返回 None。
+
+        0 = 地面；>0 = 高处/坡/桥面。桥面(1262)=11、(116,211)引桥(1203)=3 之类。
+        """
+        o = self.cell_offsets().get((int(cx), int(cy)))
+        if o is None:
+            return None
+        return struct.unpack_from('<H', self.plain, o + self.CELL_LEVEL_OFF)[0] & 0xFF
+
+    def cell_levels(self):
+        """{ (x,y): level } —— 全图存档层高（一次扫完，比逐格调 cell_level 快）。"""
+        out = {}
+        pl = self.plain
+        for xy, o in self.cell_offsets().items():
+            out[xy] = struct.unpack_from('<H', pl, o + self.CELL_LEVEL_OFF)[0] & 0xFF
+        return out
+
+    def bridge_like_tiles(self):
+        """这份地图里"属于桥结构"的 tile 集合（tile 上有层高、且成片连续）。
+
+        ★用途：解释/预警"兵上不了车、走不到某格"。桥面格地面单位**只能从引桥进**，
+        不能从旁边的地面平着跨上去，即使坐标相邻、层高都是 0 也不行。
+        """
+        mk = self.map_cells()
+        lv = self.cell_levels()
+        out = set()
+        for xy, t in mk.items():
+            if lv.get(xy, 0) > 0:
+                out.add(t[0])
+        return out
 
     def walkable_tiles(self):
         """这份档里**真实地面单位/建筑踩过**的 tile 集合 —— 不需要 theater INI 也能判可通行。
@@ -6629,6 +7106,70 @@ class SaveDoc(object):
     def cell_taken(self, cx, cy):
         """该格是否被建筑地基/单位占着（O(1)，走 `_occupancy()` 缓存）。"""
         return (int(cx), int(cy)) in self._occupancy()
+
+    def cell_flat_info(self, cx, cy):
+        """落点"是不是平地"的体检（§251）→ dict。
+
+        ★★2026-10-24 §251 定案（玩家 T105 A/B 实测，此前 6 轮全是这个坑）：
+          **把单位放在"层高与八邻不一致"的格子上（斜坡/悬崖/引桥），打掉它会弹框**；
+          放在全平地（层高 0、八邻也 0）则一切正常。而且它还会"有目标"——引擎认为站位
+          不合法，一直想把它挪走，看起来就像"有目的地、往外飞"。
+
+          实证（T105 同一档、同一套克隆配方，**唯一差别是落点**）：
+            (104,212) tile 1265 层高 **7**，八邻 8/0/0/4 = 悬崖边 ⇒ **打掉弹框**
+            (108,206) 层高 1 ⇒ 正常      (109,206) 层高 0 ⇒ 正常
+          反证：玩家验收通过的 T97/T99 落点都是**八邻全 0 的平地**。
+
+        ⚠ 这个坑特别难查，因为 `free_cell_near(walkable)` 只判"可通行"，
+          而 tile 1265 这种**斜坡是可以通行的** —— 于是落点校验一路绿灯。
+        """
+        cx, cy = int(cx), int(cy)
+        lv = self.cell_level(cx, cy)
+        t = self.cell_terrain(cx, cy)
+        nb = {}
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                v = self.cell_level(cx + dx, cy + dy)
+                if v is not None:
+                    nb[(dx, dy)] = v
+        if lv is None:
+            return {'level': None, 'tile': None, 'nb': nb, 'is_flat': False,
+                    'why': '这一格不在存档里（地图外/虚空）'}
+        if not nb:
+            return {'level': lv, 'tile': t[0] if t else None, 'nb': nb,
+                    'is_flat': lv == 0, 'why': ''}
+        diff = sorted({v for v in nb.values()} - {lv})
+        if diff:
+            return {'level': lv, 'tile': t[0] if t else None, 'nb': nb,
+                    'is_flat': False,
+                    'why': '层高 %d，但相邻格是 %s —— 斜坡/悬崖边/引桥'
+                           % (lv, '/'.join(map(str, diff)))}
+        return {'level': lv, 'tile': t[0] if t else None, 'nb': nb,
+                'is_flat': True, 'why': ''}
+
+    def flat_cell_near(self, cx, cy, radius=10):
+        """找离 (cx,cy) 最近的**平地格**（层高与八邻一致、且没有占位对象）→ (x,y) / None。"""
+        best = None
+        occ = self._occupancy()
+        pl = self.plain
+        co = self.cell_offsets()
+        for (x, y), off in co.items():
+            if abs(x - cx) > radius or abs(y - cy) > radius:
+                continue
+            if (x, y) in occ:
+                continue
+            if struct.unpack_from('<I', pl, off + 0xF8)[0]:
+                continue
+            if struct.unpack_from('<I', pl, off + 0xF0)[0]:
+                continue
+            if not self.cell_flat_info(x, y)['is_flat']:
+                continue
+            d = abs(x - cx) + abs(y - cy)
+            if best is None or d < best[0]:
+                best = (d, x, y)
+        return (best[1], best[2]) if best else None
 
     def free_cell_near(self, cx, cy, radius=6, clearance=2, terrain=True):
         """在 (cx,cy) 附近找一块**引擎认可的空地** → (x,y)；找不到返回 None。
@@ -6687,6 +7228,21 @@ class SaveDoc(object):
         """
         pl = self.plain
         best = None
+        # ★2026-10-24 §249：`+0x198` 的"同型号众数"（T85 的飞碟 97/98 = 0x7093df，
+        #   玩家地编放进去、引擎亲手造的那台**也是** 0x7093df ⇒ 这是个**型号级共享值**，
+        #   不是每台私有的对象）。个别单位是离群值（实测 1/98 = 0x14f36600），
+        #   拿它当骨架会把离群值继承过来 ⇒ 优先挑与众数一致的。
+        modal_198 = None
+        if len(recs) >= 3:
+            _c = {}
+            for _r in recs:
+                try:
+                    _v = struct.unpack_from('<I', pl, _r['off'] + 0x198)[0]
+                except Exception:
+                    continue
+                _c[_v] = _c.get(_v, 0) + 1
+            if _c:
+                modal_198 = max(_c.items(), key=lambda kv: kv[1])[0]
         for r in recs:
             try:
                 n = min(r['size'] + r['comp_size'], 0x9C0)
@@ -6701,6 +7257,10 @@ class SaveDoc(object):
             idle = (u(0x10C) == 0 and u(0x11C) == 0 and u(0x120) == 0)
             if self._pick_registered([r]) is not None:
                 score += 100                      # 登记表里有的（引擎认领，身份干净）
+            # ★2026-10-24 晚：**不要**按"有没有目标点 `0x298`"加减分。
+            #   T72（昨天验收通过）那台克隆飞碟的 `+0x298` 就是**60**（继承骨架值），
+            #   照样能飞能打能正常死。我中午加的"+150 无目标点"会把骨架换成另一批，
+            #   反而偏离了验证过的配方 ⇒ 撤销。
             # ★定案项：空闲状态权重必须**压过**其它所有加分项（否则会被"恰好在对的高度"翻盘）
             if idle:
                 score += 200
@@ -6708,22 +7268,197 @@ class SaveDoc(object):
                 score -= 100                      # 部署中/任务中的骨架一律排后面
             loco = r.get('loco')
             if (tgt_loco or loco) in ('Fly', 'Aircraft'):
-                if u(0xB8) > 0:
-                    score += 20                   # 真在天上
+                # ★2026-10-24 晚：`+0x270/+0xB8` 是**当前高度**（同型号会有 416/832/1248 几种），
+                #   克隆到低空骨架 ⇒ 新单位看着"从地下冒出来"（玩家 T92 实测）。
+                #   这里给"飞得高"的骨架加分，优先 1248 那种正常巡航高度。
+                if u(0xB8) >= 1000:
+                    score += 30
+                elif u(0xB8) > 0:
+                    score += 10
                 if u(0x270) and u(0xB8) == u(0x270):
-                    score += 5                    # 在巡航高度（次要：放置时会按类型高度重设）
+                    score += 5                    # 在巡航高度（次要）
             else:
                 if u(0xB8) == 0:
                     score += 20                   # 在地上
             if u(0x198) == 0:
                 score += 6                        # 没有目标对象（放置时也会清）
+            # ★2026-10-24 §245：`+0x5EC` = 指向别的单位的键（链指针）。骨架这一项非 0
+            #   ⇒ 克隆出来会挂一条指向无关单位的野链（T96 读档崩、T72 那台是 0）。
+            # ★★2026-10-24 §249（活内存实证，推翻 §243 的撤销理由）：
+            #   克隆继承的是骨架的**整套会话档案**，不只是 `+0x10C/11C/120` 那三项。
+            #   T85 实测（98 架飞碟）：92 架"正在跑地图脚本"的在 `+0x0D8/+0x54C/+0x654`
+            #   上各挂着一个**自己私有的指令/脚本对象**（每台取值都不同），
+            #   而 6 架空闲的这些槽是**一致的共享值**（0x17B1FB / 0x17B241）、
+            #   `+0x670/+0x114/+0x17C…` 一串是 0xE1。
+            #   ⇒ 挑到"忙"骨架 ⇒ 新单位读档就朝老目标飞（玩家原话："有目标，不知道要去干什么"），
+            #     被打掉时引擎去更新那条脚本/指令 ⇒ 跳失效对象弹框（T103 实测）。
+            #   §243 曾以"T72 那台 0x298=60 也能跑"为由撤销这项评分 —— **那是误判**：
+            #   T72 所在的平地三V3 里所有飞碟本来就处于良性状态，"匹配同档原生"恰好成立。
+            # ★权重刻意压在"空闲 200"之下（§215：空闲必须最高优先），但压过其它加分项：
+            #   空闲+无任务 320 > 空闲+有任务 200 > 非空闲+无任务 20 > 非空闲+有任务 −160。
+            no_mission = (u(0x298) == 0 and u(0x29C) == 0
+                          and u(0x2A0) == 0 and u(0x2A4) == 0)
+            if no_mission:
+                score += 120
+            else:
+                score -= 60
+            # ★§249：`+0x198` 与同型号众数一致（型号级共享值，见函数头）
+            if modal_198 is not None:
+                score += 20 if u(0x198) == modal_198 else -20
+            if u(0x5EC) == 0:
+                score += 40
+            else:
+                score -= 40
+            # ★★2026-10-24 §246：**按"外来指针数"挑骨架**（今天所有"打掉就崩"的总根）。
+            #   记录里凡是"落在键值域、但本档没有这个键"的 dword，都是骨架**自己那一局**的
+            #   运行期指针（链表/队列/传感器…，形如 0x145Cxxxx）。原生单位由引擎在自己的
+            #   会话里建好、读档时重建，所以没事；克隆体会把它们带过来 ⇒ 指向一堆
+            #   **属于骨架**的运行期对象 ⇒ 死亡/深层更新时顺着走就炸。
+            #   实证：T85 的飞碟 47 架带 250+ 个（打掉必崩），51 架只带 7~10 个（正常）；
+            #   T98 用的骨架属于前者，T97/T99（玩家验收通过）属于后者。
+            # ★权重上限 200：足以在同为"空闲"的骨架里挑出干净的，但**压不过空闲的 ±300**
+            #   （§215 定案：空闲状态必须最高优先，否则会挑到"已部署/任务中"的骨架 = T71 症状）。
+            _fk = self.object_keys()
+            foreign = sum(
+                1 for _o in range(0, len(b) - 3, 4)
+                if 0x01000000 <= struct.unpack_from('<I', b, _o)[0] <= 0x17FFFFFF
+                and struct.unpack_from('<I', b, _o)[0] not in _fk)
+            score -= min(foreign, 100) * 2
             if u(0xA8) in (0, 1):
                 score += 2
             if best is None or score > best[0]:
                 best = (score, r)
         return best[1] if best else (recs[0] if recs else None)
 
-    def add_unit_by_clone(self, type_name, cx, cy, house=None, veterancy=None, borrow_type=None):
+    def _apply_idle_order_state(self, blob, src_plain=None, src_off=None,
+                                cx=None, cy=None):
+        """把「任务 / 目的地 / 当前指令」整组写成**同档原生空闲单位的样子**（§252）。
+
+        返回 `{'cleared':n,'kept':n,'dest':(x,y)或None}`。
+
+        规则（每一条都有 T106 的 98 台原生 DISK / 157 台 SREF 实测支撑）：
+          · `+0x298/+0x29C/+0x2A0/+0x2A4` → 0（= 空闲/无任务；空闲原生本来也是 0）
+          · `+0x5EC` → 0（野链，指向别的单位）
+          · `+0x3A4/+0x3BC` → **抄骨架**（全档统一的共享指令对象；抄成 0 = 空对象，
+            引擎在死亡路径上不判空 ⇒ 打掉弹框，这就是 §243 当年实测的现象）
+          · `+0x960/+0x964`（+ `0x658/0x680`）→ **骨架非 0 时**改写成"自己脚下那格"，
+            骨架是 0 就保持 0（地面载具 157/157 原生都是 0，不能无脑写坐标）
+        """
+        out = {'cleared': 0, 'kept': 0, 'dest': None}
+        for _o in self.UNIT_ORDER_CLEAR:
+            if _o + 4 <= len(blob):
+                struct.pack_into('<I', blob, _o, 0)
+                out['cleared'] += 1
+        if src_plain is not None and src_off is not None:
+            for _o in self.UNIT_ORDER_KEEP:
+                if _o + 4 <= len(blob) and src_off + _o + 4 <= len(src_plain):
+                    struct.pack_into('<I', blob, _o,
+                                     struct.unpack_from('<I', src_plain, src_off + _o)[0])
+                    out['kept'] += 1
+        if cx is None or cy is None or src_plain is None or src_off is None:
+            return out
+        # ★伴随段长度必须够（步兵的伴随段只有 81 字节，0x960 已经越过记录末尾）——
+        #   越过记录末尾去读，读到的是**下一个对象**的字节 ⇒ 会写进垃圾"目的地"。
+        if len(blob) < self.UNIT_DEST_Y + 4:
+            return out
+        if src_off + self.UNIT_DEST_X + 4 > len(src_plain):
+            return out
+        src_dest = struct.unpack_from('<I', src_plain, src_off + self.UNIT_DEST_X)[0]
+        if not src_dest:
+            return out            # 骨架本来就没有目的地（地面载具）⇒ 保持 0
+        lx = (int(cx) << 8) | 0x80         # 格中心 lepton（原生全是 ...80）
+        ly = (int(cy) << 8) | 0x80
+        if self.UNIT_DEST_X + 4 <= len(blob):
+            struct.pack_into('<I', blob, self.UNIT_DEST_X, lx)
+        if self.UNIT_DEST_Y + 4 <= len(blob):
+            struct.pack_into('<I', blob, self.UNIT_DEST_Y, ly)
+        for _o in self.UNIT_DEST_Y_COPY:
+            if _o + 4 <= len(blob):
+                struct.pack_into('<I', blob, _o, ly)
+        out['dest'] = (cx, cy)
+        return out
+
+    def _clean_foreign_ptrs(self, blob, new_key, src):
+        """清掉克隆体里**外来的运行期指针**（§246，2026-10-24 晚）→ 清了几个。
+
+        克隆 = 原样复制骨架记录。骨架身上带着它**自己那一局**的运行期指针
+        （链表/队列/传感器…），形如 `0x145Cxxxx`：落在键值域里、但**本档并没有这个键**。
+        原生单位这些字段由引擎在自己的会话里写好、读档时重建，所以没事；
+        克隆体把它们带过来 ⇒ 指向一堆**属于骨架**的运行期对象
+        ⇒ 死亡 / 深层更新时顺着走就炸（玩家实测：T98 打掉就弹框，`Eip` 落在堆上）。
+
+        判据（本机实测 + 与**已验收档** T97/T99 逐字段对照；
+         §243/§245 的教训是"多清字段必须先对照验收档，不能凭猜"）：
+          · 只清"键值域内、但不是本档有效键"的值 —— **合法键原样保留**
+            （类型键 `+0x6D8` 在 `object_keys()` 里、所属方键等也是）；
+          · **全员共有的偏移不清**：同型号 ≥90% 的记录在该偏移都有这种值
+            ⇒ 那是结构字段，不是毒。实测 T85 的 98 架飞碟：
+              保留 10 个（覆盖 98~92：`+0x000/+0x004` CLSID、`+0x0F8`、`+0x118`、
+              `+0x160/+0x230` 所属方键、`+0x3C0`、`+0x560`、`+0x688`、`+0x910`），
+              清除 238 个（覆盖 ≤55 —— 只有"正在执行任务"的那 47 架才有）。
+          · `new_key`（刚分配给克隆体的自键，还没进存档键集）也算有效，不能清。
+
+        ★安全性：对**已经干净**的克隆体是**空操作** —— T97 / T99 这两个玩家验收通过的档，
+          本函数一个字节都不会改（它们这类值本来就只在全员共有偏移上）。
+        """
+        n = len(blob)
+        if n < 8:
+            return 0
+        KEY_LO, KEY_HI = 0x01000000, 0x17FFFFFF
+        pl = self.plain
+        valid = set(self.object_keys())
+        valid.add(new_key & 0xFFFFFFFF)
+        if 0x6D8 + 4 <= n:                       # 类型键 = 单位身份，必须留
+            valid.add(struct.unpack_from('<I', blob, 0x6D8)[0])
+        # ★所属方键（+352/+560）**不在 `object_keys()` 里**（House 不是按对象锚点扫的），
+        #   只靠"全员共有偏移"侥幸保住不够稳 —— 显式把这两个偏移设为永不清。
+        #   （2026-10-24 自检实踩：B2 断言失败，`+0x160` 的值 0xFAAB120 确实不是对象键。）
+        never = set(self.UNIT_HOUSE_OFF)
+        # ★★2026-10-24 §247：`+0x48` = 单位的**标签挂接字段**（存 CellTag 运行期指针 X）。
+        #   它虽然在键值域内，却因为"同型号大多挂着标签"而落进"全员共有偏移"
+        #   （实测 T85：91 架飞碟里 85 架带标签 ⇒ 覆盖率 93% ≥ 90%），
+        #   所以 §246 的通用规则会把它**误保下来** —— 那等于把新单位挂到骨架所属的触发上。
+        #   玩家实测（T100）：克隆飞碟一被打 → 触发 01000250「飞碟被攻击寻敌」放全家 →
+        #   打掉就弹框（except.txt 16:50：Eip=0EFF4DAA 在堆上、Ebx/Edx=0x159Bxxxx
+        #   正是触发对象所在段、读 −1）。
+        #   ⇒ 显式强制清 0：全档 91.9% 的单位这一项本来就是 0，"新单位不挂任何触发"才是正常态。
+        force_clear = {0x48}
+        # ---- 采样：同型号优先（布局+语义都一致）；太少就按"同主体长度"放大样本 ----
+        recs = self.unit_records()
+        tn = str(src['type']).upper()
+        sample = [r for r in recs if r['type'].upper() == tn]
+        if len(sample) < 5:
+            sample = [r for r in recs if r['size'] == src['size']]
+        if len(sample) < 5:
+            sample = recs
+        # ---- 全员共有偏移 = 结构字段（不清）----
+        universal = set()
+        if sample:
+            need = max(1, int(len(sample) * 0.9))
+            share = {}
+            for r in sample:
+                base = r['off']
+                end = min(n, r['size'] + r['comp_size'])
+                for o in range(0, end - 3, 4):
+                    v = struct.unpack_from('<I', pl, base + o)[0]
+                    if KEY_LO <= v <= KEY_HI and v not in valid:
+                        share[o] = share.get(o, 0) + 1
+            universal = {o for o, c in share.items() if c >= need}
+        # ---- 清 ----
+        n_clean = 0
+        for o in range(0, n - 3, 4):
+            if o in never:
+                continue
+            v = struct.unpack_from('<I', blob, o)[0]
+            if o in force_clear or (KEY_LO <= v <= KEY_HI and v not in valid
+                                    and o not in universal):
+                if v:
+                    struct.pack_into('<I', blob, o, 0)
+                    n_clean += 1
+        return n_clean
+
+    def add_unit_by_clone(self, type_name, cx, cy, house=None, veterancy=None, borrow_type=None,
+                          exact_cell=True, auto_nudge=False):
         """**克隆放置**一个单位（2026-10-17 玩家 U2 游戏内验收通过）。
 
         做法 = 拿档内**同类型**单位当模板，克隆「主体 + 伴随」，然后办 7 处手续：
@@ -6751,6 +7486,20 @@ class SaveDoc(object):
         cells = {v: k for k, v in self._cell_by_key().items()}   # (x,y) → 格对象自键
         if (cx, cy) not in cells:
             raise RuntimeError('该档没有格 (%d,%d) 的格对象，无法落位' % (cx, cy))
+        # ★★§251 落点必须平地（否则打掉会弹框 + 单位"有目标"往外跑）。
+        #   斜坡格 tile 1265 是**可通行**的，所以老的"可通行"校验拦不住 —— 这里单独判层高。
+        # ★★★§252（玩家第 7 轮原话）：「我指定是平地，你选的地方反而更危险」
+        #   ⇒ **默认不再自动挪位**：调用方给的格就是最终格，只在不是平地时**大声告警**。
+        #   要"自动挪到最近平地"必须显式 `auto_nudge=True`（CLI/GUI 已加开关）。
+        #   `exact_cell=False` 保留旧语义（= 允许挪），只为兼容老脚本。
+        _nudge = None
+        _ci = self.cell_flat_info(cx, cy)
+        _allow_nudge = auto_nudge or (exact_cell is False)
+        if not _ci['is_flat'] and _allow_nudge:
+            _alt = self.flat_cell_near(cx, cy)
+            if _alt:
+                _nudge = {'from': (cx, cy), 'to': _alt, 'why': _ci.get('why') or '不是平地'}
+                cx, cy = _alt
         recs = self.unit_records()
         # ★§210：`borrow_type` = **强制拿某个型号当骨架**（A/B 用：同一份档、同一片地形，
         #   唯一变量是"骨架从哪来"）。不传 = 原来的自动选择。
@@ -6815,6 +7564,12 @@ class SaveDoc(object):
         _scaffold_idle = all(
             struct.unpack_from('<I', self.plain, src['off'] + _o)[0] == 0
             for _o in (0x10C, 0x11C, 0x120)
+            if src['off'] + _o + 4 <= len(self.plain))
+        # ★§249：骨架"有没有任务/目标"（`+0x298~0x2A4` 全 0 = 原地待命）。
+        #   挑不到这种骨架 ⇒ 克隆体会继承一整套私有的脚本/指令对象 ⇒ 自己跑 + 打掉可能弹框。
+        _scaffold_no_mission = all(
+            struct.unpack_from('<I', self.plain, src['off'] + _o)[0] == 0
+            for _o in (0x298, 0x29C, 0x2A0, 0x2A4)
             if src['off'] + _o + 4 <= len(self.plain))
         _scaffold_type = src['type']
         pl = bytearray(self.plain)
@@ -6920,20 +7675,22 @@ class SaveDoc(object):
         struct.pack_into('<I', blob, 224, cells[(cx, cy)])
         struct.pack_into('<H', blob, 1392, cx)
         struct.pack_into('<H', blob, 1394, cy)
-        # ★★2026-10-23 §212（玩家实测 T66："一个直接在空中，而且要去攻击什么东西，
-        #   把它的攻击目标也克隆过来了"）：克隆会把模板的**指令/目的地**一起带过来。
-        #   刚放下的单位应该"原地待命"，所以这里统一清掉：
-        #     `+0x198` = 目标对象指针（清 0 = 没有目标）
-        #     `+0x658/+0x680` = 目的地像素（真机是当前任务点）
-        #     `+0x960/+0x964` = 伴随段里的目的地格
-        #   空中单位再把"当前高度 `+0xB8`"设成"类型高度 `+0x270`"（真机 8 架恒 1248），
-        #   否则它沿用捐赠者（直升机 832）的高度 ⇒ 看着像"卡在地上"。
-        for _o in self.UNIT_ORDER_CLEAR:
-            if _o + 4 <= len(blob):
-                struct.pack_into('<I', blob, _o, 0)
+        # ★★2026-10-24 §252：清零路线被数据推翻（详见 `UNIT_ORDER_CLEAR` 的注释）。
+        #   现在交给 `_apply_idle_order_state()`：任务组清 0、指令组抄骨架、
+        #   目的地（空中单位才有）改写成**自己脚下那格** —— 三样都做到"与同档原生一致"。
+        _order_state = self._apply_idle_order_state(blob, pl, src['off'], cx, cy)
+        # ★★2026-10-24 §246：清掉模板残留的**外来运行期指针** —— 今天所有"克隆单位
+        #   打掉就弹框"的总根（T98：159+88 个；验收档 T97/T99 这些位置是 0/合法值）。
+        #   详见 `_clean_foreign_ptrs()` 的判据说明（含"对已验收档是空操作"的安全性）。
+        _n_foreign = self._clean_foreign_ptrs(blob, new_key, src)
         if tgt_loco in ('Fly', 'Aircraft') and 0x270 + 4 <= len(blob):
+            # ★2026-10-24 §248.8：**只抬高、不压低**。
+            #   旧代码无条件 `0xB8 = 0x270`（类型高度）——骨架正飞在 1998 时会被强按成 1248，
+            #   偏离同档原生众数（T85 的飞碟大多在 1998）。现在只在"当前高度低于类型高度"时抬起来
+            #   （避免 §212 那个"骨架在低空 ⇒ 克隆从地下冒出来"的老问题），高的保持骨架原值。
             _alt = struct.unpack_from('<I', blob, 0x270)[0]
-            if _alt:
+            _cur = struct.unpack_from('<I', blob, 0xB8)[0]
+            if _alt and _cur < _alt:
                 struct.pack_into('<I', blob, 0xB8, _alt)
 
         # ---- 所属方（★2026-10-17 新增：house 参数真正改主人，不再只挑模板）----
@@ -6957,6 +7714,13 @@ class SaveDoc(object):
         _tw = self.terrain_warning(cx, cy, air=(tgt_loco in ('Fly', 'Aircraft')))
         if _tw:
             warnings.append(_tw)
+        # ★§252：不再自动挪位，所以"落点不是平地"必须由这里明确喊出来。
+        if not _ci['is_flat']:
+            warnings.append(
+                '⚠ 落点 (%d,%d) **不是平地**（%s）。按你的要求已**原样落位、没有挪动**，'
+                '但实测在这种格子上单位会"有目标、自己往外跑"，被打掉时还容易弹框。'
+                '要换成最近平地请勾"自动挪到平地"（或传 auto_nudge=True）。'
+                % (cx, cy, _ci.get('why') or '层高与相邻格不一致'))
         if tgt_loco in ('Fly', 'Aircraft'):
             _ex = 4
             if (cx < _ex or cy < _ex or cx >= lim[0] - _ex or cy >= lim[1] - _ex):
@@ -7133,6 +7897,17 @@ class SaveDoc(object):
                 'scaffold_key': old_key,
                 'scaffold_type': _scaffold_type,
                 'scaffold_idle': _scaffold_idle,
+                'scaffold_no_mission': _scaffold_no_mission,
+                # ★§251：落点被"平地校验"挪走了的话，这里给出 从哪→到哪 / 原因。
+                #   斜坡/悬崖格上放单位 ⇒ 打掉必弹框 + 单位"有目标"往外跑（T105 实证）。
+                'cell_nudge': _nudge,
+                # ★§252：任务/目的地/指令这一组怎么写的 ——
+                #   `dest` 非空 = 骨架有目的地（空中单位），已改写成自己脚下那格；
+                #   `kept` = 从骨架抄来的共享指令对象个数（0 就是没抄到，可能又变空对象）。
+                'order_state': _order_state,
+                # ★§246：清掉了多少个"模板残留的外来运行期指针"（打掉就崩的总根）。
+                #   干净骨架出来的是 0；数字大说明这个档里同型号大多在"执行任务中"。
+                'foreign_ptrs': _n_foreign,
                 'delta': len(pl) - base, 'replaced': nrep, 'tables': len(tabs),
                 'warnings': warnings,
                 'note': '同类型克隆：武器/动画等子对象与模板一致'}
@@ -8694,8 +9469,24 @@ class SaveDoc(object):
     HOUSE_LIST_BASE = 48       # 块尾 − (48 + 12×建筑数) = 「本阵营建筑清单」的 count 位置
     HOUSE_TRIGOWNER_OFF = 72   # House 块 +72 = 该阵营的「触发所属方对象」键（2026-10-17 定案）
 
+    def _attach_ov_key(self):
+        """`attach_overview()` 的缓存键：明文长度 + 触发名指纹（名字改了也要重算）。"""
+        h = 0
+        try:
+            for r in self.records:
+                if r.kind == '触发':
+                    h = (h * 131 + hash(r.name)) & 0xFFFFFFFF
+        except Exception:
+            h = -1
+        return (len(self.plain), h)
+
     def _house_blocks(self):
         """[(对象偏移, House 键, 块尾偏移)]，块尾 = 下一个 House 对象起点（最后一个 = 文件尾）。"""
+        # ★§256 缓存：本函数每次全档 find GUID（28MB × 若干个阵营）；`trigger_owner_name`
+        #   每次调它 18 次 ⇒ `trigger_detail` 里又多花 0.24 秒。
+        _c = getattr(self, '_hblocks', None)
+        if _c is not None:
+            return _c
         pl = bytes(self.plain)
         objs, q = [], 0
         while True:
@@ -8707,6 +9498,7 @@ class SaveDoc(object):
         for j, (i, k) in enumerate(objs):
             nxt = objs[j + 1][0] if j + 1 < len(objs) else len(pl)
             out.append((i, k, nxt))
+        self._hblocks = out
         return out
 
     def _house_bld_keys(self, key):
@@ -10660,11 +11452,15 @@ class SaveDoc(object):
             argv = struct.unpack_from('<I', pl, a + OBJ_ARG_OFF)[0]
             if atp in ACTION_VAR_TYPES:          # §175：56/57 的变量号在 +164
                 argv = struct.unpack_from('<I', pl, a + ACT_VAR_OFF)[0]
+            # ★§255：行为 80/107（援军 / 超时空援军）的**小队键在 `+0x44`**
+            #   （`+0x48` 不是！§218 实证）。这里统一回填，触发编辑器才能反查出小队名。
+            team = struct.unpack_from('<I', pl, a + 0x44)[0] if atp in self.SPAWN_ACTIONS else 0
             out.append({'ordinal': i + 1,
                         'index': r['start'] + i,
                         'action_off': a,
                         'type': atp,
                         'arg': argv,
+                        'team': team,
                         'name': bytes(pl[a + 104:a + 112]).split(b'\x00')[0]
                                   .decode('ascii', 'ignore').strip(),
                         'waypoint': wp, 'cell': self.waypoint_cell(wp),
@@ -10846,8 +11642,16 @@ class SaveDoc(object):
         ev_size = grps['ev_size']
         node_pos, cell_pos = grps.get('node'), grps.get('cell')
         idx = len(grps['trig'])                  # 集群内序号（追加到末尾）
-        ticks = ev_arg * LOGIC_FPS if ev_type == 13 else 0
+        # ★2026-10-24 玩家定案（纠正 §219.7 的写法）：事件 8「任何事件」的 TagNode
+        #   帧数**必须是 15**（1 逻辑秒）。帧数 0 ⇒ 不进「定时触发器挂接表」⇒ 引擎
+        #   不轮询 ⇒ 永不评估（R2/R4 + §219.7 双向实测）。旧写法 `else 0` 会让
+        #   "事件 8" 建出来就是废触发，而且与 `set_event` / `repair_tag_node` 的口径
+        #   （两处早就把 8 自动武装成 15）不一致 —— 现在统一按 15 写。
+        ticks = ev_arg * LOGIC_FPS if ev_type == 13 else (15 if ev_type == 8 else 0)
         warnings = []
+        if ev_type == 8:
+            warnings.append('事件 8「任何事件」：TagNode 帧数已武装为 15（1 秒）—— '
+                            '帧数 0 不进计时表、引擎不轮询 ⇒ 永不评估')
         # ★§181：事件 36/37 是纯电平查询，没有对象/标签回调 —— 只有进了
         #   「定时触发器挂接表」（条件：ticks>0，即首个事件是 13）才会被轮询。
         #   这里只提示、不擅自改事件列表（调用方可能随后还会 add_event 补计时）。
@@ -10960,29 +11764,14 @@ class SaveDoc(object):
             K_CELL = fresh([int.from_bytes(pl[p + 16:p + 20], 'little') for p in cell_pos],
                            NODEGRP_BASE_KEY)
 
-        # 新 ID：现有 触发+标签 ID 的最大值 +1（FA2 两类共用一个顺序计数）
-        sids = []
-        for r in self.records:
-            if r.kind in ('触发', '标签') and len(r.sid) == 8:
-                try:
-                    sids.append(int(r.sid, 16))
-                except ValueError:
-                    pass
-        # ★2026-10-20：AI 三大件（小队/特遣/脚本）也用同一套 8 位 ID 编号空间。
-        #   它们现在被单独分类、不再算进"触发/标签"，若不让它们参与取最大值，
-        #   新分配的 ID 会撞到某条特遣部队/脚本上 ⇒ 新建的触发被当成 AI 记录（自检抓到）。
-        #   ⚠ 只取 **01xxxxxx** 那一段：AI 里还有一堆 GUID 风格的随机 ID
-        #     （如 0ECCF03D），把它们算进最大值会让新 ID 跳到 GUID 区，
-        #     既不符合 FA2 的 01xxxxxx 顺序编号，也会让记录扫描找不到它。
-        for _a in self._ai_ids():
-            if not _a.startswith('01'):
-                continue
-            try:
-                sids.append(int(_a, 16))
-            except Exception:
-                pass
-        nxt = (max(sids) + 1) if sids else 0x01000000
-        sid_t, sid_g = '%08X' % nxt, '%08X' % (nxt + 1)
+        # 新 ID：**统一走 `_next_sid(2)`**（§254）。
+        #   · 它只扫 `0100xxxx` 那一段（AI 三大件里那批 GUID 风格随机 ID 不算 ——
+        #     算进去新 ID 会跳到 GUID 区，既不符合 FA2 的顺序编号，记录扫描也找不到）；
+        #   · 三类（特遣/小队/脚本）+ 触发/标签**共享同一序列**，一起取最大值；
+        #   · ★以前这里自己算一套、且 `_ai_ids()` 是**缓存**的 ⇒ 同一批操作里
+        #     "先建特遣、再建触发" 两边拿到同一个 `01000494`，ID 撞车（§254 抓到）。
+        #   · FA2 里触发和标签各占一个连号 ⇒ 一次取 2 个。
+        sid_t, sid_g = self._next_sid(2)
 
         def patch(buf, off, data):
             buf[off:off + len(data)] = data
@@ -11339,18 +12128,25 @@ class SaveDoc(object):
             if isinstance(a, dict):
                 acts.append({'type': int(a['type']), 'arg': int(a.get('arg') or 0),
                              'name': a.get('name'), 'waypoint': a.get('waypoint'),
-                             'cell': a.get('cell')})
+                             'cell': a.get('cell'),
+                             # ★§255：80/107 的小队键（走 `+0x44`，不能塞进 arg）
+                             'team': a.get('team')})
             else:
                 acts.append({'type': _pair(a)[0], 'arg': _pair(a)[1]})
 
         first_ac = acts[0] if acts else None
+        # ★§255：第一条行为若是"援军型 + 指定了小队"，不能交给 `create_trigger` 的第一条
+        #   去建（那条只认 ac_name/waypoint/cell，写不了小队）⇒ 先建**空触发**，
+        #   所有行为统一用 `add_action(team=…)` 追加。
+        _post_first = bool(first_ac and first_ac['type'] in self.SPAWN_ACTIONS
+                           and first_ac.get('team'))
         info = self.create_trigger(
             name, evs[0][0], evs[0][1],
-            None if first_ac is None else first_ac['type'],
-            0 if first_ac is None else first_ac['arg'],
-            ac_name=first_ac.get('name') if first_ac else None,
-            ac_waypoint=first_ac.get('waypoint') if first_ac else None,
-            ac_cell=first_ac.get('cell') if first_ac else None,
+            None if (first_ac is None or _post_first) else first_ac['type'],
+            0 if (first_ac is None or _post_first) else first_ac['arg'],
+            ac_name=first_ac.get('name') if (first_ac and not _post_first) else None,
+            ac_waypoint=first_ac.get('waypoint') if (first_ac and not _post_first) else None,
+            ac_cell=first_ac.get('cell') if (first_ac and not _post_first) else None,
             hb_warn=False,          # 多事件版自己按全量事件判断心跳，避免重复提示
             **kw)
         sid = info['trigger_id']
@@ -11362,11 +12158,11 @@ class SaveDoc(object):
                 self.add_event(sid, t, a)
             except Exception as e:
                 warns.append('追加事件失败（类型 %s）：%s' % (t, e))
-        for a in acts[1:]:
+        for a in (acts if _post_first else acts[1:]):
             try:
                 self.add_action(sid, a['type'], a['arg'],
                                 name=a.get('name'), waypoint=a.get('waypoint'),
-                                cell=a.get('cell'))
+                                cell=a.get('cell'), team=a.get('team'))
             except Exception as e:
                 warns.append('追加行为失败（类型 %s）：%s' % (a['type'], e))
         # 回读实际结果（以引擎口径的链序为准，别信我们自己的记账）
@@ -11989,19 +12785,27 @@ class SaveDoc(object):
         return out
 
     def add_event(self, sid, etype, arg=0):
-        """给触发**追加一个事件**（§155：事件链是**头插逆序**）→ dict。
+        """给触发**追加一个事件**（接**链尾**）→ dict。
 
-        ★为什么是头插：地编里事件列表是"一块一块拼"的，存档里存的却是**逆序链** ——
-          GUI 列表的**最后一条**才是链头（触发实例 `+192`），引擎**按链序短路**（§163：
-          链头不满足时后面的摧毁事件根本没被接管）。所以 `add_event` 必须：
-            新事件.next = 旧链头；实例 `+192` = 新事件键
-          ⇒ 新事件出现在链头 = 地编列表末尾，与 FA2 的观感一致。
-          （行为相反：`add_action` 接**链尾**正序，因为行为是按列表顺序依次执行。）
+        ★方向（§155.3 全档统计定案）：**接链尾**。
+          地图自带的档是"链头插"写出来的（`TEventClass` 链上 seq 递减 `[84,83,82]`），
+          所以**地图第 1 个事件落在链尾**；而本工具 GUI 的显示顺序 = **链序 = 引擎评估
+          顺序**（`_fill_events` 里写死"从上到下 = 评估顺序"）。两者叠加 ⇒ 往已有触发
+          加事件，只有接**链尾**才满足两件事：
+            ① 新事件排在列表最后（= 引擎最后评估），不动已有事件的短路顺序；
+            ② 不会把「13 流逝时间」心跳挤出链头（§181：36/37 触发的心跳必须第一位）。
+          （2026-10-24 说明：§219 那天为修撞号把它改成过"头插"，方向其实是退步，
+            §193 自检 `[7] 新事件接在链尾` 也一直是按链尾写的。）
+
+        ★序号（§219 定案，这条才是真 bug）：事件对象 `+0x38`(=+56) 是**事件表内物理
+          序号**（实测 0..N-1 连续唯一），不是"所属触发的序号"。写触发序号会与表里
+          同号旧对象撞号 ⇒ 引擎定位到别人的旧对象。这里写 **表内 max+1**（追加到组尾，
+          物理上就是 max+1）。
 
         `ev_size` 优先按档内实测（`events[1].obj - events[0].obj`，普通档 108 / 大任务档 124），
         档里只有 1 个事件时退回 `_newtrig_groups()` 的推断值。
         克隆源 = 档内**最后一个**事件对象；运行期指针（`+40` 起）全部清零，
-        只留身份签名 + 类常量 + 类型 + 参数 + 所属触发序号。
+        只留身份签名 + 类常量 + 类型 + 参数 + 序号。
         """
         pl = self.plain
         etype, arg = int(etype), int(arg)
@@ -12039,9 +12843,19 @@ class SaveDoc(object):
         buf[56:60] = struct.pack('<I', ev_ord)       # ★事件表内序号（max+1，§219）
         buf[OBJ_TYPE_OFF:OBJ_TYPE_OFF + 4] = struct.pack('<I', etype)
         buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', arg)
-        buf[self.EVENT_NEXT_OFF:self.EVENT_NEXT_OFF + 4] = struct.pack('<I', old_head)
+        buf[self.EVENT_NEXT_OFF:self.EVENT_NEXT_OFF + 4] = struct.pack('<I', 0)  # 链尾
         pl[tpl + ev_size:tpl + ev_size] = bytes(buf)
-        pl[inst + 192:inst + 196] = struct.pack('<I', k)   # ★头插：新事件 = 新链头
+        # ★接**链尾**（见 docstring / §155.3）：改链尾的 next，不动链头；
+        #   链是空的（实例 +192 为 0）才把它当链头。
+        if not old_head:
+            pl[inst + 192:inst + 196] = struct.pack('<I', k)
+        else:
+            byk = {e.get('key'): e for e in evs if e.get('key')}
+            tail = byk.get(self.event_chain(old_head)[-1]) if self.event_chain(old_head) else None
+            if tail is None:
+                raise RuntimeError('事件链异常（链尾对象找不到）—— 请勿保存')
+            pl[tail['obj'] + self.EVENT_NEXT_OFF:
+               tail['obj'] + self.EVENT_NEXT_OFF + 4] = struct.pack('<I', k)
         self.invalidate_caches(rescan=True)
         evs2 = self.events()
         if evs2:
@@ -12050,49 +12864,10 @@ class SaveDoc(object):
             pl[p0:p0 + 4] = struct.pack('<I', n + 1)
         self.invalidate_caches(rescan=True)
         return {'key': k, 'obj': tpl + ev_size, 'type': etype, 'arg': arg,
-                'next': old_head, 'chain_head': k, 'ev_size': ev_size}
+                'next': 0, 'chain_head': int.from_bytes(
+                    pl[inst + 192:inst + 196], 'little'), 'ev_size': ev_size}
 
-    def remove_event(self, sid, ev_key):
-        """删掉触发的一个事件（先补链，再删对象字节，最后组计数 −1）。"""
-        pl = self.plain
-        o = self.trigger_objects(sid)
-        inst = o['inst']
-        evs = self.events()
-        byk = {e.get('key'): e for e in evs}
-        e = byk.get(ev_key)
-        if inst is None or e is None:
-            raise RuntimeError('找不到该事件（或该触发没有实例）')
-        ev_size = (evs[1]['obj'] - evs[0]['obj']) if len(evs) >= 2 else None
-        if not ev_size or ev_size < 64:
-            ev_size = self._newtrig_groups()['ev_size']
-        nxt = int.from_bytes(pl[e['obj'] + self.EVENT_NEXT_OFF:
-                                e['obj'] + self.EVENT_NEXT_OFF + 4], 'little')
-        head = int.from_bytes(pl[inst + 192:inst + 196], 'little')
-        if head == ev_key:
-            pl[inst + 192:inst + 196] = struct.pack('<I', nxt)
-        else:
-            prev = None
-            for kk in self.event_chain(head):
-                if kk == ev_key:
-                    break
-                prev = kk
-            if prev is None:
-                raise RuntimeError('该事件不在链上，已拒绝删除')
-            pv = byk.get(prev)
-            pl[pv['obj'] + self.EVENT_NEXT_OFF:
-               pv['obj'] + self.EVENT_NEXT_OFF + 4] = struct.pack('<I', nxt)
-        obj = e['obj']
-        del pl[obj:obj + ev_size]
-        self.invalidate_caches(rescan=True)
-        evs2 = self.events()
-        if evs2:
-            p0 = evs2[0]['obj'] - 4
-            n = int.from_bytes(pl[p0:p0 + 4], 'little')
-            pl[p0:p0 + 4] = struct.pack('<I', max(0, n - 1))
-        self.invalidate_caches(rescan=True)
-        return {'removed': ev_key, 'type': e['type'], 'arg': e['arg']}
-
-    def add_action(self, sid, atype, arg=0, name=None, waypoint=None, cell=None):
+    def add_action(self, sid, atype, arg=0, name=None, waypoint=None, cell=None, team=None):
         """给触发**追加一条行为**（§193 修正版）。
 
         ★2026-10-23 修正（原实现在 7MB 小档上"静默无效"的根因）：
@@ -12166,6 +12941,25 @@ class SaveDoc(object):
                 waypoint = wp
             buf[104:112] = str(name).upper().encode('ascii', 'ignore')[:8].ljust(8, b'\x00')
             buf[88:92] = struct.pack('<I', int(waypoint))
+        if atype in self.SPAWN_ACTIONS:
+            # ★§253：行为 80「援军」/107「超时空传送援军」——「触发挂载作战小队」。
+            #   布局（§218 实测，两者相同）：`+0x40` 类型 / **`+0x44` 小队键** /
+            #   `+0x58` 路径点 / `+0x48` 恒 0。注意小队键**不是** `+0x48`（工具默认参数槽）。
+            if team is None:
+                raise RuntimeError('行为 %d（援军/超时空援军）必须给 team（小队键 / 小队 ID / 名称）'
+                                   % atype)
+            tkey = self.team_key_of(team)
+            if not tkey:
+                raise RuntimeError('认不出小队 %r（可用小队 ID / 名称 / 键）' % (team,))
+            if waypoint is None:
+                if cell is None:
+                    raise RuntimeError('行为 %d 还要给 waypoint（路径点号）或 cell=(x,y)' % atype)
+                waypoint = self.ensure_waypoint_at(int(cell[0]), int(cell[1]))
+                if waypoint is None:
+                    raise RuntimeError('格 %s 处建不了路径点（号段用满且无近点可复用）' % (cell,))
+            buf[0x44:0x48] = struct.pack('<I', tkey)
+            buf[0x48:0x4C] = b'\x00' * 4
+            buf[0x58:0x5C] = struct.pack('<I', int(waypoint))
         pl[pos:pos] = bytes(buf)
         self.invalidate_caches(rescan=True)
         pl = self.plain
@@ -12189,109 +12983,15 @@ class SaveDoc(object):
             n = int.from_bytes(pl[p0:p0 + 4], 'little')
             pl[p0:p0 + 4] = struct.pack('<I', n + 1)
         self.invalidate_caches(rescan=True)
+        rest = self.trigger_actions(sid)
+        # ★2026-10-24：返回里补 `obj`（新对象的明文偏移）。旧返回值只有 key/ordinal，
+        #   调用方要校验刚写进去的字段（如行为 125 的建筑名 +104 / 路径点 +88）还得自己
+        #   再遍历一遍 —— `_selftest_ev174` 就是因此报 KeyError 'obj'。
+        obj_off = next((a.get('action_off') for a in rest if a.get('key') == k), None)
+        if obj_off is None:
+            obj_off = next((x['obj'] for x in self.actions() if x.get('key') == k), None)
         return {'key': k, 'type': atype, 'arg': arg, 'ordinal': neword,
-                'total': len(self.trigger_actions(sid))}
-
-    def add_event(self, sid, etype, arg=0):
-        """给触发**追加一个事件**（§193）。事件是**键链**，没有序号，插到链尾即可。
-
-        · 模板取该触发链尾的事件（没有就取全档最后一个）⇒ 天然拿到本档的事件尺寸
-          （小任务档 108B / 大 mod 档 124B，**不能用常量**）
-        · `+56` 写"所属触发的序号"（与地编/引擎一致），`+0x3C` 置 0 = 链尾
-        · 事件组计数在「组首 obj−4」，插完后 +1
-        """
-        pl = self.plain
-        etype, arg = int(etype), int(arg)
-        if etype not in EVENT_TYPES:
-            raise ValueError('事件类型 %s 无效' % etype)
-        if etype == 0:
-            raise RuntimeError('事件类型 0「-无事件-」会让读档崩溃，已拒绝')
-        o = self.trigger_objects(sid)
-        inst = o['inst']
-        if inst is None:
-            raise RuntimeError('该触发没有运行期实例，不能加事件')
-        evs = self.events()
-        if not evs:
-            raise RuntimeError('档内没有可克隆的事件对象')
-        size = o.get('ev_size') or (evs[1]['obj'] - evs[0]['obj'] if len(evs) > 1 else 108)
-        head = int.from_bytes(pl[inst + 192:inst + 196], 'little')
-        chain = self.event_chain(head)
-        byk = {e.get('key'): e for e in evs if e.get('key')}
-        tail = byk.get(chain[-1]) if chain else None
-        tpl = tail['obj'] if tail is not None else evs[-1]['obj']
-        pos = tpl + size
-        keys = [e.get('key') for e in evs if e.get('key')] + \
-               [a.get('key') for a in self.actions() if a.get('key')]
-        k = ((max(keys) + 0x1000) if keys else 0x02A75020) & 0xFFFFFFFF
-        while pl.find(struct.pack('<I', k)) >= 0:
-            k = (k + 0x1000) & 0xFFFFFFFF
-        buf = bytearray(pl[tpl:tpl + size])
-        for off in range(40, size, 4):                 # 清运行期指针（保留 0..36 类签名）
-            buf[off:off + 4] = b'\x00' * 4
-        buf[16:20] = struct.pack('<I', k)
-        buf[56:60] = struct.pack('<I', int.from_bytes(
-            pl[inst + self.TRIG_SEQ_OFF:inst + self.TRIG_SEQ_OFF + 4], 'little'))
-        buf[self.EVENT_NEXT_OFF:self.EVENT_NEXT_OFF + 4] = b'\x00' * 4
-        buf[OBJ_TYPE_OFF:OBJ_TYPE_OFF + 4] = struct.pack('<I', etype)
-        buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', arg)
-        cpos = evs[0]['obj'] - 4
-        n = struct.unpack_from('<I', pl, cpos)[0]
-        pl[pos:pos] = bytes(buf)
-        self.invalidate_caches(rescan=True)
-        pl = self.plain
-        head = int.from_bytes(pl[inst + 192:inst + 196], 'little')
-        chain = self.event_chain(head)
-        byk2 = {e.get('key'): e for e in self.events() if e.get('key')}
-        if not chain:
-            pl[inst + 192:inst + 196] = struct.pack('<I', k)
-        else:
-            last = byk2.get(chain[-1])
-            if last is None:
-                raise RuntimeError('事件链异常（链尾对象找不到）—— 请勿保存')
-            pl[last['obj'] + self.EVENT_NEXT_OFF:
-               last['obj'] + self.EVENT_NEXT_OFF + 4] = struct.pack('<I', k)
-        self.invalidate_caches(rescan=True)
-        pl = self.plain
-        pl[cpos:cpos + 4] = struct.pack('<I', n + 1)
-        self.invalidate_caches(rescan=True)
-        return {'key': k, 'type': etype, 'arg': arg,
-                'total': len(self.trigger_event_list(sid))}
-
-    def remove_action(self, sid, ac_key):
-        """删掉触发的一条行为（先补链，再删 168 字节，最后组计数 −1）。"""
-        pl = self.plain
-        o = self.trigger_objects(sid)
-        inst = o['inst']
-        byk = {a.get('key'): a for a in self.actions()}
-        a = byk.get(ac_key)
-        if inst is None or a is None:
-            raise RuntimeError('找不到该行为（或该触发没有实例）')
-        nxt = int.from_bytes(pl[a['obj'] + self.ACTION_NEXT_OFF:
-                                a['obj'] + self.ACTION_NEXT_OFF + 4], 'little')
-        head = int.from_bytes(pl[inst + 196:inst + 200], 'little')
-        if head == ac_key:
-            pl[inst + 196:inst + 200] = struct.pack('<I', nxt)
-        else:
-            prev = None
-            for kk in self.action_chain(head):
-                if kk == ac_key:
-                    break
-                prev = kk
-            if prev is None:
-                raise RuntimeError('该行为不在链上，已拒绝删除')
-            pv = byk.get(prev)
-            pl[pv['obj'] + self.ACTION_NEXT_OFF:
-               pv['obj'] + self.ACTION_NEXT_OFF + 4] = struct.pack('<I', nxt)
-        obj = a['obj']
-        del pl[obj:obj + ACTION_SIZE]
-        self.invalidate_caches(rescan=True)
-        acts2 = self.actions()
-        if acts2:
-            p0 = acts2[0]['obj'] - 4
-            n = int.from_bytes(pl[p0:p0 + 4], 'little')
-            pl[p0:p0 + 4] = struct.pack('<I', max(0, n - 1))
-        self.invalidate_caches(rescan=True)
-        return {'removed': ac_key, 'type': a['type'], 'arg': a['arg']}
+                'total': len(rest), 'obj': obj_off}
 
     # ---------- 复制 / 删除 ----------
     def copy_trigger(self, sid, new_name=None):
@@ -12444,11 +13144,20 @@ class SaveDoc(object):
         步骤：链重连（前驱 +0x3C 或链头 +192 → 被删者 next）→ 删字节 → 事件组计数 −1。
         """
         inst, head_off, seq, next_off = self._chain_objs(sid, 'ev')
+        # ★兼容两种调用（2026-10-24 实踩）：小整数 = **链序**（0 基，列表化编辑器用）；
+        #   大整数 = **事件自键**（旧 API、「触发编辑器」、`_selftest_ev174` 在用）。
+        #   自键形如 0x02A7xxxx，绝不会落进 0..len 区间 —— 原实现只按序号解释，
+        #   GUI 的「删除选中事件」传的是 `r['key']` ⇒ 一点就报「事件序号越界」。
+        orig = index
         index = int(index)
         if len(seq) <= 1:
             raise RuntimeError('这条触发只有 1 个事件，删掉它触发就永远不会成立了 —— 已拒绝')
         if not (0 <= index < len(seq)):
-            raise RuntimeError('事件序号越界（共 %d 条）' % len(seq))
+            idx2 = next((i for i, (k, _o) in enumerate(seq) if k == orig), None)
+            if idx2 is None:
+                raise RuntimeError('事件序号/键 %s 不在这条触发里（共 %d 条）'
+                                   % (orig, len(seq)))
+            index = idx2
         size = self._obj_size('ev', sid)
         obj = seq[index][1]
         nxt = struct.unpack_from('<I', self.plain, obj + next_off)[0]
@@ -12473,7 +13182,8 @@ class SaveDoc(object):
                 'order': [k for k, _o in seq if k != seq[index][0]]}
 
     def remove_action(self, sid, index):
-        """删除某触发第 index 个行为（**最后一条不能删**：触发必须有至少一条行为）。
+        """删除某触发第 index 个行为（**最后一条也能删**：删完 = 无行为对象的空触发，
+        实例行为链头写 0 —— §219 证明引擎能读这种形态）。
 
         行为的序号 `+0x38` 必须与位置一致 ⇒ 删完要把后面同触发行为的序号各 −1；
         删的是第一条时，实例 `+196` 链头要指向新的第一条（键 = 新第一条对象的 +16）。
@@ -12493,7 +13203,22 @@ class SaveDoc(object):
                 raise RuntimeError('行为序号/键 %s 不在这条触发里' % index)
             index = idx2
         if len(acts) <= 1:
-            raise RuntimeError('这条触发只有 1 条行为，删掉它触发就没有效果了 —— 已拒绝')
+            # ★§257：**最后一条也能删**（§231 玩家要求"删完就是空触发"；
+            #   §219 已证明「无行为对象的空触发」引擎能读 —— 实例行为链头写 0 即可，
+            #   `create_trigger(ac_type=None)` 建的就是这种形态）。
+            #   旧实现直接拒绝 ⇒ GUI 里"删最后一条"一直弹「删除失败」。
+            pl = self.plain
+            obj = acts[index]['action_off']
+            first = self.actions()[0]['obj']
+            cpos = first - 4
+            n = struct.unpack_from('<I', pl, cpos)[0]
+            pl[inst + 196:inst + 200] = b'\x00' * 4        # 行为链头 = 0（空触发）
+            del pl[obj:obj + ACTION_SIZE]
+            self.invalidate_caches(rescan=True)
+            pl = self.plain
+            pl[cpos:cpos + 4] = struct.pack('<I', max(0, n - 1))
+            self.invalidate_caches(rescan=True)
+            return {'removed': index, 'size': ACTION_SIZE, 'left': 0, 'order': []}
         if not (0 <= index < len(acts)):
             raise RuntimeError('行为序号越界（共 %d 条）' % len(acts))
         pl = self.plain

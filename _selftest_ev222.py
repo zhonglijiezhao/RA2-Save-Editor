@@ -21,7 +21,8 @@ sys.path.insert(0, os.path.join(HERE, 'core'))
 
 from editor_core import SaveDoc                                        # noqa: E402
 
-SAV = sys.argv[1] if len(sys.argv) > 1 else 'E:/YURI/SAVE0029.SAV'
+_CAND = ['E:/YURI/SAVE0029.SAV', 'E:/YURI/新建文件夹 (30)/SAVE0029.SAV']
+SAV = sys.argv[1] if len(sys.argv) > 1 else next((x for x in _CAND if os.path.isfile(x)), _CAND[0])
 n_ok = n_bad = 0
 fails = []
 

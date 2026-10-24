@@ -51,20 +51,66 @@ NAME_OFF = 0x78
 NAME_LEN = 0x28
 ID_OFF = 0x38
 
-# TeamType 布尔标志位（bit → 名字）；来源=逐位与地图 INI 的 yes/no 向量比对
-FLAG_BITS = {
-    # ★★2026-10-19 00:1x **A/B 实证**：玩家给的 `E://YURI//SAVE4823.SAV`（预装载已打开）与
-    #   `E://YURI//SAVE0029.SAV`（同图、同小队、预装载关闭）**只差 +0xB9 这 1 个字节（00→01）**
-    #   ⇒ 这个字节就是 FA2「作战小队」里的**预装载**开关。
-    #   注：all01umd.map 的 `Full` 向量与这一列 223/223 完全重合 ⇒ 地图 INI 那边它叫 `Full`，
-    #   而 FA2 的复选框叫「预装载」；以游戏行为为准，工具里统一叫「预装载」。
-    (0xB8, 8): '预装载',
-    (0xBC, 0): 'Recruiter',
-    (0xBC, 24): 'Reinforce',
-    (0xC0, 24): 'Suicide/AvoidThreats',
-    (0xC4, 0): 'Droppod',
-    (0xC4, 8): 'UseTransportOrigin',
+# TeamType 布尔标志：**一个字节一个标志**（不是位域！），偏移已用引擎反汇编 + 地图 INI 双证。
+# ★★2026-10-24 §235 定案：
+#   ① 引擎写盘函数 `0x6F10E0–0x6F13C0` 里每个 `mov al,[esi+runtime]` 紧跟着
+#      `push "<INI 键>"` ⇒ 得到「键 ↔ 运行期偏移」，加 0x14 就是存档偏移
+#      （运行期偏移 = 存档偏移 − 0x14，与 §对象头口径一致）。
+#   ② 用 ALL01UMD.MAP 的 125 条真小队逐条对账：**16/16 字段、125/125 全中**。
+#   ③ MindControlDecision（玩家说的「心控重建」）= 存档 **+0xD4 的 dword**
+#      （地图 124 条=0、1 条=5，存档一一对应；`0x5276d0` = 读整数）。
+#   ⚠ 旧版注释写的 "(0xB8,8) 位" 其实是"第 0xB9 字节" —— 位号 = (字节−0xB8)*8，
+#     看着像位域，实为一串独立的 bool 字节。别再按位域去解析。
+TEAM_FLAGS = {
+    0xB8: 'Loadable',              # FA2「可装载」（≠ 预装载）
+    0xB9: 'Full',                  # FA2「预装载」（★A/B 实测：开/关只差这 1 字节）
+    0xBA: 'Annoyance',
+    0xBB: 'GuardSlower',
+    0xBC: 'Recruiter',
+    0xBD: 'Autocreate',
+    0xBE: 'Prebuild',
+    0xBF: 'Reinforce',
+    0xC0: 'Whiner',
+    0xC1: 'Aggressive',
+    0xC2: 'LooseRecruit',
+    0xC3: 'Suicide',
+    0xC4: 'Droppod',
+    0xC5: 'UseTransportOrigin',
+    0xC7: 'OnTransOnly',
+    0x106: 'AvoidThreats',         # ★离得远（不在 0xB8 那串里），反汇编才看得出来
 }
+
+# 中文显示名（GUI 用；顺序即显示顺序）
+TEAM_FLAG_LABELS = {
+    'Full': '预装载',
+    'Loadable': '可装载',
+    'Recruiter': '可招募',
+    'Reinforce': '增援',
+    'Prebuild': '预建',
+    'Autocreate': '自动创建',
+    'GuardSlower': '守卫减速',
+    'Annoyance': '骚扰',
+    'Aggressive': '主动攻击',
+    'LooseRecruit': '散兵招募',
+    'Suicide': '自杀式',
+    'Droppod': '空降舱',
+    'UseTransportOrigin': '用运输起点',
+    'OnTransOnly': '仅运输时',
+    'AvoidThreats': '避让威胁',
+    'Whiner': '抱怨',
+}
+
+# ★「心控重建」= MindControlDecision（dword，0/1/2/5…；地图 INI 同名键，125/125 对账）
+TEAM_MC_OFF = 0xD4
+TEAM_TAG_OFF = 0xE4        # TeamType.Tag —— **指向标签对象(TagType)的键**（0 = 没挂标签）
+                           # ★2026-10-24 §247：与单位记录 +0x48（存 CellTag 运行期指针 X）不同，
+                           #   小队这里直接存**标签对象键**，所以写起来只要标签键，不用管 X。
+                           #   实证：T85 小队 01000241「a飞碟转圈A」+0xE4 = 0x159796E0
+                           #   = 标签 01000251 的键（与玩家 FA2 截图「关联标签」逐字一致）。
+TAGOBJ_GUID = bytes.fromhex('33e4f654ed09d211aca5006008055bb5')   # 54F6E433 标签对象
+
+# 旧名保留（别处可能 import 到；等价于 TEAM_FLAGS 的字节解释）
+FLAG_BITS = {(o, 0): nm for o, nm in TEAM_FLAGS.items()}
 
 TF_MAX = 6          # 特遣部队最多 6 种型号
 
@@ -139,6 +185,21 @@ def read_ai(doc):
     except Exception:
         hname = {}
 
+    # 标签对象索引：{标签键: 标签 ID}（用于把小队的 +0xE4 解析成能看懂的 0100xxxx）
+    tag_sid = {}
+    try:
+        _q = 0
+        while True:
+            _i = pl.find(TAGOBJ_GUID, _q)
+            if _i < 0:
+                break
+            _q = _i + 1
+            if _i + 64 > len(pl):
+                continue
+            tag_sid[struct.unpack_from('<I', pl, _i + 16)[0]] = _dec(pl[_i + 56:_i + 64])
+    except Exception:
+        pass
+
     scripts, tfs = [], []
     for o in _walk(pl, *AI_CLASSES['scripttype']):
         cnt = struct.unpack_from('<i', pl, o + 0xB4)[0]
@@ -175,12 +236,12 @@ def read_ai(doc):
     teams = []
     for o in _walk(pl, *AI_CLASSES['teamtype']):
         flags = {}
-        for (base, bit), nm in FLAG_BITS.items():
-            v = struct.unpack_from('<I', pl, o + base)[0]
-            flags[nm] = bool((v >> bit) & 1)
+        for foff, nm in TEAM_FLAGS.items():
+            flags[nm] = bool(pl[o + foff])
         tkey = struct.unpack_from('<I', pl, o + 0xF8)[0]
         skey = struct.unpack_from('<I', pl, o + 0xF4)[0]
         hkey = struct.unpack_from('<I', pl, o + 0xD8)[0]
+        tagkey = struct.unpack_from('<I', pl, o + TEAM_TAG_OFF)[0]
         tf = tf_by_key.get(tkey)
         sc = sc_by_key.get(skey)
         if sc is not None and not sc['entries']:
@@ -198,6 +259,9 @@ def read_ai(doc):
             'priority': struct.unpack_from('<i', pl, o + 0xCC)[0],
             'house': hname.get(hkey, '#%08X' % hkey),
             'flags': flags,
+            'mc_decision': struct.unpack_from('<i', pl, o + TEAM_MC_OFF)[0],
+            'tag_key': tagkey,
+            'tag_id': tag_sid.get(tagkey) if tagkey else None,
             'tf_key': tkey, 'script_key': skey,
             'taskforce': tf['name'] if tf else None,
             'taskforce_id': tf['id'] if tf else None,
@@ -565,6 +629,173 @@ def set_team_loadable(doc, team_id, on=True):
     pl[off] = new
     return {'team_id': t['id'], 'name': t['name'], 'off': off,
             'old': old, 'new': new}
+
+
+def list_tags(doc):
+    """本档全部**标签对象**（TagType）→ [{'key','id','trigger_id','trigger_name'}]，按 ID 排序。
+
+    用来给「小队关联标签」挑目标（GUI 下拉框与 CLI 报错提示同源）。
+    `trigger_id/name` = 该标签链到的触发（TagType `+180` = 触发实例键）；解不出为 None。
+    """
+    pl = doc.plain
+    if isinstance(pl, bytearray):
+        pl = bytes(pl)
+    from editor_core import TRIG_TAGOBJ_GUID, TRIG_INSTANCE_GUID
+    # 标签对象：{键: (off, ID)}
+    tags = {}
+    q = 0
+    while True:
+        i = pl.find(TRIG_TAGOBJ_GUID, q)
+        if i < 0:
+            break
+        q = i + 1
+        if i + 64 > len(pl):
+            continue
+        tags[struct.unpack_from('<I', pl, i + 16)[0]] = (i, _dec(pl[i + 56:i + 64]))
+    # 触发实例：{键: (ID, 名字)}
+    tinst = {}
+    q = 0
+    while True:
+        i = pl.find(TRIG_INSTANCE_GUID, q)
+        if i < 0:
+            break
+        q = i + 1
+        if i + 64 > len(pl):
+            continue
+        k = struct.unpack_from('<I', pl, i + 16)[0]
+        tinst[k] = (_dec(pl[i + 56:i + 64]), _dec(pl[i + 120:i + 152]))
+    out = []
+    for k, (off, sid) in tags.items():
+        tk = struct.unpack_from('<I', pl, off + 180)[0]
+        tid, tname = tinst.get(tk, (None, None))
+        out.append({'key': k, 'id': sid, 'off': off,
+                    'trigger_id': tid, 'trigger_name': tname})
+    return sorted(out, key=lambda x: x['id'])
+
+
+def set_team_tag(doc, team_id, tag):
+    """给作战小队挂/换**关联标签**（`+0xE4`，FA2「作战小队」里的「关联标签」）→ dict。
+
+    §247 定案（玩家 FA2 截图对账）：小队 01000241「a飞碟转圈A」的关联标签 01000251
+    就存在 `+0x0E4` 这 4 个字节里，存的是**标签对象(TagType)的键**（不是 CellTag 指针，
+    与单位记录 `+0x48` 存 X 不同）⇒ 写一个键就行，不用管运行期指针。
+
+    `tag`：
+      · `None` / `''` / `'0'` / `'none'` ⇒ **解除**（写 0 = 没挂标签）；
+      · 标签 ID（如 `'01000251'`）或标签对象键（如 `'0x159796e0'`）⇒ 挂该标签
+        （校验本档确实存在这个标签对象，不存在直接报错不写 —— 避免悬空键）。
+
+    ★只写 `+0xE4` 这 4 个字节，长度不变。
+    ★语义提醒：小队挂上标签后，**挂在该标签上的触发**就会把这支小队当作事件对象
+      （例如「小队被攻击 → 全部寻敌」）。这正是 T100 崩溃的来路：那条触发本来是挂在
+      **单位**上的（单位 `+0x48`），克隆时被一起继承 ⇒ 打掉就崩。小队这条路是**显式**
+      挂的，用途不一样，但用之前请确认触发的行为列表不会把自己想保留的单位搞乱。
+    """
+    ai = read_ai(doc)
+    t = next((x for x in ai['teams'] if x['id'] == str(team_id)), None)
+    if t is None:
+        raise KeyError('这份存档里没有 ID 为 %r 的作战小队（共 %d 个）'
+                       % (team_id, len(ai['teams'])))
+    pl = doc.plain
+    if not isinstance(pl, bytearray):
+        raise RuntimeError('doc.plain 不是可写 bytearray')
+    off = t['off'] + TEAM_TAG_OFF
+    old_key = struct.unpack_from('<I', pl, off)[0]
+
+    # 解析目标标签
+    new_key = 0
+    tag_name = None
+    if tag is not None and str(tag).strip().lower() not in ('', '0', 'none', '（空）'):
+        txt = str(tag).strip()
+        cand = None
+        for x in ai['teams']:
+            pass
+        # 在本档标签对象里找（ID 或键都认）
+        q = 0
+        found = []
+        while True:
+            i = pl.find(TAGOBJ_GUID, q)
+            if i < 0:
+                break
+            q = i + 1
+            if i + 64 > len(pl):
+                continue
+            k = struct.unpack_from('<I', pl, i + 16)[0]
+            sid = _dec(pl[i + 56:i + 64])
+            found.append((k, sid))
+        want = txt.lower().replace('0x', '')
+        for k, sid in found:
+            if txt == sid or want == ('%08x' % k) or txt == ('%08X' % k):
+                cand = (k, sid)
+                break
+        if cand is None:
+            raise KeyError('本档没有标签 %r（可用 --aitag 先看有哪些：%s）'
+                           % (tag, '、'.join(s for _, s in sorted(found, key=lambda x: x[1])[:8])))
+        new_key, tag_name = cand
+
+    if new_key == old_key:
+        return {'team_id': t['id'], 'name': t['name'], 'off': t['off'],
+                'old': old_key, 'new': new_key, 'changed': False,
+                'tag_id': tag_name, 'note': '没有变化'}
+    struct.pack_into('<I', pl, off, new_key)
+    # 回读校验
+    back = struct.unpack_from('<I', pl, off)[0]
+    if back != new_key:
+        raise RuntimeError('写入后回读不一致（%#x ≠ %#x）' % (back, new_key))
+    return {'team_id': t['id'], 'name': t['name'], 'off': t['off'],
+            'old': old_key, 'new': new_key, 'changed': True,
+            'tag_id': tag_name}
+
+
+def set_team_flag(doc, team_id, flag, on=True):
+    """开/关作战小队的任一**布尔标志**（§235：一字节一个标志，见 `TEAM_FLAGS`）。
+
+    `flag` 可用 INI 名（`'Reinforce'` / `'Droppod'` …）或中文名（`'增援'` / `'空降舱'` …）。
+    只写 1 个字节，记录长度不变 ⇒ 安全。会回读校验。
+    """
+    alias = {v: k for k, v in TEAM_FLAG_LABELS.items()}
+    name = alias.get(str(flag), str(flag))
+    if name not in TEAM_FLAGS.values():
+        raise KeyError('未知小队标志 %r（可用：%s）'
+                       % (flag, ', '.join(TEAM_FLAGS.values())))
+    foff = next(o for o, nm in TEAM_FLAGS.items() if nm == name)
+    ai = read_ai(doc)
+    t = next((x for x in ai['teams'] if x['id'] == str(team_id)), None)
+    if t is None:
+        raise KeyError('这份存档里没有 ID 为 %r 的作战小队（共 %d 个）'
+                       % (team_id, len(ai['teams'])))
+    pl = doc.plain
+    off = t['off'] + foff
+    old = pl[off]
+    new = 1 if on else 0
+    pl[off] = new
+    ok = pl[off] == new
+    return {'team_id': t['id'], 'name': t['name'], 'flag': name,
+            'off': off, 'old': old, 'new': new, 'ok': ok}
+
+
+def set_team_mc_decision(doc, team_id, value):
+    """设置小队「**心控重建**」= `MindControlDecision`（`+0xD4`，dword）。
+
+    依据（§235）：引擎写盘函数把 `MindControlDecision` 这个键绑在运行期 `+0xC0`
+    （= 存档 `+0xD4`）且用读整数的方式（`0x5276d0`）；ALL01UMD.MAP 的 125 条小队
+    逐条对账 **125/125 一致**（124 条 0，1 条 5）。
+    只写 4 字节，长度不变。
+    """
+    v = int(value)
+    if not (-1 <= v <= 0x7FFFFFFF):
+        raise ValueError('MindControlDecision 取值不合法：%r' % (value,))
+    ai = read_ai(doc)
+    t = next((x for x in ai['teams'] if x['id'] == str(team_id)), None)
+    if t is None:
+        raise KeyError('这份存档里没有 ID 为 %r 的作战小队（共 %d 个）'
+                       % (team_id, len(ai['teams'])))
+    off = t['off'] + TEAM_MC_OFF
+    old = struct.unpack_from('<i', doc.plain, off)[0]
+    struct.pack_into('<i', doc.plain, off, v)
+    return {'team_id': t['id'], 'name': t['name'], 'off': off,
+            'old': old, 'new': v,
+            'ok': struct.unpack_from('<i', doc.plain, off)[0] == v}
 
 
 # ==================== 删除特遣部队的第 i 项（槽位前移） ====================

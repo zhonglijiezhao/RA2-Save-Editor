@@ -38,7 +38,9 @@ def fp(*names):
     return names[0]
 
 
-SAV = sys.argv[1] if len(sys.argv) > 1 else fp('SAVE0029.SAV')
+_CAND = ['E:/YURI/SAVE0029.SAV', 'E:/YURI/新建文件夹 (30)/SAVE0029.SAV',
+         fp('SAVE0029.SAV')]
+SAV = sys.argv[1] if len(sys.argv) > 1 else next((x for x in _CAND if os.path.isfile(x)), _CAND[0])
 n_ok = n_bad = 0
 fails = []
 

@@ -181,14 +181,13 @@ for o in _SIG_SLOTS:
     if want != got:
         bad.append('0x%X %s!=%s' % (o, got, want))
 ck('★每个参数落到了正确位置（0x940 之后在伴随段里）', not bad, '; '.join(bad))
-ck('★当前高度 = 类型高度（空中，不卡地上）',
-   val(d, new, 0xB8) == val(d, new, 0x270) and val(d, new, 0x270) > 0,
+# ★§248.8：高度"只抬不压"；0x198 保留骨架值（匹配同档原生）
+ck('★当前高度不低于类型高度（空中，不卡地上）',
+   val(d, new, 0xB8) >= val(d, new, 0x270) and val(d, new, 0x270) > 0,
    '%d / %d' % (val(d, new, 0xB8), val(d, new, 0x270)))
 ck('★没有残余指令（不会自己跑去打人）',
-   val(d, new, 0x10C) == 0 and val(d, new, 0x11C) == 0 and val(d, new, 0x120) == 0
-   and val(d, new, 0x198) == 0,
-   '%d/%d/%d 目标=%#x' % (val(d, new, 0x10C), val(d, new, 0x11C),
-                          val(d, new, 0x120), val(d, new, 0x198)))
+   val(d, new, 0x10C) == 0 and val(d, new, 0x11C) == 0 and val(d, new, 0x120) == 0,
+   '%d/%d/%d' % (val(d, new, 0x10C), val(d, new, 0x11C), val(d, new, 0x120)))
 
 out = os.path.join(HERE, '_selftest_out', 'ev216_模板库.SAV')
 if not os.path.isdir(os.path.dirname(out)):

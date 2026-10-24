@@ -139,7 +139,12 @@ def selftest(sav):
         lines.append('[6] 建造动画判态(%d 栋)      OK（%s；会播两遍 %d 栋；异常 %d 栋）'
                      % (n_anim, st_anim, n_replay, bad))
 
-        # FA2 触发器（§174）：**多事件 + 链头插逆序** —— 内存里建一条再核对，不写盘
+        # FA2 触发器（§174 / §155.3）：**多事件 + 链序 = 列表顺序**
+        #   ★2026-10-24 改：旧断言要求链序是列表的**逆序**（地图作者写的档确实是逆序，
+        #     因为引擎是头插），但工具侧的 `add_event` 按 §155.3 铁规则接**链尾**，
+        #     所以工具建出来的链序 = 列表顺序 = GUI 从上到下 = 引擎评估顺序。
+        #     两者都对，差别只在"是不是和地图手写的档长得一样"；工具侧选链尾是因为
+        #     这样不会把「13 流逝时间」心跳挤出链头（§181）。
         try:
             info7 = doc.create_trigger_multi(
                 '自检多事件', [(13, 5), (8, 0)], [(21, 0)])
@@ -147,8 +152,8 @@ def selftest(sav):
                    for e in doc.trigger_event_list(info7['trigger_id'])]
             ac7 = [(a['type'], a['arg'])
                    for a in doc.trigger_action_list(info7['trigger_id'])]
-            ok7 = (ch7 == [(8, 0), (13, 5)]) and (ac7 == [(21, 0)])
-            lines.append('[7] FA2 多事件触发器         %s（链头=%s，行为=%s）'
+            ok7 = (ch7 == [(13, 5), (8, 0)]) and (ac7 == [(21, 0)])
+            lines.append('[7] 多事件触发链序           %s（链序=%s，行为=%s）'
                          % ('OK' if ok7 else 'FAIL', ch7, ac7))
             if not ok7:
                 raise RuntimeError('多事件触发链序不对：%s / %s' % (ch7, ac7))
@@ -766,6 +771,124 @@ def aiwp(args):
         return 1
 
 
+def aiflag(args):
+    """--aiflag <in> <out> <小队ID> <标志> <0|1>：开/关小队任一布尔标志（§235，一字节）。"""
+    if len(args) < 5:
+        _write_report('AIFLAG FAIL\n用法: --aiflag <in> <out> <小队ID> <标志> <0|1>\n'
+                      '可用标志：' + ', '.join(ai_objects_flag_names()))
+        return 2
+    src, out, tid, flag = args[0], args[1], args[2], args[3]
+    try:
+        on = int(args[4]) != 0
+    except ValueError:
+        _write_report('AIFLAG FAIL\n最后那个数只能是 0 或 1')
+        return 2
+    try:
+        from editor_core import SaveDoc
+        import ai_objects
+        d = SaveDoc(src)
+        info = ai_objects.set_team_flag(d, tid, flag, on)
+        r = d.save(out, backup=False)
+        e = SaveDoc(out)
+        t = next(x for x in ai_objects.read_ai(e)['teams'] if x['id'] == tid)
+        _write_report('\n'.join([
+            'AIFLAG PASS', 'src: %s' % src, 'out: %s' % out,
+            '小队 %s「%s」%s：%d → %d（写 +0x%X）'
+            % (info['team_id'], info['name'], info['flag'], info['old'], info['new'],
+               info['off'] - t['off']),
+            '保存：块 %d/%d %s' % (r['blocks'], r['blocks_expect'], r['writer']),
+            '回验：%s=%s' % (info['flag'], t['flags'].get(info['flag']))]))
+        return 0
+    except BaseException:
+        _write_report('AIFLAG FAIL\n\n' + traceback.format_exc())
+        return 1
+
+
+def aimc(args):
+    """--aimc <in> <out> <小队ID> <值>：改小队「心控重建」= MindControlDecision（+0xD4）。"""
+    if len(args) < 4:
+        _write_report('AIMC FAIL\n用法: --aimc <in> <out> <小队ID> <值>（0=关，1/2=开）')
+        return 2
+    src, out, tid = args[0], args[1], args[2]
+    try:
+        v = int(args[3])
+    except ValueError:
+        _write_report('AIMC FAIL\n值必须是整数')
+        return 2
+    try:
+        from editor_core import SaveDoc
+        import ai_objects
+        d = SaveDoc(src)
+        info = ai_objects.set_team_mc_decision(d, tid, v)
+        r = d.save(out, backup=False)
+        e = SaveDoc(out)
+        t = next(x for x in ai_objects.read_ai(e)['teams'] if x['id'] == tid)
+        _write_report('\n'.join([
+            'AIMC PASS', 'src: %s' % src, 'out: %s' % out,
+            '小队 %s「%s」心控重建 %d → %d（写 +0x%X）'
+            % (info['team_id'], info['name'], info['old'], info['new'],
+               ai_objects.TEAM_MC_OFF),
+            '保存：块 %d/%d %s' % (r['blocks'], r['blocks_expect'], r['writer']),
+            '回验：MindControlDecision=%d' % t.get('mc_decision', -999)]))
+        return 0
+    except BaseException:
+        _write_report('AIMC FAIL\n\n' + traceback.format_exc())
+        return 1
+
+
+def aitag(args):
+    """--aitag <in> <out> <小队ID> <标签ID|0>：给小队挂/换「关联标签」（+0xE4，§247）。
+
+    <标签ID> 传 `0`/`none` = 解除。传标签 ID（如 01000251）或标签对象键（0x159796e0）。
+    不带第 4 个参数 = 只列出本档全部标签（挑目标用）。
+    """
+    if not args:
+        _write_report('AITAG FAIL\n用法:\n'
+                      '  --aitag <存档>                     列出本档全部标签（挑目标用）\n'
+                      '  --aitag <in> <out> <小队ID> <标签ID|0>   挂/换/解除（0=解除）')
+        return 2
+    if len(args) < 3:                       # 只给了存档 ⇒ 列标签
+        try:
+            from editor_core import SaveDoc
+            import ai_objects
+            ts = ai_objects.list_tags(SaveDoc(args[0]))
+            lines = ['%s：本档共 %d 个标签对象' % (args[0], len(ts))]
+            for t in ts:
+                lines.append('  %s  键=%#010x  → 触发 %s「%s」'
+                             % (t['id'], t['key'], t['trigger_id'], t['trigger_name']))
+            _write_report('\n'.join(lines))
+            return 0
+        except BaseException:
+            _write_report('AITAG FAIL\n\n' + traceback.format_exc())
+            return 1
+    src, out, tid = args[0], args[1], args[2]
+    tag = args[3] if len(args) > 3 else None
+    try:
+        from editor_core import SaveDoc
+        import ai_objects
+        d = SaveDoc(src)
+        info = ai_objects.set_team_tag(d, tid, tag)
+        r = d.save(out, backup=False)
+        e = SaveDoc(out)
+        t = next(x for x in ai_objects.read_ai(e)['teams'] if x['id'] == tid)
+        _write_report('\n'.join([
+            'AITAG PASS', 'src: %s' % src, 'out: %s' % out,
+            '小队 %s「%s」关联标签 %#x → %#x（写 +0x%X，4 字节）'
+            % (info['team_id'], info['name'], info['old'], info['new'],
+               ai_objects.TEAM_TAG_OFF),
+            '保存：块 %d/%d %s' % (r['blocks'], r['blocks_expect'], r['writer']),
+            '回验：tag_id=%s tag_key=%#x' % (t.get('tag_id'), t.get('tag_key') or 0)]))
+        return 0
+    except BaseException:
+        _write_report('AITAG FAIL\n\n' + traceback.format_exc())
+        return 1
+
+
+def ai_objects_flag_names():
+    import ai_objects
+    return list(ai_objects.TEAM_FLAGS.values())
+
+
 def aiload(args):
     """--aiload <in> <out> <小队ID> <0|1>：开/关小队「预装载」（+0xB9）。"""
     if len(args) < 4:
@@ -800,12 +923,18 @@ def aiload(args):
 
 
 def putunit(args):
-    """--putunit <in> <out> <类型> <cx> <cy> [--house 阵营] [--vet 0|1|2]：克隆放置一个单位。"""
+    """--putunit <in> <out> <类型> <cx> <cy> [--house 阵营] [--vet 0|1|2] [--flatnudge]
+
+    ★§252：默认**你给哪格就放哪格**（不再自动挪到平地），非平地只出警告；
+    要"自动挪到最近的平地"就加 `--flatnudge`。
+    """
+    nudge = '--flatnudge' in args
+    args = [a for a in args if a != '--flatnudge']
     house, args = _take_house(args)
     vet, args = _take_vet(args)
     if len(args) < 5:
         _write_report('PUTUNIT FAIL\n用法: --putunit <in> <out> <类型> <cx> <cy> '
-                      '[--house 阵营] [--vet 0|1|2]')
+                      '[--house 阵营] [--vet 0|1|2] [--flatnudge]')
         return 2
     src, out, tname = args[0], args[1], args[2]
     try:
@@ -817,7 +946,8 @@ def putunit(args):
         from editor_core import SaveDoc
         from editor_core import UnitUnavailable
         d = SaveDoc(src)
-        info = d.add_unit_by_clone(tname, cx, cy, house=house, veterancy=vet)
+        info = d.add_unit_by_clone(tname, cx, cy, house=house, veterancy=vet,
+                                   auto_nudge=nudge)
         d.save(out)
         c = SaveDoc(out)
         got = [(r['type'], r['x'], r['y']) for r in c.unit_records()]
@@ -840,6 +970,192 @@ def putunit(args):
     except BaseException:
         _write_report('PUTUNIT FAIL\n\n' + traceback.format_exc())
         return 1
+
+
+def _spec_units(s):
+    """'DISK:2,ZEP:1' → [('DISK',2),('ZEP',1)]"""
+    out = []
+    for part in str(s).replace('，', ',').split(','):
+        part = part.strip()
+        if not part:
+            continue
+        sep = ':' if ':' in part else ('=' if '=' in part else None)
+        if not sep:
+            raise ValueError('单位要写成「型号:数量」，收到 %r' % part)
+        t, n = part.split(sep, 1)
+        out.append((t.strip().upper(), int(n)))
+    if not out:
+        raise ValueError('至少一个单位')
+    return out
+
+
+def _spec_entries(s):
+    """'5:10,58:1' → [(5,10),(58,1)]"""
+    out = []
+    for part in str(s).replace('，', ',').split(','):
+        part = part.strip()
+        if not part:
+            continue
+        sep = ':' if ':' in part else ('=' if '=' in part else None)
+        if not sep:
+            raise ValueError('动作要写成「动作:参数」，收到 %r' % part)
+        a, arg = part.split(sep, 1)
+        out.append((int(a, 0), int(arg, 0)))
+    return out
+
+
+def _take_opt(args, flag):
+    """从 args 里取走 `--flag 值`（没有就返回 None）。"""
+    if flag not in args:
+        return None, args
+    i = args.index(flag)
+    if i + 1 >= len(args):
+        raise ValueError('%s 后面要跟一个值' % flag)
+    val = args[i + 1]
+    return val, args[:i] + args[i + 2:]
+
+
+def newtf(args):
+    """--newtf <in> <out> <型号:数量[,型号:数量]> [--name 名称] [--sid 8位ID]
+
+    ★§253：单独新建一个**特遣部队**（不建小队/触发；昨天刷兵三件套拆开用）。
+    """
+    try:
+        name, args = _take_opt(args, '--name')
+        sid, args = _take_opt(args, '--sid')
+    except ValueError as e:
+        _write_report('NEWTF FAIL\n%s' % e)
+        return 2
+    if len(args) < 3:
+        _write_report('NEWTF FAIL\n用法: --newtf <in> <out> <型号:数量[,型号:数量]> '
+                      '[--name 名称] [--sid 8位ID]')
+        return 2
+    src, out, spec = args[0], args[1], args[2]
+    try:
+        from editor_core import SaveDoc
+        d = SaveDoc(src)
+        u = _spec_units(spec)
+        r = d.clone_taskforce(u, name=name, sid=sid)
+        d.save(out)
+    except BaseException:
+        _write_report('NEWTF FAIL\n\n' + traceback.format_exc())
+        return 1
+    _write_report('\n'.join([
+        'NEWTF PASS', 'src: %s' % src, 'out: %s' % out,
+        '特遣部队：%s「%s」 键 %#x' % (r['sid'], r['name'], r['key']),
+        '成员：%s' % '、'.join('%s×%d' % (t, n) for t, n in u),
+        '模板：%s' % r.get('template')]))
+    return 0
+
+
+def newscript(args):
+    """--newscript <in> <out> <动作:参数[,动作:参数]> [--name 名称]"""
+    try:
+        name, args = _take_opt(args, '--name')
+        sid, args = _take_opt(args, '--sid')
+    except ValueError as e:
+        _write_report('NEWSCRIPT FAIL\n%s' % e)
+        return 2
+    if len(args) < 3:
+        _write_report('NEWSCRIPT FAIL\n用法: --newscript <in> <out> <动作:参数[,动作:参数]> '
+                      '[--name 名称]')
+        return 2
+    try:
+        from editor_core import SaveDoc
+        d = SaveDoc(args[0])
+        e = _spec_entries(args[2])
+        r = d.clone_script(e, name=name, sid=sid)
+        d.save(args[1])
+    except BaseException:
+        _write_report('NEWSCRIPT FAIL\n\n' + traceback.format_exc())
+        return 1
+    _write_report('\n'.join([
+        'NEWSCRIPT PASS', 'src: %s' % args[0], 'out: %s' % args[1],
+        '动作脚本：%s「%s」 键 %#x 条数 %d' % (r['sid'], r['name'], r['key'], r['count']),
+        '内容：%s' % '、'.join('%s:%s' % (a, b) for a, b in e)]))
+    return 0
+
+
+def newteam(args):
+    """--newteam <in> <out> <型号:数量[,型号:数量]> [--name 名称] [--vet 1|2|3]
+    [--max N] [--script 动作:参数] [--tfsid 特遣ID] [--scriptid 脚本ID]
+
+    ★§253：一把建「特遣部队 +（可选）动作脚本 + 作战小队」，不建触发。
+    星级写 `+0xB4`（1 新兵 / 2 老兵 / 3 精英，与地编同口径）。
+    """
+    opts = {}
+    try:
+        for fl in ('--name', '--vet', '--max', '--script', '--tfsid', '--scriptid', '--house'):
+            opts[fl], args = _take_opt(args, fl)
+    except ValueError as e:
+        _write_report('NEWTEAM FAIL\n%s' % e)
+        return 2
+    if len(args) < 3:
+        _write_report('NEWTEAM FAIL\n用法: --newteam <in> <out> <型号:数量[,型号:数量]> '
+                      '[--name 名称] [--vet 1|2|3] [--max N] [--script 动作:参数]')
+        return 2
+    try:
+        from editor_core import SaveDoc
+        d = SaveDoc(args[0])
+        ent = _spec_entries(opts['--script']) if opts.get('--script') else None
+        r = d.create_ai_team(
+            _spec_units(args[2]), name=opts.get('--name'),
+            veteran=int(opts.get('--vet') or 3),
+            max_teams=int(opts.get('--max') or 5),
+            house=opts.get('--house'),
+            script_entries=ent,
+            script_key=(0 if not ent else None),
+            tf_template=opts.get('--tfsid'))
+        d.save(args[1])
+    except BaseException:
+        _write_report('NEWTEAM FAIL\n\n' + traceback.format_exc())
+        return 1
+    lines = ['NEWTEAM PASS', 'src: %s' % args[0], 'out: %s' % args[1],
+             '特遣部队：%s「%s」 键 %#x' % (r['tf']['sid'], r['tf']['name'], r['tf']['key']),
+             '作战小队：%s「%s」 键 %#x 星级 %s'
+             % (r['team']['sid'], r['team']['name'], r['team']['key'], r['team'].get('veteran')),
+             '脚本：%s' % ('%s（%d 条）' % (r['script']['sid'], r['script']['count'])
+                          if r.get('script') else '空（原地待命）')]
+    for w in (r.get('warnings') or []):
+        lines.append('警告：%s' % w)
+    _write_report('\n'.join(lines))
+    return 0
+
+
+def attachteam(args):
+    """--attachteam <in> <out> <触发ID> <小队ID> <路径点号|x,y> [--action 80|107]"""
+    try:
+        act, args = _take_opt(args, '--action')
+    except ValueError as e:
+        _write_report('ATTACHTEAM FAIL\n%s' % e)
+        return 2
+    if len(args) < 5:
+        _write_report('ATTACHTEAM FAIL\n用法: --attachteam <in> <out> <触发ID> <小队ID> '
+                      '<路径点号|x,y> [--action 80|107]')
+        return 2
+    src, out, tid, team, where = args[0], args[1], args[2], args[3], args[4]
+    try:
+        from editor_core import SaveDoc
+        d = SaveDoc(src)
+        wp = cell = None
+        if ',' in where:
+            a, b = where.replace('，', ',').split(',')
+            cell = (int(a), int(b))
+        else:
+            wp = int(where)
+        r = d.attach_team_to_trigger(tid, team, waypoint=wp, cell=cell,
+                                     action=int(act or 80))
+        d.save(out)
+    except BaseException:
+        _write_report('ATTACHTEAM FAIL\n\n' + traceback.format_exc())
+        return 1
+    _write_report('\n'.join([
+        'ATTACHTEAM PASS', 'src: %s' % src, 'out: %s' % out,
+        '触发：%s  方式：%s' % (tid, '改写原有行为' if r['mode'] == 'reuse' else '追加新行为'),
+        '小队键：%#x   路径点：%d   行为：%d（%s）'
+        % (r['team_key'], r['waypoint'], r['action'],
+           '援军' if r['action'] == 80 else '超时空援军')]))
+    return 0
 
 
 def unitowner(args):
@@ -1454,12 +1770,34 @@ def main():
     if '--putunit' in sys.argv:
         i = sys.argv.index('--putunit')
         return putunit(sys.argv[i + 1:])
+    # ★§253：新建 AI 三大件 + 触发挂小队
+    if '--newtf' in sys.argv:
+        i = sys.argv.index('--newtf')
+        return newtf(sys.argv[i + 1:])
+    if '--newscript' in sys.argv:
+        i = sys.argv.index('--newscript')
+        return newscript(sys.argv[i + 1:])
+    if '--newteam' in sys.argv:
+        i = sys.argv.index('--newteam')
+        return newteam(sys.argv[i + 1:])
+    if '--attachteam' in sys.argv:
+        i = sys.argv.index('--attachteam')
+        return attachteam(sys.argv[i + 1:])
     if '--aivet' in sys.argv:
         i = sys.argv.index('--aivet')
         return aivet(sys.argv[i + 1:])
     if '--aiload' in sys.argv:
         i = sys.argv.index('--aiload')
         return aiload(sys.argv[i + 1:])
+    if '--aiflag' in sys.argv:
+        i = sys.argv.index('--aiflag')
+        return aiflag(sys.argv[i + 1:])
+    if '--aimc' in sys.argv:
+        i = sys.argv.index('--aimc')
+        return aimc(sys.argv[i + 1:])
+    if '--aitag' in sys.argv:
+        i = sys.argv.index('--aitag')
+        return aitag(sys.argv[i + 1:])
     if '--aiwp' in sys.argv:
         i = sys.argv.index('--aiwp')
         return aiwp(sys.argv[i + 1:])

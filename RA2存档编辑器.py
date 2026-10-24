@@ -60,6 +60,20 @@ class App(tk.Tk):
         self.after(120, self._poll)
         self.refresh_list()
 
+    def report_callback_exception(self, exc, val, tb):
+        """Tk 回调里的异常 —— **写日志 + 弹出来**（不让窗口"静默闪退"）。
+
+        ★§255：玩家报「点新建会闪退」却拿不到任何信息。打包成 exe 后没有控制台，
+          默认行为在 windowed 模式下要么静默、要么直接结束进程。
+        """
+        write_crash_log(exc, val, tb, 'tk-callback')
+        try:
+            messagebox.showerror('出错了（已写入 crash.log）',
+                                 '%s: %s\n\n详情见程序目录下的 crash.log'
+                                 % (getattr(exc, '__name__', 'Error'), val))
+        except Exception:
+            pass
+
     # ---------------- UI ----------------
     def _build_style(self):
         st = ttk.Style(self)
@@ -265,9 +279,9 @@ class App(tk.Tk):
         # ★2026-10-22 §192：TagTypeClass 全字段（ID/名字/序号/持久性/触发连线/残留槽）
         ttk.Button(row, text='🔖 标签字段…',
                    command=self.tag_fields_dialog).pack(side='left', padx=6)
-        # ★2026-10-20 玩家要求：原「新写触发…」向导已删除，新建统一走「触发编辑器」
-        ttk.Button(row, text='➕ 新建触发…',
-                   command=self.new_trigger_via_editor).pack(side='left', padx=6)
+        # ★2026-10-25 §256 玩家：「这两个功能 有点重复了 只留触发编辑器就行」
+        #   —— 「➕ 新建触发…」已删；新建统一走「✏ 触发编辑器…」里的「新建」按钮
+        #   （在那个窗口里点「新建」= 进入新建模式，填完再点一次才真正创建）。
         # ★2026-10-20：仿 FA2「触发编辑器」——一个窗口改完名字/国家/类型/难度/事件/行为/删除
         ttk.Button(row, text='✏ 触发编辑器…',
                    command=self.open_trigger_editor).pack(side='left', padx=6)
@@ -2858,7 +2872,7 @@ class App(tk.Tk):
         ttk.Label(f, text='原理：挂上 = 目标建筑的 tag 字段 ← 该 CellTag 的自键 + CellTag 计数+1'
                           '（两侧缺一不可，游戏内实测：双电厂 / 跨类型地堡 / 新写触发）。'
                           '解除 = 字段清 0 + 计数−1（只剩 1 栋也能解；解完这条触发没有启动条件，节点保留、可随时挂到别的建筑上）。\n'
-                          '流程：用「触发」页的「➕ 新建触发…」（触发编辑器）造触发，'
+                          '流程：用「触发」页的「✏ 触发编辑器…」造触发（窗口里点「新建」进入新建模式），'
                           '或在这里把任意一个挂接标签挂到更多建筑；① 里挂接数为 0 的行就是还没挂出去的新触发。\n'
                           '★口径（2026-10-23 §202）：③ 按**存档**的挂接键判断"是否已挂"——'
                           '地图 [Structures] 的 Tag 列常常与存档不一致（实测 all01umd.map 里 '
@@ -3403,6 +3417,10 @@ class App(tk.Tk):
         self.mv_u_vet.pack(side='left')
         ttk.Button(rowu, text='🪖 放单位到选中格',
                    command=self.mv_putunit).pack(side='left', padx=6)
+        # ★★§252（玩家： 「我指定是平地，你选的地方反而更危险」）：
+        #   默认**不挪位** —— 你选中哪格就放哪格。这个勾是"我宁可你帮我挪到最近平地"。
+        self.mv_u_nudge = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rowu, text='自动挪到平地', variable=self.mv_u_nudge).pack(side='left', padx=(2, 6))
         # ★§216：单位模板库（学习 / 查看），跨型号放置不再依赖"手边得有一份含该型号的存档"
         ttk.Button(rowu, text='🔫 刷单位(小队法)',
                    command=self.mv_spawn_team).pack(side='left', padx=6)
@@ -4068,15 +4086,18 @@ class App(tk.Tk):
             if vals:
                 keep = cb.get()
                 cb.set(keep if keep in vals else (me_disp or vals[0]))
-        # ★2026-10-17：单位用的所属方下拉**多一个「沿用模板」**并默认选它
-        #   （默认就改主人会让"任务图里唯一模板是敌方单位"的档被误翻成玩家方）
+        # ★2026-10-17：单位用的所属方下拉**多一个「沿用模板」**。
+        # ★★§252（玩家实测反馈：「你这次放的是美国啊 玩家方是苏俄」）：
+        #   默认改成**当前玩家方**。原来默认「沿用模板」—— 而模板常常是敌方/别的国家的
+        #   单位（本档 98 架原生飞碟全是 Americans），于是放出来直接变成对面的。
+        #   想"给对面刷兵"就在下拉里显式选那个阵营。
         ucb = getattr(self, 'mv_u_house', None)
         if ucb is not None:
             ucb['values'] = [UNIT_HOUSE_INHERIT] + vals
-            keep = ucb.get()
-            ucb.set(keep if keep in ucb['values'] else UNIT_HOUSE_INHERIT)
+            ucb.set(me_disp or UNIT_HOUSE_INHERIT)
         if log:
-            self._gift_log('所属方列表：%d 个（建筑默认 = 当前玩家；单位默认 = 沿用模板）' % len(vals))
+            self._gift_log('所属方列表：%d 个（建筑/单位默认 = 当前玩家；'
+                           '单位下拉可切「沿用模板」）' % len(vals))
 
     def _gift_fill_types(self):
         if not self.doc:
@@ -4450,6 +4471,7 @@ class App(tk.Tk):
         house = self._picked_house('mv_u_house')
         _vl = self.mv_u_vet.get() if hasattr(self, 'mv_u_vet') else UNIT_VET_INHERIT
         vet = _VET_BY_LABEL.get(_vl)
+        _nudge = bool(getattr(self, 'mv_u_nudge', None) and self.mv_u_nudge.get())
         # ★2026-10-18 新增：目标格被建筑/单位占着 ⇒ 主动**挪到最近的空地**（玩家要求）
         #   引擎的占用口径 = 建筑记录 + 地基（`cell_taken`），跟格表 +0xF8 不是一回事。
         try:
@@ -4497,7 +4519,8 @@ class App(tk.Tk):
                     _sig = None
                 if _sig:
                     info = self.doc.add_unit_by_signature(tname, sel[0], sel[1],
-                                                         house=house, veterancy=vet)
+                                                         house=house, veterancy=vet,
+                                                         auto_nudge=_nudge)
                     self.status.set('已用「模板库」写入 %s @(%d,%d)（样本 %s 票，参数 %d 个）'
                                     % (tname, sel[0], sel[1], _sig.get('votes'),
                                        info.get('params_applied') or 0))
@@ -4514,12 +4537,14 @@ class App(tk.Tk):
                         initialdir=os.path.dirname(self.doc.path))
                     if _ref:
                         info = self.doc.import_unit_from(_ref, tname, sel[0], sel[1],
-                                                         house=house, veterancy=vet)
+                                                         house=house, veterancy=vet,
+                                                         auto_nudge=_nudge)
                         self.status.set('已用「直接写入法」从 %s 导入 %s @(%d,%d)'
                                         % (os.path.basename(_ref), tname, sel[0], sel[1]))
             if info is None:
                 info = self.doc.add_unit_by_clone(tname, sel[0], sel[1],
-                                                  house=house, veterancy=vet)
+                                                  house=house, veterancy=vet,
+                                                  auto_nudge=_nudge)
         except Exception as e:
             self.status.set('放置单位失败')
             messagebox.showerror('放置单位失败', str(e))
@@ -4549,6 +4574,30 @@ class App(tk.Tk):
                     _terr, info['tables'], info['delta'],
                     ('｜' + '；'.join(_w)) if _w else ''))
         self._gift_log('[放单位] %s @(%d,%d)：%s' % (tname, sel[0], sel[1], info))
+        # ★★§251：落点不是平地时**必须明确告警** —— 实测在斜坡/悬崖/引桥格上放单位，
+        #   打掉它会弹框崩溃，而且它还会"有目标"到处飞（引擎认为站位不合法、一直想挪走）。
+        #   这个坑藏了 6 轮测试，因为斜坡格是"可通行"的，老的地形校验一路绿灯。
+        _nudge = info.get('cell_nudge')
+        if _nudge:
+            messagebox.showwarning(
+                '落点已自动挪到平地',
+                '你要放的是 (%d,%d)，但那格**不是平地**（%s）。\n\n'
+                '实测后果：在斜坡/悬崖/引桥格上放单位，**打掉它会弹框崩溃**，'
+                '而且它会"有目标"、自己往外飞。\n\n'
+                '已自动改放到最近的平地 (%d,%d)。'
+                % (_nudge['from'][0], _nudge['from'][1], _nudge.get('why') or '',
+                   _nudge['to'][0], _nudge['to'][1]))
+        # ★★§252：默认**不再自动挪位**（玩家原话「我指定是平地，你选的地方反而更危险」）。
+        #   所以"不是平地"这件事必须在这里明确弹出来，否则用户以为一切正常。
+        elif any('不是平地' in _x for _x in _w):
+            messagebox.showwarning(
+                '落点不是平地（已按你的指定原样落位）',
+                '你指定的 (%d,%d) **不是平地**：\n%s\n\n'
+                '已按你的要求**原样放上去，没有挪动**。\n\n'
+                '提醒：实测在这种格子上，单位会"有目标、自己往外跑"，被打掉时还容易弹框。'
+                '要让它自动改放到最近的平地，请勾上「自动挪到平地」再放一次。'
+                % (sel[0], sel[1],
+                   next((x for x in _w if '不是平地' in x), '')))
         # ★§215：骨架不是"空闲"状态时明确告警 —— 实测这种骨架会让新单位继承
         #   "已部署/任务中"（趴在地上，或空中却不能移动、空血不死）。打分已优先挑空闲的，
         #   这里只是兜底（万一整份档都没有空闲的同类）。
@@ -5658,6 +5707,24 @@ class App(tk.Tk):
         self.lbl_ai_count.pack(side='left', padx=10)
         ttk.Button(qrow, text='导出 CSV…', command=self._ai_export).pack(side='right')
 
+        # ★§253（玩家 2026-10-24 22:1x 要求）：「新建特遣部队 / 动作脚本 / 作战小队」+「触发挂小队」。
+        #   昨天已经有"刷兵三件套一把做完"（§217/§218，GUI 里是地图页的「🔫 刷单位(小队法)」），
+        #   这一排是把它**拆开单独用**，并且补上"给已有触发挂小队"这一步。
+        nrow = ttk.Frame(f)
+        nrow.pack(fill='x', pady=(0, 6))
+        ttk.Label(nrow, text='新建：', foreground='#1d4ed8').pack(side='left')
+        ttk.Button(nrow, text='＋ 特遣部队',
+                   command=self._ai_new_tf).pack(side='left', padx=2)
+        ttk.Button(nrow, text='＋ 动作脚本',
+                   command=self._ai_new_script).pack(side='left', padx=2)
+        ttk.Button(nrow, text='＋ 作战小队',
+                   command=self._ai_new_team).pack(side='left', padx=2)
+        ttk.Button(nrow, text='🔗 触发挂小队…',
+                   command=self._ai_attach_team).pack(side='left', padx=(14, 2))
+        ttk.Label(nrow, text='（挂小队 = 给触发器写「80 援军 / 107 超时空援军」行为：'
+                             '小队键 +0x44、路径点 +0x58，与刷兵是同一条路）',
+                  foreground='#6b7280').pack(side='left', padx=6)
+
         sub = ttk.Notebook(f)
         sub.pack(fill='both', expand=True)
         self.ai_sub = sub
@@ -5778,7 +5845,10 @@ class App(tk.Tk):
         self.ai_load = tk.BooleanVar(value=False)
         ttk.Checkbutton(rowE, text='预装载', variable=self.ai_load).pack(side='left', padx=(10, 2))
         ttk.Button(rowE, text='应用', command=self._ai_apply_loadable).pack(side='left', padx=2)
-        ttk.Label(rowE, text='只改 +0xB4/+0xB9/+0xD8/+0xE8，长度不变',
+        # ★§235：16 个布尔标志 + 心控重建，一屏勾选
+        ttk.Button(rowE, text='标志…', command=self._ai_flags_dialog).pack(side='left', padx=(8, 2))
+        ttk.Button(rowE, text='关联标签…', command=self._ai_tag_dialog).pack(side='left', padx=2)
+        ttk.Label(rowE, text='只改 +0xB4/+0xB9/+0xD8/+0xE8/+0xE4，长度不变',
                   foreground='#b45309').pack(side='left', padx=6)
 
         ttk.Label(f, text='选中任一页里的一行 ⇒ 下方显示明细，并在另外两页里高亮它关联的对象'
@@ -5817,7 +5887,9 @@ class App(tk.Tk):
         self._ai_tfs = {t['id']: t for t in ai['taskforces']}
         self._ai_scripts = {t['id']: t for t in ai['scripts']}
         for t in ai['teams']:
-            fl = '/'.join(k.split('/')[0][:4] for k, v in t['flags'].items() if v) or '—'
+            # ★§235：标志现在解全了（16 个），表格里只列前 3 个开着的，其余用 … 表示
+            _on = [ai_objects.TEAM_FLAG_LABELS.get(k, k) for k, v in t['flags'].items() if v]
+            fl = '/'.join(_on[:3]) + ('…' if len(_on) > 3 else '') if _on else '—'
             self._ai_rows['team'].append((t['id'], (
                 t['id'], t['name'], t['house'], t['max'], t['priority'], t['veteran'],
                 t['group'], self._wp_text(t.get('waypoint')),
@@ -6006,8 +6078,12 @@ class App(tk.Tk):
             L.append('  国家 %s　Max %d　优先级 %d　老兵等级 %d（%s）　编组 %d'
                      % (t['house'], t['max'], t['priority'], t['veteran'],
                         ai_objects.TEAM_VET_NAMES.get(t['veteran'], '未定义'), t['group']))
-            L.append('  标志：' + '　'.join('%s=%s' % (k, '是' if v else '否')
-                                          for k, v in t['flags'].items()))
+            L.append('  标志：' + '　'.join(
+                '%s=%s' % (ai_objects.TEAM_FLAG_LABELS.get(k, k), '是' if v else '否')
+                for k, v in t['flags'].items()))
+            L.append('  心控重建（MindControlDecision）= %d' % t.get('mc_decision', 0))
+            L.append('  关联标签 = %s（+0xE4；挂上后该标签上的触发会把本队当事件对象）'
+                     % (t.get('tag_id') or '（无）'))
             L.append('  明文偏移 +%#x（只读）' % t['off'])
             # ★§225：挂着"非地图定义"的脚本时给一行说明 —— 本图地图的
             #   [ScriptTypes] 只有 ID 索引列表，地编/第三方工具对这类脚本常显示 None，
@@ -6053,6 +6129,534 @@ class App(tk.Tk):
             L.append('（在上面三页里选一行看明细）')
         self.ai_text.delete('1.0', 'end')
         self.ai_text.insert('end', '\n'.join(L))
+
+    # ================= §253 新建 AI 三大件 + 触发挂小队 =================
+    def _dlg_form(self, title, rows, note=''):
+        """简易表单对话框。`rows` = [(标签, key, 默认值, 'text'|'combo', [选项…])]。
+
+        返回 `{key: 字符串}`；取消返回 None。
+        """
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.transient(self)
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill='both', expand=True)
+        vs = {}
+        for i, row in enumerate(rows):
+            label, key, default, kind = row[0], row[1], row[2], row[3]
+            vals = row[4] if len(row) > 4 else None
+            ttk.Label(body, text=label).grid(row=i, column=0, sticky='w', pady=3)
+            v = tk.StringVar(value=str(default))
+            vs[key] = v
+            if kind == 'combo':
+                ttk.Combobox(body, textvariable=v, values=list(vals or []),
+                             width=46, state='readonly').grid(
+                    row=i, column=1, sticky='we', padx=(8, 0), pady=3)
+            else:
+                ttk.Entry(body, textvariable=v, width=48).grid(
+                    row=i, column=1, sticky='we', padx=(8, 0), pady=3)
+        if note:
+            ttk.Label(body, text=note, foreground='#6b7280', wraplength=540,
+                      justify='left').grid(row=len(rows), column=0, columnspan=2,
+                                           sticky='w', pady=(6, 0))
+        res = {}
+
+        def _ok():
+            res.update({k: v.get() for k, v in vs.items()})
+            win.destroy()
+
+        bar = ttk.Frame(body)
+        bar.grid(row=len(rows) + 1, column=0, columnspan=2, sticky='e', pady=(10, 0))
+        ttk.Button(bar, text='确定', command=_ok).pack(side='left', padx=4)
+        ttk.Button(bar, text='取消', command=win.destroy).pack(side='left')
+        win.grab_set()
+        self.wait_window(win)
+        return res or None
+
+    @staticmethod
+    def _parse_units_spec(s):
+        out = []
+        for part in str(s).replace('，', ',').split(','):
+            part = part.strip()
+            if not part:
+                continue
+            sep = ':' if ':' in part else ('=' if '=' in part else None)
+            if not sep:
+                raise ValueError('单位要写成「型号:数量」，例如 DISK:2 —— 收到 %r' % part)
+            t, n = part.split(sep, 1)
+            out.append((t.strip().upper(), int(n)))
+        if not out:
+            raise ValueError('至少填一个单位')
+        return out
+
+    @staticmethod
+    def _parse_entries_spec(s):
+        out = []
+        for part in str(s).replace('，', ',').split(','):
+            part = part.strip()
+            if not part:
+                continue
+            sep = ':' if ':' in part else ('=' if '=' in part else None)
+            if not sep:
+                raise ValueError('动作要写成「动作:参数」，例如 5:10 —— 收到 %r' % part)
+            a, arg = part.split(sep, 1)
+            out.append((int(a, 0), int(arg, 0)))
+        return out
+
+    def _mk_modal(self, title, w, h):
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.transient(self)
+        win.geometry('%dx%d' % (w, h))
+        win.grab_set()
+        return win
+
+    def _unit_type_names(self):
+        try:
+            return sorted((self.doc.unit_type_index() or {}).keys())
+        except Exception:
+            return []
+
+    def _dlg_tf(self, name='新特遣部队', units=None):
+        """特遣部队对话框（仿地编：名称 / 分组 / 单位列表 / 添加 / 删除 / 数目 / 类型）。"""
+        units = [list(u) for u in (units or [])]
+        win = self._mk_modal('特遣部队', 560, 430)
+        top = ttk.Frame(win, padding=8)
+        top.pack(fill='x')
+        ttk.Label(top, text='名称').pack(side='left')
+        v_name = tk.StringVar(value=name)
+        ttk.Entry(top, textvariable=v_name, width=40).pack(side='left', padx=6)
+        ttk.Label(top, text='分组 -1（与地编一致）',
+                  foreground='#6b7280').pack(side='left', padx=6)
+        body = ttk.Frame(win, padding=(8, 0))
+        body.pack(fill='both', expand=True)
+        tv = ttk.Treeview(body, columns=('i', 'cnt', 'type'), show='headings', height=10)
+        for c, t, w, a in (('i', '#', 40, 'e'), ('cnt', '数目', 70, 'e'),
+                           ('type', '类型', 160, 'w')):
+            tv.heading(c, text=t)
+            tv.column(c, width=w, anchor=a)
+        tv.pack(fill='both', expand=True)
+
+        def refill(sel=None):
+            tv.delete(*tv.get_children())
+            for i, (cnt, ty) in enumerate(units):
+                tv.insert('', 'end', iid=str(i), values=(i + 1, cnt, ty))
+            if sel is not None and str(sel) in tv.get_children():
+                tv.selection_set(str(sel))
+
+        refill()
+        row = ttk.Frame(win, padding=8)
+        row.pack(fill='x')
+        ttk.Label(row, text='数目').pack(side='left')
+        v_cnt = tk.StringVar(value='1')
+        ttk.Spinbox(row, from_=0, to=999, width=5, textvariable=v_cnt).pack(side='left', padx=(2, 8))
+        ttk.Label(row, text='类型').pack(side='left')
+        v_ty = tk.StringVar(value=(self._unit_type_names() or [''])[0])
+        ttk.Combobox(row, textvariable=v_ty, values=self._unit_type_names(),
+                     width=16).pack(side='left', padx=2)
+
+        def add():
+            try:
+                n = int(v_cnt.get() or 0)
+            except ValueError:
+                return
+            ty = (v_ty.get() or '').strip().upper()
+            if not ty or n <= 0:
+                return
+            if len(units) >= 6:
+                messagebox.showwarning('特遣部队', '最多 6 种单位（结构如此）', parent=win)
+                return
+            for u in units:                     # 同型号合并
+                if u[1] == ty:
+                    u[0] += n
+                    break
+            else:
+                units.append([n, ty])
+            refill(len(units) - 1)
+
+        def rm():
+            sel = tv.selection()
+            if not sel:
+                return
+            for i in sorted((int(x) for x in sel), reverse=True):
+                units.pop(i)
+            refill()
+
+        ttk.Button(row, text='添加', command=add).pack(side='left', padx=(7, 2))
+        ttk.Button(row, text='删除', command=rm).pack(side='left', padx=2)
+        bar = ttk.Frame(win, padding=8)
+        bar.pack(fill='x')
+        res = {}
+
+        def ok():
+            if not units:
+                messagebox.showwarning('特遣部队', '至少要有一个单位', parent=win)
+                return
+            res.update({'name': v_name.get().strip() or '新特遣部队',
+                        'units': [(u[1], int(u[0])) for u in units]})
+            win.destroy()
+
+        ttk.Button(bar, text='确定', command=ok).pack(side='right', padx=4)
+        ttk.Button(bar, text='取消', command=win.destroy).pack(side='right')
+        self.wait_window(win)
+        return res or None
+
+    def _dlg_script(self, name='新脚本', entries=None):
+        """动作脚本对话框（仿地编：行为列表 + 行为类型(中文名) + 参数 + 行为描述）。"""
+        try:
+            import script_actions as sa          # 只有"行为描述"
+        except Exception:
+            sa = None
+        try:
+            import fa2_tables as _ft             # 动作中文名（已有表，别重复维护）
+        except Exception:
+            _ft = None
+
+        def _nm(i):
+            return _ft.script_action_name(int(i)) if _ft else '#%d' % int(i)
+        entries = [list(e) for e in (entries or [])]
+        win = self._mk_modal('动作脚本', 820, 540)
+        top = ttk.Frame(win, padding=8)
+        top.pack(fill='x')
+        ttk.Label(top, text='名称').pack(side='left')
+        v_name = tk.StringVar(value=name)
+        ttk.Entry(top, textvariable=v_name, width=40).pack(side='left', padx=6)
+        ttk.Label(top, text='（空脚本 = 小队原地待命）',
+                  foreground='#6b7280').pack(side='left', padx=6)
+
+        body = ttk.Frame(win, padding=(8, 0))
+        body.pack(fill='both', expand=True)
+        left = ttk.Frame(body)
+        left.pack(side='left', fill='both', expand=True)
+        tv = ttk.Treeview(left, columns=('i', 'nm', 'arg'), show='headings', height=13)
+        for c, t, w, a in (('i', '行', 40, 'e'), ('nm', '动作（地编名称）', 400, 'w'),
+                           ('arg', '参数', 90, 'e')):
+            tv.heading(c, text=t)
+            tv.column(c, width=w, anchor=a)
+        tv.pack(fill='both', expand=True)
+        right = ttk.LabelFrame(body, text='行为描述', padding=6)
+        right.pack(side='left', fill='both', padx=(8, 0))
+        txt = tk.Text(right, width=42, height=14, wrap='word', state='disabled')
+        txt.pack(fill='both', expand=True)
+
+        def refill(sel=None):
+            tv.delete(*tv.get_children())
+            for i, (a, g) in enumerate(entries):
+                tv.insert('', 'end', iid=str(i), values=(i + 1, _nm(a), g))
+            if sel is not None and str(sel) in tv.get_children():
+                tv.selection_set(str(sel))
+                show_desc()
+
+        def show_desc(*_a):
+            sel = tv.selection()
+            txt.config(state='normal')
+            txt.delete('1.0', 'end')
+            if sel:
+                a = entries[int(sel[0])][0]
+                txt.insert('end', (sa.action_desc(a) if sa else '') or '（地编没有这条的说明）')
+            txt.config(state='disabled')
+
+        tv.bind('<<TreeviewSelect>>', show_desc)
+
+        cl = ttk.Frame(win, padding=8)
+        cl.pack(fill='x')
+        ttk.Label(cl, text='行为类型').pack(side='left')
+        labels = (['%d - %s' % (i, _ft.script_action_name(i))
+                   for i in sorted(_ft.SCRIPT_ACTIONS)] if _ft else [])
+        v_act = tk.StringVar(value=(labels[5] if len(labels) > 5 else ''))
+        cb = ttk.Combobox(cl, textvariable=v_act, values=labels, width=44)
+        cb.pack(side='left', padx=4)
+        ttk.Label(cl, text='参数/路径点').pack(side='left', padx=(10, 0))
+        v_arg = tk.StringVar(value='0')
+        ttk.Entry(cl, textvariable=v_arg, width=10).pack(side='left', padx=4)
+
+        bar2 = ttk.Frame(win, padding=(8, 0))
+        bar2.pack(fill='x')
+
+        def act_id():
+            txt = v_act.get().strip()
+            try:
+                return int(txt.split(' ')[0])
+            except Exception:
+                return 5
+
+        def add():
+            try:
+                g = int(v_arg.get() or 0)
+            except ValueError:
+                g = 0
+            if len(entries) >= 50:
+                messagebox.showwarning('动作脚本', '最多 50 条（结构如此）', parent=win)
+                return
+            entries.append([act_id(), g])
+            refill(len(entries) - 1)
+
+        def dup():
+            sel = tv.selection()
+            if not sel:
+                return
+            i = int(sel[0])
+            entries.insert(i + 1, list(entries[i]))
+            refill(i + 1)
+
+        def rm():
+            sel = tv.selection()
+            if not sel:
+                return
+            for i in sorted((int(x) for x in sel), reverse=True):
+                entries.pop(i)
+            refill()
+
+        def mv(d):
+            sel = tv.selection()
+            if not sel:
+                return
+            i = int(sel[0])
+            j = i + d
+            if 0 <= j < len(entries):
+                entries[i], entries[j] = entries[j], entries[i]
+                refill(j)
+
+        ttk.Button(bar2, text='添加', command=add).pack(side='left', padx=2)
+        ttk.Button(bar2, text='复制', command=dup).pack(side='left', padx=2)
+        ttk.Button(bar2, text='删除', command=rm).pack(side='left', padx=2)
+        ttk.Button(bar2, text='上移', command=lambda: mv(-1)).pack(side='left', padx=2)
+        ttk.Button(bar2, text='下移', command=lambda: mv(1)).pack(side='left', padx=2)
+        res = {}
+
+        def ok():
+            if not entries:
+                messagebox.showwarning('动作脚本', '至少加一条动作（要"原地待命"就别建脚本）',
+                                       parent=win)
+                return
+            res.update({'name': v_name.get().strip() or '新脚本',
+                        'entries': [(int(a), int(g) & 0xFFFFFFFF) for a, g in entries]})
+            win.destroy()
+
+        ttk.Button(bar2, text='确定', command=ok).pack(side='right', padx=4)
+        ttk.Button(bar2, text='取消', command=win.destroy).pack(side='right')
+        refill(0)
+        self.wait_window(win)
+        return res or None
+
+    def _dlg_team(self):
+        """作战小队对话框（仿地编：名称 / 国家 / 特遣部队 / 动作脚本 / 星级 / 优先级 / 最大）。
+
+        ★§254：特遣 / 脚本各有两类来源 ——
+          · **地图定义**：ID `0100xxxx`，地编里能看见、能改，玩家该用的就是这批；
+          · **AI 运行期生成**：ID 是 8 位随机十六进制（`05C60C4C` 这种），名字是
+            「数量 + 单位名」自动拼的（"3 GIs, 3 Guards"），**地编里看不到、改了也没用**。
+        默认只列地图定义的；AI 那批**不显示**（玩家 2026-10-24：「AI 的脚本和特遣、
+        小队些没有用，没有显示的必要」—— 地编里看不到，选了也改不动）。
+        """
+        tf_all = self.doc.taskforces()
+        sc_all = self.doc.script_types()
+        tf_map = [t for t in tf_all if t.get('defined', True)]
+        sc_map = [x for x in sc_all if x.get('defined', True)]
+        try:
+            houses = list(self.doc.house_keys().keys())
+        except Exception:
+            houses = []
+
+        def _disp(lst):
+            return [('%s  %s' % (x['sid'], x['name'])) if x.get('defined', True)
+                    else ('[AI] %s  %s' % (x['sid'], x['name'])) for x in lst]
+
+        state = {'tf': tf_map, 'sc': sc_map}
+        win = self._mk_modal('作战小队', 640, 440)
+        g = ttk.Frame(win, padding=10)
+        g.pack(fill='both', expand=True)
+
+        def row(i, label, widget):
+            ttk.Label(g, text=label).grid(row=i, column=0, sticky='w', pady=4)
+            widget.grid(row=i, column=1, sticky='we', padx=(8, 0), pady=4)
+
+        v_name = tk.StringVar(value='新小队')
+        e_name = ttk.Entry(g, textvariable=v_name, width=44)
+        row(0, '名称', e_name)
+        v_house = tk.StringVar(value=(self.doc.player_house() or (houses[0] if houses else '')))
+        row(1, '国家', ttk.Combobox(g, textvariable=v_house, values=houses,
+                                   width=42, state='readonly'))
+        v_tf = tk.StringVar(value=_disp(tf_map)[0] if tf_map
+                            else '（本档没有地图定义的特遣部队）')
+        cb_tf = ttk.Combobox(g, textvariable=v_tf, values=_disp(tf_map) or [v_tf.get()],
+                             width=42, state='readonly')
+        row(2, '特遣部队', cb_tf)
+        v_sc = tk.StringVar(value='（空脚本 · 原地待命）')
+        cb_sc = ttk.Combobox(g, textvariable=v_sc,
+                             values=['（空脚本 · 原地待命）'] + _disp(sc_map),
+                             width=42, state='readonly')
+        row(3, '动作脚本', cb_sc)
+        v_vet = tk.StringVar(value='3')
+        row(4, '星级（3 精英 / 2 老兵 / 1 新兵）',
+            ttk.Combobox(g, textvariable=v_vet, values=['3', '2', '1'], width=8,
+                         state='readonly'))
+        v_pri = tk.StringVar(value='5')
+        row(5, '优先级', ttk.Entry(g, textvariable=v_pri, width=8))
+        v_max = tk.StringVar(value='5')
+        row(6, '最大', ttk.Entry(g, textvariable=v_max, width=8))
+        ttk.Label(g, text='★ 星级写的是小队 +0xB4（与地编「星级」同口径）；'
+                          '刷出来的兵在游戏里就按这个显示',
+                  foreground='#1d4ed8', wraplength=560, justify='left').grid(
+            row=7, column=0, columnspan=2, sticky='w', pady=(8, 0))
+        bar = ttk.Frame(g)
+        bar.grid(row=8, column=0, columnspan=2, sticky='ew', pady=(12, 0))
+        res = {}
+
+        def ok():
+            tf = next((t for t in state['tf'] if t['sid'] and t['sid'] in v_tf.get()), None)
+            if tf is None:
+                messagebox.showwarning('作战小队', '本档没有特遣部队，请先新建一个',
+                                       parent=win)
+                return
+            sc_key = None
+            if not v_sc.get().startswith('（'):
+                sc = next((x for x in state['sc'] if x['sid'] and x['sid'] in v_sc.get()), None)
+                if sc:
+                    sc_key = sc['key']
+            else:
+                sc_key = 0                       # 显式"空脚本"
+            try:
+                pri = int(v_pri.get() or 5)
+                mx = int(v_max.get() or 5)
+            except ValueError:
+                pri, mx = 5, 5
+            res.update({'name': v_name.get().strip() or '新小队', 'tf_key': tf['key'],
+                        'tf_sid': tf['sid'], 'country_key': self.doc.house_key_of(v_house.get())
+                        or None, 'veteran': int(v_vet.get()), 'priority': pri,
+                        'max': mx, 'script_key': sc_key})
+            win.destroy()
+
+        ttk.Button(bar, text='确定', command=ok).pack(side='right', padx=4)
+        ttk.Button(bar, text='取消', command=win.destroy).pack(side='right')
+        g.columnconfigure(1, weight=1)
+        self.wait_window(win)
+        return res or None
+
+    def _ai_new_tf(self):
+        """新建一个特遣部队（只建特遣，不动小队/触发）。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        v = self._dlg_tf()
+        if not v:
+            return
+        try:
+            r = self.doc.clone_taskforce(v['units'], name=v['name'])
+        except Exception as e:
+            messagebox.showerror('新建特遣部队失败', str(e))
+            return
+        self._fill_ai_all()
+        self.status.set('已新建特遣部队 %s「%s」' % (r['sid'], r['name']))
+        messagebox.showinfo('新建特遣部队',
+                            '已新建特遣部队\n\nID：%s\n名称：%s\n成员：%s\n\n'
+                            '下一步：在「＋ 作战小队」里选它。'
+                            % (r['sid'], r['name'],
+                               '、'.join('%s×%d' % (t, n) for t, n in v['units'])))
+
+    def _ai_new_script(self):
+        """新建一段动作脚本（ScriptType）。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        v = self._dlg_script()
+        if not v:
+            return
+        try:
+            import fa2_tables as _ft
+        except Exception:
+            _ft = None
+        try:
+            r = self.doc.clone_script(v['entries'], name=v['name'])
+        except Exception as e:
+            messagebox.showerror('新建动作脚本失败', str(e))
+            return
+        self._fill_ai_all()
+        self.status.set('已新建动作脚本 %s「%s」' % (r['sid'], r['name']))
+        messagebox.showinfo('新建动作脚本',
+                            '已新建动作脚本\n\nID：%s\n名称：%s\n条数：%d\n%s'
+                            % (r['sid'], r['name'], r['count'],
+                               '、'.join('%s(%s)' % ((_ft.script_action_name(a) if _ft else a), g)
+                                        for a, g in v['entries'])))
+
+    def _ai_new_team(self):
+        """新建作战小队（引用已有的特遣部队 / 动作脚本）。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        v = self._dlg_team()
+        if not v:
+            return
+        try:
+            tm = self.doc.clone_team(v['tf_key'], name=v['name'],
+                                     country_key=v['country_key'],
+                                     veteran=v['veteran'], max_teams=v['max'],
+                                     script_key=v['script_key'],
+                                     priority=v['priority'])
+        except Exception as e:
+            messagebox.showerror('新建作战小队失败', str(e))
+            return
+        self._fill_ai_all()
+        self.status.set('已新建作战小队 %s「%s」' % (tm['sid'], tm['name']))
+        messagebox.showinfo('新建作战小队',
+                            '已新建作战小队\n\nID：%s\n名称：%s\n'
+                            '特遣部队：%s\n星级：%s\n优先级：%d  最大：%d\n\n'
+                            '下一步：用「🔗 触发挂小队…」把它挂到触发器上。'
+                            % (tm['sid'], tm['name'], v['tf_sid'], v['veteran'],
+                               v['priority'], v['max']))
+
+    def _ai_attach_team(self):
+        """把一支作战小队挂到**已有触发器**上（行为 80 援军 / 107 超时空援军）。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        try:
+            teams = self.doc.team_types()
+        except Exception as e:
+            messagebox.showerror('读取失败', str(e))
+            return
+        disp = ['%s  %s' % (t['sid'], t['name']) for t in teams]
+        v = self._dlg_form('触发挂载作战小队', [
+            ('触发ID', 'tid', getattr(self, '_cur', '') or '', 'text'),
+            ('作战小队', 'team', disp[0] if disp else '', 'combo', disp),
+            ('路径点号（留空则用下面的格子）', 'wp', '', 'text'),
+            ('或格子 x,y（如 110,206）', 'cell', '', 'text')],
+            '写的是行为「80 援军」：小队键 → +0x44、路径点 → +0x58（与刷兵同一条路）。\n'
+            '若该触发器已经有 80/107 行为，会**改写那一条**，不会重复加。')
+        if not v:
+            return
+        tid = str(v['tid']).strip()
+        if not tid:
+            messagebox.showwarning('提示', '要填触发 ID（在触发器页选中一条就能拿到）')
+            return
+        try:
+            team = str(v['team']).split()[0] if str(v['team']).strip() else ''
+            wp = int(str(v['wp']).strip()) if str(v['wp']).strip() else None
+            cell = None
+            if wp is None:
+                s = str(v['cell']).replace('，', ',').strip()
+                if not s:
+                    messagebox.showwarning('提示', '路径点号和格子至少要填一个')
+                    return
+                a, b = s.split(',')
+                cell = (int(a), int(b))
+            r = self.doc.attach_team_to_trigger(tid, team, waypoint=wp, cell=cell)
+        except Exception as ex:
+            messagebox.showerror('挂载失败', str(ex))
+            return
+        self._fill_ai_all()
+        try:
+            self._fill_trig_tree()
+        except Exception:
+            pass
+        self.status.set('已把小队挂到触发 %s' % tid)
+        messagebox.showinfo('触发挂载作战小队',
+                            '%s\n\n触发器：%s\n小队键：%#x\n路径点：%d\n行为：%d（%s）'
+                            % ('已改写原来那条 80/107 行为' if r['mode'] == 'reuse'
+                               else '已追加一条行为',
+                               tid, r['team_key'], r['waypoint'], r['action'],
+                               '援军' if r['action'] == 80 else '超时空援军'))
 
     def _ai_apply_vet(self):
         """把「作战小队」子页里选中的那条改成指定老兵等级（★唯一的写入功能，先易后难第一步）。"""
@@ -6513,6 +7117,163 @@ class App(tk.Tk):
         self.status.set('已改小队 %s「%s」预装载 %d → %d（尚未保存）'
                         % (sid, info['name'], info['old'], info['new']))
 
+    def _ai_tag_dialog(self):
+        """§247：给选中的作战小队挂/换「关联标签」（小队记录 `+0xE4`）。
+
+        依据：T85 小队 01000241「a飞碟转圈A」的关联标签 01000251 就在 `+0x0E4`，
+        存的是**标签对象(TagType)的键**（与单位记录 `+0x48` 存 CellTag 指针 X 不同）。
+        只改 4 字节，记录长度不变。
+        """
+        if not self.doc or not getattr(self, '_ai', None):
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        sel = self.tat.selection()
+        if not sel:
+            messagebox.showwarning('提示', '请先在「作战小队」子页里选中一条')
+            return
+        sid = sel[0]
+        t = self._ai_teams.get(sid)
+        if not t:
+            return
+        try:
+            tags = ai_objects.list_tags(self.doc)
+        except Exception as e:                       # noqa: BLE001
+            messagebox.showerror('关联标签', '读不到本档标签对象：%s' % e, parent=self)
+            return
+        if not tags:
+            messagebox.showwarning('关联标签', '这份存档里一个标签对象都没有', parent=self)
+            return
+        win = tk.Toplevel(self)
+        win.title('关联标签 — %s「%s」' % (sid, t['name']))
+        win.transient(self)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill='both', expand=True)
+        cur = t.get('tag_id') or '（无）'
+        ttk.Label(frm, text='小队 %s「%s」当前关联标签：%s'
+                          % (sid, t['name'], cur)).grid(row=0, column=0, columnspan=2,
+                                                        sticky='w', pady=(0, 6))
+        ttk.Label(frm, text='挂上后，挂在该标签上的触发就会把这支小队当作事件对象'
+                            '（如「小队被攻击 → 全部寻敌」）。',
+                  foreground='#6b7280').grid(row=1, column=0, columnspan=2,
+                                             sticky='w', pady=(0, 8))
+        opts = ['（无）'] + ['%s → 触发 %s' % (x['id'], x['trigger_id'] or '?') for x in tags]
+        ids = [None] + [x['id'] for x in tags]
+        var = tk.StringVar(value=cur if cur in ids else '（无）')
+        ttk.Combobox(frm, textvariable=var, values=opts, width=40,
+                     state='readonly').grid(row=2, column=0, columnspan=2,
+                                            sticky='w', pady=(0, 10))
+
+        def apply():
+            pick = var.get()
+            want = None if pick == '（无）' else pick.split(' → ')[0].strip()
+            try:
+                info = ai_objects.set_team_tag(self.doc, sid, want)
+            except Exception as e:                   # noqa: BLE001
+                messagebox.showerror('关联标签', str(e), parent=win)
+                return
+            if not info.get('changed'):
+                self.status.set('小队 %s：关联标签没有变化' % sid)
+            else:
+                self.status.set('已改小队 %s「%s」关联标签 → %s（+0xE4，尚未保存）'
+                                % (sid, t['name'], info['tag_id'] or '（无）'))
+            win.destroy()
+            self.refresh_ai()
+            self._ai_select(self.tat, sid)
+            self._ai_pick('team')
+
+        bar = ttk.Frame(frm)
+        bar.grid(row=3, column=0, columnspan=2, sticky='e')
+        ttk.Button(bar, text='取消', command=win.destroy).pack(side='right', padx=4)
+        ttk.Button(bar, text='应用', command=apply).pack(side='right')
+
+    def _ai_flags_dialog(self):
+        """§235：小队 16 个布尔标志 + 「心控重建」一屏编辑。
+
+        依据：引擎写盘函数 `0x6F10E0–0x6F13C0`（键 ↔ 偏移）+ ALL01UMD.MAP 125 条小队
+        对账 125/125。**每个标志是 1 个字节**（不是位域），心控重建是 `+0xD4` 的 dword。
+        只改勾选项：先比对、只写有变化的那些字节。
+        """
+        if not self.doc or not getattr(self, '_ai', None):
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        sel = self.tat.selection()
+        if not sel:
+            messagebox.showwarning('提示', '请先在「作战小队」子页里选中一条')
+            return
+        sid = sel[0]
+        t = self._ai_teams.get(sid)
+        if not t:
+            return
+        win = tk.Toplevel(self)
+        win.title('小队标志 — %s「%s」' % (sid, t['name']))
+        win.transient(self)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text='勾选即写入（每个标志只占 1 个字节，记录长度不变）',
+                  foreground='#6b7280').grid(row=0, column=0, columnspan=4,
+                                             sticky='w', pady=(0, 8))
+        vars_ = {}
+        order = ['Full', 'Loadable', 'Reinforce', 'Prebuild', 'Autocreate', 'Recruiter',
+                 'GuardSlower', 'Annoyance', 'Aggressive', 'Suicide', 'Droppod',
+                 'UseTransportOrigin', 'OnTransOnly', 'AvoidThreats', 'LooseRecruit',
+                 'Whiner']
+        for i, name in enumerate(order):
+            v = tk.BooleanVar(value=bool(t['flags'].get(name)))
+            vars_[name] = v
+            ttk.Checkbutton(frm, text=ai_objects.TEAM_FLAG_LABELS.get(name, name),
+                            variable=v).grid(row=1 + i // 4, column=i % 4,
+                                             sticky='w', padx=6, pady=2)
+        r0 = 1 + (len(order) + 3) // 4
+        ttk.Separator(frm, orient='horizontal').grid(
+            row=r0, column=0, columnspan=4, sticky='ew', pady=8)
+        ttk.Label(frm, text='心控重建（MindControlDecision）：').grid(
+            row=r0 + 1, column=0, columnspan=2, sticky='w')
+        mc = tk.StringVar(value=str(t.get('mc_decision', 0)))
+        ttk.Entry(frm, textvariable=mc, width=8).grid(row=r0 + 1, column=2, sticky='w')
+        ttk.Label(frm, text='0=关；1/2=开（+0xD4，4 字节）',
+                  foreground='#6b7280').grid(row=r0 + 1, column=3, sticky='w')
+
+        def apply():
+            changed, failed = [], []
+            for name, v in vars_.items():
+                want = bool(v.get())
+                if want == bool(t['flags'].get(name)):
+                    continue
+                try:
+                    ai_objects.set_team_flag(self.doc, sid, name, want)
+                    changed.append('%s=%s' % (ai_objects.TEAM_FLAG_LABELS.get(name, name),
+                                              '是' if want else '否'))
+                except Exception as e:
+                    failed.append('%s：%s' % (name, e))
+            try:
+                mv = int(mc.get())
+            except ValueError:
+                failed.append('心控重建不是整数')
+                mv = None
+            if mv is not None and mv != int(t.get('mc_decision', 0)):
+                try:
+                    ai_objects.set_team_mc_decision(self.doc, sid, mv)
+                    changed.append('心控重建=%d' % mv)
+                except Exception as e:
+                    failed.append('心控重建：%s' % e)
+            if failed:
+                messagebox.showerror('部分没改成', '\n'.join(failed), parent=win)
+            if not changed:
+                self.status.set('小队 %s：没有改动' % sid)
+            else:
+                self.status.set('已改小队 %s「%s」：%s（尚未保存）'
+                                % (sid, t['name'], '，'.join(changed)))
+            win.destroy()
+            self.refresh_ai()
+            self._ai_select(self.tat, sid)
+            self._ai_pick('team')
+
+        bar = ttk.Frame(frm)
+        bar.grid(row=r0 + 2, column=0, columnspan=4, sticky='e', pady=(10, 0))
+        ttk.Button(bar, text='取消', command=win.destroy).pack(side='right', padx=4)
+        ttk.Button(bar, text='应用', command=apply).pack(side='right')
+
     def _ai_export(self):
         """把三张表导出成一份 CSV（UTF-8 带 BOM，Excel 直接打开不乱码）。"""
         if not getattr(self, '_ai', None):
@@ -6627,8 +7388,12 @@ class TriggerEditor(tk.Toplevel):
         ttk.Label(r1, text='名称').pack(side='left')
         self.var_name = tk.StringVar()
         e = ttk.Entry(r1, textvariable=self.var_name, width=26)
+        self.ent_name = e          # ★§257：新建后自动聚焦到这里（点完就能直接打字改名）
         e.pack(side='left', padx=6)
         e.bind('<Return>', lambda ev: self.apply_name())
+        # ★§256（玩家 2026-10-25）：「新触发的名字能不能填入即生效和地编中一样，
+        #   不用再点一次改名」⇒ 新建模式下边打边记（`_pending_name`），创建时直接用它。
+        self.var_name.trace_add('write', lambda *_a: self._on_name_change())
         ttk.Button(r1, text='改名', command=self.apply_name).pack(side='left')
         ttk.Label(r1, text='  ID：').pack(side='left')
         self.lbl_sid = ttk.Label(r1, text='—', foreground='#6b7280')
@@ -6733,8 +7498,18 @@ class TriggerEditor(tk.Toplevel):
         ttk.Button(r5, text='复制', width=5, command=self.dup_action).pack(side='left', padx=2)
         ttk.Button(r5, text='删除', width=5, command=self.del_action).pack(side='left', padx=2)
 
+        # ★§255：行为 80/107（援军 / 超时空援军）专用行 —— 小队在「参数」下拉里选，
+        #   这里填**路径点号**（地编里 80 也是"小队类型 + 路径点"两个字段）。
+        self.var_wp = tk.StringVar()
+        self.row_wp = ttk.Frame(ac)
+        ttk.Label(self.row_wp, text='路径点').pack(side='left')
+        ttk.Entry(self.row_wp, textvariable=self.var_wp, width=8).pack(side='left', padx=6)
+        ttk.Label(self.row_wp, text='（上面的「参数」= 小队，这里 = 刷出来的位置；留空 = 0）',
+                  foreground='#6b7280').pack(side='left')
+
         body = ttk.Frame(ac)
         body.pack(fill='both', expand=True, pady=(6, 0))
+        self.frm_ac_body = body
         cols = ('idx', 'type', 'name', 'arg', 'argtext')
         self.tv_ac = ttk.Treeview(body, columns=cols, show='headings', height=8)
         for c, t, w, a in (('idx', '#', 34, 'center'), ('type', '类型', 46, 'center'),
@@ -7145,21 +7920,39 @@ class TriggerEditor(tk.Toplevel):
             return
         self.after_change('已删事件 %s' % event_name(r['type']))
 
+    def _ac_text(self, atype, arg, team=0, waypoint=0):
+        """「参数含义」列的文字：80/107 显示「小队名 · 路径点」。"""
+        if atype in self.doc.SPAWN_ACTIONS:
+            nm = next((lab for lab, k in self._team_choices() if k == team), '')
+            return '%s · 路径点 %s' % (
+                nm or ('小队 %08X' % team if team else '（没选小队）'), waypoint)
+        return self.doc._arg_text(action_ptype(atype), arg)
+
     def _fill_actions(self):
         self.tv_ac.delete(*self.tv_ac.get_children())
         if getattr(self, '_new_mode', False):
-            for i, (t, a) in enumerate(getattr(self, '_pending_actions', []), 1):
+            for i, it in enumerate(getattr(self, '_pending_actions', []), 1):
+                if isinstance(it, dict):
+                    t, a = int(it['type']), int(it.get('arg') or 0)
+                    tm, wp = it.get('team') or 0, it.get('waypoint') or 0
+                else:
+                    t, a = int(it[0]), int(it[1])
+                    tm, wp = 0, 0
                 self.tv_ac.insert('', 'end', iid=str(i), values=(
-                    i, t, action_name(t), a, self.doc._arg_text(action_ptype(t), a)))
+                    i, t, action_name(t), wp if t in self.doc.SPAWN_ACTIONS else a,
+                    self._ac_text(t, a, tm, wp)))
             return
         for i, a in enumerate(self._det.get('actions') or [], 1):
             # ★§219.8：援军行为 80/107 的参数在 +0x44（小队键）/+0x58（路径点），
-            #   不是默认的 +0x48（恒 0）。参数列显示路径点，含义列显示小队+格子。
+            #   不是默认的 +0x48（恒 0）。参数列显示路径点，含义列显示小队+路径点。
             argcol = a['arg']
-            if a.get('type') in (80, 107):
+            if a.get('type') in self.doc.SPAWN_ACTIONS:
                 argcol = a.get('waypoint', 0)
             self.tv_ac.insert('', 'end', iid=str(i), values=(
-                i, a['type'], a['name'], argcol, a['arg_text']))
+                i, a['type'], a['name'], argcol,
+                self._ac_text(a['type'], a['arg'],
+                              a.get('team') or a.get('team_key') or 0,
+                              a.get('waypoint') or 0)))
 
     # ---------------- 触发设置 ----------------
     def apply_name(self):
@@ -7437,6 +8230,73 @@ class TriggerEditor(tk.Toplevel):
                           % (event_name(t), arg, note, rep))
 
     # ---------------- 行为 ----------------
+    # ---- ★§255：行为 80/107（援军 / 超时空援军）的小队 + 路径点 ----
+    def _team_choices(self):
+        """地图定义的作战小队 `[('01000241  a飞船转圈A', 键), …]`（AI 生成的不列）。"""
+        out = []
+        try:
+            for t in (self.doc.team_types() or []):
+                if not t.get('defined', True):
+                    continue
+                out.append(('%s  %s' % (t['sid'], t['name']), t['key']))
+        except Exception:
+            pass
+        return out
+
+    def _fill_team_values(self, combo, cur_key):
+        ch = self._team_choices()
+        combo['values'] = [c[0] for c in ch]
+        if cur_key:
+            for lab, k in ch:
+                if k == cur_key:
+                    combo.set(lab)
+                    break
+        return ch
+
+    def _team_key_from_text(self, text):
+        """把「参数」框里的文字解析成小队键：`ID 名称` / `ID` / `0x键`。"""
+        s = (text or '').strip()
+        if not s:
+            return None
+        for lab, k in self._team_choices():
+            if lab == s:
+                return k
+        try:
+            for t in (self.doc.team_types() or []):
+                if t['sid'] and t['sid'] in s:
+                    return t['key']
+        except Exception:
+            pass
+        if s.lower().startswith('0x'):
+            try:
+                return int(s, 16)
+            except ValueError:
+                return None
+        return None
+
+    def _show_wp(self, show):
+        try:
+            if show:
+                if not self.row_wp.winfo_ismapped():
+                    self.row_wp.pack(fill='x', pady=(6, 0), before=self.frm_ac_body)
+            else:
+                self.row_wp.pack_forget()
+        except Exception:
+            pass
+
+    def _ac_payload(self, atype):
+        """按行为类型算提交用的 `(arg, kwargs)` —— 80/107 走「小队 + 路径点」。"""
+        if atype in self.doc.SPAWN_ACTIONS:
+            tkey = self._team_key_from_text(self.var_acarg.get())
+            if not tkey:
+                raise ValueError('援军型行为要先在「参数」里选一支作战小队')
+            try:
+                wp = int((self.var_wp.get() or '0').strip())
+            except ValueError:
+                raise ValueError('路径点必须是整数')
+            return 0, {'team': tkey, 'waypoint': wp}
+        return self._parse_arg(self.var_acarg.get()), {}
+
     def _ac_hint(self):
         nt = ''
         sel = self.tv_ac.focus()
@@ -7460,16 +8320,26 @@ class TriggerEditor(tk.Toplevel):
                 k = self._ac_keys[self.cb_ac.current()]
             if k is not None:
                 pt = action_ptype(k)
-                try:
-                    cur = self._parse_arg(self.var_acarg.get())
-                except Exception:
-                    cur = None
-                self._fill_arg_values(self.cb_acarg, pt, cur)
-                if pt == 2:
-                    hs = self.doc.house_order() or []
-                    nt = ('所属方型：0 = 玩家自己（本档 %s）；其余按存档阵营顺序'
-                          % next((h['cn'] for h in hs if h['is_player']), '?')) + \
+                if k in self.doc.SPAWN_ACTIONS:
+                    # ★§255：80/107 的「参数」= 小队（不是数字），另给一个路径点输入
+                    _ch = self._fill_team_values(
+                        self.cb_acarg, self._team_key_from_text(self.var_acarg.get())) or []
+                    self._show_wp(True)
+                    nt = ('援军型：**「参数」下拉 = 作战小队**（本档地图定义的小队 %d 个）；'
+                          '「路径点」= 刷出来的位置' % len(_ch)) + \
                          ('　' + nt if nt else '')
+                else:
+                    try:
+                        cur = self._parse_arg(self.var_acarg.get())
+                    except Exception:
+                        cur = None
+                    self._fill_arg_values(self.cb_acarg, pt, cur)
+                    self._show_wp(False)
+                    if pt == 2:
+                        hs = self.doc.house_order() or []
+                        nt = ('所属方型：0 = 玩家自己（本档 %s）；其余按存档阵营顺序'
+                              % next((h['cn'] for h in hs if h['is_player']), '?')) + \
+                             ('　' + nt if nt else '')
         except Exception:
             pass
         # ★2026-10-20：附带「引擎口径」的参数类型（来自地图 [Actions] 真实数据），
@@ -7501,7 +8371,14 @@ class TriggerEditor(tk.Toplevel):
             self.cb_ac.current(self._ac_keys.index(a['type']))
         else:
             self.cb_ac.set('%d  %s' % (a['type'], a.get('name') or ''))
-        self.var_acarg.set(str(a['arg']))
+        if a['type'] in self.doc.SPAWN_ACTIONS:
+            # ★§255：援军型 —— 回填"小队 + 路径点"（参数槽里不是数字）
+            self._fill_team_values(self.cb_acarg,
+                                   a.get('team') or a.get('team_key') or 0)
+            self.var_wp.set(str(a.get('waypoint') or 0))
+        else:
+            self.var_acarg.set(str(a['arg']))
+            self.var_wp.set('')
         # ★填完再刷一次提示：所属方型会把 "8" 显示成 "8 古巴"，不然下拉看着像空的
         self._ac_hint()
 
@@ -7525,15 +8402,18 @@ class TriggerEditor(tk.Toplevel):
             if j < 0:
                 self.app.status.set('新建触发：先选行为类型')
                 return
+            _t = self._ac_keys[j]
             try:
-                arg = self._parse_arg(self.var_acarg.get())
-            except ValueError:
-                self.app.status.set('参数必须是整数')
+                arg, kw = self._ac_payload(_t)
+            except ValueError as e:
+                self.app.status.set(str(e))
                 return
-            self._pending_actions[i] = (self._ac_keys[j], arg)
+            self._pending_actions[i] = dict({'type': _t, 'arg': arg}, **kw)
             self._fill_actions()
-            self.app.status.set('新建触发：第 %d 条行为 → %s（参数 %d）'
-                                % (i + 1, ACTION_TYPES[self._ac_keys[j]][0], arg))
+            self.app.status.set('新建触发：第 %d 条行为 → %s（%s）'
+                                % (i + 1, ACTION_TYPES[_t][0],
+                                   self._ac_text(_t, arg, kw.get('team') or 0,
+                                                 kw.get('waypoint') or 0)))
             return
         sel = self.tv_ac.focus()
         acts = (self._det or {}).get('actions') or []
@@ -7544,19 +8424,22 @@ class TriggerEditor(tk.Toplevel):
         if i < 0:
             messagebox.showinfo('提示', '先选行为类型', parent=self)
             return
+        _t = self._ac_keys[i]
         try:
-            arg = self._parse_arg(self.var_acarg.get())
-        except ValueError:
-            messagebox.showwarning('提示', '参数必须是整数', parent=self)
+            arg, kw = self._ac_payload(_t)
+        except ValueError as e:
+            messagebox.showwarning('提示', str(e), parent=self)
             return
         a = acts[int(sel) - 1]
         try:
-            self.doc.set_action(a, atype=self._ac_keys[i], arg=arg)
+            self.doc.set_action(a, atype=_t, arg=arg, **kw)
         except Exception as e:
             messagebox.showerror('修改失败', str(e), parent=self)
             return
-        self.after_change('行为 #%s → %s（参数 %d）'
-                          % (sel, ACTION_TYPES[self._ac_keys[i]][0], arg))
+        self.after_change('行为 #%s → %s（%s）'
+                          % (sel, ACTION_TYPES[_t][0],
+                             self._ac_text(_t, arg, kw.get('team') or 0,
+                                           kw.get('waypoint') or 0)))
 
     def add_action(self):
         if getattr(self, '_new_mode', False):
@@ -7565,31 +8448,37 @@ class TriggerEditor(tk.Toplevel):
                 # 没选类型就点「添加」：只提示，不弹框（玩家要求）
                 self.app.status.set('新建触发：先在「行为类型」里选一个再点「添加」')
                 return
+            _t = self._ac_keys[j]
             try:
-                arg = self._parse_arg(self.var_acarg.get())
-            except ValueError:
-                self.app.status.set('参数必须是整数')
+                arg, kw = self._ac_payload(_t)
+            except ValueError as e:
+                self.app.status.set(str(e))
                 return
-            self._pending_actions.append((self._ac_keys[j], arg))
+            self._pending_actions.append(dict({'type': _t, 'arg': arg}, **kw))
             self._fill_actions()
-            self.app.status.set('新建触发：已加第 %d 条行为 %s（参数 %d）—— 还没写入存档'
-                                % (len(self._pending_actions),
-                                   ACTION_TYPES[self._ac_keys[j]][0], arg))
+            self.app.status.set('新建触发：已加第 %d 条行为 %s（%s）—— 还没写入存档'
+                                % (len(self._pending_actions), ACTION_TYPES[_t][0],
+                                   self._ac_text(_t, arg, kw.get('team') or 0,
+                                                 kw.get('waypoint') or 0)))
             return
         i = self.cb_ac.current()
         if i < 0 or not self._cur:
             return
+        _t = self._ac_keys[i]
         try:
-            arg = self._parse_arg(self.var_acarg.get())
-        except ValueError:
-            messagebox.showwarning('提示', '参数必须是整数', parent=self)
+            arg, kw = self._ac_payload(_t)
+        except ValueError as e:
+            messagebox.showwarning('提示', str(e), parent=self)
             return
         try:
-            self.doc.add_action(self._cur, self._ac_keys[i], arg)
+            self.doc.add_action(self._cur, _t, arg, **kw)
         except Exception as e:
             messagebox.showerror('添加失败', str(e), parent=self)
             return
-        self.after_change('已添加行为：%s（参数 %d）' % (ACTION_TYPES[self._ac_keys[i]][0], arg))
+        self.after_change('已添加行为：%s（%s）'
+                          % (ACTION_TYPES[_t][0],
+                             self._ac_text(_t, arg, kw.get('team') or 0,
+                                           kw.get('waypoint') or 0)))
 
     def dup_action(self):
         if getattr(self, '_new_mode', False):
@@ -7620,7 +8509,8 @@ class TriggerEditor(tk.Toplevel):
             if i is None:
                 self.app.status.set('新建触发：先在列表里选一条行为')
                 return
-            t = self._pending_actions.pop(i)[0]
+            it = self._pending_actions.pop(i)
+            t = it['type'] if isinstance(it, dict) else it[0]
             self._fill_actions()
             self.app.status.set('新建触发：已删掉第 %d 条行为（%s）' % (i + 1, action_name(t)))
             return
@@ -7645,25 +8535,40 @@ class TriggerEditor(tk.Toplevel):
         self.after_change('已删除行为：%s' % a['name'])
 
     # ---------------- 新建 / 复制 / 删除 ----------------
-    def new_trigger(self):
-        """把"待建清单"提交成一条真触发（= 玩家说的"保存这个写好的触发"）。
+    def _next_new_name(self):
+        """下一个可用的「新触发N」名字。"""
+        n = 1
+        try:
+            names = {r.name for r in self.doc.records if r.kind == '触发'}
+        except Exception:
+            names = set()
+        while ('新触发%d' % n) in names:
+            n += 1
+        return '新触发%d' % n
 
-        §174：**一次可以带多个事件 + 多条行为**（走 `create_trigger_multi`）。
-        事件顺序 = 清单顺序；存档里链头是**清单最后一条**（引擎最先评估它）。
+    def new_trigger(self):
+        """点「新建」= **立刻建一条**（不再是"先进表单、再点一次才建"两步走）。
+
+        ★§257 玩家 2026-10-25：「已经点了新建了 写入名字后 再点一次新建才会刷新触发名，
+          能不能省略这步」⇒ 取消两段式：
+          · 点一下就在存档里建出来（名字取「新触发N」，建完自动选中它）；
+          · 之后**改名字是实时的**（见 `_on_name_change`），不用再点「改名」；
+          · 事件默认给一条「8 任何事件」，下面随时改/加；行为可以先不加（空触发合法）。
+
+        旧路径（`TriggerEditor(new=True)`，脚本用）仍走"待建清单"：那种情况下
+        `_pending_name / _pending_events / _pending_actions` 有值，按清单一次建完。
         """
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档', parent=self)
+            return
         events = list(getattr(self, '_pending_events', []) or [])
         acts = list(getattr(self, '_pending_actions', []) or [])
         if not events:
-            messagebox.showwarning(
-                '提示', '至少要有一个事件。\n\n先在「事件设置」里选类型/参数，再点「＋添加」。',
-                parent=self)
-            return
-        et, ea = events[0]
+            events = [(8, 0)]          # 默认「8 任何事件」，玩家在下面改
+        nm = (getattr(self, '_pending_name', None) or self._next_new_name())[:16]
+        et = events[0][0]
         # ★2026-10-20 玩家要求：**没有行为就建一条空触发**（不再硬塞 21 播放语音，
         #   否则还得再加一条才能把它删掉）。actions=None 就是不建行为对象。
-        src_name = (getattr(self, '_pending_name', None) or self.var_name.get().strip()
-                    or '新触发')[:16]
-        nm = src_name
         try:
             info = self.doc.create_trigger_multi(
                 nm, events, acts or None,
@@ -7696,6 +8601,12 @@ class TriggerEditor(tk.Toplevel):
         if warn:
             msg += '　⚠ ' + '；'.join(warn)
         self.after_change(msg, new_sid=sid)
+        # ★§257：建完把光标丢进名字框并全选 —— 想改名直接打字覆盖，一步都不用多点
+        try:
+            self.after(60, lambda: (self.ent_name.focus_set(),
+                                    self.ent_name.select_range(0, 'end')))
+        except Exception:
+            pass
 
     def copy_trigger(self):
         if self._blocked_in_new():
@@ -7811,19 +8722,111 @@ class TriggerEditor(tk.Toplevel):
                           '要写文件请回主窗口点「保存」' % self._cur)
 
     # ---------------- 统一善后 ----------------
-    def after_change(self, msg, new_sid=None):
+    def _on_name_change(self):
+        """名字**随输入实时生效**（地编同款，不用再点「改名」）。
+
+        ★§257 玩家 2026-10-25：「写入名字后 再点一次新建才会刷新触发名，能不能省略这步」
+          ⇒ 两种情形都做到"打完就是"：
+          · 新建模式（旧入口）：实时写 `_pending_name`，点「新建」时就用它；
+          · **普通模式（编辑已有触发）：直接改名**（与当前名相同就跳过，
+            避免 `reload()` 回填时自己触发一遍写盘）。
+        """
+        nm = (self.var_name.get() or '').strip()
+        if not nm:
+            return                       # 清空不写（存档里名字不能为空）
+        nm = nm[:16]
+        if getattr(self, '_new_mode', False):
+            self._pending_name = nm
+            try:
+                self.app.status.set('新建触发名：%s（点「新建」立即创建）' % nm)
+            except Exception:
+                pass
+            return
+        cur = getattr(self, '_cur', None)
+        if not cur:
+            return
+        if nm == ((self._det or {}).get('name') or ''):
+            return                        # reload 回填的同名，不用写
         try:
-            self.app.refresh_records()
-            self.app.refresh_events()
-            self.app.refresh_actions()
+            self.doc.set_trigger_name(cur, nm)
+            self._det['name'] = nm
+            self.app._lists_dirty = True
+            self.app.status.set('触发名 → %s（已写进内存，回主窗口「保存」才落盘）' % nm)
+        except Exception:
+            pass
+
+    def after_change(self, msg, new_sid=None):
+        """改完一处后的收尾。
+
+        ★★§256 性能（玩家 2026-10-25：「触发编辑器每点一个操作都会小卡一下」）：
+          主窗口那三张列表是**全量重扫**（`refresh_records` 本档 ~2 秒，它要逐条判
+          「运行期状态/是否已执行」）。以前每次改一个字段都刷三张表 ⇒ 编辑器里
+          点一下卡两秒。现在只**标脏**，关闭编辑器时刷一次；编辑器自己的界面照常立刻刷新。
+        """
+        try:
+            self.app._lists_dirty = True
         except Exception:
             pass
         self.app.status.set(msg + '（尚未保存）')
         self.reload(new_sid or self._cur)
 
+    def destroy(self):
+        """关闭窗口时把主窗口那三张列表刷一次（§256：改的过程中只标脏，免得每步卡 2 秒）。"""
+        try:
+            if getattr(self.app, '_lists_dirty', False):
+                self.app._lists_dirty = False
+                self.app.refresh_records()
+                self.app.refresh_events()
+                self.app.refresh_actions()
+        except Exception:
+            pass
+        try:
+            tk.Toplevel.destroy(self)
+        except Exception:
+            pass
+
 
 REPEAT_LABEL = {0: '一次性·任一挂载', 1: '一次性·挂载清空', 2: '可重复'}
 
 
+def crash_log_path():
+    """崩溃日志路径（exe 同目录；源码跑时在脚本目录）。"""
+    import sys as _s
+    base = os.path.dirname(os.path.abspath(_s.executable if getattr(_s, 'frozen', False)
+                                           else __file__))
+    return os.path.join(base, 'crash.log')
+
+
+def write_crash_log(exc, val, tb, tag=''):
+    """把未捕获异常追加写到 crash.log。
+
+    ★§255：玩家 2026-10-24 报「触发编辑器点新建会闪退」，但打包成 exe 后没有控制台，
+      异常要么被吞、要么整个进程消失 ⇒ 什么信息都拿不到。写文件是最低成本的自证手段。
+    """
+    import traceback as _tb
+    import datetime as _dt
+    try:
+        with open(crash_log_path(), 'a', encoding='utf-8') as f:
+            f.write('\n===== %s  %s =====\n'
+                    % (_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), tag))
+            f.write(''.join(_tb.format_exception(exc, val, tb)))
+    except Exception:
+        pass
+
+
+def _install_crash_hooks():
+    _old = sys.excepthook
+
+    def _hook(exc, val, tb):
+        write_crash_log(exc, val, tb, 'uncaught')
+        try:
+            _old(exc, val, tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _hook
+
+
 if __name__ == '__main__':
+    _install_crash_hooks()
     App().mainloop()

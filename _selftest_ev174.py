@@ -60,15 +60,19 @@ ck('建档成功（无警告）', not info['warnings'], info['warnings'])
 ck('事件数 2 → 5', len(d.events()) == n_ev0 + 3, '%d → %d' % (n_ev0, len(d.events())))
 ck('行为数 1 → 3', len(d.actions()) == n_ac0 + 2, '%d → %d' % (n_ac0, len(d.actions())))
 ch = [(e['type'], e['arg']) for e in info['events']]
-ck('★链序 = 列表逆序（链头是列表最后一条）',
-   ch == [(13, 60), (8, 0), (13, 30)], ch)
+# ★2026-10-24 改判：链序 = **列表顺序**（add_event 接链尾，§155.3 铁规则 + GUI
+#   列表"从上到下 = 引擎评估顺序"）。旧断言要求逆序，是 10-22 那头插写法留下的；
+#   两种结构游戏里都能跑（T9/T10/T11 是头插档验收的，T75~T87 是链尾档验收的），
+#   选链尾是因为**用户在列表末尾点"添加"就该出现在末尾**，且不动已有事件的短路顺序。
+ck('★链序 = 列表顺序（链头 = 列表第一条）',
+   ch == [(13, 30), (8, 0), (13, 60)], ch)
 ck('行为按列表顺序（执行序）',
    [(a['type'], a['arg']) for a in info['actions']] == [(21, 0), (56, 7)],
    [(a['type'], a['arg']) for a in info['actions']])
 inst = d.trigger_inst_off(sid)
 head = struct.unpack_from('<I', d.plain, inst + 192)[0]
-ck('实例 +192 = 链头 = 最后加的那条',
-   head == next(e['key'] for e in info['events'] if e['type'] == 13 and e['arg'] == 60),
+ck('实例 +192 = 链头 = 列表第一条',
+   head == next(e['key'] for e in info['events'] if e['type'] == 13 and e['arg'] == 30),
    '%08X' % head)
 evs, acts = d.events(), d.actions()
 ck('事件组计数 = 实际数',
@@ -88,8 +92,8 @@ print('\n[2] add_event / remove_event 往返')
 before = [(e['type'], e['arg']) for e in d.trigger_event_list(sid)]
 r = d.add_event(sid, 48, 0)
 mid = [(e['type'], e['arg']) for e in d.trigger_event_list(sid)]
-ck('add_event 后链头 = 新加的那个', mid[0] == (48, 0), mid)
-ck('add_event 不动其它事件', mid[1:] == before, mid[1:])
+ck('add_event 后新事件在链尾（列表最后）', mid[-1] == (48, 0), mid)
+ck('add_event 不动其它事件', mid[:-1] == before, mid[:-1])
 d.remove_event(sid, r['key'])
 after = [(e['type'], e['arg']) for e in d.trigger_event_list(sid)]
 ck('remove_event 完整还原', after == before, after)
@@ -158,7 +162,8 @@ if len(free) >= 3:
     if res:
         ce = [(e['type'], e['arg']) for e in res['events']]
         ce36 = [x for x in ce if x[0] == 36]
-        ck('★汇总是 3 × 事件 36（AND）', ce36 == [(36, 3), (36, 2), (36, 1)], ce)
+        ck('★汇总是 3 × 事件 36（AND）、心跳在链头',
+           ce36 == [(36, 1), (36, 2), (36, 3)] and ce and ce[0][0] == 13, ce)
         ck('★汇总带 13 心跳', any(t == 13 for t, _ in ce), ce)
         ck('汇总行为 = 设定值', [(a['type'], a['arg']) for a in res['actions']] == [(21, 0)])
         ck('汇总持久性强制 0',

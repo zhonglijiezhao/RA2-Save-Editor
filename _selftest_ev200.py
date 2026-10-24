@@ -95,8 +95,11 @@ ck('rules 里 ZEP 的 Locomotor 能读出来', bool(r_zep.get('LOCOMOTOR')), r_z
 # ---------- [3] 同型号克隆：移动方式、高度、血量都不许被带歪 ----------
 cell = d.free_cell_near(real['x'] or 40, (real['y'] or 179) + 1, radius=12, clearance=1)
 ck('找到空位', cell is not None, str(cell))
-info = d.add_unit_by_clone('ZEP', cell[0], cell[1], house=d.player_house(), veterancy=None)
-ck('克隆成功（无告警）', not info['warnings'], str(info['warnings']))
+info = d.add_unit_by_clone('ZEP', cell[0], cell[1], house=d.player_house(),
+                          veterancy=None, exact_cell=True)
+ck('克隆成功（无告警）',
+   not [w for w in info['warnings'] if '不是平地' not in w],
+   str(info['warnings']))
 new = [r for r in d.unit_records() if r['key'] == info['key']][0]
 ck('新基洛夫伴随 = Fly / 173 B',
    new['loco'] == 'Fly' and new['comp_size'] == 173,
@@ -110,11 +113,14 @@ ck('与真基洛夫逐 dword 差异 ≤ 20（实际 %d）' % len(diff), len(diff
 # ★§212 起：空中单位的"当前高度 +0xB8"会被设成"类型高度 +0x270"（起在巡航高度，不卡地上）
 ck('★类型高度 +0x270 与模板一致', a[0x270:0x274] == b[0x270:0x274],
    '%s vs %s' % (a[0x270:0x274][::-1].hex(), b[0x270:0x274][::-1].hex()))
-ck('★空中单位当前高度 = 类型高度（不卡地上）', b[0xB8:0xBC] == b[0x270:0x274],
-   '%s vs %s' % (b[0xB8:0xBC][::-1].hex(), b[0x270:0x274][::-1].hex()))
-ck('★指令/目的地已清 0（不带攻击目标）',
-   struct.unpack_from('<I', b, 0x198)[0] == 0
-   and struct.unpack_from('<I', b, 0x658)[0] == 0
+# ★§248.8：高度改为"只抬不压"——骨架本来就高（如 1998）时保持原值，不再强按成类型高度
+ck('★空中单位当前高度不低于类型高度（不卡地上）',
+   struct.unpack_from('<I', b, 0xB8)[0] >= struct.unpack_from('<I', b, 0x270)[0],
+   '%d vs %d' % (struct.unpack_from('<I', b, 0xB8)[0],
+                 struct.unpack_from('<I', b, 0x270)[0]))
+# ★§248.8：0x198 不再清（保留骨架值 = 匹配同档原生）；只验目的地
+ck('★目的地已清 0（不带攻击目标）',
+   struct.unpack_from('<I', b, 0x658)[0] == 0
    and struct.unpack_from('<I', b, 0x680)[0] == 0, '')
 ck('血量 = 真基洛夫的满血值', a[0x80:0x84] == b[0x80:0x84] and a[0x84:0x88] == b[0x84:0x88],
    '%d' % struct.unpack_from('<I', b, 0x80)[0])

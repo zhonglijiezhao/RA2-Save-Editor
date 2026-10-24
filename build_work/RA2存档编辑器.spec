@@ -40,7 +40,8 @@ a = Analysis(
     binaries=[],
     datas=_datas,
     hiddenimports=['editor_core', 'cfb', 'cfb_write', 'map_render', 'map_ini', 'game_ini',
-                   'unit_comp_lib', 'mix', 'lzo_fast', 'ai_objects'],
+                   'unit_comp_lib', 'mix', 'lzo_fast', 'ai_objects',
+                   'script_actions'],   # ★§253 脚本动作中文名表（动态 import，必须列在这里）
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
