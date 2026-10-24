@@ -5717,7 +5717,8 @@ class App(tk.Tk):
                    command=self._ai_new_tf).pack(side='left', padx=2)
         ttk.Button(nrow, text='＋ 动作脚本',
                    command=self._ai_new_script).pack(side='left', padx=2)
-        ttk.Button(nrow, text='＋ 作战小队',
+        # ★§258：改成完整编辑器（仿地编：新建/复制/编辑全字段）
+        ttk.Button(nrow, text='✏ 作战小队…',
                    command=self._ai_new_team).pack(side='left', padx=2)
         ttk.Button(nrow, text='🔗 触发挂小队…',
                    command=self._ai_attach_team).pack(side='left', padx=(14, 2))
@@ -6440,99 +6441,322 @@ class App(tk.Tk):
         self.wait_window(win)
         return res or None
 
-    def _dlg_team(self):
-        """作战小队对话框（仿地编：名称 / 国家 / 特遣部队 / 动作脚本 / 星级 / 优先级 / 最大）。
+    # ---- ★§258 作战小队（仿地编全字段）----
+    # 地编截图里带 `*` 的复选框才有用（玩家 2026-10-25 原话），所以只列这 12 个。
+    # 前 9 个偏移已在 `ai_objects.TEAM_FLAGS` 定案；后 3 个还缺对照档 ⇒ 灰显不可改。
+    TEAM_FLAG_UI = (
+        ('Loadable', '可装载*', True),
+        ('Full', '预装载小队*', True),
+        ('Droppod', '运输机空投*', True),
+        ('Aggressive', '侵略部队*', True),
+        ('Autocreate', '自动建造*', True),
+        ('Reinforce', '增援部队*', True),
+        ('AvoidThreats', '躲避威胁*', True),
+        ('LooseRecruit', '忽视分组*', True),
+        ('Whiner', '忽视阻拦*', True),
+        ('AreTeamMembersRecruitable', '小队成员可被重组*', False),
+        ('IsBaseDefense', '用于基地防御*', False),
+        ('OnlyTargetHouseEnemy', '仅攻击敌方或敌对*', False),
+    )
+    TEAM_MC_CHOICES = [(0, '0 - 随机'), (1, '1 - 我方基地'), (2, '2 - 敌方基地'),
+                       (3, '3 - 最短路径'), (4, '4 - 最富'), (5, '5 - 其他')]
 
-        ★§254：特遣 / 脚本各有两类来源 ——
-          · **地图定义**：ID `0100xxxx`，地编里能看见、能改，玩家该用的就是这批；
-          · **AI 运行期生成**：ID 是 8 位随机十六进制（`05C60C4C` 这种），名字是
-            「数量 + 单位名」自动拼的（"3 GIs, 3 Guards"），**地编里看不到、改了也没用**。
-        默认只列地图定义的；AI 那批**不显示**（玩家 2026-10-24：「AI 的脚本和特遣、
-        小队些没有用，没有显示的必要」—— 地编里看不到，选了也改不动）。
-        """
-        tf_all = self.doc.taskforces()
-        sc_all = self.doc.script_types()
-        tf_map = [t for t in tf_all if t.get('defined', True)]
-        sc_map = [x for x in sc_all if x.get('defined', True)]
+    def _team_defs(self):
+        """地图定义的作战小队 [(显示名, sid, key)]。"""
+        out = []
         try:
-            houses = list(self.doc.house_keys().keys())
+            for t in self.doc.team_types():
+                if t.get('defined', True):
+                    out.append(('%s  %s' % (t['sid'], t['name']), t['sid'], t['key']))
         except Exception:
-            houses = []
+            pass
+        return out
 
-        def _disp(lst):
-            return [('%s  %s' % (x['sid'], x['name'])) if x.get('defined', True)
-                    else ('[AI] %s  %s' % (x['sid'], x['name'])) for x in lst]
+    def _dlg_team(self, ident=None, new=False):
+        """「作战小队」对话框（仿地编，§258）——新建 / 复制 / 编辑全字段。
 
-        state = {'tf': tf_map, 'sc': sc_map}
-        win = self._mk_modal('作战小队', 640, 440)
-        g = ttk.Frame(win, padding=10)
+        返回 `{'saved': True, 'sid':…, 'key':…}` 或 None（取消）。
+        ★地编里带 `*` 的复选框才有用，这里只放那 12 个；其中 3 个偏移未定案 ⇒ 灰显。
+        """
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return None
+        teams = self._team_defs()
+        if not teams and not new:
+            messagebox.showwarning('作战小队', '本档没有地图定义的作战小队')
+            return None
+        state = {'key': None}
+        win = self._mk_modal('作战小队', 700, 700)
+
+        top = ttk.Frame(win, padding=8)
+        top.pack(fill='x')
+        ttk.Label(top, text='作战小队连接到特遣部队和动作脚本，并可被触发调用。'
+                            '（带 * 的标志是地编里真正生效的那些）',
+                  foreground='#374151').pack(side='left')
+        ttk.Button(top, text='查找引用', command=lambda: self._team_refs_dlg(state['key'])
+                   ).pack(side='right')
+
+        rowt = ttk.Frame(win, padding=(8, 0))
+        rowt.pack(fill='x', pady=(4, 6))
+        v_cur = tk.StringVar()
+        cb_cur = ttk.Combobox(rowt, textvariable=v_cur, width=44, state='readonly',
+                              values=[x[0] for x in teams])
+        ttk.Label(rowt, text='当前小队').pack(side='left')
+        cb_cur.pack(side='left', padx=6)
+
+        g = ttk.Frame(win, padding=(8, 0))
         g.pack(fill='both', expand=True)
 
-        def row(i, label, widget):
-            ttk.Label(g, text=label).grid(row=i, column=0, sticky='w', pady=4)
-            widget.grid(row=i, column=1, sticky='we', padx=(8, 0), pady=4)
+        def lab(i, j, text, w=None):
+            ttk.Label(g, text=text).grid(row=i, column=j * 2, sticky='w', pady=3)
 
-        v_name = tk.StringVar(value='新小队')
-        e_name = ttk.Entry(g, textvariable=v_name, width=44)
-        row(0, '名称', e_name)
-        v_house = tk.StringVar(value=(self.doc.player_house() or (houses[0] if houses else '')))
-        row(1, '国家', ttk.Combobox(g, textvariable=v_house, values=houses,
-                                   width=42, state='readonly'))
-        v_tf = tk.StringVar(value=_disp(tf_map)[0] if tf_map
-                            else '（本档没有地图定义的特遣部队）')
-        cb_tf = ttk.Combobox(g, textvariable=v_tf, values=_disp(tf_map) or [v_tf.get()],
-                             width=42, state='readonly')
-        row(2, '特遣部队', cb_tf)
-        v_sc = tk.StringVar(value='（空脚本 · 原地待命）')
-        cb_sc = ttk.Combobox(g, textvariable=v_sc,
-                             values=['（空脚本 · 原地待命）'] + _disp(sc_map),
-                             width=42, state='readonly')
-        row(3, '动作脚本', cb_sc)
-        v_vet = tk.StringVar(value='3')
-        row(4, '星级（3 精英 / 2 老兵 / 1 新兵）',
-            ttk.Combobox(g, textvariable=v_vet, values=['3', '2', '1'], width=8,
-                         state='readonly'))
-        v_pri = tk.StringVar(value='5')
-        row(5, '优先级', ttk.Entry(g, textvariable=v_pri, width=8))
-        v_max = tk.StringVar(value='5')
-        row(6, '最大', ttk.Entry(g, textvariable=v_max, width=8))
-        ttk.Label(g, text='★ 星级写的是小队 +0xB4（与地编「星级」同口径）；'
-                          '刷出来的兵在游戏里就按这个显示',
-                  foreground='#1d4ed8', wraplength=560, justify='left').grid(
-            row=7, column=0, columnspan=2, sticky='w', pady=(8, 0))
-        bar = ttk.Frame(g)
-        bar.grid(row=8, column=0, columnspan=2, sticky='ew', pady=(12, 0))
+        v_name = tk.StringVar()
+        v_house = tk.StringVar()
+        v_tf = tk.StringVar()
+        v_sc = tk.StringVar()
+        v_tag = tk.StringVar()
+        v_vet = tk.StringVar()
+        v_pri = tk.StringVar()
+        v_max = tk.StringVar()
+        v_grp = tk.StringVar()
+        v_wp = tk.StringVar()
+        v_mc = tk.StringVar()
+        f_vars = {}
+
+        lab(0, 0, '名称')
+        ttk.Entry(g, textvariable=v_name, width=52).grid(
+            row=0, column=1, columnspan=3, sticky='we', padx=6, pady=3)
+        lab(1, 0, '国家')
+        cb_house = ttk.Combobox(g, textvariable=v_house, width=50, state='readonly')
+        cb_house.grid(row=1, column=1, columnspan=3, sticky='we', padx=6, pady=3)
+        lab(2, 0, '特遣部队')
+        cb_tf = ttk.Combobox(g, textvariable=v_tf, width=50, state='readonly')
+        cb_tf.grid(row=2, column=1, columnspan=3, sticky='we', padx=6, pady=3)
+        lab(3, 0, '动作脚本')
+        cb_sc = ttk.Combobox(g, textvariable=v_sc, width=50, state='readonly')
+        cb_sc.grid(row=3, column=1, columnspan=3, sticky='we', padx=6, pady=3)
+        lab(4, 0, '关联标签')
+        cb_tag = ttk.Combobox(g, textvariable=v_tag, width=50, state='readonly')
+        cb_tag.grid(row=4, column=1, columnspan=3, sticky='we', padx=6, pady=3)
+
+        lab(5, 0, '星级')
+        ttk.Combobox(g, textvariable=v_vet, width=8, state='readonly',
+                     values=['1', '2', '3']).grid(row=5, column=1, sticky='w', padx=6)
+        lab(5, 2, '优先级')
+        ttk.Spinbox(g, from_=0, to=99, width=8, textvariable=v_pri).grid(
+            row=5, column=3, sticky='w', padx=6)
+        lab(6, 0, '最大')
+        ttk.Spinbox(g, from_=0, to=99, width=8, textvariable=v_max).grid(
+            row=6, column=1, sticky='w', padx=6)
+        lab(6, 2, '分组')
+        ttk.Spinbox(g, from_=-1, to=99, width=8, textvariable=v_grp).grid(
+            row=6, column=3, sticky='w', padx=6)
+        lab(7, 0, '小队出现于（路径点号）')
+        ttk.Entry(g, textvariable=v_wp, width=10).grid(row=7, column=1, sticky='w', padx=6)
+        lab(7, 2, '心控结局')
+        cb_mc = ttk.Combobox(g, textvariable=v_mc, width=14, state='readonly',
+                             values=[x[1] for x in self.TEAM_MC_CHOICES])
+        cb_mc.grid(row=7, column=3, sticky='w', padx=6)
+
+        # ---- 复选框（只放带 * 的）----
+        box = ttk.Labelframe(win, text='小队标志（地编里带 * 的才有用）', padding=8)
+        box.pack(fill='x', padx=8, pady=(8, 0))
+        fgrid = ttk.Frame(box)
+        fgrid.pack()
+        for i, (nm, txt, ok) in enumerate(self.TEAM_FLAG_UI):
+            var = tk.BooleanVar(value=False)
+            f_vars[nm] = var
+            cb = ttk.Checkbutton(fgrid, text=txt, variable=var)
+            cb.grid(row=i % 3, column=i // 3, sticky='w', padx=8, pady=2)
+            if not ok:
+                cb.state(['disabled'])
+        ttk.Label(box, text='（灰掉的两个/三个：偏移还没定案 —— 需要一份"这些勾选有开有关"的存档来对账）',
+                  foreground='#9ca3af').pack(anchor='w', pady=(4, 0))
+
+        bar = ttk.Frame(win, padding=8)
+        bar.pack(fill='x')
+
+        # ---- 数据装载 ----
+        def load(key):
+            state['key'] = key
+            det = self.doc.team_detail(key)
+            v_name.set(det['name'])
+            hs = [h.get('cn') or h.get('short') for h in (self.doc.houses() or [])]
+            cb_house['values'] = hs
+            hk = det['house']
+            nmh = next((h.get('cn') or h.get('short') for h in (self.doc.houses() or [])
+                        if h.get('key') == hk), None)
+            v_house.set(nmh or (hs[0] if hs else ''))
+            tfs = [('%s  %s' % (t['sid'], t['name']), t['key'])
+                   for t in self.doc.taskforces() if t.get('defined', True)]
+            cb_tf['values'] = [x[0] for x in tfs]
+            v_tf.set(next((x[0] for x in tfs if x[1] == det['taskforce']),
+                          tfs[0][0] if tfs else ''))
+            scs = [('（空脚本 · 原地待命）', 0)] + \
+                  [('%s  %s' % (x['sid'], x['name']), x['key'])
+                   for x in self.doc.script_types() if x.get('defined', True)]
+            cb_sc['values'] = [x[0] for x in scs]
+            v_sc.set(next((x[0] for x in scs if x[1] == det['script']), scs[0][0]))
+            tgs = [('None', 0)] + \
+                  [('%s  %s' % (x.get('sid'), x.get('name')), x.get('key'))
+                   for x in (__import__('ai_objects').list_tags(self.doc) or [])]
+            cb_tag['values'] = [x[0] for x in tgs]
+            v_tag.set(next((x[0] for x in tgs if x[1] == det['tag']), 'None'))
+            v_vet.set(str(det['veteran'] or 1))
+            v_pri.set(str(det['priority']))
+            v_max.set(str(det['max']))
+            v_grp.set(str(det['group']))
+            v_wp.set(str(det['waypoint']))
+            v_mc.set(next((x[1] for x in self.TEAM_MC_CHOICES
+                           if x[0] == det['mind_control']), self.TEAM_MC_CHOICES[0][1]))
+            for nm, var in f_vars.items():
+                var.set(bool(det['flags'].get(nm)))
+            cb_cur.set(next((x[0] for x in teams if x[2] == key),
+                            cb_cur.get()))
+            self.status.set('作战小队 %s「%s」' % (det['sid'], det['name']))
+
+        def on_pick(*_a):
+            txt = v_cur.get()
+            hit = next((x for x in teams if x[0] == txt), None)
+            if hit:
+                load(hit[2])
+
+        cb_cur.bind('<<ComboboxSelected>>', on_pick)
+
+        def refresh_cur():
+            nonlocal teams
+            teams = self._team_defs()
+            cb_cur['values'] = [x[0] for x in teams]
+
+        def do_new():
+            tfs = [t for t in self.doc.taskforces() if t.get('defined', True)]
+            if not tfs:
+                messagebox.showwarning('新建小队', '本档没有特遣部队，请先「＋ 特遣部队」',
+                                       parent=win)
+                return
+            n = 1
+            names = {t['name'] for t in self.doc.team_types()}
+            while ('新小队%d' % n) in names:
+                n += 1
+            try:
+                r = self.doc.clone_team(tfs[0]['key'], name='新小队%d' % n,
+                                        veteran=1, max_teams=5, script_key=0)
+            except Exception as e:
+                messagebox.showerror('新建失败', str(e), parent=win)
+                return
+            refresh_cur()
+            load(r['key'])
+
+        def do_copy():
+            if not state['key']:
+                return
+            src = self.doc.team_detail(state['key'])
+            try:
+                r = self.doc.clone_team(src['taskforce'], name=(src['name'] + '_copy')[:16],
+                                        country_key=src['house'] or None,
+                                        veteran=src['veteran'], max_teams=src['max'],
+                                        script_key=src['script'], priority=src['priority'])
+            except Exception as e:
+                messagebox.showerror('复制失败', str(e), parent=win)
+                return
+            refresh_cur()
+            load(r['key'])
+
+        def do_del():
+            messagebox.showinfo(
+                '暂不支持删除',
+                '删除作战小队要同时拆掉「触发 80/107 对它的引用」并重排组内序号，\n'
+                '风险高，本版先不做。想让它失效可以直接把「星级」调 1、或把特遣清空。',
+                parent=win)
+
+        ttk.Button(rowt, text='新建', width=6, command=do_new).pack(side='left', padx=3)
+        ttk.Button(rowt, text='复制', width=6, command=do_copy).pack(side='left', padx=3)
+        ttk.Button(rowt, text='删除', width=6, command=do_del).pack(side='left', padx=3)
+        for c in range(4):
+            g.columnconfigure(c, weight=1 if c % 2 else 0)
+
         res = {}
 
         def ok():
-            tf = next((t for t in state['tf'] if t['sid'] and t['sid'] in v_tf.get()), None)
-            if tf is None:
-                messagebox.showwarning('作战小队', '本档没有特遣部队，请先新建一个',
-                                       parent=win)
+            key = state['key']
+            if not key:
+                win.destroy()
                 return
-            sc_key = None
-            if not v_sc.get().startswith('（'):
-                sc = next((x for x in state['sc'] if x['sid'] and x['sid'] in v_sc.get()), None)
-                if sc:
-                    sc_key = sc['key']
-            else:
-                sc_key = 0                       # 显式"空脚本"
             try:
-                pri = int(v_pri.get() or 5)
-                mx = int(v_max.get() or 5)
-            except ValueError:
-                pri, mx = 5, 5
-            res.update({'name': v_name.get().strip() or '新小队', 'tf_key': tf['key'],
-                        'tf_sid': tf['sid'], 'country_key': self.doc.house_key_of(v_house.get())
-                        or None, 'veteran': int(v_vet.get()), 'priority': pri,
-                        'max': mx, 'script_key': sc_key})
+                tfk = next((x[1] for x in
+                            [('%s  %s' % (t['sid'], t['name']), t['key'])
+                             for t in self.doc.taskforces() if t.get('defined', True)]
+                            if x[0] == v_tf.get()), None)
+                sck = next((x[1] for x in
+                            [('（空脚本 · 原地待命）', 0)] +
+                            [('%s  %s' % (x['sid'], x['name']), x['key'])
+                             for x in self.doc.script_types() if x.get('defined', True)]
+                            if x[0] == v_sc.get()), 0)
+                tgk = next((x[1] for x in
+                            [('None', 0)] +
+                            [('%s  %s' % (x.get('sid'), x.get('name')), x.get('key'))
+                             for x in (__import__('ai_objects').list_tags(self.doc) or [])]
+                            if x[0] == v_tag.get()), 0)
+                hk = self.doc.house_key_of(v_house.get()) or 0
+                fields = [('name', v_name.get().strip()[:16]),
+                          ('house', hk), ('taskforce', tfk or 0),
+                          ('script', sck or 0), ('tag', tgk or 0),
+                          ('veteran', int(v_vet.get() or 1)),
+                          ('priority', int(v_pri.get() or 0)),
+                          ('max', int(v_max.get() or 0)),
+                          ('group', int(v_grp.get() or -1)),
+                          ('waypoint', int(v_wp.get() or 0)),
+                          ('mind_control', next((x[0] for x in self.TEAM_MC_CHOICES
+                                                 if x[1] == v_mc.get()), 0))]
+                for nm, var in f_vars.items():
+                    if dict((a, c) for a, _b, c in self.TEAM_FLAG_UI)[nm]:
+                        fields.append((nm, bool(var.get())))
+                for f, val in fields:
+                    self.doc.set_team_field(key, f, val)
+            except Exception as e:
+                messagebox.showerror('保存失败', str(e), parent=win)
+                return
+            self._lists_dirty = True      # ★这里 self 是 App 本身（不是 TriggerEditor）
+            res.update({'saved': True, 'key': key})
             win.destroy()
 
-        ttk.Button(bar, text='确定', command=ok).pack(side='right', padx=4)
-        ttk.Button(bar, text='取消', command=win.destroy).pack(side='right')
-        g.columnconfigure(1, weight=1)
+        ttk.Button(bar, text='确定', width=8, command=ok).pack(side='right', padx=4)
+        ttk.Button(bar, text='取消', width=8, command=win.destroy).pack(side='right')
+
+        # 初始选中
+        init = ident
+        if init is None and teams:
+            init = teams[0][2]
+        if init:
+            try:
+                load(init)
+            except Exception as e:
+                self.status.set('装载失败：%s' % e)
         self.wait_window(win)
+        if res.get('saved'):
+            self._fill_ai_all()
         return res or None
+
+    def _team_refs_dlg(self, key):
+        """「查找引用」：列出用行为 80/107 引用这支小队的触发。"""
+        if not key:
+            messagebox.showinfo('查找引用', '先选一支小队', parent=self)
+            return
+        try:
+            refs = self.doc.team_refs(key)
+        except Exception as e:
+            messagebox.showerror('查找引用失败', str(e), parent=self)
+            return
+        if not refs:
+            messagebox.showinfo('查找引用', '没有任何触发引用这支小队', parent=self)
+            return
+        lines = ['%s  %s  行为%d 路径点%s%s'
+                 % (r['trigger_id'], r['name'], r['action'], r['waypoint'],
+                    (' 格%s' % (r['cell'],)) if r.get('cell') else '')
+                 for r in refs[:20]]
+        messagebox.showinfo('查找引用（%d 条）' % len(refs),
+                            '\n'.join(lines) + ('\n…' if len(refs) > 20 else ''),
+                            parent=self)
 
     def _ai_new_tf(self):
         """新建一个特遣部队（只建特遣，不动小队/触发）。"""
@@ -6581,30 +6805,14 @@ class App(tk.Tk):
                                         for a, g in v['entries'])))
 
     def _ai_new_team(self):
-        """新建作战小队（引用已有的特遣部队 / 动作脚本）。"""
+        """打开「作战小队」对话框（仿地编：新建 / 复制 / 编辑全字段，§258）。"""
         if not self.doc:
             messagebox.showwarning('提示', '请先打开一个存档')
             return
-        v = self._dlg_team()
-        if not v:
-            return
-        try:
-            tm = self.doc.clone_team(v['tf_key'], name=v['name'],
-                                     country_key=v['country_key'],
-                                     veteran=v['veteran'], max_teams=v['max'],
-                                     script_key=v['script_key'],
-                                     priority=v['priority'])
-        except Exception as e:
-            messagebox.showerror('新建作战小队失败', str(e))
-            return
-        self._fill_ai_all()
-        self.status.set('已新建作战小队 %s「%s」' % (tm['sid'], tm['name']))
-        messagebox.showinfo('新建作战小队',
-                            '已新建作战小队\n\nID：%s\n名称：%s\n'
-                            '特遣部队：%s\n星级：%s\n优先级：%d  最大：%d\n\n'
-                            '下一步：用「🔗 触发挂小队…」把它挂到触发器上。'
-                            % (tm['sid'], tm['name'], v['tf_sid'], v['veteran'],
-                               v['priority'], v['max']))
+        r = self._dlg_team()
+        if r:
+            self._fill_ai_all()
+            self.status.set('作战小队已保存到内存（回主窗口「保存」才写盘）')
 
     def _ai_attach_team(self):
         """把一支作战小队挂到**已有触发器**上（行为 80 援军 / 107 超时空援军）。"""

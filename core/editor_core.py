@@ -5288,6 +5288,134 @@ class SaveDoc(object):
                 'waypoint': wp, 'action': action, 'action_off': r.get('obj'),
                 'action_key': r.get('key')}
 
+    # ---------------- ★§258 作战小队全字段（仿地编对话框） ----------------
+    # 记录 268B 的字段布局（与地编 INI 键的对应关系见 §235 / §252.17 / §258 对账）：
+    #   名字 +0x78(48B GBK) / 分组 +0xB0 / 星级 +0xB4 / 优先级 +0xC8 / 最大 +0xCC
+    #   心控结局 +0xD4 / 国家 +0xD8(键) / 关联标签 +0xE4(键) / 出现于 +0xE8(路径点号)
+    #   动作脚本 +0xF4(键) / 特遣部队 +0xF8(键)
+    # 布尔标志一字节一个，见 `ai_objects.TEAM_FLAGS`（16 个，地编带 * 的 11 个都在里面）。
+    TEAM_FIELD_OFF = {
+        'group': 0xB0,
+        'veteran': 0xB4,
+        'priority': 0xC8,
+        'max': 0xCC,
+        'mind_control': 0xD4,
+        'waypoint': 0xE8,
+    }
+    TEAM_KEY_OFF = {
+        'house': 0xD8,
+        'tag': 0xE4,
+        'script': 0xF4,
+        'taskforce': 0xF8,
+    }
+    TEAM_NAME_OFF = 0x78
+    TEAM_NAME_LEN = 48
+
+    # ★§258：地编对话框里有、但**目前没有硬证据定位**的字段（不猜，一律灰显）
+    TEAM_UNKNOWN_FIELDS = {
+        'tech_level': ('科技等级', '0..10；本档 125 个小队全是 0 ⇒ 对账不出偏移'),
+        'is_base_defense': ('用于基地防御（*）', '需一份该标志有开有关的对照档'),
+        'only_target_house_enemy': ('仅攻击敌方或敌对（*）', '同上'),
+        'are_team_members_recruitable': ('小队成员可被重组（*）', '同上'),
+        'transports_return_on_unload': ('运输机下客后返回', '同上'),
+        'ion_immune': ('无视离子风暴', '同上'),
+        'para_drop_aircraft': ('运输机类型', '同上'),
+        'transport_waypoint': ('运输机起始', '同上'),
+        'loose_recruit_alt': ('解散重组', '同上'),
+    }
+
+    def team_detail(self, ident):
+        """读一个作战小队的**全部已知字段**（仿地编「作战小队」对话框）。
+
+        `ident` = 键 / 小队 ID（`01000241`）/ 名称（走 `team_key_of`）。
+        返回 dict；`flags` 是 16 个布尔（见 `ai_objects.TEAM_FLAGS`）。
+        """
+        key = ident if isinstance(ident, int) else self.team_key_of(ident)
+        if not key:
+            raise RuntimeError('认不出小队 %r（可用小队 ID / 名称 / 键）' % (ident,))
+        rec = None
+        for t in self.team_types():
+            if t['key'] == key:
+                rec = t
+                break
+        if rec is None:
+            raise RuntimeError('小队键 %#x 不在本档' % key)
+        pl = self.plain
+        off = rec['off']
+        import ai_objects as _aio
+        flags = {}
+        for foff, nm in _aio.TEAM_FLAGS.items():
+            flags[nm] = pl[off + foff] != 0
+        out = {'key': key, 'sid': rec['sid'], 'defined': rec.get('defined', True),
+               'name': rec['name'],
+               'group': struct.unpack_from('<i', pl, off + self.TEAM_FIELD_OFF['group'])[0],
+               'veteran': struct.unpack_from('<i', pl, off + self.TEAM_FIELD_OFF['veteran'])[0],
+               'priority': struct.unpack_from('<i', pl, off + self.TEAM_FIELD_OFF['priority'])[0],
+               'max': struct.unpack_from('<i', pl, off + self.TEAM_FIELD_OFF['max'])[0],
+               'mind_control': struct.unpack_from('<i', pl, off + self.TEAM_FIELD_OFF['mind_control'])[0],
+               'waypoint': struct.unpack_from('<i', pl, off + self.TEAM_FIELD_OFF['waypoint'])[0],
+               'flags': flags}
+        for k, o in self.TEAM_KEY_OFF.items():
+            out[k] = struct.unpack_from('<I', pl, off + o)[0]
+        return out
+
+    def set_team_field(self, ident, field, value):
+        """改作战小队的一个字段（**只写已知偏移**；未知字段直接报错，绝不猜）。
+
+        `field` 取 `TEAM_FIELD_OFF` / `TEAM_KEY_OFF` 的键，或 `name`，
+        或布尔标志名（`Loadable` / `Reinforce` … 走 `ai_objects.set_team_flag`）。
+        返回改后的 `team_detail()`。
+        """
+        import ai_objects as _aio
+        key = ident if isinstance(ident, int) else self.team_key_of(ident)
+        if not key:
+            raise RuntimeError('认不出小队 %r' % (ident,))
+        rec = next((t for t in self.team_types() if t['key'] == key), None)
+        if rec is None:
+            raise RuntimeError('小队键 %#x 不在本档' % key)
+        if field in _aio.TEAM_FLAGS.values():
+            _aio.set_team_flag(self, rec['sid'], field, bool(value))
+            return self.team_detail(key)
+        off = rec['off']
+        pl = self.plain
+        if field == 'name':
+            nm = str(value)[:47].encode('gbk', 'ignore')[:self.TEAM_NAME_LEN - 1]
+            pl[off + self.TEAM_NAME_OFF:off + self.TEAM_NAME_OFF + self.TEAM_NAME_LEN] = \
+                b'\x00' * self.TEAM_NAME_LEN
+            pl[off + self.TEAM_NAME_OFF:off + self.TEAM_NAME_OFF + len(nm)] = nm
+        elif field in self.TEAM_FIELD_OFF:
+            struct.pack_into('<i', pl, off + self.TEAM_FIELD_OFF[field], int(value))
+        elif field in self.TEAM_KEY_OFF:
+            struct.pack_into('<I', pl, off + self.TEAM_KEY_OFF[field],
+                             int(value or 0) & 0xFFFFFFFF)
+        elif field in self.TEAM_UNKNOWN_FIELDS:
+            raise RuntimeError('%s：偏移还没定案（缺对照档），不敢写' % field)
+        else:
+            raise KeyError('未知小队字段 %r' % (field,))
+        self._invalidate_if_shifted()
+        return self.team_detail(key)
+
+    def team_refs(self, ident):
+        """「查找引用」：哪些触发用行为 80/107 引用了这支小队 → [{trigger_id, name, action, waypoint}]。"""
+        key = ident if isinstance(ident, int) else self.team_key_of(ident)
+        if not key:
+            raise RuntimeError('认不出小队 %r' % (ident,))
+        out = []
+        names = {r.sid: r.name for r in self.records}
+        for r in self.records:
+            if r.kind != '触发':
+                continue
+            try:
+                acts = self.trigger_actions(r.sid)
+            except Exception:
+                continue
+            for a in acts:
+                if a['type'] in self.SPAWN_ACTIONS and a.get('team') == key:
+                    out.append({'trigger_id': r.sid, 'name': names.get(r.sid, ''),
+                                'action': a['type'], 'waypoint': a.get('waypoint'),
+                                'cell': a.get('cell')})
+        return out
+
     def script_types(self):
         """列出全部动作脚本：[{off,key,sid,name,index,entries:[{action,arg,name}]}]（§222）。"""
         try:
