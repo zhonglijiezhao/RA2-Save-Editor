@@ -207,6 +207,31 @@ class MapIni(object):
         except Exception:
             return 256, 256
 
+    def local_size(self):
+        """`[Map] LocalSize=left,top,width,height` → (left, top, w, h)；没有就 None。
+
+        ★这就是地编「地图参数 → **可见区域**」（格式「左, 上, 宽, 高」）那一项，
+          玩家俗称的**蓝线内**：整张地图可能 180×120，但真正可玩/可见的只有这一块。
+          例：`LocalSize=5,4,174,107` ⇒ 地编坐标 x∈[5,179)、y∈[4,111)。
+        ★★2026-10-25 §271：这一项是**地编 tile 坐标**；存档里的格坐标是它的 **2 倍**
+          （实测标定：`(16,179)` 在界内、`(1,180)`/`(2,179)` 在界外，
+           只有 ×2 换算能同时满足这三条）。
+        """
+        v = ''
+        for k, vv in self.sections.get('map', {}).items():
+            if k.lower() == 'localsize':
+                v = vv
+                break
+        if not v:
+            return None
+        try:
+            p = [int(x) for x in v.split(',')]
+            if len(p) < 4:
+                return None
+            return p[0], p[1], p[2], p[3]
+        except Exception:
+            return None
+
     @staticmethod
     def _ints(v):
         out = []

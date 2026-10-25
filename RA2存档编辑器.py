@@ -3934,6 +3934,12 @@ class App(tk.Tk):
             self._mv_grid_safe()
             bld, unit, wp = self._mv_grid_data()
             head = '选中格 (%d,%d)' % (x, y)
+            try:
+                _mp = (getattr(self, 'mv_state', None) or {}).get('path')
+                if self.doc and self.doc.cell_visible(x, y, map_path=_mp) is False:
+                    head += '　⚠ 在蓝线外（游戏里不显示这块地图）'
+            except Exception:
+                pass
             head += '　建筑：%s' % bld[(x, y)] if (x, y) in bld else '　建筑：无'
             if (x, y) in unit:
                 head += '　单位：%s' % unit[(x, y)]
@@ -3951,6 +3957,11 @@ class App(tk.Tk):
         msgs = mr.check_cell(st['mp'], st['blds'], x, y)
         b = st['occ'].get((x, y))
         head = '选中格 (%d,%d)' % (x, y)
+        try:
+            if self.doc and self.doc.cell_visible(x, y, map_path=st.get('path')) is False:
+                head += '　⚠ 在蓝线外（游戏里不显示这块地图）'
+        except Exception:
+            pass
         # ★§266：点到的格子若正好是路径点，直接把号说出来（填「出现于/运输机起始」时不用猜）
         try:
             mp_w, only_w = self._mv_wp_points()
@@ -4686,6 +4697,36 @@ class App(tk.Tk):
         return '剪贴板：%d 台（%s）· 源格 (%d,%d)' % (len(c['units']), txt,
                                                   c['cell'][0], c['cell'][1])
 
+    def _mv_check_visible(self, cell, action='放置'):
+        """目标格在**可见区域（蓝线）外**时问一句；返回 True = 继续。
+
+        ★§271：蓝线 = 地图 `[Map] LocalSize`（地编「地图参数 → 可见区域」）。
+          存档格坐标 = 地编 tile 坐标 × 2。地图没读出来时一律放行（不猜）。
+        """
+        _mp = (getattr(self, 'mv_state', None) or {}).get('path')
+        try:
+            v = self.doc.cell_visible(cell[0], cell[1], map_path=_mp)
+        except Exception:
+            v = None
+        if v is not False:
+            return True
+        tip = ''
+        try:
+            ls = self.doc.map_local_size(_mp)
+            if ls:
+                tip = ('\n\n地图可见区域（地编「地图参数 → 可见区域」）= %d,%d,%d,%d\n'
+                       '换算成编辑器格坐标：x %d..%d、y %d..%d'
+                       % (ls[0], ls[1], ls[2], ls[3],
+                          2 * ls[0], 2 * (ls[0] + ls[2]) - 1,
+                          2 * ls[1], 2 * (ls[1] + ls[3]) - 1))
+        except Exception:
+            tip = ''
+        return messagebox.askyesno(
+            '%s位置在「蓝线」外' % action,
+            '格 (%d,%d) 在**可见区域（蓝线）之外** —— 游戏里这块地图根本不显示，\n'
+            '%s了也看不见（等于白做）。%s\n\n仍要继续吗？'
+            % (cell[0], cell[1], action, tip), icon='warning')
+
     def mv_copy_units(self):
         """把选中格的单位记进剪贴板（只记 类型/所属方/等级，不改存档）。"""
         got = self._mv_sel_cell(need_units=True)
@@ -4713,6 +4754,8 @@ class App(tk.Tk):
         if not got:
             return
         sel = got[0]
+        if not self._mv_check_visible(sel, '粘贴'):
+            return
         self.status.set('正在粘贴 %d 台单位到 (%d,%d)…' % (len(clip['units']), sel[0], sel[1]))
         self.update_idletasks()
         done, fail, warns = 0, [], []
@@ -4754,6 +4797,8 @@ class App(tk.Tk):
         sel = got[0]
         if tuple(sel) == tuple(clip['cell']):
             messagebox.showinfo('提示', '源格和目标格是同一格')
+            return
+        if not self._mv_check_visible(sel, '移动'):
             return
         self.status.set('正在把 (%d,%d) 的单位移到 (%d,%d)…'
                         % (clip['cell'][0], clip['cell'][1], sel[0], sel[1]))
@@ -4867,6 +4912,8 @@ class App(tk.Tk):
         sel = st.get('sel')
         if not sel:
             messagebox.showwarning('提示', '请先在地图/网格上点选一个格子')
+            return
+        if not self._mv_check_visible(sel, '放置'):
             return
         cur = self.mv_unit.get() if hasattr(self, 'mv_unit') else ''
         if not cur:

@@ -7554,6 +7554,57 @@ class SaveDoc(object):
         """该格是否被建筑地基/单位占着（O(1)，走 `_occupancy()` 缓存）。"""
         return (int(cx), int(cy)) in self._occupancy()
 
+    # ★★2026-10-25 §271：可见区域（玩家俗称「蓝线」）= 地图 `[Map] LocalSize`。
+    def map_local_size(self, path=None):
+        """地图 `[Map] LocalSize=左,上,宽,高`（**地编 tile 坐标**）→ tuple 或 None。
+
+        ★**以地图文件为准**（玩家 2026-10-25 16:17 明确要求）：
+          · `path` 给了就按它读（GUI 传"当前地图页打开的那张图"）；
+          · 没给就用 `scenario_map_path()`（存档对应的那张）；
+          · `_map` 已挂载且就是同一个文件时直接用现成对象；
+          · 都读不到 ⇒ 返回 None（**调用方不拦人**，不猜）。
+        结果按"路径"缓存在 `_localsize_memo`，换图自动失效。
+        """
+        try:
+            p = path or self.scenario_map_path()
+        except Exception:
+            p = path
+        memo = getattr(self, '_localsize_memo', None)
+        if memo is not None and memo[0] == p:
+            return memo[1]
+        ls = None
+        try:
+            m = self._map
+            if m is not None and (p is None or getattr(m, 'path', None) == p):
+                ls = m.local_size()
+        except Exception:
+            ls = None
+        if not ls and p and os.path.exists(p):
+            try:
+                import map_ini
+                ls = map_ini.MapIni(p).local_size()
+            except Exception:
+                ls = None
+        self._localsize_memo = (p, ls)
+        return ls
+
+    def cell_visible(self, cx, cy, map_path=None):
+        """该格是否在**可见区域（蓝线）内** → True / False / None（地图读不出来就别拦）。
+
+        ★换算（§271 玩家标定）：**存档格坐标 = 地编 tile 坐标 × 2**。
+          验证：`SAVE4823` 那张图 `LocalSize=5,4,174,107` ⇒ 地编 x∈[5,179)、y∈[4,111)
+          ⇒ 存档坐标 x∈[10,358)、y∈[8,222)。
+          玩家给的三个点全部吻合：`(16,179)` 界内 ✔、`(1,180)` 界外 ✔、`(19,177)` 界内 ✔。
+          （按 ×1 换算则 `(16,179)` 的 y=179 > 111 会被判界外，与实测矛盾 ⇒ 只有 ×2 成立。）
+        `map_path`：GUI 传"当前打开的地图"，做到**以你看到的那张图为准**。
+        """
+        ls = self.map_local_size(map_path)
+        if not ls:
+            return None
+        l, t, w, h = ls
+        return (2 * l) <= int(cx) < 2 * (l + w) and (2 * t) <= int(cy) < 2 * (t + h)
+
+
     def cell_flat_info(self, cx, cy):
         """落点"是不是平地"的体检（§251）→ dict。
 
