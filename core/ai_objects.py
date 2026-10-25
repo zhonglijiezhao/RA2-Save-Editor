@@ -78,6 +78,23 @@ TEAM_FLAGS = {
     0xC5: 'UseTransportOrigin',
     0xC7: 'OnTransOnly',
     0x106: 'AvoidThreats',         # ★离得远（不在 0xB8 那串里），反汇编才看得出来
+    # ★★§260 定案（2026-10-25，玩家给的 SAVE5F90.SAV）：地编「小队成员可被重组」
+    #   = `AreTeamMembersRecruitable` = u8 **`+0x109`**。
+    #   证据：① 两档 A/B（SAVE4AE1 未勾 / SAVE5F90 勾了）里，三支小队的 268B 逐字节 diff
+    #          **只有 `+0x109` 是"仅在 AAAAA 上 00→01"**（另两支不受影响）；
+    #        ② 字节级值向量扫描：268 个偏移里**只有 `+0x109`** 满足 (AAAAA=1, BBBBB=0, CCCCC=0)；
+    #        ③ 全档分布 0/1 两值（94 支 0、73 支 1），73 支正是引擎 AI 生成的小队。
+    0x109: 'AreTeamMembersRecruitable',
+    # ★★§261 定案（2026-10-25，玩家给的 SAVE1649.SAV）：地编「用于基地防御（*）」
+    #   = `IsBaseDefense` = u8 **`+0x10A`**。
+    #   证据：① **三档正交表**（下同三支测试小队）：
+    #          +0x109 = (4AE1,5F90,1649) = (0,1,0)  ← 只跟「可重组」走
+    #          +0x10A = (4AE1,5F90,1649) = (0,0,1)  ← 只跟「基地防御」走
+    #        ② 字节级值向量 `[1,0,0]` 扫 268 偏移，**唯一命中 `+0x10A`**；
+    #        ③ ★语义自证：全档 13 支为 1，其中 **12 支是 AI 的基地防御类小队**
+    #          （`Allied Base Guard - Refine/Tech/Adv/Basic`、`Soviet Base Defense Infantry`、
+    #            `Yuri Base Guard - Adv`、`Yuri Anti-BEagle/Harrier Defense`…），第 13 支就是玩家勾的 AAAAA。
+    0x10A: 'IsBaseDefense',
 }
 
 # 中文显示名（GUI 用；顺序即显示顺序）

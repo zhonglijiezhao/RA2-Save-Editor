@@ -120,7 +120,13 @@ for xy in ((24, 180), (26, 180), (20, 182), (28, 182)):
     if t and t[0] in (d2.walkable_tiles() or set()):
         cell = xy
         break
-ck('找到落点', cell is not None, str(cell))
+if cell is None:
+    # ★2026-10-25：同上 —— 玩家换成了 80x80 空图，地形读不出来 ⇒ SKIP 而非假失败。
+    print('  [SKIP] 选不出落点：%s 地形为空（80x80 空图），存档里也没有原生单位'
+          % d2.scenario_map_path())
+    print('§222 自检：SKIP（环境不支持，非回归）')
+    sys.exit(0)
+ck('找到落点', True, str(cell))
 r2 = d2.spawn_units_by_trigger('V3', 3, cell=cell, trigger_name='自检挂脚本',
                                max_teams=1, script_key=None,
                                script_entries=[(5, 10), (6, 0)])

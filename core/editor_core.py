@@ -5301,6 +5301,14 @@ class SaveDoc(object):
         'max': 0xCC,
         'mind_control': 0xD4,
         'waypoint': 0xE8,
+        # ★§259 定案：运输机起始 = TransportWaypoint = i32 `+0xEC`。
+        #   证据（玩家 2026-10-25 给的 SAVE4AE1.SAV + 地编截图）：
+        #     ① 地编里三支小队设成 98 / 0 / 99，存档 `+0xEC` 精确是 98 / 0 / 99；
+        #     ② 老档（T85 系）125 支地图定义小队是 `+0xE8=0` 而 `+0xEC=-1` ⇒ **两列独立**，
+        #        不是「出现于」的副本；
+        #     ③ `-1` = 未设置（地编显示 None）；★`0` 是**合法**路径点（0 号），
+        #        所以判空只能用 -1，绝不能用 0。
+        'transport_waypoint': 0xEC,
     }
     TEAM_KEY_OFF = {
         'house': 0xD8,
@@ -5314,14 +5322,16 @@ class SaveDoc(object):
     # ★§258：地编对话框里有、但**目前没有硬证据定位**的字段（不猜，一律灰显）
     TEAM_UNKNOWN_FIELDS = {
         'tech_level': ('科技等级', '0..10；本档 125 个小队全是 0 ⇒ 对账不出偏移'),
-        'is_base_defense': ('用于基地防御（*）', '需一份该标志有开有关的对照档'),
+        # ★§261 「用于基地防御」**已定案**（`IsBaseDefense` = u8 `+0x10A`），移出本表
         'only_target_house_enemy': ('仅攻击敌方或敌对（*）', '同上'),
-        'are_team_members_recruitable': ('小队成员可被重组（*）', '同上'),
+        # ★§260 「小队成员可被重组」**已定案**（`AreTeamMembersRecruitable` = u8 `+0x109`），移出本表
         'transports_return_on_unload': ('运输机下客后返回', '同上'),
         'ion_immune': ('无视离子风暴', '同上'),
         'para_drop_aircraft': ('运输机类型', '同上'),
-        'transport_waypoint': ('运输机起始', '同上'),
         'loose_recruit_alt': ('解散重组', '同上'),
+        # ★§258.6 玩家裁定：科技等级 / 运输机类型 / 无视离子风暴 / 运输机下客后返回 /
+        #   解散重组(AreTeamMembersRecruitable) 「没什么用 / 不重要」⇒ 不做。
+        # ★§259 「运输机起始」**已定案**（`transport_waypoint` = `+0xEC`），从这里移出去了。
     }
 
     def team_detail(self, ident):
@@ -5354,6 +5364,8 @@ class SaveDoc(object):
                'max': struct.unpack_from('<i', pl, off + self.TEAM_FIELD_OFF['max'])[0],
                'mind_control': struct.unpack_from('<i', pl, off + self.TEAM_FIELD_OFF['mind_control'])[0],
                'waypoint': struct.unpack_from('<i', pl, off + self.TEAM_FIELD_OFF['waypoint'])[0],
+               'transport_waypoint': struct.unpack_from(
+                   '<i', pl, off + self.TEAM_FIELD_OFF['transport_waypoint'])[0],
                'flags': flags}
         for k, o in self.TEAM_KEY_OFF.items():
             out[k] = struct.unpack_from('<I', pl, off + o)[0]

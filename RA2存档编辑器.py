@@ -5935,10 +5935,11 @@ class App(tk.Tk):
             self.ai_wp['values'] = vals
             if vals and self.ai_wp.get() not in vals:
                 self.ai_wp.set(vals[0])
-        # §226：动作脚本下拉 = 「（空）」+ 全部脚本 ID（只列当前过滤可见的更易找，
-        #   但这里给全量 —— 引擎生成的脚本也能挂）
+        # §226：动作脚本下拉 = 「（空）」+ 脚本 ID
+        # ★§262：只列**地图定义**的脚本 —— 玩家 2026-10-25：「AI 的脚本不要显示，这个没用，
+        #   只显示玩家自己的脚本即可」。判据同 §254（`is_map` = `0100xxxx`）。
         if hasattr(self, 'ai_script'):
-            svals = ['（空）'] + [s['id'] for s in ai['scripts']]
+            svals = self._ai_script_values(self.ai_script.get())
             self.ai_script['values'] = svals
             if self.ai_script.get() not in svals:
                 self.ai_script.set('（空）')
@@ -6034,9 +6035,13 @@ class App(tk.Tk):
             _t = self._ai_teams.get(team_id) if team_id else None
             self.ai_load.set(bool(_t.get('loadable')) if _t else False)
         # §226：脚本下拉跟着选中的小队同步（选中谁就显示谁当前的脚本）
+        # ★§262：候选只列地图定义脚本；当前值若是 AI 脚本就临时补进列表，
+        #   否则下拉会显示成「（空）」—— 把真实值藏起来比显示它更糟
         if hasattr(self, 'ai_script'):
             _s = self._ai_teams.get(team_id) if team_id else None
-            self.ai_script.set((_s.get('script_id') or '（空）') if _s else '（空）')
+            _cur = (_s.get('script_id') or '（空）') if _s else '（空）'
+            self.ai_script['values'] = self._ai_script_values(_cur)
+            self.ai_script.set(_cur)
         self._ai_detail(kind, team_id, tf_id, sc_id)
 
     def _ai_unsync(self):
@@ -6454,8 +6459,8 @@ class App(tk.Tk):
         ('AvoidThreats', '躲避威胁*', True),
         ('LooseRecruit', '忽视分组*', True),
         ('Whiner', '忽视阻拦*', True),
-        ('AreTeamMembersRecruitable', '小队成员可被重组*', False),
-        ('IsBaseDefense', '用于基地防御*', False),
+        ('AreTeamMembersRecruitable', '小队成员可被重组*', True),   # ★§260 定案 +0x109
+        ('IsBaseDefense', '用于基地防御*', True),          # ★§261 定案 +0x10A
         ('OnlyTargetHouseEnemy', '仅攻击敌方或敌对*', False),
     )
     TEAM_MC_CHOICES = [(0, '0 - 随机'), (1, '1 - 我方基地'), (2, '2 - 敌方基地'),
@@ -6520,6 +6525,7 @@ class App(tk.Tk):
         v_max = tk.StringVar()
         v_grp = tk.StringVar()
         v_wp = tk.StringVar()
+        v_twp = tk.StringVar()          # ★§259 运输机起始（+0xEC，-1=未设置）
         v_mc = tk.StringVar()
         f_vars = {}
 
@@ -6557,6 +6563,15 @@ class App(tk.Tk):
         cb_mc = ttk.Combobox(g, textvariable=v_mc, width=14, state='readonly',
                              values=[x[1] for x in self.TEAM_MC_CHOICES])
         cb_mc.grid(row=7, column=3, sticky='w', padx=6)
+        # ★§259：运输机起始（TransportWaypoint，`+0xEC`）。勾了「运输机空投」才有意义。
+        lab(8, 0, '运输机起始（路径点号）')
+        ttk.Entry(g, textvariable=v_twp, width=10).grid(row=8, column=1, sticky='w', padx=6)
+        lbl_twp = ttk.Label(g, text='', foreground='#6b7280')
+        lbl_twp.grid(row=8, column=2, columnspan=2, sticky='w', padx=6)
+        ttk.Label(g, text='★「运输机起始」= 空投飞机**起飞**的路径点，只有勾了「运输机空投*」才有意义；'
+                          '-1 = 未设置（地编显示 None），0 是合法路径点',
+                  foreground='#1d4ed8', wraplength=640, justify='left').grid(
+            row=9, column=0, columnspan=4, sticky='w', pady=(2, 0))
 
         # ---- 复选框（只放带 * 的）----
         box = ttk.Labelframe(win, text='小队标志（地编里带 * 的才有用）', padding=8)
@@ -6607,6 +6622,16 @@ class App(tk.Tk):
             v_max.set(str(det['max']))
             v_grp.set(str(det['group']))
             v_wp.set(str(det['waypoint']))
+            v_twp.set(str(det.get('transport_waypoint', -1)))
+            try:
+                _tw = int(det.get('transport_waypoint', -1))
+                if _tw < 0:
+                    lbl_twp.config(text='（未设置）')
+                else:
+                    _c = self.doc.waypoint_cell(_tw)
+                    lbl_twp.config(text=('格 %s' % (_c,)) if _c else '')
+            except Exception:
+                lbl_twp.config(text='')
             v_mc.set(next((x[1] for x in self.TEAM_MC_CHOICES
                            if x[0] == det['mind_control']), self.TEAM_MC_CHOICES[0][1]))
             for nm, var in f_vars.items():
@@ -6706,6 +6731,8 @@ class App(tk.Tk):
                           ('max', int(v_max.get() or 0)),
                           ('group', int(v_grp.get() or -1)),
                           ('waypoint', int(v_wp.get() or 0)),
+                          ('transport_waypoint',
+                           int(v_twp.get() or 0) if v_twp.get().strip() else -1),
                           ('mind_control', next((x[0] for x in self.TEAM_MC_CHOICES
                                                  if x[1] == v_mc.get()), 0))]
                 for nm, var in f_vars.items():
@@ -7248,6 +7275,26 @@ class App(tk.Tk):
         self.status.set('已改小队 %s「%s」出现于 路径点 %d → %d（%s，尚未保存）'
                         % (sid, info['name'], info['old'], info['new'],
                            ('(%d,%d)' % info['cell']) if info['cell'] else '未定义'))
+
+    def _ai_script_values(self, cur=None):
+        """动作脚本下拉的候选列表（★§262）。
+
+        玩家 2026-10-25：那个「改脚本」下拉里全是 `0C9C878C` 这种 **AI 运行期生成**的脚本，
+        「这个没用，只显示玩家自己的脚本即可」。判据与 §254 一致：
+        **地图定义** = `0100xxxx`（`ai_objects` 的 `is_map`），AI 生成 = 8 位随机十六进制。
+
+        ★当前值若恰好是 AI 脚本，**临时补进列表**：否则下拉会显示成「（空）」，
+        等于把真实值藏起来 —— 那比显示它更糟（用户会以为这支小队没脚本）。
+        """
+        try:
+            ids = sorted({x['id'] for x in (self._ai or {}).get('scripts', [])
+                          if x.get('is_map')})
+        except Exception:
+            ids = []
+        vals = ['（空）'] + ids
+        if cur and cur not in vals:
+            vals.append(cur)
+        return vals
 
     def _ai_apply_script(self):
         """改选中小队挂的**动作脚本**（+0xF4；选「（空）」= 清空，§226）。"""
