@@ -1007,8 +1007,49 @@ class SaveDoc(object):
                 info['地图尺寸'] += '；0x348E 那组是 %d×%d（不是 [Map] Size 口径）' % _sz
         else:
             info['地图尺寸'] = ('%d×%d（存档自带）' % _sz) if _sz else '未读出'
-        # 任务名：文件头部 16KB 里的 UTF-16LE 中文串
-        info['任务名'] = self._find_title() or '-'
+        # ★★§276：任务名读**存档头部的固定字段**（以前是"猜最长的中文串"，取到的是简报，
+        #   还因为试了奇偶两种对齐而多出个乱码首字 `鈀`）。字段布局（827 档实测一致）：
+        #     0x1360 UTF-16 显示名（上限 44 字，00 00 结尾，后补零到 0x13B8），如「军事行动：丛林救援」
+        #     0x13BA ASCII  地图 `[Basic] Name=` 的原始 CSF 键，如 `Name:ALL01md`（可空）
+        #     0x13DA UTF-16 副标题/章节（上限 43 字），官方战役是「美國：導火索」，自制图常是地图名
+        #     0x1450 UTF-16 任务简报（正文）
+        # ★★§277（玩家给的"百分百正确"办法）：**地图文件名 → ra2md.csf 的键就是任务名**。
+        #   `ALL01UMD.MAP` → `name:all01md`；`SOV01UMD.MAP` → `name:sov01md`（有 `...mdsav` 是短名）。
+        #   优先级：CSF 命中 ＞ 存档 0x1360 ＞ 启发式兜底。
+        _csf_txt = _csf_key = _csf_short = None
+        try:
+            _csf_txt, _csf_key, _csf_short = self._csf_task_name()
+        except Exception:
+            pass
+        if _csf_txt:
+            info['任务名'] = _csf_txt
+            info['任务名来源'] = 'CSF：%s' % _csf_key
+            info['任务名全称'] = _csf_txt
+            info['任务副标题'] = _csf_short or '-'
+            info['任务名短'] = _csf_short or (
+                _csf_txt[len('军事行动：'):] if _csf_txt.startswith('军事行动：') else _csf_txt)
+            info['名字键'] = _csf_key
+            try:
+                _sn0 = self.scenario_strings()
+            except Exception:
+                _sn0 = {}
+            info['存档内任务名'] = (_sn0.get('name') or '') or '-'
+        else:
+            try:
+                _sn = self.scenario_strings()
+            except Exception:
+                _sn = {}
+            _full = (_sn.get('name') or '').strip()
+            _short = _full[len('军事行动：'):] if _full.startswith('军事行动：') else _full
+            # 统一口径：两条路都保留原文（CSF 的值本身带「军事行动：」），另给剥前缀的短名
+            info['任务名'] = (_full or (_sn.get('subtitle') or '').strip()
+                              or self._find_title() or '-')
+            info['任务名短'] = _short or info['任务名']
+            info['任务名来源'] = '存档 0x1360' if _full else '启发式兜底'
+            info['任务名全称'] = _full or '-'
+            info['任务副标题'] = (_sn.get('subtitle') or '').strip() or '-'
+            info['名字键'] = (_sn.get('name_key') or '').strip() or '-'
+            info['存档内任务名'] = _full or '-'
         # 玩家阵营
         ph = s('Player House')
         hid = ph[:4] if len(ph) >= 4 else b''
@@ -1040,12 +1081,105 @@ class SaveDoc(object):
             d.append('主字段@%d' % main)
         return ' / '.join(d)
 
+    SCEN_NAME_OFF = 0x1360      # UTF-16 显示名（上限 44 字，00 00 结尾，后补零到 0x13B8）
+    SCEN_KEY_OFF = 0x13BA       # ASCII：地图 `[Basic] Name=` 的原始 CSF 键（如 `Name:ALL01md`，可空）
+    #   ★实测在 0x13BA 而不是 0x13B8（名字字段实际给了 45 个字宽，多占 2 字节）
+    SCEN_SUB_OFF = 0x13DA       # UTF-16 副标题/章节（上限 43 字，后面是 FF 填充）
+    SCEN_BRIEF_OFF = 0x1450     # UTF-16 任务简报正文
+
+    def _utf16_at(self, off, limit, pl=None):
+        """明文 `off` 处的 UTF-16LE 零结尾串（最多 `limit` 个字）→ str。"""
+        pl = self.plain if pl is None else pl
+        buf = bytearray()
+        for k in range(int(limit)):
+            pair = pl[off + 2 * k: off + 2 * k + 2]
+            if len(pair) < 2 or pair == b'\x00\x00':
+                break
+            buf += pair
+        try:
+            return buf.decode('utf-16le', 'ignore').strip('\x00').strip()
+        except Exception:
+            return ''
+
+    def _ascii_at(self, off, limit, pl=None):
+        """明文 `off` 处的零结尾 ASCII 串（最多 `limit` 字节）→ str。"""
+        pl = self.plain if pl is None else pl
+        raw = bytes(pl[off: off + int(limit)]).split(b'\x00')[0]
+        if not raw or any(b < 0x20 or b > 0x7e for b in raw):
+            return ''
+        return raw.decode('ascii', 'ignore')
+
+    def _csf_task_name(self):
+        """★§277 按玩家规则从 `ra2md.csf` 取任务名 → `(全称, 命中的键, 短名)`。
+
+        规则：**地图文件名就是 CSF 键**（`ALL01UMD.MAP` → `name:all01md`，
+        `SOV01UMD.MAP` → `name:sov01md`；`...mdsav` 那条是不带「军事行动：」的短名）。
+        找不到地图 / 找不到 CSF / 键不存在 ⇒ 返回 `(None, None, None)`，由调用方回退存档字段。
+        """
+        mp = None
+        try:
+            mp = self.scenario_map_path()
+        except Exception:
+            mp = None
+        try:
+            import csf as _csf_mod
+        except Exception:
+            return None, None, None
+        # CSF 的位置：地图所在目录 ＞ 存档所在目录 ＞ 再往上一级（玩家常把档挪进子文件夹）
+        hints = [mp, self.path]
+        try:
+            d = os.path.dirname(os.path.abspath(self.path))
+            for _ in range(2):
+                d = os.path.dirname(d)
+                if d:
+                    hints.append(d)
+        except Exception:
+            pass
+        path = _csf_mod.find_csf(*hints)
+        if not path:
+            return None, None, None
+        c = _csf_mod.load(path)
+        if c is None:
+            return None, None, None
+        full = key = None
+        if mp:
+            full, key = c.name_for_map(mp)
+        # ⚠ 不要拿存档 0x13BA 里的 `Name:xxx` 去查 CSF 兜底：实测有反例
+        #   （`B0_光棱塔同类型_带格子.SAV` 里 0x13BA=`Name:ALL01md` 但 0x1360=`军事行动：丛林救援`，
+        #    那个 ASCII 键会给出别的任务名）。没地图就老实回退存档字段，别猜。
+        if not full:
+            return None, None, None
+        short, _k2 = c.short_name_for_map(mp) if mp else (None, None)
+        if not short and key:
+            short = c.get(key + 'sav')
+        return full, key, short
+
+    def scenario_strings(self):
+        """★§276 场景名字段（存档明文头部固定偏移）→ dict。
+
+        827 个存档实测：`0x1360` 处永远是一个合法的任务名串（677 个是「军事行动：xxx」，
+        其余是繁体/自行命名的名字，没有前缀）；`0x13B8` 有时是 `Name:ALL01md` 这种
+        `[Basic] Name=` 原始 CSF 键、有时为空；`0x13DA` 是副标题；`0x1450` 才是简报正文。
+
+        ⚠ 别再用"扫头部找最长中文串"那套：它会抓到 0x1450 的简报当任务名。
+        """
+        return {'name': self._utf16_at(self.SCEN_NAME_OFF, 44),
+                'name_key': self._ascii_at(self.SCEN_KEY_OFF, 34),
+                'subtitle': self._utf16_at(self.SCEN_SUB_OFF, 43),
+                'brief': self._utf16_at(self.SCEN_BRIEF_OFF, 600)}
+
     def _find_title(self):
-        """任务名：文件头 16KB 内最长的含 CJK 的 UTF-16LE 串（两种对齐都试）"""
+        """**兜底**：任务名。头部里最长的含 CJK UTF-16LE 串。
+
+        ★§276 起它只在 `scenario_strings()['name']` 为空时才用。
+          并且**只试偶对齐**：以前两种对齐都试，奇对齐会解出"看着像中文"的乱码
+          （那份档首字被解成 `鈀`），而且乱码串往往更长 ⇒ 反而被选中。
+        """
         best = ''
         pat = re.compile(u'[\u4e00-\u9fff\u3000-\u303f\uff00-\uffefA-Za-z0-9 _:\\-]{3,}')
-        head = self.raw[:16384]
-        for start in (0, 1):
+        head = bytes(self.plain[:16384])   # ★§276 读**明文**：容器 raw 的对齐不同，
+                                            #   按 raw 偶对齐解出来仍会多一个 `鈀`
+        for start in (0,):          # ★§276 只试偶对齐（奇对齐全是乱码，见 docstring）
             try:
                 txt = head[start:].decode('utf-16le', 'ignore')
             except Exception:

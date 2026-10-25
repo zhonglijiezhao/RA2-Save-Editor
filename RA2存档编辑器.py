@@ -159,7 +159,10 @@ class App(tk.Tk):
     def _tab_overview(self, nb):
         f = ttk.Frame(nb, padding=12)
         self.info_labels = {}
-        keys = ['文件', '文件大小', '明文大小', '块数', '任务名', '玩家阵营', '开始时间', '存档时间']
+        # ★§276：「任务名」读存档头部固定字段（0x1360 → 剥掉「军事行动：」前缀），
+        #   「任务副标题」= 0x13DA（官方战役是「國家：章節」，自制图常是地图名）。
+        keys = ['文件', '文件大小', '明文大小', '块数', '任务名', '任务副标题',
+                '玩家阵营', '开始时间', '存档时间']
         for i, k in enumerate(keys):
             ttk.Label(f, text=k, width=10, anchor='e').grid(row=i, column=0, sticky='e', pady=3)
             v = ttk.Label(f, text='-', anchor='w')
