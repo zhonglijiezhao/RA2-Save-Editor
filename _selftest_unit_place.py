@@ -333,20 +333,28 @@ try:
     chk('veterancy' in _r0, "unit_records 返回 veterancy 字段（%r）" % _r0.get('veterancy'))
     chk(_r0.get('veterancy') in (0, 1, 2), '原单位的等级在 0/1/2 内（%r）' % _r0.get('veterancy'))
 
-    # 成对不变量：+0x164 == float(2 − +0x150)
+    # ★★§270（2026-10-25 玩家三档实测）：`+0x164` **不是**等级的镜像。
+    #   同一台 E1 在游戏里升到 0/1/2 级得到三份存档，逐字节对比：
+    #   **记录内只有 `+0x150` 这 1 个字节不同**，`+0x164` 三份全是 2.0f。
+    #   ⇒ 旧断言"全档 +0x164 恒等于 float(2−等级)"与实际不符，已删除；
+    #     现在的口径是：**写等级只写 +0x150，绝不动 +0x164**。
     _pl = d4.plain
-    _bad = 0
+    _pair, _odd = 0, 0
     for _r in d4.unit_records():
         if _r['off'] + 0x168 > len(_pl):
             continue
         _v = _st.unpack_from('<i', _pl, _r['off'] + 0x150)[0]
         _f = _st.unpack_from('<f', _pl, _r['off'] + 0x164)[0]
-        if _v in (0, 1, 2) and abs(_f - (2 - _v)) > 1e-4:
-            _bad += 1
-    chk(_bad == 0, '全档 +0x164 恒等于 float(2 − +0x150)（违例 %d 条）' % _bad)
+        if _v in (0, 1, 2):
+            if abs(_f - (2 - _v)) <= 1e-4:
+                _pair += 1
+            else:
+                _odd += 1
+    chk(_pair + _odd > 0, '全档等级字段可读（成对 %d / 不成对 %d —— 不成对是正常的，§270）'
+        % (_pair, _odd))
 
     _outs = []
-    for _vet, _want_f in ((0, 2.0), (1, 1.0), (2, 0.0)):
+    for _vet in (0, 1, 2):
         _d = SaveDoc(S)
         _inf = _d.add_unit_by_clone('E1', 62, 66, house='Americans', veterancy=_vet)
         chk(_inf.get('veterancy') == _vet, '放单位回报等级 = %d（%r）' % (_vet, _inf.get('veterancy')))
@@ -365,8 +373,14 @@ try:
         chk(_off is not None, '能找到新单位的记录起点')
         _v = _st.unpack_from('<i', _po, _off + 0x150)[0]
         _f = _st.unpack_from('<f', _po, _off + 0x164)[0]
-        chk(_v == _vet and abs(_f - _want_f) < 1e-6,
-            '等级 %d ⇒ +0x150=%d +0x164=%.1f（实际 %d / %.1f）' % (_vet, _vet, _want_f, _v, _f))
+        # ★§270：只要求 +0x150 对；+0x164 必须**等于骨架自己的值**（= 没被动过）。
+        #   骨架的 +0x164 可能是 2.0 也可能是 0.0（不同档不同），所以不能写死期望值。
+        _sk = _inf.get('scaffold_key')
+        _src = [r for r in _d.unit_records() if r['key'] == _sk]
+        _f_exp = (_st.unpack_from('<f', _po, _src[0]['off'] + 0x164)[0] if _src else _f)
+        chk(_v == _vet and abs(_f - _f_exp) < 1e-6,
+            '等级 %d ⇒ +0x150=%d，+0x164 与骨架一致（%.1f）'
+            % (_vet, _v, _f_exp))
         # 往返：存盘再读回
         _p = os.path.join(tmp, 'vet%d.SAV' % _vet)
         _d.save(_p, backup=False)

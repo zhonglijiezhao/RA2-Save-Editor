@@ -3333,6 +3333,16 @@ class App(tk.Tk):
         self.mv_grid = tk.BooleanVar(value=True)
         ttk.Checkbutton(row2, text='网格', variable=self.mv_grid,
                         command=self.mv_render).pack(side='left', padx=6)
+        # ★§266：路径点叠加显示（默认开）—— 绿底白字 = 地图 [Waypoints] 里定义的；
+        #   空心蓝框 = 只有存档里有（引擎运行期生成的），两边对不上时一眼就能看出来。
+        self.mv_wp = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row2, text='路径点', variable=self.mv_wp,
+                        command=self.mv_render).pack(side='left', padx=(0, 6))
+        # ★§267：单位标记 —— **默认不勾**；勾上会自动把缩放提到 20 倍（低于 20 倍一律不画，
+        #   不然几百个单位糊成一片红点，反而看不清地形）。
+        self.mv_units = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text='单位（≥20 倍）', variable=self.mv_units,
+                        command=self._mv_toggle_units).pack(side='left', padx=(0, 6))
         ttk.Button(row2, text='重绘', command=self.mv_render).pack(side='left', padx=6)
         ttk.Label(row2, text='（点格子选位：红=已占 / 深红细线=高度差(悬崖/斜坡) / 暗色=地图外）',
                   foreground='#6b7280').pack(side='left', padx=8)
@@ -3433,6 +3443,20 @@ class App(tk.Tk):
         ttk.Button(rowu, text='规则目录…',
                    command=self.mv_pick_rules).pack(side='left')
 
+        # ★§268（玩家 2026-10-25）：「选中格 → 复制 / 粘贴 / 移动」，按**格**操作，不做多选框选
+        rowc = ttk.Frame(f)
+        rowc.pack(fill='x', pady=(0, 2))
+        ttk.Label(rowc, text='单位操作（作用于选中格）：').pack(side='left')
+        ttk.Button(rowc, text='📋 复制该格', command=self.mv_copy_units).pack(side='left', padx=(2, 4))
+        ttk.Button(rowc, text='📌 粘贴到此格', command=self.mv_paste_units).pack(side='left', padx=4)
+        ttk.Button(rowc, text='➡ 把源格单位移到此格',
+                   command=self.mv_move_units).pack(side='left', padx=4)
+        ttk.Button(rowc, text='🗑 删除该格单位',
+                   command=self.mv_delete_units).pack(side='left', padx=4)
+        self.mv_clip = None
+        self.mv_clip_lbl = ttk.Label(rowc, text='剪贴板：空', foreground='#6b7280')
+        self.mv_clip_lbl.pack(side='left', padx=8)
+
         cw = ttk.Frame(f)
         cw.pack(fill='both', expand=True, pady=(6, 4))
         self.mv_canvas = tk.Canvas(cw, bg='#12141a', highlightthickness=0)
@@ -3451,7 +3475,7 @@ class App(tk.Tk):
         self.mv_info.pack(anchor='w')
         self.mv_state = {'mp': None, 'ok': False, 'scale': 8, 'img': None,
                          'blds': [], 'occ': {}, 'sel': None, 'path': None,
-                         'gdata': None}
+                         'gdata': None, 'wpdata': None, 'udata': None}
         return f
 
     def _mv_reset(self):
@@ -3460,7 +3484,8 @@ class App(tk.Tk):
             return
         p = getattr(getattr(self.doc, '_map', None), 'path', st.get('path')) if self.doc else None
         st.update({'mp': None, 'ok': False, 'img': None, 'blds': [],
-                   'occ': {}, 'sel': None, 'path': p, 'gdata': None, 'dims': None})
+                   'occ': {}, 'sel': None, 'path': p, 'gdata': None, 'dims': None,
+                   'wpdata': None, 'udata': None})
         self.mv_canvas.delete('all')
         self.mv_info.config(text='')
         if self.doc and p and os.path.exists(p):
@@ -3530,6 +3555,9 @@ class App(tk.Tk):
         """
         st = self.mv_state
         st['path'] = path
+        st['gdata'] = None          # 换地图/换档 ⇒ 缓存的建筑/单位/路径点全部作废
+        st['wpdata'] = None
+        st['udata'] = None
         self.status.set('正在校验「地图 ↔ 存档」…')
         self.update_idletasks()
         try:
@@ -3625,6 +3653,144 @@ class App(tk.Tk):
         st['gdata'] = (bld, unit, wp)
         return st['gdata']
 
+    def _mv_wp_points(self):
+        """路径点两组数据 → `(地图定义的, 只有存档才有的)`，键是号、值是 (x, y)。
+
+        ★为什么要分两组（§266）：
+          · 地图 `[Waypoints]` 里声明的 = **地编里看得见**的那批。填「小队出现于」「运输机起始」
+            「行为 80 的路径点」时要对的就是这些号；
+          · 存档里的路径点数组（`waypoints_save()`，702 槽）是**引擎运行期**的，可能多出地图
+            没定义的点（也可能是地图写了但存档没同步）。两组一起画，对不上一眼就看见。
+        坐标空间相同（就是编辑器的格子坐标），不需要换算。
+        """
+        st = self.mv_state
+        if st.get('wpdata') is not None:
+            return st['wpdata']
+        mp, sv = {}, {}
+        path = st.get('path')
+        if path:
+            try:
+                import editor_core as _ec
+                mp = dict(_ec.read_scenario_waypoints(path).get('items') or {})
+            except Exception:
+                mp = {}
+        if self.doc:
+            try:
+                sv = dict(self.doc.waypoints_save() or {})
+            except Exception:
+                sv = {}
+        only = dict((n, c) for n, c in sv.items() if n not in mp)
+        st['wpdata'] = (mp, only)
+        return st['wpdata']
+
+    def _mv_draw_waypoints(self, c):
+        """在画布上叠加路径点：**绿底白字圆 = 地图定义的号**，蓝框 = 只有存档里有的。"""
+        st = self.mv_state
+        s = max(1, int(st.get('scale') or 8))
+        try:
+            W, H = (st['mp']['size'] if st.get('mp') else self._mv_dims())
+        except Exception:
+            W, H = 160, 160
+        mp, only = self._mv_wp_points()
+        r = max(5.0, min(13.0, s * 0.62))
+        fs = max(6, min(11, int(s * 0.52)))
+        for n, (x, y) in sorted(mp.items()):
+            if not (0 <= x < W and 0 <= y < H):
+                continue
+            cx, cy = x * s + s / 2.0, y * s + s / 2.0
+            c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                          fill='#1f7a33', outline='#ffffff', width=1,
+                          tags=('wp',))
+            c.create_text(cx, cy, text=str(n), fill='#ffffff',
+                          font=('Consolas', fs, 'bold'), tags=('wp',))
+        for n, (x, y) in sorted(only.items()):
+            if not (0 <= x < W and 0 <= y < H):
+                continue
+            cx, cy = x * s + s / 2.0, y * s + s / 2.0
+            c.create_rectangle(cx - 4, cy - 4, cx + 4, cy + 4,
+                               outline='#1d4ed8', width=1, tags=('wp',))
+            if s >= 12:
+                c.create_text(cx, cy - 9, text=str(n), fill='#1d4ed8',
+                              font=('Consolas', 7), tags=('wp',))
+
+    def _mv_toggle_units(self):
+        """勾上「单位」时，若缩放还没到 20 倍就自动放大到 20 倍（并说一句为什么）。"""
+        st = self.mv_state
+        if self.mv_units.get() and int(st.get('scale') or 8) < 20:
+            st['scale'] = 20
+            self.mv_render()
+            try:
+                self.status.set('单位标记只在 ≥20 倍显示（太小会糊成一片），已自动放大到 20 倍')
+            except Exception:
+                pass
+            return
+        self.mv_render()
+
+    def _mv_units(self):
+        """存档里的**单位**（步兵/载具实例记录）→ `[(x, y, 类型, 所属方)]`。
+
+        ★数据源用 `doc.unit_records()`（单位实例记录，权威）而不是 `house_placements()`：
+          后者是"建筑与单位混排"的布置表，在**测试/重开局的档里经常是空的**
+          （实测 `SAVE5AF1` / `SAVE26E9` 都是 0 条），只有正儿八经的任务档才有内容。
+          `unit_records()` 在 `光棱 飞碟干净.SAV` 上读出 1420 条（1365 条带坐标）、耗时 0.4 秒，
+          其中 55 条没有坐标 = 模板/未部署的记录，直接丢掉。
+        缓存到 `mv_state['udata']`，换图/换档时清。
+        """
+        st = self.mv_state
+        if st.get('udata') is not None:
+            return st['udata']
+        out = []
+        if self.doc:
+            try:
+                for r in (self.doc.unit_records() or []):
+                    x, y = r.get('x'), r.get('y')
+                    if x is None or y is None:
+                        continue
+                    out.append((int(x), int(y), str(r.get('type') or '?'),
+                                str(r.get('house') or '')))
+            except Exception:
+                out = []
+        st['udata'] = out
+        return out
+
+    def _mv_draw_units(self, c):
+        """单位标记（只在 **≥20 倍** 且勾了「单位」时画）：琥珀色小方块 + 白描边，同格多台标 ×N。
+
+        ★为什么不按敌我上色：`houses()` 的 `is_player` 在部分档上不可靠 ——
+          实测 `光棱 飞碟干净.SAV` 判成 `Russians`，可档里 1365 台单位**一台 Russians 都没有**
+          （Alliance/Americans/YuriCountry），照它上色会全画成"敌方"。
+          按玩家"编号别猜"的一贯要求，这里只标位置，不猜阵营。
+        """
+        st = self.mv_state
+        s = int(st.get('scale') or 8)
+        if s < 20:
+            return 0
+        if not (self.mv_units.get() if hasattr(self, 'mv_units') else False):
+            return 0
+        try:
+            W, H = (st['mp']['size'] if st.get('mp') else self._mv_dims())
+        except Exception:
+            W, H = 160, 160
+        us = self._mv_units()
+        if not us:
+            return 0
+        per = {}
+        for x, y, _t, _h in us:
+            per[(x, y)] = per.get((x, y), 0) + 1
+        r = max(6, min(11, int(s * 0.3)))
+        n = 0
+        for (x, y), cnt in per.items():
+            if not (0 <= x < W and 0 <= y < H):
+                continue
+            cx, cy = x * s + s / 2.0, y * s + s / 2.0
+            c.create_rectangle(cx - r, cy - r, cx + r, cy + r, fill='#f59e0b',
+                               outline='#ffffff', width=1, tags=('unit',))
+            if cnt > 1:
+                c.create_text(cx, cy - r - 6, text='×%d' % cnt, fill='#111827',
+                              font=('Consolas', 8, 'bold'), tags=('unit',))
+            n += 1
+        return n
+
     def _mv_grid_safe(self):
         """网格模式的入口：任何异常都在画布上写清楚，绝不留黑屏。"""
         try:
@@ -3664,14 +3830,21 @@ class App(tk.Tk):
             if x < W and y < H:
                 c.create_rectangle(x * s, y * s, (x + 1) * s, (y + 1) * s,
                                    fill='#e8927c', outline='', stipple='gray50')
-        for (x, y), t in unit.items():
-            if x < W and y < H:
-                c.create_oval(x * s + 1, y * s + 1, (x + 1) * s - 1, (y + 1) * s - 1,
-                              fill='#7aa7e0', outline='')
-        for n, (x, y) in wp.items():
-            if x < W and y < H:
-                c.create_text(x * s + s / 2, y * s + s / 2, text=str(n),
-                              fill='#2f7d32', font=('Consolas', 7))
+        # ★§267：单位标记改成与地图模式同一套画法（默认关 + ≥20 倍才画），
+        #   原来"一直画蓝椭圆"的行为撤掉 —— 小比例下几百个单位糊成一片，看不出东西。
+        # ★§266：路径点（与地图模式同一套画法：绿圆=地图定义，蓝框=只有存档有）
+        if bool(self.mv_wp.get() if hasattr(self, 'mv_wp') else True):
+            try:
+                self._mv_draw_waypoints(c)
+            except Exception:
+                for n, (x, y) in wp.items():
+                    if x < W and y < H:
+                        c.create_text(x * s + s / 2, y * s + s / 2, text=str(n),
+                                      fill='#2f7d32', font=('Consolas', 7))
+        try:
+            self._mv_draw_units(c)
+        except Exception:
+            pass
         if st.get('sel'):
             x, y = st['sel']
             c.create_rectangle(x * s, y * s, (x + 1) * s, (y + 1) * s,
@@ -3701,6 +3874,17 @@ class App(tk.Tk):
         c = self.mv_canvas
         c.delete('all')
         c.create_image(0, 0, anchor='nw', image=st['img'])
+        # ★§266：路径点叠加（勾选框控制；画在地形图之上，缩放/重绘自动跟随）
+        if bool(self.mv_wp.get() if hasattr(self, 'mv_wp') else True):
+            try:
+                self._mv_draw_waypoints(c)
+            except Exception:
+                pass
+        # ★§267：单位标记（默认关；≥20 倍才画，画在路径点之上）
+        try:
+            self._mv_draw_units(c)
+        except Exception:
+            pass
         c.configure(scrollregion=(0, 0, W * st['scale'], H * st['scale']))
 
     def mv_zoom(self, d):
@@ -3767,6 +3951,27 @@ class App(tk.Tk):
         msgs = mr.check_cell(st['mp'], st['blds'], x, y)
         b = st['occ'].get((x, y))
         head = '选中格 (%d,%d)' % (x, y)
+        # ★§266：点到的格子若正好是路径点，直接把号说出来（填「出现于/运输机起始」时不用猜）
+        try:
+            mp_w, only_w = self._mv_wp_points()
+            a1 = [n for n, cc in sorted(mp_w.items()) if cc == (x, y)]
+            a2 = [n for n, cc in sorted(only_w.items()) if cc == (x, y)]
+            if a1:
+                head += '　路径点（地图定义）：%s' % ','.join(str(n) for n in a1)
+            if a2:
+                head += '　路径点（只有存档里）：%s' % ','.join(str(n) for n in a2)
+        except Exception:
+            pass
+        # ★§267：该格有哪些单位（不受"≥20 倍"限制，点一下就报）
+        try:
+            us = [t for (ux, uy, t, _h) in self._mv_units() if (ux, uy) == (x, y)]
+            if us:
+                show = '、'.join(us[:6])
+                if len(us) > 6:
+                    show += ' …（共 %d 台）' % len(us)
+                head += '　单位：%s' % show
+        except Exception:
+            pass
         if b:
             head += '　该格建筑：%s（耐久 %d，所属方指针 0x%08X，挂接键 0x%08X，对象 @0x%X）' % (
                 b['type'], b['hp'], b['house'], b['tag'], b['base'])
@@ -4452,6 +4657,206 @@ class App(tk.Tk):
         if not ts:
             messagebox.showinfo('模板库是空的',
                                 '还没有学到任何型号。点「📚 学习模板」，选一份含单位的存档。')
+
+    # ---------------- 单位：复制 / 粘贴 / 移动（§268，2026-10-25 玩家要求） ---------------- #
+    def _mv_sel_cell(self, need_units=False):
+        """取「当前选中格 + 该格单位记录」；不满足条件时弹提示并返回 None。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return None
+        sel = self.mv_state.get('sel')
+        if not sel:
+            messagebox.showwarning('提示', '请先在地图上点选一个格子')
+            return None
+        recs = [r for r in (self.doc.unit_records() or [])
+                if isinstance(r.get('x'), int) and (r['x'], r['y']) == (sel[0], sel[1])]
+        if need_units and not recs:
+            messagebox.showinfo('提示', '格 (%d,%d) 上没有单位' % (sel[0], sel[1]))
+            return None
+        return sel, recs
+
+    def _mv_clip_text(self):
+        c = getattr(self, 'mv_clip', None)
+        if not c:
+            return '剪贴板：空'
+        kinds = {}
+        for u in c['units']:
+            kinds[u['type']] = kinds.get(u['type'], 0) + 1
+        txt = '、'.join(('%s×%d' % (t, n)) if n > 1 else t for t, n in kinds.items())
+        return '剪贴板：%d 台（%s）· 源格 (%d,%d)' % (len(c['units']), txt,
+                                                  c['cell'][0], c['cell'][1])
+
+    def mv_copy_units(self):
+        """把选中格的单位记进剪贴板（只记 类型/所属方/等级，不改存档）。"""
+        got = self._mv_sel_cell(need_units=True)
+        if not got:
+            return
+        sel, recs = got
+        self.mv_clip = {'cell': tuple(sel),
+                        'units': [{'type': r['type'],
+                                   'house': r.get('house') or '',
+                                   'veterancy': r.get('veterancy')} for r in recs]}
+        self.mv_clip_lbl.config(text=self._mv_clip_text(), foreground='#1d4ed8')
+        self.status.set('已复制格 (%d,%d) 的 %d 台单位' % (sel[0], sel[1], len(recs)))
+        self.mv_info.config(text='📋 已复制格 (%d,%d) 的 %d 台单位：%s\n'
+                                 '下一步：点目标格 → 「📌 粘贴到此格」（复制一份）'
+                                 '或「➡ 把源格单位移到此格」（搬过去）'
+                                 % (sel[0], sel[1], len(recs), self._mv_clip_text()))
+
+    def mv_paste_units(self):
+        """在选中格**克隆**剪贴板里的单位（走 add_unit_by_clone，U2 已验收那条路）。"""
+        clip = getattr(self, 'mv_clip', None)
+        if not clip:
+            messagebox.showinfo('提示', '剪贴板是空的 —— 先选中源格，点「📋 复制该格」')
+            return
+        got = self._mv_sel_cell()
+        if not got:
+            return
+        sel = got[0]
+        self.status.set('正在粘贴 %d 台单位到 (%d,%d)…' % (len(clip['units']), sel[0], sel[1]))
+        self.update_idletasks()
+        done, fail, warns = 0, [], []
+        for u in clip['units']:
+            try:
+                info = self.doc.add_unit_by_clone(u['type'], sel[0], sel[1],
+                                                  house=(u['house'] or None),
+                                                  veterancy=u['veterancy'],
+                                                  exact_cell=True, auto_nudge=False)
+                done += 1
+                warns += [w for w in (info.get('warnings') or [])]
+            except Exception as e:
+                fail.append('%s：%s' % (u['type'], e))
+        self.mv_state['gdata'] = None
+        self.mv_state['udata'] = None
+        self.mv_render()
+        msg = '✅ 已粘贴 %d/%d 台单位到格 (%d,%d)' % (done, len(clip['units']), sel[0], sel[1])
+        if warns:
+            msg += '\n⚠ ' + '；'.join(warns[:3])
+        if fail:
+            msg += '\n❌ ' + '；'.join(fail[:3])
+        self.mv_info.config(text=msg)
+        self.status.set('粘贴完成：%d 台（失败 %d）' % (done, len(fail)))
+        if fail:
+            messagebox.showwarning('部分没粘上', '\n'.join(fail[:8]))
+
+    def mv_move_units(self):
+        """把剪贴板记住的**源格**上的单位整体挪到选中格。
+
+        ★只改位置那 6 处副本（`set_unit_cell`），记录长度不变 ⇒ 不触发全档偏移重算。
+        """
+        clip = getattr(self, 'mv_clip', None)
+        if not clip:
+            messagebox.showinfo('提示', '先选中源格，点「📋 复制该格」记住源；再点目标格按这个')
+            return
+        got = self._mv_sel_cell()
+        if not got:
+            return
+        sel = got[0]
+        if tuple(sel) == tuple(clip['cell']):
+            messagebox.showinfo('提示', '源格和目标格是同一格')
+            return
+        self.status.set('正在把 (%d,%d) 的单位移到 (%d,%d)…'
+                        % (clip['cell'][0], clip['cell'][1], sel[0], sel[1]))
+        self.update_idletasks()
+        try:
+            res = self.doc.move_units_at(clip['cell'], sel)
+        except Exception as e:
+            self.status.set('移动失败')
+            messagebox.showerror('移动失败', str(e))
+            return
+        self.mv_state['gdata'] = None
+        self.mv_state['udata'] = None
+        self.mv_render()
+        old = clip['cell']
+        clip['cell'] = tuple(sel)          # 源格跟过去，方便连续微调位置
+        self.mv_clip_lbl.config(text=self._mv_clip_text(), foreground='#1d4ed8')
+        self.mv_info.config(text='✅ 已把 %d 台单位从格 (%d,%d) 移到 (%d,%d)'
+                                 '（位置 6 处副本全部重写，格占用已跟着换）'
+                                 % (res['count'], old[0], old[1], sel[0], sel[1]))
+        self.status.set('移动完成：%d 台 → (%d,%d)' % (res['count'], sel[0], sel[1]))
+
+    def mv_delete_units(self):
+        """删掉选中格上的**所有单位**（真删记录：主体 + 伴随 + 两张指针表条目 + 格占用）。
+
+        ★必须先体检引用：别的对象（建筑的目标指针、别的单位）指向它时，
+          `remove_unit` 会把那些引用**清 0** —— 这里把清单摆给用户看，让他决定。
+        ★删多台时按 `off` **从大到小**删：删字节会让后面的偏移前移，倒序才不会算错。
+        """
+        got = self._mv_sel_cell(need_units=True)
+        if not got:
+            return
+        sel, recs = got
+        # ---- 引用体检（只读）----
+        lines, foreign, unknown = [], [], []
+        self.status.set('正在检查引用…')
+        self.update_idletasks()
+        for r in recs:
+            try:
+                refs = self.doc.unit_key_refs(r)
+            except Exception as e:
+                refs = []
+                lines.append('· %s：体检失败（%s）' % (r['type'], e))
+                continue
+            for x in refs:
+                if x['kind'] == 'foreign_bld':
+                    foreign.append((r, x))
+                elif x['kind'] == 'foreign_unit':
+                    foreign.append((r, x))
+                elif x['kind'] == 'other':
+                    unknown.append((r, x))
+        kinds = {}
+        for r in recs:
+            kinds[r['type']] = kinds.get(r['type'], 0) + 1
+        msg = ['要删除格 (%d,%d) 上的 %d 台单位：' % (sel[0], sel[1], len(recs)),
+               '　' + '、'.join(('%s×%d' % (t, n)) if n > 1 else t for t, n in kinds.items()),
+               '',
+               '删除方式：把记录（主体 + 伴随）从存档里摘掉，']
+        msg.append('同时删掉两张全局指针表里的条目、清掉该格的占用。')
+        if foreign:
+            msg.append('')
+            msg.append('⚠ 还有 %d 处外部对象引用它，会**清 0**：' % len(foreign))
+            for _r, x in foreign[:6]:
+                msg.append('　· %s 记录的 +%#x（%s 在盯着它）'
+                           % (x.get('owner'), x.get('rel') or 0,
+                              '建筑' if x['kind'] == 'foreign_bld' else '别的单位'))
+        if unknown:
+            msg.append('')
+            msg.append('❌ 有 %d 处认不出的引用 ⇒ 工具会**拒绝删除**这些台' % len(unknown))
+        msg.append('')
+        msg.append('删除会改变明文长度（每台约 -1.9KB），全档偏移会重算。\n保存前请先「备份存档」。')
+        if not messagebox.askyesno('删除单位', '\n'.join(msg), icon='warning'):
+            return
+        # ---- 逐台删：★每删一台都要**重新定位**（删指针表条目会让后面所有记录前移 8 字节，
+        #      拿旧 off 直接删第二台就会撞到「定位组计数失败」）
+        ok, fail = 0, []
+        for _ in range(len(recs)):
+            cur = [r for r in (self.doc.unit_records() or [])
+                   if isinstance(r.get('x'), int) and (r['x'], r['y']) == tuple(sel)]
+            if not cur:
+                break
+            r = max(cur, key=lambda x: x['off'])
+            try:
+                info = self.doc.remove_unit(r)
+                ok += 1
+                self.status.set('已删 %s @(%d,%d)（-%d 字节）'
+                                % (r['type'], info['cell'][0], info['cell'][1], -info['delta']))
+                self.update_idletasks()
+            except Exception as e:
+                fail.append('%s：%s' % (r['type'], e))
+                break
+        self.mv_state['gdata'] = None
+        self.mv_state['udata'] = None
+        self.mv_render()
+        out = '🗑 已删除 %d/%d 台单位（格 (%d,%d)）' % (ok, len(recs), sel[0], sel[1])
+        if foreign:
+            out += '\n已清 0 的外部引用：' + '、'.join('%s+%#x' % (x.get('owner'), x.get('rel') or 0)
+                                                 for _r, x in foreign[:6])
+        if fail:
+            out += '\n❌ ' + '；'.join(fail[:3])
+        self.mv_info.config(text=out)
+        self.status.set('删除完成：%d 台（失败 %d）' % (ok, len(fail)))
+        if fail:
+            messagebox.showwarning('部分没删掉', '\n'.join(fail[:8]))
 
     def mv_putunit(self):
         """地图页：把选中类型的单位**克隆放置**到点选的格子（同类型克隆，U2 已验收）。"""

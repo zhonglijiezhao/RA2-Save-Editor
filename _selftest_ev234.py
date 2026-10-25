@@ -134,8 +134,8 @@ info6 = d6.import_unit_from(ref, TYPE, cell[0], cell[1], slots='full', veterancy
 rec6 = [r for r in d6.unit_records() if r['key'] == info6['key']][0]
 ck('F. full 导入后等级仍是调用方指定的 2（精英）',
    u32(d6.plain, rec6['off'] + 0x150) == 2, u32(d6.plain, rec6['off'] + 0x150))
-ck('F2. +0x164 镜像 float = 0.0',
-   abs(struct.unpack_from('<f', d6.plain, rec6['off'] + 0x164)[0]) < 1e-6,
+ck('F2. +0x164 **未被改动**（§270 三档实测：精英也是 2.0，不是 0.0）',
+   abs(struct.unpack_from('<f', d6.plain, rec6['off'] + 0x164)[0] - 0.0) > 1e-6,
    struct.unpack_from('<f', d6.plain, rec6['off'] + 0x164)[0])
 
 print('\n§234 自检：PASS %d / FAIL %d' % (n_ok, n_bad))

@@ -5759,14 +5759,16 @@ class SaveDoc(object):
             if alt:
                 self.plain[rec['off'] + 0xB8:rec['off'] + 0xB8 + 4] = struct.pack('<I', alt)
         # ★2026-10-24：`veterancy` 必须**在抄完之后**再写一次。
-        #   等级 `+0x150/+0x164` 属于"同型号各实例一致"的槽（参考档里可能全是新兵）
+        #   等级 `+0x150` 属于"同型号各实例一致"的槽（参考档里可能全是新兵）
         #   ⇒ full 抄写会把它覆盖回参考档的值，调用方传的 veterancy 就白传了
         #   （自检实踩：传 2 进来，落地仍是 0）。
+        # ★★§270（2026-10-25）：**只写 `+0x150`，不写 `+0x164`** ——
+        #   玩家三档实测（同一台 E1 在游戏里升到 0/1/2 级）证明记录里只有 `+0x150` 变，
+        #   `+0x164` 三份都是 2.0f；旧代码写 float(2-vet) 会让新单位显示新兵。
         if veterancy is not None:
             vv = int(veterancy)
             if vv in (0, 1, 2):
                 struct.pack_into('<i', self.plain, rec['off'] + 0x150, vv)
-                struct.pack_into('<f', self.plain, rec['off'] + 0x164, float(2 - vv))
                 info = dict(info)
                 info['veterancy'] = vv
         for attr in ('_urecs', '_uoffs', '_occ', '_blds'):
@@ -6358,8 +6360,14 @@ class SaveDoc(object):
     #   ★★2026-10-18 21:43 **游戏内验收通过**（样本 `E:\YURI\等级矩阵_4个大兵.SAV`，
     #     同一个档里 4 个大兵只有这两列不同）：玩家判读 =「0级一个、1级一个、三级二个」。
     #     ⇒ ① **`+0x150` 就是 Veterancy**（0/1/2 依次对应 无星/一级/三级）；
-    #        ② **故意错配的那一个（150=2 但 164=2.0）照样显示三级** ⇒ 显示只看 `+0x150`，
-    #           `+0x164` 是引擎自己维护的镜像，写它与否都不影响显示（但仍保持同步，避免脏状态）。
+    #        ② **故意错配的那一个（150=2 但 164=2.0）照样显示三级** ⇒ 显示只看 `+0x150`。
+    #   ★★★2026-10-25 §270 玩家三档实测（`E1_等级0/1/2_*.SAV`，同一台 E1 @(211,291)
+    #     在游戏里升到三个等级）：**记录内只有 `+0x150` 这 1 个字节不同**，
+    #     `+0x164` 三份**全是 2.0f**。⇒ 结论修正：
+    #       · 写等级**只写 `+0x150`**；
+    #       · 旧代码"成对改写" `+0x164 = float(2−vet)`（精英→0.0）是**错的** ——
+    #         实测后果：新放的"精英"兵在游戏里显示**新兵**（写 0.0 反而被判成异常状态）。
+    #     `UNIT_VET_OFF[1]` 保留只为兼容老脚本，**不要再写它**。
     UNIT_VET_OFF = (0x150, 0x164)
     VET_NAMES = {0: '新兵', 1: '老兵', 2: '精英'}
     CELL_GUID = bytes.fromhex('ce99bfc18c1ad2118175006008055bb5')     # CellClass
@@ -6509,6 +6517,288 @@ class SaveDoc(object):
                 n += 4
         return n
 
+    # ★2026-10-25 §268：单位「移动」= 只改位置相关的这几处副本（不动身份/指令/血量/等级）
+    UNIT_LEPTON_X = (176, 616)        # lepton x 的两份副本（y 在 +4）
+    UNIT_CELLKEY_OFF = 224            # 格键（指向格对象自键）
+    UNIT_CELLXY_OFF = (1392, 1394)    # u16 格坐标
+
+    def set_unit_cell(self, rec, cx, cy, fix_pos_slots=True):
+        """把**一台单位**挪到格 (cx, cy) → dict（零增长，记录长度不变，不触发偏移重算）。
+
+        ★§232 铁律：位置在记录里共有 **6 处副本**，漏任何一处都会出现
+          "看着在那里、实际进不了车 / 站在原地不动"：
+            · `+176/+180`、`+616/+620` —— lepton x/y（低字节是子格偏移，原样保留）
+            · `+224`                 —— 格键 ⇒ 改成新格格对象的自键
+            · `+1392/+1394`          —— u16 格坐标
+            · `+0x56C`/`+0x570`      —— 两个 u16 (x,y) 副本槽
+              （§232 那个"工程师上不了 FV"就是 `+0x570` 被固化成 (0,0)）
+            · 格对象 `+248`          —— 占用者自键：新格写自己，旧格若指向自己则清 0
+        ⚠ 只写 `+248`，**不碰 `+308/+312`**（实测一起写会把克隆弄崩，见 `add_unit_by_clone`）。
+        ⚠ 目标格必须在地图的格对象表里（否则引擎读档会把它挪走）。
+        """
+        cx, cy = int(cx), int(cy)
+        cells = {v: k for k, v in self._cell_by_key().items()}
+        nk = cells.get((cx, cy))
+        if nk is None:
+            raise RuntimeError('地图里没有格 (%d,%d) 的格对象，拒绝移动' % (cx, cy))
+        pl = bytearray(self.plain)
+        o = rec['off']
+        if rec.get('size') and not (1000 <= rec['size'] <= 5000):
+            raise RuntimeError('记录长度 %r 不像单位主体（步兵 1893 / 载具 2316），拒绝写入'
+                               % (rec.get('size'),))
+        old = (rec.get('x'), rec.get('y'))
+        fx = pl[o + self.UNIT_LEPTON_X[0]] & 0xFF      # 子格偏移保留
+        fy = pl[o + self.UNIT_LEPTON_X[0] + 4] & 0xFF
+        for off in self.UNIT_LEPTON_X:
+            struct.pack_into('<I', pl, o + off, (cx << 8) | fx)
+            struct.pack_into('<I', pl, o + off + 4, (cy << 8) | fy)
+        struct.pack_into('<I', pl, o + self.UNIT_CELLKEY_OFF, nk)
+        struct.pack_into('<H', pl, o + self.UNIT_CELLXY_OFF[0], cx)
+        struct.pack_into('<H', pl, o + self.UNIT_CELLXY_OFF[1], cy)
+        if fix_pos_slots:
+            for off in self.POS_SLOTS:
+                struct.pack_into('<HH', pl, o + off, cx, cy)
+        # ---- 格归属（只写 +248 键）----
+        key = struct.unpack_from('<I', pl, o + 16)[0]
+        cofs = self.cell_offsets()
+        written = cleared = False
+        tgt = cofs.get((cx, cy))
+        if tgt is not None:
+            struct.pack_into('<I', pl, tgt + self.CELL_OCC_OFF, key)
+            written = True
+        if old and isinstance(old[0], int):
+            oldc = cofs.get((old[0], old[1]))
+            if oldc is not None and oldc != tgt:
+                if struct.unpack_from('<I', pl, oldc + self.CELL_OCC_OFF)[0] == key:
+                    struct.pack_into('<I', pl, oldc + self.CELL_OCC_OFF, 0)
+                    cleared = True
+        self.plain = pl
+        self._blds = None
+        return {'key': key, 'from': old, 'to': (cx, cy), 'cell_key': nk,
+                'occ_written': written, 'old_cleared': cleared,
+                'pos_slots': fix_pos_slots}
+
+    def move_units_at(self, src_cell, dst_cell, fix_pos_slots=True):
+        """把**源格上的所有单位**一起挪到目标格 → dict。
+
+        为什么按格而不是按台：地图页点选的最小单位就是格子；同格多台一起搬
+        符合"这里一堆兵挪到那边"的直觉，也省得做多选 UI。
+        """
+        src = (int(src_cell[0]), int(src_cell[1]))
+        dst = (int(dst_cell[0]), int(dst_cell[1]))
+        if src == dst:
+            raise RuntimeError('源格和目标格是同一格 (%d,%d)' % src)
+        recs = [r for r in self.unit_records()
+                if isinstance(r.get('x'), int) and (r['x'], r['y']) == src]
+        if not recs:
+            raise RuntimeError('格 (%d,%d) 上没有单位' % src)
+        done = [self.set_unit_cell(r, dst[0], dst[1], fix_pos_slots=fix_pos_slots)
+                for r in recs]
+        return {'from': src, 'to': dst, 'count': len(done), 'items': done}
+
+    def unit_key_refs(self, rec):
+        """该单位的**自键**在明文里出现的所有位置 → `[{'off','kind',…}]`（删除前的体检）。
+
+        `kind` 取值：
+          · `self`        —— **它自己记录里**（主体 + 伴随段）。AMCV 实测有 4 处：主体 `+0x3C0`、
+                             伴随段 `+0x1C/+0x20` —— 是自我引用，随记录一起消失，不用管。
+          · `cell+248`    —— 格对象占用者（正常 1 处；可能更多：它还被别的格记着）
+          · `ptr_tab`     —— 两张全局指针表（各 1 处）
+          · `roster`      —— 阵营对象表条目（**任务图里通常没有**）
+          · `foreign_bld` —— ⚠ **某栋建筑记录里存了这个键**（实测是光棱塔的"当前目标"；
+                             1113 栋里 1070 栋该字段为 0 ⇒ 是缓存的目标指针，清 0 安全）
+          · `foreign_unit`—— ⚠ 另一台单位记录里存了这个键
+          · `other`       —— 认不出来的位置（删之前必须人看）
+        """
+        pl = self.plain
+        key = rec['key']
+        pat = struct.pack('<I', key)
+        pos, i = [], 0
+        while True:
+            j = pl.find(pat, i)
+            if j < 0:
+                break
+            pos.append(j)
+            i = j + 1
+        cell_occ = dict((v + self.CELL_OCC_OFF, xy) for xy, v in self.cell_offsets().items())
+        roster = {}
+        try:
+            for u in (self.house_placements(skip_special=False) or []):
+                roster[u['off']] = u
+        except Exception:
+            roster = {}
+        tabs = self._key_tables(key)
+        tab_pos = set()
+        for tb in tabs:
+            for k in range(tb['n']):
+                tab_pos.add(tb['first'] + 4 * k)
+        # 别的单位记录范围
+        ur = []
+        try:
+            for r in (self.unit_records() or []):
+                if r is rec or r['off'] == rec['off']:
+                    continue
+                ur.append((r['off'], r['comp'] + r['comp_size'], r['type']))
+        except Exception:
+            ur = []
+        # 建筑记录范围（用相邻 base 差值当长度，型号不同长度不同）
+        br = []
+        try:
+            bs = sorted((b['base'], b.get('type')) for b in (self.buildings() or []))
+            for i2, (o, t) in enumerate(bs):
+                br.append((o, bs[i2 + 1][0] if i2 + 1 < len(bs) else len(pl), t))
+        except Exception:
+            br = []
+        lo, hi = rec['off'], rec['comp'] + rec['comp_size']
+        out = []
+        for p in pos:
+            d2 = {'off': p, 'kind': 'other'}
+            if lo <= p < hi:
+                d2['kind'] = 'self'
+            elif p in cell_occ:
+                d2['kind'] = 'cell+248'
+                d2['cell'] = cell_occ[p]
+            elif p in tab_pos:
+                d2['kind'] = 'ptr_tab'
+            elif p in roster:
+                d2['kind'] = 'roster'
+                d2['roster'] = roster[p]
+            else:
+                own_u = next(((a, b, t) for a, b, t in ur if a <= p < b), None)
+                own_b = next(((a, b, t) for a, b, t in br if a <= p < b), None)
+                if own_u:
+                    d2['kind'] = 'foreign_unit'
+                    d2['owner'] = own_u[2]
+                    d2['rel'] = p - own_u[0]
+                elif own_b:
+                    d2['kind'] = 'foreign_bld'
+                    d2['owner'] = own_b[2]
+                    d2['rel'] = p - own_b[0]
+            out.append(d2)
+        return out
+
+    def remove_unit(self, rec, clear_cell=True, clear_foreign=True):
+        """从存档里**删掉一条单位记录（主体 + 伴随）** —— 与 `add_unit_by_clone` 严格对称。
+
+        四步（★全部按"从大偏移到小"排序后执行：删字节会让后面的偏移前移）：
+          ① 两张指针表各删掉该单位自键的 4 字节条目（`[u32 n][key×n]`），计数 −1；
+          ② 阵营对象表删掉 `(类型键, y, x)` 那条（**任务图里通常本来就没有**，没有就跳过）；
+          ③ 清格占用（格对象 `+248` 写 0）—— 不涉及长度；
+          ④ 删记录 `[off, comp + comp_size)`，组计数 −1。
+
+        ⚠ 伴随对象只能跟主体一起删：单位组的结构是「[n][主体 | 伴随] × n」，
+          留孤儿会把整组结构弄坏。
+        ⚠ **这一步必须 in-game 实测**：建筑那边"删伴随必弹框"的结论未必适用于单位
+          （建筑有"替身对象"机制）。要对照就另跑 `soft_remove_unit`。
+        ⚠ 引用体检：如果 `unit_key_refs()` 里出现 `other`（别的对象在引用这台），
+          这里会拒绝删除 —— 那种情况得先处理引用，否则读档会撞悬空指针。
+
+        返回 dict；任何一步对不上就抛异常（调用方不得保存，存档不会被写坏）。
+        """
+        pl = bytearray(self.plain)
+        off, size = rec['off'], rec['size']
+        comp, csize = rec['comp'], rec['comp_size']
+        if not (1000 <= size <= 5000 and 60 <= csize <= 400):
+            raise RuntimeError('记录尺寸异常（size=%d comp_size=%d），拒绝删除' % (size, csize))
+        key = struct.unpack_from('<I', pl, off + 16)[0]
+        refs = self.unit_key_refs(rec)
+        others = [r for r in refs if r['kind'] == 'other']
+        foreign = [r for r in refs if r['kind'] in ('foreign_unit', 'foreign_bld')]
+        if others:
+            raise RuntimeError('该单位还被 %d 处认不出的地方引用（偏移 %s）⇒ 拒绝删除，'
+                               '先把那些引用处理掉'
+                               % (len(others), ', '.join('%#x' % r['off'] for r in others[:6])))
+        if foreign and not clear_foreign:
+            raise RuntimeError('该单位还被 %d 处外部对象引用（%s）⇒ 拒绝删除；'
+                               '用 clear_foreign=True 让工具把它们清 0'
+                               % (len(foreign),
+                                  '、'.join('%s@+%#x' % (r.get('owner'), r.get('rel') or 0)
+                                            for r in foreign[:4])))
+        # ---- ⓪ 清掉指向它的外部引用（写 0，不改变长度 —— 必须在删字节之前做）----
+        cleared_refs = []
+        for r in foreign:
+            struct.pack_into('<I', pl, r['off'], 0)
+            cleared_refs.append('%s +%#x' % (r.get('owner'), r.get('rel') or 0))
+        cnt_pos = self._unit_group_count_pos(off)
+        if cnt_pos is None:
+            raise RuntimeError('定位组计数失败（记录不在标准单位组里）⇒ 拒绝删除')
+        n_grp = struct.unpack_from('<I', pl, cnt_pos)[0]
+
+        ops = []      # (pos, kind, data, 说明)
+
+        # ---- ① 指针表：删条目 + 计数 −1 ----
+        tabs = self._key_tables(key)
+        hit_tabs = 0
+        for tb in tabs:
+            for i2 in range(tb['n']):
+                p = tb['first'] + 4 * i2
+                if struct.unpack_from('<I', pl, p)[0] == key:
+                    ops.append((p, 'del', 4, '指针表条目'))
+                    ops.append((tb['count_pos'], 'dec', None, '指针表计数'))
+                    hit_tabs += 1
+                    break
+        if not hit_tabs:
+            raise RuntimeError('指针表里找不到该单位的键 %#010x ⇒ 拒绝删除' % key)
+
+        # ---- ② 阵营对象表（有就删，没有不强求） ----
+        gx, gy = struct.unpack_from('<HH', pl, off + 1392)
+        roster_removed = 0
+        try:
+            hp = self.house_placements(skip_special=False) or []
+            mine = [u for u in hp if u['type'].upper() == rec['type'].upper()
+                    and u['x'] == gx and u['y'] == gy]
+            if mine:
+                ent = mine[0]['off']
+                same_house = [u for u in hp if u['house'] == mine[0]['house']]
+                first, last = min(u['off'] for u in same_house), max(u['off'] for u in same_house)
+                cnt = first - 4
+                if (struct.unpack_from('<I', pl, cnt)[0] == len(same_house)
+                        and last + 8 == first + 8 * len(same_house)):
+                    ops.append((ent, 'del', 8, '阵营对象表条目'))
+                    ops.append((cnt, 'dec', None, '阵营对象表计数'))
+                    roster_removed = 1
+        except Exception:
+            roster_removed = 0
+
+        # ---- ③ 清格占用（不涉及长度，位置固定） ----
+        cell_cleared = 0
+        if clear_cell:
+            cofs = self.cell_offsets()
+            cells_to_clear = set([(gx, gy)])
+            for r in refs:
+                if r.get('cell'):
+                    cells_to_clear.add(tuple(r['cell']))
+            for (cx, cy) in cells_to_clear:
+                co = cofs.get((cx, cy))
+                if co is None:
+                    continue
+                if struct.unpack_from('<I', pl, co + self.CELL_OCC_OFF)[0] == key:
+                    struct.pack_into('<I', pl, co + self.CELL_OCC_OFF, 0)
+                    cell_cleared += 1
+
+        # ---- ④ 删记录（主体 + 伴随）+ 组计数 −1 ----
+        ln = (comp + csize) - off
+        ops.append((off, 'del', ln, '单位记录+伴随'))
+        ops.append((cnt_pos, 'dec', None, '组计数'))
+
+        # ---- 执行：从大偏移到小 ----
+        ops.sort(key=lambda o: (-o[0], 0 if o[1] == 'dec' else 1))
+        for pos, kind, data, _nm in ops:
+            if kind == 'del':
+                del pl[pos:pos + data]
+            else:
+                struct.pack_into('<I', pl, pos,
+                                 struct.unpack_from('<I', pl, pos)[0] - 1)
+        self.plain = pl
+        # 长度变了 ⇒ 全套按偏移缓存作废（_invalidate_if_shifted 用长度做判据）
+        self._invalidate_if_shifted()
+        return {'mode': '删除单位', 'type': rec['type'], 'key': key,
+                'cell': (gx, gy), 'rec_len': ln, 'size': size, 'comp_size': csize,
+                'group_before': n_grp, 'group_after': n_grp - 1,
+                'ptr_tables': hit_tabs, 'roster_removed': roster_removed,
+                'cell_cleared': cell_cleared, 'delta': -ln,
+                'cleared_refs': cleared_refs, 'refs': refs}
+
     def unit_records(self):
         self._invalidate_if_shifted()
         """读出单位**实例记录** → [{'type','class','off','size','comp','comp_size','key','x','y'}]。
@@ -6611,6 +6901,24 @@ class SaveDoc(object):
                                 break
                     _vk = struct.unpack_from('<i', pl, ro + self.UNIT_VET_OFF[0])[0] \
                         if size > self.UNIT_VET_OFF[0] + 4 else -1
+                    # ★★§269（2026-10-25）：**坐标读取加兜底** —— 原来只按 `+224` 格键查
+                    #   `_cell_by_key()`，查不到就把 x/y 记成 None。实测本档 55 台这样"无坐标"，
+                    #   包括玩家要删的那台盟军基地车 AMCV：
+                    #     `+224 = 0x0000b380`（不是格对象自键！算下来是 (y<<8)|0x80），
+                    #     但 `+1392/+1394` = (16,179)、`+0x570` = (16,179)、格 (16,179) 的
+                    #     `+248` 正好是它的自键 —— 说明**位置其实是好的**，只是我们的读法太窄。
+                    #   ⇒ `+1392/+1394`（u16 格坐标）兜底，55/55 全部有效。
+                    #   `pos_src` 把来源记下来（'cell' / 'u16' / 'none'），方便别处区分。
+                    _ck = struct.unpack_from('<I', pl, ro + 224)[0]
+                    _pxy = cells.get(_ck) or (None, None)
+                    _pos_src = 'cell'
+                    if _pxy[0] is None:
+                        _gx, _gy = struct.unpack_from('<HH', pl, ro + 1392)
+                        if (_gx, _gy) != (0, 0):
+                            _pxy = (_gx, _gy)
+                            _pos_src = 'u16'
+                        else:
+                            _pos_src = 'none'
                     out.append({'type': types.get(tk, '?%08x' % (tk or 0)), 'class': cls,
                                 'off': ro, 'size': size, 'comp': co, 'comp_size': csize,
                                 # 等级：-1 / 越界一律给 None（引擎原生档里 SLAV 等出现过 -1）
@@ -6618,9 +6926,8 @@ class SaveDoc(object):
                                 'comp_guid': bytes(pl[co:co + 16]),
                                 'loco': self.COMP_GUID_LOCO.get(bytes(pl[co:co + 16]), '?'),
                                 'key': struct.unpack_from('<I', pl, ro + 16)[0],
-                                'cell': struct.unpack_from('<I', pl, ro + 224)[0],
-                                'x': cells.get(struct.unpack_from('<I', pl, ro + 224)[0], (None, None))[0],
-                                'y': cells.get(struct.unpack_from('<I', pl, ro + 224)[0], (None, None))[1],
+                                'cell': _ck,
+                                'x': _pxy[0], 'y': _pxy[1], 'pos_src': _pos_src,
                                 'house_key': struct.unpack_from('<I', pl, ro + self.UNIT_HOUSE_OFF[0])[0]
                                 if size > self.UNIT_HOUSE_OFF[0] + 4 else 0,
                                 'house': hname.get(
@@ -7946,7 +8253,8 @@ class SaveDoc(object):
             if vet not in self.VET_NAMES:
                 raise ValueError('等级只能是 0（新兵）/1（老兵）/2（精英），收到 %r' % (veterancy,))
             struct.pack_into('<i', blob, self.UNIT_VET_OFF[0], vet)
-            struct.pack_into('<f', blob, self.UNIT_VET_OFF[1], float(2 - vet))
+            # ★★§270：**绝不能动 `+0x164`** —— 玩家三档实测证明那里三份都是 2.0f，
+            #   而旧代码写 float(2-vet)（精英→0.0）会让新单位在游戏里显示**新兵**。
             vet_out = vet
             if vet != struct.unpack_from('<i', pl, src['off'] + self.UNIT_VET_OFF[0])[0]:
                 warnings.append('等级已改为 %s（模板是 %s）'
