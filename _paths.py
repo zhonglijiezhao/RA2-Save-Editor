@@ -9,13 +9,19 @@ import os
 ROOTS = ('E:/YURI', 'E:/YURI/新建文件夹 (27)', 'E:/YURI/新建文件夹 (26)')
 
 
-def find_sav(name, roots=ROOTS, depth=3):
-    """按文件名找存档 → 绝对路径；找不到返回 None。"""
+def find_sav(name, roots=ROOTS, depth=3, newest=True):
+    """按文件名找存档 → 绝对路径；找不到返回 None。
+
+    ★★2026-10-25 §275：改成**取 mtime 最新的那份**。原来是"按 ROOTS 顺序先命中先返回"，
+      于是 ROOTS 里写死的 `新建文件夹 (26)` 会盖掉玩家刚挪进 `新建文件夹 (31)` 的新档
+      （实测：找 `SAVE4823.SAV` 拿到一份 2 天前的旧档，自检直接报"样本不存在"）。
+    """
+    base = os.path.basename(name)
+    hits = []
     for r in roots:
         p = os.path.join(r, name)
         if os.path.exists(p):
-            return p
-    base = os.path.basename(name)
+            hits.append(p)
     for r in roots:
         if not os.path.isdir(r):
             continue
@@ -26,8 +32,19 @@ def find_sav(name, roots=ROOTS, depth=3):
                 continue
             for fn in filenames:
                 if fn.lower() == base.lower():
-                    return os.path.join(dirpath, fn)
-    return None
+                    hits.append(os.path.join(dirpath, fn))
+    if not hits:
+        return None
+    if not newest:
+        return hits[0]
+    uniq = []
+    for p in hits:
+        if p not in uniq:
+            uniq.append(p)
+    try:
+        return max(uniq, key=lambda p: os.path.getmtime(p))
+    except Exception:
+        return uniq[0]
 
 
 def need_sav(name):

@@ -6432,6 +6432,11 @@ class SaveDoc(object):
     CELL_OCC_OFF = 248
     CELL_OCC_FLAG_OFF = 308
     CELL_OCC_KIND_OFF = 312
+    # ★§275：`+0x138`（=312）的取值语义（实测：载具 574/574 = 0x20、建筑 1088/1113 = 0x80、
+    #   单步兵格 604/604 是单个 bit）。引擎读档靠它判断"这格能不能过"⇒ 删/搬单位必须同步。
+    CELL_KIND_VEHICLE = 0x20
+    CELL_KIND_BUILDING = 0x80
+    CELL_KIND_INF_MASK = 0x1F
     # 格子占用写法：None=不写 / 'key'=只写格+248（默认）/ 'full'=连标记与类型码一起写
     # ⚠ 'full' 实测会把载具克隆弄崩（V3 vs H3），别默认开。
     UNIT_CELL_OCC_MODE = 'key'
@@ -6535,6 +6540,97 @@ class SaveDoc(object):
     UNIT_CELLKEY_OFF = 224            # 格键（指向格对象自键）
     UNIT_CELLXY_OFF = (1392, 1394)    # u16 格坐标
 
+    def cell_kind(self, cx, cy):
+        """格对象的**占用种类掩码**（`+0x138`）→ int / None（没有该格对象）。
+
+        ★★§275（2026-10-25 18:40，玩家实测"删完还占格子、别的单位过不去"）：
+
+        | 值 | 含义 | 证据 |
+        |---|---|---|
+        | `0x20` | **有载具** | 574 台载具所在格 **574/574 全是 0x20** |
+        | `0x80` | **有建筑** | 1113 栋建筑所在格 1088/1113 = 0x80 |
+        | `0x01..0x10` | **有步兵**（同格多个各占一位） | 单步兵格 604/604 是单个 bit（1/2/4/8/16） |
+        | `0` | 空 | 35576/40653 空格是 0 |
+
+        ⇒ 只清 `+248`（占用者键）**不够**：引擎读档时靠这个掩码判断"这格能不能过"，
+        掩码留着 `0x20` 就会**看不见的墙**——删掉的车、搬走的车都会留下这种幽灵。
+        """
+        o = self.cell_offsets().get((int(cx), int(cy)))
+        if o is None:
+            return None
+        return struct.unpack_from('<I', self.plain, o + self.CELL_OCC_KIND_OFF)[0]
+
+    def _kind_bit_of(self, rec, before):
+        """这台单位在 `+0x138` 掩码里占哪一位 → `(bit, note)`；判断不了就 `(None, 原因)`。
+
+        · 载具 ⇒ `0x20`（固定，574/574）
+        · 步兵 ⇒ 掩码里**只置了一位**时才敢认它（就是这一位）；同格多个步兵时
+          "哪一位是它"没有可靠判据（记录里没有任何字段等于 bit 下标，已实测），**不猜**。
+        """
+        if rec.get('class') == 'vehicle':
+            return self.CELL_KIND_VEHICLE, ''
+        inf = int(before) & self.CELL_KIND_INF_MASK
+        if inf and (inf & (inf - 1)) == 0:
+            return inf, ''
+        if not inf:
+            return None, '该格掩码里没有步兵位'
+        return None, '同格有多个步兵，位归属无可靠判据（不猜）'
+
+    def clear_cell_kind(self, rec, cell=None):
+        """把该单位在格 `+0x138` 掩码里占的那一位清掉（**不改变长度**）。
+
+        返回 `{'cell','before','after','ok','note'}`；判断不了时 `ok=False` 且原样不动。
+        """
+        xy = cell if cell is not None else (rec.get('x'), rec.get('y'))
+        if not xy or not isinstance(xy[0], int):
+            return {'cell': xy, 'before': None, 'after': None, 'ok': False,
+                    'note': '单位没有坐标'}
+        o = self.cell_offsets().get((int(xy[0]), int(xy[1])))
+        if o is None:
+            return {'cell': xy, 'before': None, 'after': None, 'ok': False,
+                    'note': '没有格对象'}
+        p = o + self.CELL_OCC_KIND_OFF
+        before = struct.unpack_from('<I', self.plain, p)[0]
+        bit, note = self._kind_bit_of(rec, before)
+        if bit is None:
+            return {'cell': xy, 'before': before, 'after': before, 'ok': False, 'note': note}
+        after = before & ~bit & 0xFFFFFFFF
+        if after == before:
+            return {'cell': xy, 'before': before, 'after': after, 'ok': True,
+                    'note': '该位本来就没置'}
+        struct.pack_into('<I', self.plain, p, after)
+        return {'cell': xy, 'before': before, 'after': after, 'ok': True, 'note': ''}
+
+    def set_cell_kind(self, rec, cx, cy):
+        """把该单位在格 `+0x138` 掩码里占的那一位**置上**（移动/放置到新格时用）。
+
+        载具置 `0x20`；步兵置**最低的空闲位**（1→2→4→8→16），与引擎自己分配的口径一致。
+        """
+        o = self.cell_offsets().get((int(cx), int(cy)))
+        if o is None:
+            return {'cell': (cx, cy), 'before': None, 'after': None, 'ok': False,
+                    'note': '没有格对象'}
+        p = o + self.CELL_OCC_KIND_OFF
+        before = struct.unpack_from('<I', self.plain, p)[0]
+        if rec.get('class') == 'vehicle':
+            bit = self.CELL_KIND_VEHICLE
+        else:
+            bit = None
+            for n in range(5):
+                b = 1 << n
+                if not (before & b):
+                    bit = b
+                    break
+            if bit is None:
+                return {'cell': (cx, cy), 'before': before, 'after': before,
+                        'ok': False, 'note': '该格步兵位（0x01..0x10）已占满'}
+        after = before | bit
+        if after == before:
+            return {'cell': (cx, cy), 'before': before, 'after': after, 'ok': True,
+                    'note': '该位本来就置着'}
+        struct.pack_into('<I', self.plain, p, after)
+        return {'cell': (cx, cy), 'before': before, 'after': after, 'ok': True, 'note': ''}
+
     def set_unit_cell(self, rec, cx, cy, fix_pos_slots=True):
         """把**一台单位**挪到格 (cx, cy) → dict（零增长，记录长度不变，不触发偏移重算）。
 
@@ -6546,7 +6642,9 @@ class SaveDoc(object):
             · `+0x56C`/`+0x570`      —— 两个 u16 (x,y) 副本槽
               （§232 那个"工程师上不了 FV"就是 `+0x570` 被固化成 (0,0)）
             · 格对象 `+248`          —— 占用者自键：新格写自己，旧格若指向自己则清 0
-        ⚠ 只写 `+248`，**不碰 `+308/+312`**（实测一起写会把克隆弄崩，见 `add_unit_by_clone`）。
+        ★§275：`+248`（占用键）与 `+0x138`（占用种类掩码：载具 0x20 / 建筑 0x80 / 步兵 1..0x10）
+          **必须一起维护** —— 只写 `+248` 会在旧格留下"看不见的墙"（玩家实测）。
+          `+308`（`CELL_OCC_FLAG_OFF`）仍然不写（当年"写全 308/312 把克隆弄崩"的教训）。
         ⚠ 目标格必须在地图的格对象表里（否则引擎读档会把它挪走）。
         """
         cx, cy = int(cx), int(cy)
@@ -6571,25 +6669,43 @@ class SaveDoc(object):
         if fix_pos_slots:
             for off in self.POS_SLOTS:
                 struct.pack_into('<HH', pl, o + off, cx, cy)
-        # ---- 格归属（只写 +248 键）----
+        # ---- 格归属（`+248` 键 + `+0x138` 占用种类掩码，两者缺一不可，见 §275）----
         key = struct.unpack_from('<I', pl, o + 16)[0]
         cofs = self.cell_offsets()
         written = cleared = False
+        kind_ops = []
         tgt = cofs.get((cx, cy))
         if tgt is not None:
             struct.pack_into('<I', pl, tgt + self.CELL_OCC_OFF, key)
             written = True
+            kp = tgt + self.CELL_OCC_KIND_OFF
+            kb = struct.unpack_from('<I', pl, kp)[0]
+            if rec.get('class') == 'vehicle':
+                bit = self.CELL_KIND_VEHICLE
+            else:
+                bit = next((1 << n for n in range(5) if not (kb & (1 << n))), None)
+            if bit is not None and not (kb & bit):
+                struct.pack_into('<I', pl, kp, kb | bit)
+                kind_ops.append({'cell': (cx, cy), 'before': kb, 'after': kb | bit})
         if old and isinstance(old[0], int):
             oldc = cofs.get((old[0], old[1]))
             if oldc is not None and oldc != tgt:
                 if struct.unpack_from('<I', pl, oldc + self.CELL_OCC_OFF)[0] == key:
                     struct.pack_into('<I', pl, oldc + self.CELL_OCC_OFF, 0)
                     cleared = True
+                # ★§275：旧格的占用掩码也要清，否则那格变成"看不见的墙"
+                kp = oldc + self.CELL_OCC_KIND_OFF
+                kb = struct.unpack_from('<I', pl, kp)[0]
+                _bit, _note = self._kind_bit_of(rec, kb)
+                if _bit and (kb & _bit):
+                    struct.pack_into('<I', pl, kp, kb & ~_bit & 0xFFFFFFFF)
+                    kind_ops.append({'cell': (old[0], old[1]), 'before': kb,
+                                     'after': kb & ~_bit & 0xFFFFFFFF})
         self.plain = pl
         self._blds = None
         return {'key': key, 'from': old, 'to': (cx, cy), 'cell_key': nk,
                 'occ_written': written, 'old_cleared': cleared,
-                'pos_slots': fix_pos_slots}
+                'kind_ops': kind_ops, 'pos_slots': fix_pos_slots}
 
     def move_units_at(self, src_cell, dst_cell, fix_pos_slots=True):
         """把**源格上的所有单位**一起挪到目标格 → dict。
@@ -6690,19 +6806,22 @@ class SaveDoc(object):
             out.append(d2)
         return out
 
-    def remove_unit(self, rec, clear_cell=True, clear_foreign=True):
+    def remove_unit(self, rec, clear_cell=True, clear_foreign=True,
+                    keep_companion=False, clear_comp_refs=True):
         """从存档里**删掉一条单位记录（主体 + 伴随）** —— 与 `add_unit_by_clone` 严格对称。
 
         四步（★全部按"从大偏移到小"排序后执行：删字节会让后面的偏移前移）：
           ① 两张指针表各删掉该单位自键的 4 字节条目（`[u32 n][key×n]`），计数 −1；
           ② 阵营对象表删掉 `(类型键, y, x)` 那条（**任务图里通常本来就没有**，没有就跳过）；
-          ③ 清格占用（格对象 `+248` 写 0）—— 不涉及长度；
+          ③ 清格占用（格对象 `+248` 写 0 **并且清 `+0x138` 占用掩码**）—— 不涉及长度；
+             ★§275 玩家实测：只清 `+248` 会让那格变成"看不见的墙"（删掉的车照样挡路）；
           ④ 删记录 `[off, comp + comp_size)`，组计数 −1。
 
-        ⚠ 伴随对象只能跟主体一起删：单位组的结构是「[n][主体 | 伴随] × n」，
-          留孤儿会把整组结构弄坏。
-        ⚠ **这一步必须 in-game 实测**：建筑那边"删伴随必弹框"的结论未必适用于单位
-          （建筑有"替身对象"机制）。要对照就另跑 `soft_remove_unit`。
+        ★§274 `keep_companion=True` ⇒ **对照组**：只删主体 `size` 字节，把伴随对象留成**孤儿**
+          （`soft_remove_unit()` 就是这个）。建筑那边当年的结论是"删伴随必弹框、只能留孤儿"，
+          单位是否同样如此必须 A/B 实测，不能拿建筑的结论套（建筑有替身对象机制）。
+          留孤儿时顺手把伴随里**回指该单位自键**的那几处清 0（`clear_comp_refs`），
+          否则孤儿还在引用一个已经不存在的键。
         ⚠ 引用体检：如果 `unit_key_refs()` 里出现 `other`（别的对象在引用这台），
           这里会拒绝删除 —— 那种情况得先处理引用，否则读档会撞悬空指针。
 
@@ -6732,6 +6851,13 @@ class SaveDoc(object):
         for r in foreign:
             struct.pack_into('<I', pl, r['off'], 0)
             cleared_refs.append('%s +%#x' % (r.get('owner'), r.get('rel') or 0))
+        # ⓪b：留孤儿时，伴随里回指该键的那几处也要清 0（否则孤儿引用一个不存在的键）
+        comp_zeroed = []
+        if keep_companion and clear_comp_refs:
+            for r in refs:
+                if comp <= r['off'] < comp + csize:
+                    struct.pack_into('<I', pl, r['off'], 0)
+                    comp_zeroed.append('伴随 +%#x' % (r['off'] - comp))
         cnt_pos = self._unit_group_count_pos(off)
         if cnt_pos is None:
             raise RuntimeError('定位组计数失败（记录不在标准单位组里）⇒ 拒绝删除')
@@ -6773,14 +6899,16 @@ class SaveDoc(object):
         except Exception:
             roster_removed = 0
 
-        # ---- ③ 清格占用（不涉及长度，位置固定） ----
+        # ---- ③ 清格占用（`+248` 键 + `+0x138` 掩码；不涉及长度，位置固定）----
         cell_cleared = 0
+        kind_cleared = []
         if clear_cell:
             cofs = self.cell_offsets()
             cells_to_clear = set([(gx, gy)])
             for r in refs:
                 if r.get('cell'):
                     cells_to_clear.add(tuple(r['cell']))
+            hit_cells = set()
             for (cx, cy) in cells_to_clear:
                 co = cofs.get((cx, cy))
                 if co is None:
@@ -6788,10 +6916,33 @@ class SaveDoc(object):
                 if struct.unpack_from('<I', pl, co + self.CELL_OCC_OFF)[0] == key:
                     struct.pack_into('<I', pl, co + self.CELL_OCC_OFF, 0)
                     cell_cleared += 1
+                hit_cells.add((cx, cy))
+            # ★★§275：**占用种类掩码（+0x138）必须一起清**。玩家实测：只清 +248 的话，
+            #   删掉的车格子照样"占着"，别的单位开不过去（一辆看不见的车）。
+            #   载具位固定 0x20；步兵位只有在"该格只置了这一位"时才敢认（多步兵不猜）。
+            for (cx, cy) in sorted(hit_cells):
+                co = cofs.get((cx, cy))
+                if co is None:
+                    continue
+                p = co + self.CELL_OCC_KIND_OFF
+                kb = struct.unpack_from('<I', pl, p)[0]
+                bit, note = self._kind_bit_of(rec, kb)
+                if bit and (kb & bit):
+                    after = kb & ~bit & 0xFFFFFFFF
+                    struct.pack_into('<I', pl, p, after)
+                    kind_cleared.append({'cell': (cx, cy), 'before': kb, 'after': after})
+                elif bit is None and note:
+                    kind_cleared.append({'cell': (cx, cy), 'before': kb, 'after': kb,
+                                         'skipped': note
+                                         if (kb & self.CELL_KIND_INF_MASK) else '该格没有对应位'})
 
         # ---- ④ 删记录（主体 + 伴随）+ 组计数 −1 ----
-        ln = (comp + csize) - off
-        ops.append((off, 'del', ln, '单位记录+伴随'))
+        if keep_companion:
+            ln = size                                   # ★§274 对照组：只删主体
+            ops.append((off, 'del', ln, '单位主体（伴随留作孤儿）'))
+        else:
+            ln = (comp + csize) - off
+            ops.append((off, 'del', ln, '单位记录+伴随'))
         ops.append((cnt_pos, 'dec', None, '组计数'))
 
         # ---- 执行：从大偏移到小 ----
@@ -6805,12 +6956,34 @@ class SaveDoc(object):
         self.plain = pl
         # 长度变了 ⇒ 全套按偏移缓存作废（_invalidate_if_shifted 用长度做判据）
         self._invalidate_if_shifted()
-        return {'mode': '删除单位', 'type': rec['type'], 'key': key,
+        # ★★§274（自检抓到的真 bug）：删字节会让**触发/标签记录表**（`self.records`）整体错位。
+        #   `_invalidate_if_shifted()` 只清按偏移缓存、**不会重扫记录表** ⇒ 删完再用
+        #   `trigger_tag_pairs()` / 触发页读到的全是错位数据（本档 93 条变 5 条，落盘后重读又是 93）。
+        #   只影响"内存里的下一步操作"，不影响已写出的文件，但会让 GUI 删完单位后触发页错乱。
+        self.records = self._scan_records()
+        self.pending_events.clear()
+        self.pending_actions.clear()
+        return {'mode': '删除单位（留孤儿伴随）' if keep_companion else '删除单位',
+                'type': rec['type'], 'key': key,
                 'cell': (gx, gy), 'rec_len': ln, 'size': size, 'comp_size': csize,
                 'group_before': n_grp, 'group_after': n_grp - 1,
                 'ptr_tables': hit_tabs, 'roster_removed': roster_removed,
                 'cell_cleared': cell_cleared, 'delta': -ln,
+                'kind_cleared': kind_cleared,
+                'kept_companion': bool(keep_companion),
+                'comp_zeroed': comp_zeroed,
                 'cleared_refs': cleared_refs, 'refs': refs}
+
+    def soft_remove_unit(self, rec, clear_cell=True, clear_foreign=True,
+                         clear_comp_refs=True):
+        """§274 **对照组**：只摘引用 + 删主体，**把伴随对象留成孤儿**（A/B 实测用）。
+
+        与 `remove_unit()` 的差别只有一处：删的字节数是 `size`（主体）而不是 `size+comp_size`，
+        外加把伴随里回指该键的几处清 0。其余（指针表 / 阵营表 / 格占用 / 组计数 / 外部引用）
+        与整条删完全一致 ⇒ 两组唯一的变量就是"伴随留不留"。
+        """
+        return self.remove_unit(rec, clear_cell=clear_cell, clear_foreign=clear_foreign,
+                                keep_companion=True, clear_comp_refs=clear_comp_refs)
 
     def unit_records(self):
         self._invalidate_if_shifted()
