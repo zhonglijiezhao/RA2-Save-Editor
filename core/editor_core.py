@@ -1683,6 +1683,7 @@ class SaveDoc(object):
         #   GUI 里更容易复现：打开存档时触发页已经把这些表建好了。
         self._instmaps = None
         self._tagobjs = None
+        self._wpbase_memo = None     # §273 路径点表基址（全档 find 定位）
         self._tagrecs = None
         self._ctimerlist = None
         self._navmemo = None
@@ -2393,6 +2394,15 @@ class SaveDoc(object):
         锚点 = 表前 38 字节的固定前缀 + 两个"堆指针形状"的 4 字节 + 中间 `FF FF FF FF`；
         再用「非零项坐标 ≤ WP_COORD_MAX」收口。`ScenarioClass` 头在明文最前面 ⇒ 取最小候选。
         """
+        # ★★§273：**必须缓存**。这个函数要全档 find 一遍锚点 + 校验 702 项坐标，
+        #   26MB 明文单次 ~20ms。而 GUI 每支小队显示"出现于 x (a,b)"都会调它一次
+        #   ⇒ 288 支小队 = 124 次调用 = **2.4 秒**（`refresh_ai` 慢的真凶，不是读 AI 对象本身）。
+        #   缓存键 = 明文长度：`set_waypoint()` 是原地改 4 字节（长度不变、定位结果也不变），
+        #   增删字节必然改长度 ⇒ 自动作废；`invalidate_caches()` 也会清掉它。
+        if pl is None:
+            memo = getattr(self, '_wpbase_memo', None)
+            if memo is not None and memo[0] == len(self.plain):
+                return memo[1]
         pl = self.plain if pl is None else pl
         n = len(pl)
         i = 0
@@ -2426,7 +2436,10 @@ class SaveDoc(object):
                     break
             if ok:
                 found.append(base)
-        return min(found) if found else None
+        base = min(found) if found else None
+        if pl is self.plain:
+            self._wpbase_memo = (n, base)
+        return base
 
     def waypoint_offset(self, n):
         """第 n 号路径点在明文里的偏移（定位失败 / 号越界 → None）。"""
@@ -13020,7 +13033,8 @@ class SaveDoc(object):
         """把"跟着明文偏移走"的缓存全部作废（增删字节后必须调）。"""
         for a in ('_objs', '_events', '_actions', '_ticks', '_celltags', '_ctimerlist',
                   '_instmaps', '_house_econ', '_custom_houses', '_house_keys_memo',
-                  '_tagrecs', '_mapm', '_aiids', '_horder'):
+                  '_tagrecs', '_mapm', '_aiids', '_horder',
+                  '_tagobjs', '_wpbase_memo'):      # §273 两个全档扫描缓存
             if hasattr(self, a):
                 setattr(self, a, None)
         if rescan:
@@ -13061,7 +13075,15 @@ class SaveDoc(object):
         return None
 
     def _tag_objs_by_key(self):
-        """标签自键 → 标签对象帧偏移。"""
+        """标签自键 → 标签对象帧偏移。
+
+        ★★§273：**必须缓存**。本档 92 个 CellTag 对象 ⇒ 每次调用 = 92 次全档 find
+        （26MB 明文 ~14ms）。而 `trigger_objects()` 每次都会调它，触发表 495 行里有 98 行走到
+        ⇒ 单这一项 **1.3 秒**。缓存键 = 明文长度，增删字节自动作废；`invalidate_caches()` 也清。
+        """
+        memo = getattr(self, '_tagobjs', None)
+        if memo is not None and memo[0] == len(self.plain):
+            return memo[1]
         pl = self.plain
         out, q = {}, 0
         while True:
@@ -13070,6 +13092,7 @@ class SaveDoc(object):
                 break
             q = i + 1
             out[int.from_bytes(pl[i + 16:i + 20], 'little')] = i
+        self._tagobjs = (len(pl), out)
         return out
 
     def trigger_objects(self, sid):

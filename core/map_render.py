@@ -8,13 +8,127 @@
     （实测：200×200 的图地形跑在 x[6..399] y[1..399]）。画布按内容自动外扩。
   · 缺地形记录的格子 = 地图外（不参与高度判定，画暗色）。
 """
+import base64
 import os
 import re
+import struct
 import sys
 
 SKILL_TERRAIN = r'C:\Users\zhao5\.workbuddy\skills\ra2-terrain-map-and-mapunits\scripts'
 if os.path.isdir(SKILL_TERRAIN) and SKILL_TERRAIN not in sys.path:
     sys.path.insert(0, SKILL_TERRAIN)
+
+# ★§272：解析结果缓存（键 = 绝对路径 + 大小 + mtime）—— 同一张图第二次解析直接返回。
+#   实测 `parse_map()` 对 714KB 的任务图要 **10.3 秒**（正则扫 [IsoMapPack5] + 逐格解压），
+#   而开档时"地图页复位"就是被它卡住的。缓存后第二次开档秒出。
+_PARSE_CACHE = {}
+_PARSE_CACHE_MAX = 8
+
+
+def _cache_key(path):
+    try:
+        st = os.stat(path)
+        return (os.path.abspath(path), st.st_size, int(st.st_mtime))
+    except Exception:
+        return None
+
+
+
+def _read_isomap_blob(raw):
+    """定位 `[IsoMapPack5]` 段 → base64 解码后的二进制（分块 LZO 流）。
+
+    ★★§272：技能脚本的 `read_section()` **段定位是对的**，但它用 `b64_decode_lenient`
+      **逐字符**解码 224KB —— 实测 **8.75 秒**！这才是"切到地图页要等 9 秒"的真凶
+      （不是 LZO 解压，解压只用 0.06 秒）。
+    · 段格式：`[IsoMapPack5]` 后每行 `序号=base64`；段末是 `\r\n\r\n[下一段]`。
+    · 段结束判定沿用技能脚本的口径（**行首 `[` 且下一个字符是字母/下划线**）——
+      因为 base64 行里也会出现 `[`，简单 `find(b"\n[")` 会提前截断。
+    · 解码用标准库：去掉每行的 `序号=` 与残留的 `=`（当填充丢弃），
+      再补 padding 到 4 的倍数。失败才退回技能脚本的容错解码器。
+    """
+    key = b'[IsoMapPack5]'
+    i = raw.find(key)
+    if i < 0:
+        return None
+    p = i + len(key)
+    j = -1
+    while True:
+        q = raw.find(b'\n[', p)
+        if q < 0:
+            break
+        nxt = raw[q + 2:q + 3]
+        if nxt.isalpha() or nxt == b'_':
+            j = q
+            break
+        p = q + 1
+    seg = raw[i + len(key): j if j > 0 else len(raw)]
+    lines = []
+    for ln in seg.split(b'\n'):
+        ln = ln.strip()
+        if not ln or ln.startswith(b';'):
+            continue
+        if b'=' in ln:
+            ln = ln.split(b'=', 1)[1]          # 去掉行首的 "序号="
+        ln = ln.strip().replace(b'=', b'')     # 行内残留的 '=' 一律当填充丢弃
+        if ln:
+            lines.append(ln)
+    s = b''.join(lines)
+    if not s:
+        return b''
+    try:
+        return base64.b64decode(s + b'=' * ((-len(s)) % 4), validate=False)
+    except Exception:
+        pass
+    try:
+        from ra2_pack import b64_decode_lenient
+        return b64_decode_lenient(s)
+    except Exception:
+        return None
+
+
+def _decode_isomap_fast(raw):
+    """用**本项目自己的 LZO（C 后端 lzo_fast.dll）**解 `[IsoMapPack5]` → (tiles, info)。
+
+    ★§272：技能脚本 `ra2_pack.decode_isomap` 用的是**纯 Python** LZO —— 对一张 714KB
+      的任务图要 **8.8 秒**（这就是"切到地图页要等 9 秒"的真凶）。同一条流换成 C 后端
+      实测 ~0.05 秒，解出来的格子**逐条一致**（42901 格）。
+    · 段定位与 base64 解码**复用技能脚本的成熟实现**（`read_section` + 容错 b64：
+      段内可能有行内 `=`、段末 base64 拼起来可能不是 4 的倍数 —— 标准库会直接抛异常）；
+    · 只把 `lzo_decompress_chunked` 的纯 Python LZO 换成 C 后端，分块格式不变：
+      `[u16 in_size][u16 out_size][in_size 字节 LZO1X]` 循环，`(0,0)` 结束；
+    · 末块在字节流里被截断是常态 ⇒ 尽力解到哪儿算哪儿（与技能脚本 tolerant 一致）。
+    失败返回 `(None, 原因)`，调用方退回技能脚本。
+    """
+    try:
+        import lzo1x
+    except Exception as e:
+        return None, 'no lzo1x: %s' % e
+    blob = _read_isomap_blob(raw)
+    if not blob:
+        return None, 'no IsoMapPack5 section'
+    out = bytearray()
+    p, n = 0, len(blob)
+    while p + 4 <= n:
+        in_size, out_size = struct.unpack_from('<HH', blob, p)
+        p += 4
+        if in_size == 0 and out_size == 0:
+            break
+        if p + in_size > n:
+            in_size = n - p
+        frag = blob[p:p + in_size]
+        p += in_size
+        try:
+            _dec, _used = lzo1x.lzo1x_decompress(frag, out_size)   # 返回 (数据, 消耗字节)
+            out += _dec
+        except Exception:
+            break                     # 末块截断：尽力而为
+    if not out:
+        return None, 'LZO 没解出内容'
+    cnt = (len(out) - 4) // 11
+    mv = struct.Struct('<hhiBBB').unpack_from
+    tiles = [mv(out, q * 11) for q in range(cnt)]
+    return tiles, 'fast b64=%dB decompressed=%dB records=%d' % (len(blob), len(out), cnt)
+
 
 MINIMAP_CANDIDATES = [
     r'C:\Users\zhao5\Desktop\HANDAMA随机地图生成器\minimap.ini',
@@ -37,9 +151,16 @@ C_SEL = (60, 200, 255)         # 选中格
 
 
 # --------------------------------------------------------------------------- #
-def parse_map(path):
+def parse_map(path, use_cache=True):
     """→ {'size':(W,H) 声明值, 'theater', 'terrain':{(x,y):(tile,sub,level)},
-          'structures':[{owner,type,x,y,tag}], 'has_terrain':bool, 'info', 'name'}"""
+          'structures':[{owner,type,x,y,tag}], 'has_terrain':bool, 'info', 'name'}
+
+    ★结果按 (路径, 大小, mtime) 缓存；**每次返回浅拷贝** —— 调用方（如地图页）
+      会改 `size` 字段，直接返回缓存对象会被改坏。
+    """
+    _key = _cache_key(path) if use_cache else None
+    if _key is not None and _key in _PARSE_CACHE:
+        return dict(_PARSE_CACHE[_key])
     raw = open(path, 'rb').read()
     txt = raw.decode('utf-8', 'replace')
 
@@ -57,10 +178,15 @@ def parse_map(path):
     name = (m.group(1).strip() if m else '')
 
     terrain = {}
-    info = 'no ra2_pack'
+    # ★先走 C 后端快速版（0.1s）；失败才退回技能脚本的纯 Python 版（8.8s）
+    tiles, info = _decode_isomap_fast(raw)
+    if tiles is None:
+        try:
+            from ra2_pack import decode_isomap
+            tiles, info = decode_isomap(raw)
+        except Exception as e:
+            tiles, info = None, 'decode 失败：%s' % e
     try:
-        from ra2_pack import decode_isomap
-        tiles, info = decode_isomap(raw)
         for x, y, idx, sub, level, ice in (tiles or []):
             terrain[(x, y)] = (idx, sub, level)
     except Exception as e:                      # 缺工具/无 IsoMapPack5 都不致命
@@ -78,9 +204,18 @@ def parse_map(path):
                                 'x': int(f[3]), 'y': int(f[4]), 'tag': f[6]})
             except Exception:
                 pass
-    return {'path': path, 'size': size, 'theater': theater, 'terrain': terrain,
+    _out = {'path': path, 'size': size, 'theater': theater, 'terrain': terrain,
             'has_terrain': bool(terrain), 'structures': structs, 'info': info,
             'name': name}
+    if _key is not None:
+        if len(_PARSE_CACHE) >= _PARSE_CACHE_MAX:
+            try:
+                _PARSE_CACHE.pop(next(iter(_PARSE_CACHE)))
+            except Exception:
+                _PARSE_CACHE.clear()
+        _PARSE_CACHE[_key] = _out
+        return dict(_out)
+    return _out
 
 
 def load_theatre(theater, path=None):

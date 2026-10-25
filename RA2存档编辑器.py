@@ -1093,6 +1093,19 @@ class App(tk.Tk):
                 self._highlight_events_for_trigger()
             elif idx == 4:                              # ★行为页（第5个标签）
                 self._highlight_actions_for_trigger()
+            elif idx == 6:                              # 地图 / 选位页（第7个）
+                # ★§272：开档时为了快，地图是"延迟渲染"的 ⇒ 第一次切到本页才画
+                if getattr(self, 'mv_deferred', False):
+                    self.mv_deferred = False
+                    _p = getattr(self, '_mv_defer_path', None) \
+                        or (getattr(self, 'mv_state', None) or {}).get('path')
+                    try:
+                        if _p:
+                            self.status.set('正在解析地图 %s …' % os.path.basename(_p))
+                            self.update_idletasks()
+                            self.mv_load(_p)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -3478,7 +3491,8 @@ class App(tk.Tk):
                          'gdata': None, 'wpdata': None, 'udata': None}
         return f
 
-    def _mv_reset(self):
+    def _mv_reset(self, lazy=False):
+        """重置地图页。`lazy=True` ⇒ **只准备好，不渲染**（开档时用，切页再画，§272）。"""
         st = getattr(self, 'mv_state', None)
         if st is None:
             return
@@ -3489,7 +3503,17 @@ class App(tk.Tk):
         self.mv_canvas.delete('all')
         self.mv_info.config(text='')
         if self.doc and p and os.path.exists(p):
-            self.mv_load(p)
+            if lazy:
+                # ★§272：**连地图解析也推迟** —— `parse_map()` 对任务图要 10.3 秒，
+                #   开档时解析等于白等（玩家多半先看触发表/单位）。
+                st['path'] = p
+                st['ok'] = False
+                self.mv_deferred = True
+                self._mv_defer_path = p
+                self.mv_lbl.config(text='%s（切到本页再解析渲染，开档更快）'
+                                        % os.path.basename(p), foreground='#6b7280')
+            else:
+                self.mv_load(p)
         else:
             self.mv_lbl.config(text='未加载地图（网格模式：可直接点选格子；放置建筑不需要地图）'
                                    + self._mv_ready_text(),
@@ -3544,7 +3568,7 @@ class App(tk.Tk):
         self.refresh_actions()
         self.mv_load(p)
 
-    def mv_load(self, path):
+    def mv_load(self, path, lazy=False):
         """加载地图 —— ★2026-10-17 20:3x 玩家定案：**不强制匹配，也绝不拦人**。
 
         「地图不是必须的，不能因为匹配不上连打开都不行」⇒ 这里只做**提示**：
@@ -3590,7 +3614,15 @@ class App(tk.Tk):
         self.mv_lbl.config(text='%s ｜ %s%s' % (os.path.basename(path), mt.get('msg', ''),
                                                self._mv_ready_text()),
                            foreground='#0b6b3a' if ok else '#b45309')
-        self.mv_fit()
+        if lazy:
+            # ★§272：开档时不渲染（生成地形图 + PNG 要 9 秒），切到本页再画
+            self.mv_deferred = True
+            st['img'] = None
+            self.mv_lbl.config(
+                text='%s ｜ %s（切到本页时再渲染）' % (os.path.basename(path), mt.get('msg', '')))
+        else:
+            self.mv_deferred = False
+            self.mv_fit()
         self.mv_info.config(text=('提示：点地图上的格子选位，然后在上方「放置建筑」选类型点放置；'
                                  '下方会给出落位判定。（写入已开放：直接放好 = U2 配方，游戏内验证通过）'
                                  + ('' if ok else '　⚠ 地图与存档的匹配只是提示，不影响任何操作。')))
@@ -5713,7 +5745,7 @@ class App(tk.Tk):
                     self.pbar.stop()
                     self._pending_load = False
                     if msg[1] is not None:
-                        self._set_doc(msg[1])
+                        self._set_doc_async(msg[1])
                 elif kind == 'done':
                     self.pbar.stop()
                     self._saving = False
@@ -5771,49 +5803,135 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
         # 结果统一由常驻的 _poll() 处理（不要在这里另开"临时等待链"）
 
-    def _set_doc(self, doc):
-        self.doc = doc
-        self._warned_zero = False
-        # 有地图就**优先挂上**（用地图的权威真值给 事件/行为 加归属、给触发表加条件/行为数）
+    # ---------------- 打开：分阶段刷新（§272 大档读条） ----------------
+    def _doc_steps(self):
+        """载入后要做的事，按"能看见进度"的粒度切成 6 步（同步版与读条版共用）。"""
+        return [('挂载地图', self._st_attach_map),
+                ('解析触发器列表', self._st_records),
+                ('刷新所属方', self._st_houses),
+                ('刷新 AI 页（小队/特遣/脚本）', self._st_ai),
+                ('准备地图页', self._st_map),
+                ('收尾', self._st_finish)]
+
+    def _st_attach_map(self):
+        """① 挂地图 + 概览上的基本信息。"""
         try:
-            mode = doc.auto_attach_map([self.game_dir.get()])
+            self._map_mode = self.doc.auto_attach_map([self.game_dir.get()])
         except Exception:
-            mode = 'no_map'
+            self._map_mode = 'no_map'
         for k, lbl in self.info_labels.items():
-            lbl.config(text=str(doc.info.get(k, '-')))
-        self.lbl_money.config(text=str(doc.info.get('金钱')))
-        self.lbl_money_field.config(text='字段: %s' % doc.info.get('金钱字段', ''))
+            lbl.config(text=str(self.doc.info.get(k, '-')))
+        self.lbl_money.config(text=str(self.doc.info.get('金钱')))
+        self.lbl_money_field.config(text='字段: %s' % self.doc.info.get('金钱字段', ''))
+
+    def _st_records(self):
+        """② 触发表（大档最慢的一步之一）。"""
         self.refresh_records()
-        self.btn_save_new.config(state='normal')
-        self.btn_save_in.config(state='normal')
-        self.btn_map_auto.config(state='normal')
+        for b in ('btn_save_new', 'btn_save_in', 'btn_map_auto', 'btn_map_pick'):
+            try:
+                getattr(self, b).config(state='normal')
+            except Exception:
+                pass
         self._refresh_unit_rule_label()          # 规则跟着"存档所在目录"走 ⇒ 换档要刷新
         if hasattr(self, 'mv_unit'):
             try:
                 self.mv_unit['values'] = self._unit_type_names()
             except Exception:
                 pass
-        self.btn_map_pick.config(state='normal')
+
+    def _st_houses(self):
+        """③ 所属方金钱表 + 各下拉的所属方列表。"""
         self.refresh_houses()
         try:
             self._fill_house_lists(log=False)      # ★所属方下拉随开档就绪（2026-10-17）
         except Exception:
             pass
+
+    def _st_ai(self):
+        """④ 事件 / 行为 / AI（小队·特遣·脚本）/ 挂接。"""
         self.refresh_events()
         self.refresh_actions()
         self.refresh_ai()
         self._attach_scanned = False
         self.refresh_attach()
-        self._mv_reset()
-        ms = getattr(doc, 'map_status', None)
+
+    def _st_map(self):
+        """⑤ 地图页：只做"准备好"，**渲染推迟到切到那一页时**（§272 提速）。"""
+        self._mv_reset(lazy=True)
+
+    def _st_finish(self):
+        """⑥ 收尾：状态栏总结 + 延迟体检建造动画。"""
+        ms = getattr(self.doc, 'map_status', None)
         self.status.set('已载入 %s：%d 条记录 · %s' % (
-            os.path.basename(doc.path), len(doc.records),
-            '未挂地图' if mode == 'no_map' else (ms or {}).get('text', '')))
-        # ★§169：开档后延迟静默体检一次「停在生长动画中途」的建筑，只在状态栏提示
+            os.path.basename(self.doc.path), len(self.doc.records),
+            '未挂地图' if getattr(self, '_map_mode', '') == 'no_map'
+            else (ms or {}).get('text', '')))
         try:
             self.after(400, self._auto_scan_anim)
         except Exception:
             pass
+
+    def _set_doc(self, doc):
+        """**同步**刷新（自检脚本 / 命令行用；界面上走 `_set_doc_async` 才有读条）。"""
+        self.doc = doc
+        self._warned_zero = False
+        for _n, fn in self._doc_steps():
+            fn()
+
+    def _set_doc_async(self, doc):
+        """★★§272：分步刷新 + 读条。
+
+        为什么要有它：大任务档（文件 3.4MB / 明文 26MB / 1448 单位 / 1113 建筑）一次刷完
+        **要 17 秒**（实测拆分：地图页复位 9.3s、触发表 5.1s、AI 页 2.5s），
+        这 17 秒里 Tk 主线程被占死、进度条也不动 —— 玩家以为程序卡了。
+        现在每步之间 `update()` 让出一次事件循环：进度条按真实步数走、状态栏显示
+        "第几步 / 已用几秒"，窗口不会假死。
+        """
+        self.doc = doc
+        self._warned_zero = False
+        self._st_steps = list(self._doc_steps())
+        self._st_total = len(self._st_steps)
+        self._st_t0 = time.time()
+        try:
+            self.pbar.stop()
+            self.pbar.config(mode='determinate', maximum=100, value=0)
+        except Exception:
+            pass
+        self.after(1, self._run_doc_stage)
+
+    def _run_doc_stage(self):
+        """走一步 + 刷一次界面；走完收进度条。"""
+        steps = getattr(self, '_st_steps', None)
+        if not steps:
+            return
+        done = self._st_total - len(steps)
+        name, fn = steps.pop(0)
+        try:
+            try:
+                self.pbar['value'] = int(done * 100.0 / self._st_total)
+            except Exception:
+                pass
+            self.status.set('正在载入 %s：%s…（%d/%d，已用 %.1f 秒）'
+                            % (os.path.basename(self.doc.path), name,
+                               done + 1, self._st_total, time.time() - self._st_t0))
+            self.update_idletasks()
+            self.update()
+            fn()
+        except Exception as e:
+            self.status.set('载入步骤「%s」出错：%s（已跳过，继续）' % (name, e))
+        if steps:
+            self.after(1, self._run_doc_stage)
+        else:
+            try:
+                self.pbar.stop()
+                self.pbar.config(mode='indeterminate')
+            except Exception:
+                pass
+            self.status.set('已载入 %s：%d 条记录 · %s（总耗时 %.1f 秒）' % (
+                os.path.basename(self.doc.path), len(self.doc.records),
+                '未挂地图' if getattr(self, '_map_mode', '') == 'no_map'
+                else (getattr(self.doc, 'map_status', None) or {}).get('text', ''),
+                time.time() - self._st_t0))
 
     def _auto_scan_anim(self):
         """开档静默体检：数一遍**真正异常**的建筑（§170 十四档定稿），只更新状态栏。
@@ -6348,6 +6466,11 @@ class App(tk.Tk):
         self._ai_teams = {t['id']: t for t in ai['teams']}
         self._ai_tfs = {t['id']: t for t in ai['taskforces']}
         self._ai_scripts = {t['id']: t for t in ai['scripts']}
+        # ★§273：路径点表**先取一次**（`_wp_text` 每支小队都要查号 → 坐标）
+        try:
+            self._wp_cache = self.doc.waypoints_save() or {}
+        except Exception:
+            self._wp_cache = {}
         for t in ai['teams']:
             # ★§235：标志现在解全了（16 个），表格里只列前 3 个开着的，其余用 … 表示
             _on = [ai_objects.TEAM_FLAG_LABELS.get(k, k) for k, v in t['flags'].items() if v]
@@ -7828,13 +7951,22 @@ class App(tk.Tk):
                         % (sid, info['name'], info['old_house'], info['new_house']))
 
     def _wp_text(self, n):
-        """路径点号的显示文本：`0 (54,86)`。"""
+        """路径点号的显示文本：`0 (54,86)`。
+
+        ★§273：先查 `self._wp_cache`（一次 `waypoints_save()` 取全表），**别逐支小队调
+          `doc.waypoint_cell()`** —— 那会每次都全档 find 定位路径点表（26MB × 124 次 = 2.4 秒）。
+        """
         if n is None or n < 0:
             return '—'
-        try:
-            c = self.doc.waypoint_cell(n) if self.doc else None
-        except Exception:
-            c = None
+        c = None
+        cache = getattr(self, '_wp_cache', None)
+        if isinstance(cache, dict) and cache:
+            c = cache.get(int(n))
+        else:
+            try:
+                c = self.doc.waypoint_cell(n) if self.doc else None
+            except Exception:
+                c = None
         return ('%d (%d,%d)' % (n, c[0], c[1])) if c else ('%d (未定义)' % n)
 
     def _ai_apply_wp(self):
