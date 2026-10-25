@@ -95,6 +95,15 @@ TEAM_FLAGS = {
     #          （`Allied Base Guard - Refine/Tech/Adv/Basic`、`Soviet Base Defense Infantry`、
     #            `Yuri Base Guard - Adv`、`Yuri Anti-BEagle/Harrier Defense`…），第 13 支就是玩家勾的 AAAAA。
     0x10A: 'IsBaseDefense',
+    # ★★§263 定案（2026-10-25，玩家给的 SAVE5AF1.SAV）：地编「仅攻击敌方或敌对（*）」
+    #   = `OnlyTargetHouseEnemy` = u8 **`+0x10B`**。
+    #   证据：① **四档正交表**（同一张三支测试小队）：
+    #          +0x109 = (4AE1,5F90,1649,5AF1) = (0,1,0,0)  ← 只跟「可重组」走
+    #          +0x10A = (0,0,1,0)                          ← 只跟「基地防御」走
+    #          +0x10B = (0,0,0,1)                          ← 只跟「仅攻击敌对」走
+    #        ② 字节级值向量 `[1,0,0]` 扫 268 偏移，**唯一命中 `+0x10B`**；
+    #           而且全档 167 支小队里**只有这一支**为 1（默认全 0，符合"AI 小队一般不设"）。
+    0x10B: 'OnlyTargetHouseEnemy',
 }
 
 # 中文显示名（GUI 用；顺序即显示顺序）
@@ -115,10 +124,40 @@ TEAM_FLAG_LABELS = {
     'OnTransOnly': '仅运输时',
     'AvoidThreats': '避让威胁',
     'Whiner': '抱怨',
+    # ★§260/§261/§263 新增的三个
+    'AreTeamMembersRecruitable': '小队成员可重组',
+    'IsBaseDefense': '用于基地防御',
+    'OnlyTargetHouseEnemy': '仅攻击敌方或敌对',
 }
 
-# ★「心控重建」= MindControlDecision（dword，0/1/2/5…；地图 INI 同名键，125/125 对账）
+# ★「心控结果」（玩家 §235 时口头叫「心控重建」）= MindControlDecision
+#   （dword，0~5；地图 INI 同名键，125/125 对账）
 TEAM_MC_OFF = 0xD4
+
+# ★§265（2026-10-25 玩家订正）：这个字段**不是**"AI 任务目标"，语义是——
+#   「本小队里的心控单位（尤里 / 精神控制车 / 心灵突击队…）控制了敌方单位之后，
+#     那个**被控住的敌方单位**该去干什么」。
+#   取值 6 档，**逐字照 FA2 地编「心控结果」下拉**（玩家放大图 QQ20261025-125905.png）：
+#     0 - 随机 / 1 - 加入小队 / 2 - 放入部队回收厂 / 3 - 放入生化反应炉 /
+#     4 - 寻敌 / 5 - 什么也不做
+#   ⚠ 我先后错了两版，记在这里免得再犯：
+#     ① 第一版整串填成「我方基地/敌方基地/最短路径/最富/其他」—— 那是 AI 任务目标列表，
+#        地编里根本没有这几项；
+#     ② 第二版把 4 认成「解放」、把 2/3 写成「收入/进入」—— 是**看小图看错了字**，
+#        还据此编了个"FA2 中文化误译"的说法（不成立，地编原文就是「寻敌」）。
+#   ⇒ **教训：读别人的截图必须放大逐字核对，别凭字形相近猜。**
+TEAM_MC_CHOICES = (
+    (0, '随机'),
+    (1, '加入小队'),
+    (2, '放入部队回收厂'),
+    (3, '放入生化反应炉'),
+    (4, '寻敌'),
+    (5, '什么也不做'),
+)
+TEAM_MC_LABELS = {v: t for v, t in TEAM_MC_CHOICES}
+TEAM_MC_NOTE = ('「心控结果」= 本小队的心控单位（尤里/脑车/心灵突击队）控制住敌方单位后，'
+                '那个**被控单位**的行为：0 随机 / 1 加入本小队 / 2 放入部队回收厂（换钱）/ '
+                '3 放入生化反应炉（发电）/ 4 **寻敌 —— 到处找敌人打** / 5 停在原地什么也不做。')
 TEAM_TAG_OFF = 0xE4        # TeamType.Tag —— **指向标签对象(TagType)的键**（0 = 没挂标签）
                            # ★2026-10-24 §247：与单位记录 +0x48（存 CellTag 运行期指针 X）不同，
                            #   小队这里直接存**标签对象键**，所以写起来只要标签键，不用管 X。
@@ -792,7 +831,11 @@ def set_team_flag(doc, team_id, flag, on=True):
 
 
 def set_team_mc_decision(doc, team_id, value):
-    """设置小队「**心控重建**」= `MindControlDecision`（`+0xD4`，dword）。
+    """设置小队「**心控结果/心控重建**」= `MindControlDecision`（`+0xD4`，dword）。
+
+    语义（§265 玩家订正）：**本小队的心控单位控制住敌方单位后，被控单位的行为** ——
+    0 随机 / 1 加入本小队 / 2 放入部队回收厂 / 3 放入生化反应炉 /
+    4 **寻敌（到处找敌人打）** / 5 什么也不做。
 
     依据（§235）：引擎写盘函数把 `MindControlDecision` 这个键绑在运行期 `+0xC0`
     （= 存档 `+0xD4`）且用读整数的方式（`0x5276d0`）；ALL01UMD.MAP 的 125 条小队
@@ -800,8 +843,10 @@ def set_team_mc_decision(doc, team_id, value):
     只写 4 字节，长度不变。
     """
     v = int(value)
-    if not (-1 <= v <= 0x7FFFFFFF):
-        raise ValueError('MindControlDecision 取值不合法：%r' % (value,))
+    if not (0 <= v <= 5):
+        raise ValueError('「心控结果」只有 0~5 六档（地编下拉）：0 随机 / 1 加入小队 / '
+                         '2 放入部队回收厂 / 3 放入生化反应炉 / 4 寻敌 / 5 什么也不做；'
+                         '收到 %r' % (value,))
     ai = read_ai(doc)
     t = next((x for x in ai['teams'] if x['id'] == str(team_id)), None)
     if t is None:
@@ -843,3 +888,123 @@ def remove_taskforce_member(doc, tf_id, index):
     return {'tf_id': tf['id'], 'name': tf['name'], 'index': idx,
             'old_n': n, 'new_n': n - 1, 'moved': moved,
             'removed': tf['members'][idx]}
+
+
+# ==================== ★§264 整组替换（给"双击编辑"用；一次读档一次写完） ====================
+SCRIPT_COUNT_OFF = 0xB4      # ScriptType 条目数
+SCRIPT_ENT_OFF = 0xB8        # 条目数组：(动作, 参数) ×50，每项 8 字节
+SCRIPT_MAX = 50              # 结构上限（§217 实测）
+
+
+def set_taskforce_units(doc, tf_id, units):
+    """**整组替换**特遣部队的成员（最多 6 种）。`units = [(型号名, 数量), ...]`。
+
+    ★为什么不用 `set_taskforce_member` 循环：那个函数每次调用都 `read_ai(doc)`
+      全档扫一遍（本档 5-6 秒），改 6 项就扫 6 次。这里一次读档、一次写完。
+    ★全部都是**定长字段**（`+0xB0` 种数 + `+0xB8` 起 8B×6），记录长度不变。
+    ★数量 <= 0 的项会被丢弃；剩余槽位**数量与型号键一起清零**（引擎按种数截断读，
+      清干净不留残值）。
+    """
+    ai = read_ai(doc)
+    tf = next((x for x in ai['taskforces'] if x['id'] == str(tf_id)), None)
+    if tf is None:
+        raise KeyError('这份存档里没有 ID 为 %r 的特遣部队（共 %d 个）'
+                       % (tf_id, len(ai['taskforces'])))
+    norm = []
+    for t, c in (units or []):
+        c = int(c)
+        if c <= 0:
+            continue
+        norm.append((str(t).strip().upper(), c))
+    if len(norm) > TF_MAX:
+        raise ValueError('特遣部队最多 %d 种型号（收到 %d）' % (TF_MAX, len(norm)))
+    pl = doc.plain
+    if not isinstance(pl, bytearray):
+        raise RuntimeError('doc.plain 不是可写 bytearray')
+    ix = _type_index(doc)
+    base = tf['off']
+    old_n = struct.unpack_from('<i', pl, base + TF_COUNT_OFF)[0]
+    keyed = []
+    for nm, c in norm:
+        k = ix.get(nm)
+        if k is None:
+            raise KeyError('档里找不到型号 %r 的类型对象（已知 %d 个）' % (nm, len(ix)))
+        keyed.append((nm, c, k & 0xFFFFFFFF))
+    for i in range(TF_MAX):
+        p = base + TF_MEM_OFF + 8 * i
+        if i < len(keyed):
+            _nm, c, k = keyed[i]
+            struct.pack_into('<i', pl, p, c)
+            struct.pack_into('<I', pl, p + 4, k)
+        else:
+            struct.pack_into('<i', pl, p, 0)
+            struct.pack_into('<I', pl, p + 4, 0)
+    struct.pack_into('<i', pl, base + TF_COUNT_OFF, len(keyed))
+    return {'tf_id': tf['id'], 'name': tf['name'], 'off': base,
+            'old_n': old_n, 'new_n': len(keyed),
+            'units': [(nm, c) for nm, c, _k in keyed]}
+
+
+def set_script_entries(doc, script_id, entries):
+    """**整段替换** ScriptType 的动作列表。`entries = [(动作, 参数), ...]`（最多 50）。
+
+    ★定长：`+0xB4` 条数 + `+0xB8` 起 8B×50，记录长度不变。
+      超出条数的槽位**清零**。
+    ★动作号是**脚本动作表**（`fa2_tables.SCRIPT_ACTIONS`），与触发「行为」表是两套编号。
+    """
+    ai = read_ai(doc)
+    sc = next((x for x in ai['scripts'] if x['id'] == str(script_id)), None)
+    if sc is None:
+        raise KeyError('这份存档里没有 ID 为 %r 的动作脚本（共 %d 个）'
+                       % (script_id, len(ai['scripts'])))
+    norm = []
+    for a, g in (entries or []):
+        norm.append((int(a), int(g)))
+    if len(norm) > SCRIPT_MAX:
+        raise ValueError('动作脚本最多 %d 条（收到 %d）' % (SCRIPT_MAX, len(norm)))
+    for a, _g in norm:
+        if not (0 <= a <= 200):
+            raise ValueError('动作号 %d 超出范围（0..200）' % a)
+    pl = doc.plain
+    if not isinstance(pl, bytearray):
+        raise RuntimeError('doc.plain 不是可写 bytearray')
+    base = sc['off']
+    old = struct.unpack_from('<i', pl, base + SCRIPT_COUNT_OFF)[0]
+    for i in range(SCRIPT_MAX):
+        p = base + SCRIPT_ENT_OFF + 8 * i
+        if i < len(norm):
+            a, g = norm[i]
+            struct.pack_into('<i', pl, p, a)
+            struct.pack_into('<i', pl, p + 4, g)
+        else:
+            struct.pack_into('<i', pl, p, 0)
+            struct.pack_into('<i', pl, p + 4, 0)
+    struct.pack_into('<i', pl, base + SCRIPT_COUNT_OFF, len(norm))
+    return {'script_id': sc['id'], 'name': sc['name'], 'off': base,
+            'old_n': old, 'new_n': len(norm)}
+
+
+def set_ai_name(doc, kind, ident, name):
+    """改 AI 三大件的**名称**（`+0x78`，48 字节，gbk）。
+
+    `kind`：`'team'` / `'taskforce'` / `'script'`；`ident` 是它们的 8 位 ID。
+    ★定长字段：只写这 48 字节（先整段清零再写），记录长度不变。
+    """
+    field = {'team': 'teams', 'taskforce': 'taskforces', 'script': 'scripts'}.get(kind)
+    if field is None:
+        raise ValueError("kind 只能是 'team' / 'taskforce' / 'script'（收到 %r）" % (kind,))
+    ai = read_ai(doc)
+    obj = next((x for x in ai[field] if x['id'] == str(ident)), None)
+    if obj is None:
+        raise KeyError('这份存档里没有 ID 为 %r 的 %s（共 %d 个）'
+                       % (ident, kind, len(ai[field])))
+    raw = str(name or '')[:NAME_LEN - 1].encode('gbk', 'ignore')[:NAME_LEN - 1]
+    pl = doc.plain
+    if not isinstance(pl, bytearray):
+        raise RuntimeError('doc.plain 不是可写 bytearray')
+    o = obj['off'] + NAME_OFF
+    old = _dec(pl[o:o + NAME_LEN])
+    pl[o:o + NAME_LEN] = b'\x00' * NAME_LEN
+    pl[o:o + len(raw)] = raw
+    return {'kind': kind, 'id': obj['id'], 'off': obj['off'],
+            'old': old, 'new': str(name or '')}

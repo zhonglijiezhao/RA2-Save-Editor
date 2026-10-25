@@ -5291,7 +5291,7 @@ class SaveDoc(object):
     # ---------------- ★§258 作战小队全字段（仿地编对话框） ----------------
     # 记录 268B 的字段布局（与地编 INI 键的对应关系见 §235 / §252.17 / §258 对账）：
     #   名字 +0x78(48B GBK) / 分组 +0xB0 / 星级 +0xB4 / 优先级 +0xC8 / 最大 +0xCC
-    #   心控结局 +0xD4 / 国家 +0xD8(键) / 关联标签 +0xE4(键) / 出现于 +0xE8(路径点号)
+    #   心控结果 +0xD4（MindControlDecision，0~5，§265） / 国家 +0xD8(键) / 关联标签 +0xE4(键) / 出现于 +0xE8(路径点号)
     #   动作脚本 +0xF4(键) / 特遣部队 +0xF8(键)
     # 布尔标志一字节一个，见 `ai_objects.TEAM_FLAGS`（16 个，地编带 * 的 11 个都在里面）。
     TEAM_FIELD_OFF = {
@@ -5323,7 +5323,7 @@ class SaveDoc(object):
     TEAM_UNKNOWN_FIELDS = {
         'tech_level': ('科技等级', '0..10；本档 125 个小队全是 0 ⇒ 对账不出偏移'),
         # ★§261 「用于基地防御」**已定案**（`IsBaseDefense` = u8 `+0x10A`），移出本表
-        'only_target_house_enemy': ('仅攻击敌方或敌对（*）', '同上'),
+        # ★§263 「仅攻击敌方或敌对」**已定案**（`OnlyTargetHouseEnemy` = u8 `+0x10B`），移出本表
         # ★§260 「小队成员可被重组」**已定案**（`AreTeamMembersRecruitable` = u8 `+0x109`），移出本表
         'transports_return_on_unload': ('运输机下客后返回', '同上'),
         'ion_immune': ('无视离子风暴', '同上'),

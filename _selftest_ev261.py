@@ -107,6 +107,34 @@ ck(len(sem) >= 10,
    '★至少 10 支名字含 Base/Defense/Guard（实际 %d/%d）' % (len(sem), len(on)), sem)
 ck(any(nm == 'AAAAA' for _s, nm in on), '玩家勾的那支 AAAAA 在里面')
 
+# ---------- D2. 第二份独立存档复现（不同局、键全不同，结论必须一致） ----------
+print('\n[D2] 第二份独立存档复现（SAVE6DF1：同样只有 AAAAA 勾「基地防御」）')
+p2 = find_sav('SAVE6DF1.SAV')
+if os.path.isfile(p2):
+    n2 = ec.SaveDoc(p2)
+    npl = n2.plain
+    nrec = {t['sid']: t for t in n2.team_types()}
+    got2 = {sid: n2.team_detail(sid)['flags'].get(FLD) for sid, _n in SIDS}
+    ck(got2 == {'01000002': True, '01000003': False, '01000004': False},
+       '★读出与玩家描述一致（只有 AAAAA 勾）', got2)
+
+    o2n, o3n, o4n = (nrec[s]['off'] for s, _n in SIDS)
+    hits2 = [off for off in range(268)
+             if npl[o2n + off] == 1 and npl[o3n + off] == 0 and npl[o4n + off] == 0]
+    ck(hits2 == [0x10A], '★第二份档里值向量仍**唯一命中** +0x10A',
+       ['%#x' % x for x in hits2[:8]])
+
+    same = all(
+        [npl[nrec[s]['off'] + 0x109], npl[nrec[s]['offset'] if False else nrec[s]['off'] + 0x10A]]
+        == [docs['1649'][0].plain[
+                next(t['off'] for t in docs['1649'][0].team_types() if t['sid'] == s) + 0x109],
+            docs['1649'][0].plain[
+                next(t['off'] for t in docs['1649'][0].team_types() if t['sid'] == s) + 0x10A]]
+        for s, _n in SIDS)
+    ck(same, '★两份档的 (+0x109, +0x10A) 三支全一致（换局换键，结论不变）')
+else:
+    ck(True, '（跳过：SAVE6DF1.SAV 不在）')
+
 # ---------- E. 读：与玩家描述一致 ----------
 print('\n[E] 读（玩家：AAAAA 勾了用于基地防御，另两支未改）')
 for sid, nm in SIDS:

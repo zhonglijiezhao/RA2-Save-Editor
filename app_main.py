@@ -805,9 +805,15 @@ def aiflag(args):
 
 
 def aimc(args):
-    """--aimc <in> <out> <小队ID> <值>：改小队「心控重建」= MindControlDecision（+0xD4）。"""
+    """--aimc <in> <out> <小队ID> <值>：改小队「心控结果」= MindControlDecision（+0xD4）。
+
+    取值 = FA2 地编「心控结果」下拉（§265，逐字）：0 随机 / 1 加入小队 /
+    2 放入部队回收厂 / 3 放入生化反应炉 / 4 寻敌（到处找敌人打）/ 5 什么也不做。
+    """
     if len(args) < 4:
-        _write_report('AIMC FAIL\n用法: --aimc <in> <out> <小队ID> <值>（0=关，1/2=开）')
+        _write_report('AIMC FAIL\n用法: --aimc <in> <out> <小队ID> <值>\n'
+                      '值：0 随机 / 1 加入小队 / 2 放入部队回收厂 / 3 放入生化反应炉 / '
+                      '4 寻敌 / 5 什么也不做')
         return 2
     src, out, tid = args[0], args[1], args[2]
     try:
@@ -825,8 +831,9 @@ def aimc(args):
         t = next(x for x in ai_objects.read_ai(e)['teams'] if x['id'] == tid)
         _write_report('\n'.join([
             'AIMC PASS', 'src: %s' % src, 'out: %s' % out,
-            '小队 %s「%s」心控重建 %d → %d（写 +0x%X）'
+            '小队 %s「%s」心控结果 %d → %d（%s）写 +0x%X'
             % (info['team_id'], info['name'], info['old'], info['new'],
+               ai_objects.TEAM_MC_LABELS.get(info['new'], '?'),
                ai_objects.TEAM_MC_OFF),
             '保存：块 %d/%d %s' % (r['blocks'], r['blocks_expect'], r['writer']),
             '回验：MindControlDecision=%d' % t.get('mc_decision', -999)]))

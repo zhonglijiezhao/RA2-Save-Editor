@@ -5745,6 +5745,9 @@ class App(tk.Tk):
             self.tat.column(c, width=w, anchor=a)
         self.tat.pack(fill='both', expand=True)
         self.tat.bind('<<TreeviewSelect>>', lambda e: self._ai_pick('team'))
+        # ★§264 玩家要求：**双击一行 ⇒ 直接打开「作战小队」对话框改这一支**
+        self.tat.bind('<Double-1>', self._ai_team_dblclick)
+        self.tat.configure(cursor='hand2')      # 提示"这行能点"
         sub.add(f1, text='  作战小队 TeamType  ')
 
         # ② 特遣部队
@@ -5758,6 +5761,9 @@ class App(tk.Tk):
             self.tft.column(c, width=w, anchor=a)
         self.tft.pack(fill='both', expand=True)
         self.tft.bind('<<TreeviewSelect>>', lambda e: self._ai_pick('tf'))
+        # ★§264 双击 ⇒ 直接改这一支特遣部队
+        self.tft.bind('<Double-1>', self._ai_tf_dblclick)
+        self.tft.configure(cursor='hand2')
         # ★2026-10-18 第二步写入：改「数量 / 型号」（定长槽位 +0xB8 + 8×序号）
         # ★2026-10-19 仿 FA2「特遣部队」对话框：成员列表 + 数目/类型 + 添加/删除/应用
         box = ttk.LabelFrame(f2, text='选中的特遣部队（成员表，仿地编样式）', padding=6)
@@ -5815,6 +5821,9 @@ class App(tk.Tk):
             self.tst.column(c, width=w, anchor=a)
         self.tst.pack(fill='both', expand=True)
         self.tst.bind('<<TreeviewSelect>>', lambda e: self._ai_pick('script'))
+        # ★§264 双击 ⇒ 直接改这一段脚本
+        self.tst.bind('<Double-1>', self._ai_script_dblclick)
+        self.tst.configure(cursor='hand2')
         sub.add(f3, text='  动作脚本 ScriptType  ')
 
         # ★2026-10-18 第一步写入：只改「老兵等级」这一个定长字段（+0xB4，4 字节）
@@ -6087,7 +6096,9 @@ class App(tk.Tk):
             L.append('  标志：' + '　'.join(
                 '%s=%s' % (ai_objects.TEAM_FLAG_LABELS.get(k, k), '是' if v else '否')
                 for k, v in t['flags'].items()))
-            L.append('  心控重建（MindControlDecision）= %d' % t.get('mc_decision', 0))
+            _mcv = int(t.get('mc_decision', 0) or 0)
+            L.append('  心控结果（MindControlDecision）= %d（%s）'
+                     % (_mcv, ai_objects.TEAM_MC_LABELS.get(_mcv, '未定义')))
             L.append('  关联标签 = %s（+0xE4；挂上后该标签上的触发会把本队当事件对象）'
                      % (t.get('tag_id') or '（无）'))
             L.append('  明文偏移 +%#x（只读）' % t['off'])
@@ -6224,10 +6235,14 @@ class App(tk.Tk):
         except Exception:
             return []
 
-    def _dlg_tf(self, name='新特遣部队', units=None):
-        """特遣部队对话框（仿地编：名称 / 分组 / 单位列表 / 添加 / 删除 / 数目 / 类型）。"""
+    def _dlg_tf(self, name='新特遣部队', units=None, ident=None):
+        """特遣部队对话框（仿地编：名称 / 分组 / 单位列表 / 添加 / 删除 / 数目 / 类型）。
+
+        ★§264：给了 `ident`（特遣的 8 位 ID）= **编辑已有的那一支**（表格里双击进来的）；
+          不给 = 新建。`units` 格式 `[(数量, 型号), ...]`。
+        """
         units = [list(u) for u in (units or [])]
-        win = self._mk_modal('特遣部队', 560, 430)
+        win = self._mk_modal(('编辑特遣部队 %s' % ident) if ident else '特遣部队', 560, 430)
         top = ttk.Frame(win, padding=8)
         top.pack(fill='x')
         ttk.Label(top, text='名称').pack(side='left')
@@ -6300,7 +6315,8 @@ class App(tk.Tk):
                 messagebox.showwarning('特遣部队', '至少要有一个单位', parent=win)
                 return
             res.update({'name': v_name.get().strip() or '新特遣部队',
-                        'units': [(u[1], int(u[0])) for u in units]})
+                        'units': [(u[1], int(u[0])) for u in units],
+                        'ident': ident})
             win.destroy()
 
         ttk.Button(bar, text='确定', command=ok).pack(side='right', padx=4)
@@ -6308,8 +6324,11 @@ class App(tk.Tk):
         self.wait_window(win)
         return res or None
 
-    def _dlg_script(self, name='新脚本', entries=None):
-        """动作脚本对话框（仿地编：行为列表 + 行为类型(中文名) + 参数 + 行为描述）。"""
+    def _dlg_script(self, name='新脚本', entries=None, ident=None):
+        """动作脚本对话框（仿地编：行为列表 + 行为类型(中文名) + 参数 + 行为描述）。
+
+        ★§264：给了 `ident` = **编辑已有的那一段脚本**（表格里双击进来的）；不给 = 新建。
+        """
         try:
             import script_actions as sa          # 只有"行为描述"
         except Exception:
@@ -6322,7 +6341,7 @@ class App(tk.Tk):
         def _nm(i):
             return _ft.script_action_name(int(i)) if _ft else '#%d' % int(i)
         entries = [list(e) for e in (entries or [])]
-        win = self._mk_modal('动作脚本', 820, 540)
+        win = self._mk_modal(('编辑动作脚本 %s' % ident) if ident else '动作脚本', 820, 540)
         top = ttk.Frame(win, padding=8)
         top.pack(fill='x')
         ttk.Label(top, text='名称').pack(side='left')
@@ -6432,12 +6451,14 @@ class App(tk.Tk):
         res = {}
 
         def ok():
-            if not entries:
+            # 新建时必须至少一条；★编辑已有的允许清空（= 把这段脚本改成空脚本）
+            if not entries and not ident:
                 messagebox.showwarning('动作脚本', '至少加一条动作（要"原地待命"就别建脚本）',
                                        parent=win)
                 return
             res.update({'name': v_name.get().strip() or '新脚本',
-                        'entries': [(int(a), int(g) & 0xFFFFFFFF) for a, g in entries]})
+                        'entries': [(int(a), int(g) & 0xFFFFFFFF) for a, g in entries],
+                        'ident': ident})
             win.destroy()
 
         ttk.Button(bar2, text='确定', command=ok).pack(side='right', padx=4)
@@ -6461,10 +6482,12 @@ class App(tk.Tk):
         ('Whiner', '忽视阻拦*', True),
         ('AreTeamMembersRecruitable', '小队成员可被重组*', True),   # ★§260 定案 +0x109
         ('IsBaseDefense', '用于基地防御*', True),          # ★§261 定案 +0x10A
-        ('OnlyTargetHouseEnemy', '仅攻击敌方或敌对*', False),
+        ('OnlyTargetHouseEnemy', '仅攻击敌方或敌对*', True),   # ★§263 定案 +0x10B
     )
-    TEAM_MC_CHOICES = [(0, '0 - 随机'), (1, '1 - 我方基地'), (2, '2 - 敌方基地'),
-                       (3, '3 - 最短路径'), (4, '4 - 最富'), (5, '5 - 其他')]
+    # ★§265：取值与中文名**逐字照 FA2 地编「心控结果」下拉**（玩家 2026-10-25 订正）。
+    #   旧版错填成「我方基地/敌方基地/最短路径/最富/其他」—— 那是 AI 任务目标列表，
+    #   地编里没有这几项。真实语义：本小队心控单位控制的敌方单位，接下来干什么。
+    TEAM_MC_CHOICES = [(v, '%d - %s' % (v, t)) for v, t in ai_objects.TEAM_MC_CHOICES]
 
     def _team_defs(self):
         """地图定义的作战小队 [(显示名, sid, key)]。"""
@@ -6559,8 +6582,8 @@ class App(tk.Tk):
             row=6, column=3, sticky='w', padx=6)
         lab(7, 0, '小队出现于（路径点号）')
         ttk.Entry(g, textvariable=v_wp, width=10).grid(row=7, column=1, sticky='w', padx=6)
-        lab(7, 2, '心控结局')
-        cb_mc = ttk.Combobox(g, textvariable=v_mc, width=14, state='readonly',
+        lab(7, 2, '心控结果')
+        cb_mc = ttk.Combobox(g, textvariable=v_mc, width=22, state='readonly',
                              values=[x[1] for x in self.TEAM_MC_CHOICES])
         cb_mc.grid(row=7, column=3, sticky='w', padx=6)
         # ★§259：运输机起始（TransportWaypoint，`+0xEC`）。勾了「运输机空投」才有意义。
@@ -6568,10 +6591,13 @@ class App(tk.Tk):
         ttk.Entry(g, textvariable=v_twp, width=10).grid(row=8, column=1, sticky='w', padx=6)
         lbl_twp = ttk.Label(g, text='', foreground='#6b7280')
         lbl_twp.grid(row=8, column=2, columnspan=2, sticky='w', padx=6)
+        ttk.Label(g, text='★' + ai_objects.TEAM_MC_NOTE,
+                  foreground='#1d4ed8', wraplength=640, justify='left').grid(
+            row=9, column=0, columnspan=4, sticky='w', pady=(2, 0))
         ttk.Label(g, text='★「运输机起始」= 空投飞机**起飞**的路径点，只有勾了「运输机空投*」才有意义；'
                           '-1 = 未设置（地编显示 None），0 是合法路径点',
                   foreground='#1d4ed8', wraplength=640, justify='left').grid(
-            row=9, column=0, columnspan=4, sticky='w', pady=(2, 0))
+            row=10, column=0, columnspan=4, sticky='w', pady=(2, 0))
 
         # ---- 复选框（只放带 * 的）----
         box = ttk.Labelframe(win, text='小队标志（地编里带 * 的才有用）', padding=8)
@@ -6786,32 +6812,71 @@ class App(tk.Tk):
                             parent=self)
 
     def _ai_new_tf(self):
-        """新建一个特遣部队（只建特遣，不动小队/触发）。"""
+        """按钮入口：新建一个特遣部队（只建特遣，不动小队/触发）。"""
+        self._ai_tf_dialog()
+
+    def _ai_tf_dialog(self, ident=None):
+        """「特遣部队」对话框：`ident=None` 新建；给了 ident 就是**改已有的那一支**（§264 双击进来）。
+
+        ★改已有用的是 `ai_objects.set_taskforce_units()`：一次读档、一次写完
+          （`set_taskforce_member` 每调一次都要全档扫，改 6 项太慢）。
+        """
         if not self.doc:
             messagebox.showwarning('提示', '请先打开一个存档')
             return
-        v = self._dlg_tf()
+        name, units = '新特遣部队', []
+        if ident:
+            tf = next((x for x in self.doc.taskforces() if x['sid'] == str(ident)), None)
+            if tf is None:
+                messagebox.showwarning('编辑特遣部队', '找不到特遣部队 %s' % ident)
+                return
+            name = tf['name']
+            units = [(int(u['count']), u['type']) for u in (tf.get('units') or [])]
+        v = self._dlg_tf(name=name, units=units, ident=ident)
         if not v:
             return
         try:
-            r = self.doc.clone_taskforce(v['units'], name=v['name'])
+            if v.get('ident'):
+                import ai_objects as _aio
+                res = _aio.set_taskforce_units(self.doc, v['ident'], v['units'])
+                if v['name'] and v['name'] != name:
+                    _aio.set_ai_name(self.doc, 'taskforce', v['ident'], v['name'])
+                sid, nm = v['ident'], (v['name'] or name)
+            else:
+                r = self.doc.clone_taskforce(v['units'], name=v['name'])
+                sid, nm = r['sid'], r['name']
         except Exception as e:
-            messagebox.showerror('新建特遣部队失败', str(e))
+            messagebox.showerror('保存特遣部队失败', str(e))
             return
-        self._fill_ai_all()
-        self.status.set('已新建特遣部队 %s「%s」' % (r['sid'], r['name']))
-        messagebox.showinfo('新建特遣部队',
-                            '已新建特遣部队\n\nID：%s\n名称：%s\n成员：%s\n\n'
-                            '下一步：在「＋ 作战小队」里选它。'
-                            % (r['sid'], r['name'],
-                               '、'.join('%s×%d' % (t, n) for t, n in v['units'])))
+        self._lists_dirty = True
+        self.refresh_ai()
+        self.status.set('%s特遣部队 %s「%s」（尚未保存）'
+                        % ('已修改' if v.get('ident') else '已新建', sid, nm))
+        if not v.get('ident'):
+            messagebox.showinfo('新建特遣部队',
+                                '已新建特遣部队\n\nID：%s\n名称：%s\n成员：%s\n\n'
+                                '下一步：在「✏ 作战小队…」里选它。'
+                                % (sid, nm,
+                                   '、'.join('%s×%d' % (t, n) for t, n in v['units'])))
 
     def _ai_new_script(self):
-        """新建一段动作脚本（ScriptType）。"""
+        """按钮入口：新建一段动作脚本（ScriptType）。"""
+        self._ai_script_dialog()
+
+    def _ai_script_dialog(self, ident=None):
+        """「动作脚本」对话框：`ident=None` 新建；给了 ident 就是**改已有的那一段**（§264 双击进来）。"""
         if not self.doc:
             messagebox.showwarning('提示', '请先打开一个存档')
             return
-        v = self._dlg_script()
+        name, entries = '新脚本', []
+        if ident:
+            sc = next((x for x in self.doc.script_types() if x['sid'] == str(ident)), None)
+            if sc is None:
+                messagebox.showwarning('编辑动作脚本', '找不到动作脚本 %s' % ident)
+                return
+            name = sc['name']
+            entries = [(int(e['action']), int(e['arg'])) for e in (sc.get('entries') or [])]
+        v = self._dlg_script(name=name, entries=entries, ident=ident)
         if not v:
             return
         try:
@@ -6819,17 +6884,101 @@ class App(tk.Tk):
         except Exception:
             _ft = None
         try:
-            r = self.doc.clone_script(v['entries'], name=v['name'])
+            if v.get('ident'):
+                import ai_objects as _aio
+                res = _aio.set_script_entries(self.doc, v['ident'], v['entries'])
+                if v['name'] and v['name'] != name:
+                    _aio.set_ai_name(self.doc, 'script', v['ident'], v['name'])
+                sid, nm, cnt = v['ident'], (v['name'] or name), res['new_n']
+            else:
+                r = self.doc.clone_script(v['entries'], name=v['name'])
+                sid, nm, cnt = r['sid'], r['name'], r['count']
         except Exception as e:
-            messagebox.showerror('新建动作脚本失败', str(e))
+            messagebox.showerror('保存动作脚本失败', str(e))
             return
-        self._fill_ai_all()
-        self.status.set('已新建动作脚本 %s「%s」' % (r['sid'], r['name']))
-        messagebox.showinfo('新建动作脚本',
-                            '已新建动作脚本\n\nID：%s\n名称：%s\n条数：%d\n%s'
-                            % (r['sid'], r['name'], r['count'],
-                               '、'.join('%s(%s)' % ((_ft.script_action_name(a) if _ft else a), g)
-                                        for a, g in v['entries'])))
+        self._lists_dirty = True
+        self.refresh_ai()
+        self.status.set('%s动作脚本 %s「%s」%d 条（尚未保存）'
+                        % ('已修改' if v.get('ident') else '已新建', sid, nm, cnt))
+        if not v.get('ident'):
+            messagebox.showinfo('新建动作脚本',
+                                '已新建动作脚本\n\nID：%s\n名称：%s\n条数：%d\n%s'
+                                % (sid, nm, cnt,
+                                   '、'.join('%s(%s)' % ((_ft.script_action_name(a) if _ft else a), g)
+                                            for a, g in v['entries'])))
+
+    def _ai_tf_dblclick(self, event):
+        """双击「特遣部队」表格的一行 ⇒ 改这一支（§264）。"""
+        tv = event.widget
+        try:
+            iid = tv.identify_row(event.y)
+        except Exception:
+            iid = ''
+        if not iid:
+            return
+        try:
+            tv.selection_set(iid)
+            tv.focus(iid)
+        except Exception:
+            pass
+        self._ai_tf_dialog(iid)
+
+    def _ai_script_dblclick(self, event):
+        """双击「动作脚本」表格的一行 ⇒ 改这一段（§264）。"""
+        tv = event.widget
+        try:
+            iid = tv.identify_row(event.y)
+        except Exception:
+            iid = ''
+        if not iid:
+            return
+        try:
+            tv.selection_set(iid)
+            tv.focus(iid)
+        except Exception:
+            pass
+        self._ai_script_dialog(iid)
+
+    def _ai_team_dblclick(self, event):
+        """双击「作战小队」表格里的一行 ⇒ 打开「作战小队」对话框编辑这一支（★§264）。
+
+        玩家 2026-10-25：这个界面里点一行只能看明细，要改还得走别的入口
+        ⇒ 双击就该能直接改。
+
+        ★用 `identify_row(event.y)` 取被双击的那一行，**不用** `selection()`：
+          双击时"选中变化"和"双击"两个事件的先后顺序不保证，按坐标定位才稳。
+        ★双击表头 / 空白区（`identify_row` 返回空串）直接忽略。
+        """
+        tv = event.widget
+        try:
+            iid = tv.identify_row(event.y)
+        except Exception:
+            iid = ''
+        if not iid:
+            return
+        try:
+            tv.selection_set(iid)
+            tv.focus(iid)
+        except Exception:
+            pass
+        # 先把明细/下拉同步到这一支（对话框的初始状态要用）
+        self._ai_syncing = False
+        try:
+            self._ai_pick('team')
+        except Exception:
+            pass
+        try:
+            r = self._dlg_team(ident=iid)
+        except Exception as e:
+            messagebox.showerror('打开失败', str(e))
+            return
+        if r and r.get('saved'):
+            try:
+                self._ai_select(self.tat, iid)
+                self._ai_pick('team')
+            except Exception:
+                pass
+            self.status.set('已修改小队 %s（尚未保存，回主窗口「保存」才写盘）' % iid)
 
     def _ai_new_team(self):
         """打开「作战小队」对话框（仿地编：新建 / 复制 / 编辑全字段，§258）。"""
@@ -7442,10 +7591,11 @@ class App(tk.Tk):
         ttk.Button(bar, text='应用', command=apply).pack(side='right')
 
     def _ai_flags_dialog(self):
-        """§235：小队 16 个布尔标志 + 「心控重建」一屏编辑。
+        """§235：小队 16 个布尔标志 + 「心控结果」一屏编辑。
 
         依据：引擎写盘函数 `0x6F10E0–0x6F13C0`（键 ↔ 偏移）+ ALL01UMD.MAP 125 条小队
-        对账 125/125。**每个标志是 1 个字节**（不是位域），心控重建是 `+0xD4` 的 dword。
+        对账 125/125。**每个标志是 1 个字节**（不是位域），心控结果是 `+0xD4` 的 dword。
+        取值 = FA2 地编「心控结果」下拉 6 档（§265）。
         只改勾选项：先比对、只写有变化的那些字节。
         """
         if not self.doc or not getattr(self, '_ai', None):
@@ -7482,12 +7632,18 @@ class App(tk.Tk):
         r0 = 1 + (len(order) + 3) // 4
         ttk.Separator(frm, orient='horizontal').grid(
             row=r0, column=0, columnspan=4, sticky='ew', pady=8)
-        ttk.Label(frm, text='心控重建（MindControlDecision）：').grid(
+        ttk.Label(frm, text='心控结果（MindControlDecision）：').grid(
             row=r0 + 1, column=0, columnspan=2, sticky='w')
-        mc = tk.StringVar(value=str(t.get('mc_decision', 0)))
-        ttk.Entry(frm, textvariable=mc, width=8).grid(row=r0 + 1, column=2, sticky='w')
-        ttk.Label(frm, text='0=关；1/2=开（+0xD4，4 字节）',
-                  foreground='#6b7280').grid(row=r0 + 1, column=3, sticky='w')
+        # ★§265：改成下拉（地编同名 6 档），不再让人手打数字
+        _mc0 = next((x[1] for x in self.TEAM_MC_CHOICES
+                     if x[0] == t.get('mc_decision', 0)), self.TEAM_MC_CHOICES[0][1])
+        mc = tk.StringVar(value=_mc0)
+        ttk.Combobox(frm, textvariable=mc, width=20, state='readonly',
+                     values=[x[1] for x in self.TEAM_MC_CHOICES]).grid(
+            row=r0 + 1, column=2, columnspan=2, sticky='w')
+        ttk.Label(frm, text='= 本小队心控单位控制住的敌方单位接下来做什么（+0xD4，4 字节）',
+                  foreground='#6b7280').grid(row=r0 + 2, column=0, columnspan=4,
+                                             sticky='w', pady=(2, 0))
 
         def apply():
             changed, failed = [], []
@@ -7501,17 +7657,14 @@ class App(tk.Tk):
                                               '是' if want else '否'))
                 except Exception as e:
                     failed.append('%s：%s' % (name, e))
-            try:
-                mv = int(mc.get())
-            except ValueError:
-                failed.append('心控重建不是整数')
-                mv = None
+            mv = next((x[0] for x in self.TEAM_MC_CHOICES if x[1] == mc.get()), None)
             if mv is not None and mv != int(t.get('mc_decision', 0)):
                 try:
                     ai_objects.set_team_mc_decision(self.doc, sid, mv)
-                    changed.append('心控重建=%d' % mv)
+                    changed.append('心控结果=%d（%s）'
+                                   % (mv, ai_objects.TEAM_MC_LABELS.get(mv, '')))
                 except Exception as e:
-                    failed.append('心控重建：%s' % e)
+                    failed.append('心控结果：%s' % e)
             if failed:
                 messagebox.showerror('部分没改成', '\n'.join(failed), parent=win)
             if not changed:

@@ -43,8 +43,8 @@ print('小队 %d 个' % len(teams))
 
 print('\n=== [1] 结构：16 个标志 + 心控字段都在 ===')
 t0 = teams[0]
-# ★§260/§261：新增 AreTeamMembersRecruitable(+0x109)、IsBaseDefense(+0x10A) ⇒ 16 → 18
-ck('flags 键数 = 18', len(t0['flags']) == 18, len(t0['flags']))
+# ★§260/§261/§263：+0x109 可重组、+0x10A 基地防御、+0x10B 仅攻击敌对 ⇒ 16 → 19
+ck('flags 键数 = 19', len(t0['flags']) == 19, len(t0['flags']))
 ck('名字与 TEAM_FLAGS 完全一致',
    set(t0['flags']) == set(ai_objects.TEAM_FLAGS.values()),
    set(t0['flags']) ^ set(ai_objects.TEAM_FLAGS.values()))
