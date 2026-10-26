@@ -3359,6 +3359,30 @@ class App(tk.Tk):
         self.mv_units = tk.BooleanVar(value=False)
         ttk.Checkbutton(row2, text='单位（≥20 倍）', variable=self.mv_units,
                         command=self._mv_toggle_units).pack(side='left', padx=(0, 6))
+        # ★★§280：地形来源（玩家："地形是不会变的，能不能把 map 的地形直接映射过来"）
+        #   · 地图（默认）—— 完全用 .MAP 的 `[IsoMapPack5]`，**与存档无关**：换哪份存档都是同一张地形
+        #   · 地图+存档补格 —— 地图为主，地图里没有的格（本档 179 个）用存档格对象补上，消掉空洞
+        #   · 存档 —— 只用存档格对象的 `+0x4C/+0x12F`（游戏运行期算完的结果，与游戏画面最接近）
+        #   没 .MAP（或解析失败）时**自动**降级到"存档"，并在标题栏写明。
+        # ★§281：Terrain 对象（树/石头/路牌）标记 —— 默认**关**（一张图动辄 3000+ 棵），
+        #   勾上就在地形图上画深绿圆点。树会占格（+0x138 的 0x10 位），跟"能不能放东西"直接相关。
+        self.mv_terr = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text='树/石', variable=self.mv_terr,
+                        command=self.mv_render).pack(side='left', padx=(0, 6))
+        # ★§283：覆盖物标记 —— 默认**开**（玩家 2026-10-26："画出来"）。
+        #   金黄点=矿/宝石、灰块=墙/沙袋/铁丝网、褐色点=石头、蓝线=桥面/铁轨，其余小灰点。
+        self.mv_ovl = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row2, text='覆盖物', variable=self.mv_ovl,
+                        command=self.mv_render).pack(side='left', padx=(0, 6))
+        ttk.Label(row2, text='地形：').pack(side='left', padx=(8, 0))
+        self.mv_terr_src = tk.StringVar(value='地图')
+        _cb_terr = ttk.Combobox(row2, textvariable=self.mv_terr_src, width=13,
+                                state='readonly', values=('地图', '地图+存档补格', '存档'))
+        _cb_terr.pack(side='left')
+        self.mv_terr_src.trace_add('write', self._mv_on_terr_src)
+        # 兼容旧代码/自检：`mv_src_save` 现在由下拉派生（True ⇔ 档位 = "存档"），不再单独占界面
+        self.mv_src_save = tk.BooleanVar(value=False)
+        self.mv_src_save.trace_add('write', self._mv_on_src_save)
         ttk.Button(row2, text='重绘', command=self.mv_render).pack(side='left', padx=6)
         ttk.Label(row2, text='（点格子选位：红=已占 / 深红细线=高度差(悬崖/斜坡) / 暗色=地图外）',
                   foreground='#6b7280').pack(side='left', padx=8)
@@ -3582,6 +3606,18 @@ class App(tk.Tk):
         """
         st = self.mv_state
         st['path'] = path
+        st['map_err'] = None
+        mode = self._mv_terr_mode()          # 'map' / 'merge' / 'save'
+        theater = None
+        if mode != 'save':
+            try:
+                import map_render as _mr0
+                theater = _mr0.parse_map(path).get('theater')
+            except Exception:
+                theater = None
+        if not theater:
+            theater = getattr(self, 'mv_theater', None) or 'NEWURBAN'
+        self.mv_theater = theater
         st['gdata'] = None          # 换地图/换档 ⇒ 缓存的建筑/单位/路径点全部作废
         st['wpdata'] = None
         st['udata'] = None
@@ -3591,17 +3627,49 @@ class App(tk.Tk):
             mt = self.doc.map_match(path)
         except Exception as e:
             mt = {'ok': False, 'msg': '匹配校验没跑通（不影响使用）：%s' % e}
-        try:
-            import map_render as mr
-            mp = mr.parse_map(path)
-        except Exception as e:
-            st['ok'] = False
-            st['mp'] = None
-            self.mv_fit()              # 落回网格模式
-            self.mv_lbl.config(text='地图读取失败，已退回网格模式（放建筑不受影响）：%s' % e,
-                               foreground='#b91c1c')
-            self.status.set('地图读取失败：%s' % e)
-            return
+        import map_render as mr
+        mp = None
+        src = mode
+        filled = 0
+        if mode != 'save':
+            try:
+                mp = mr.parse_map(path)
+            except Exception as e:
+                mp = None
+                st['map_err'] = str(e)
+        if mp is not None and mode == 'merge':
+            # ★§280「地图+存档补格」：地图是底图（永远不变），存档只补地图里没有的格。
+            #   本档实测：地图 42901 格 ⊆ 存档 43080 格，补 179 格（178 个 tile=0 + 1 个 138）。
+            try:
+                _sv = self.doc.terrain_from_save(theater)
+            except Exception:
+                _sv = None
+            if _sv:
+                _tr = dict(mp['terrain'])
+                for _xy, _v in _sv['terrain'].items():
+                    if _xy not in _tr:
+                        _tr[_xy] = _v
+                        filled += 1
+                mp = dict(mp)
+                mp['terrain'] = _tr
+                mp['size'] = (max(mp['size'][0], _sv['size'][0]),
+                              max(mp['size'][1], _sv['size'][1]))
+                mp['has_terrain'] = True
+        if mp is None:
+            # ★★§278：地图读不到（或用户强制）⇒ 用**存档自己**的格对象重建地形。
+            #   实测与 .MAP 渲染只差 1.10% 像素（差的那些是引擎挑的 tile 变体，见 docs §279）。
+            try:
+                mp = self.doc.terrain_from_save(theater)
+                src = 'save'
+            except Exception as e:
+                st['ok'] = False
+                st['mp'] = None
+                self.mv_fit()              # 落回网格模式
+                self.mv_lbl.config(text='地图读取失败，已退回网格模式（放建筑不受影响）：%s' % e,
+                                   foreground='#b91c1c')
+                self.status.set('地图读取失败：%s' % e)
+                return
+        st['src'] = src
         st['mp'] = mp
         self.status.set('正在读取存档建筑…')
         self.update_idletasks()
@@ -3614,8 +3682,18 @@ class App(tk.Tk):
                             max(st['mp']['size'][1], min(cl[1], 2 * mp_sz[1])))
         st['ok'] = True
         ok = bool(mt.get('ok'))
-        self.mv_lbl.config(text='%s ｜ %s%s' % (os.path.basename(path), mt.get('msg', ''),
-                                               self._mv_ready_text()),
+        _srctxt = ''
+        if src == 'save':
+            _srctxt = (' ｜ ⚠ 地形取自**存档**（%s；theater 按 %s）'
+                       % ('没读到 .MAP: ' + st['map_err'] if st.get('map_err') else '手动选择', theater))
+            ok = False
+        elif src == 'merge':
+            _srctxt = ' ｜ 地形 = .MAP 底图 + 存档补 %d 格' % filled
+        else:
+            _srctxt = ' ｜ 地形取自 .MAP（与存档无关）'
+        st['filled'] = filled
+        self.mv_lbl.config(text='%s ｜ %s%s%s' % (os.path.basename(path), mt.get('msg', ''),
+                                                 _srctxt, self._mv_ready_text()),
                            foreground='#0b6b3a' if ok else '#b45309')
         if lazy:
             # ★§272：开档时不渲染（生成地形图 + PNG 要 9 秒），切到本页再画
@@ -3748,6 +3826,59 @@ class App(tk.Tk):
                 c.create_text(cx, cy - 9, text=str(n), fill='#1d4ed8',
                               font=('Consolas', 7), tags=('wp',))
 
+    # ---------------- 地形来源（§280） ----------------
+    TERR_SRC_MODES = ('地图', '地图+存档补格', '存档')
+
+    def _mv_terr_mode(self):
+        """当前地形来源档位 → `'map'` / `'merge'` / `'save'`（控件不在时按"地图"）。"""
+        try:
+            v = self.mv_terr_src.get()
+        except Exception:
+            v = '地图'
+        if v.startswith('存档') and '补' not in v:
+            return 'save'
+        if '补' in v:
+            return 'merge'
+        return 'map'
+
+    def _mv_on_terr_src(self, *_):
+        """下拉变了 ⇒ 同步旧 BooleanVar，然后重载地形。"""
+        if getattr(self, '_mv_terr_sync', False):
+            return
+        self._mv_terr_sync = True
+        try:
+            self.mv_src_save.set(self._mv_terr_mode() == 'save')
+        except Exception:
+            pass
+        finally:
+            self._mv_terr_sync = False
+        self._mv_reload_terrain()
+
+    def _mv_on_src_save(self, *_):
+        """旧 BooleanVar 被外部改动（自检/老脚本）⇒ 反写下拉。"""
+        if getattr(self, '_mv_terr_sync', False):
+            return
+        self._mv_terr_sync = True
+        try:
+            if self.mv_src_save.get():
+                self.mv_terr_src.set('存档')
+            elif self._mv_terr_mode() == 'save':
+                self.mv_terr_src.set('地图')
+        except Exception:
+            pass
+        finally:
+            self._mv_terr_sync = False
+
+    def _mv_reload_terrain(self):
+        """切换地形来源 ⇒ 重新装载地形（同一个地图文件不动）。"""
+        p = (getattr(self, 'mv_state', None) or {}).get('path')
+        if not p or not self.doc:
+            return
+        try:
+            self.mv_load(p)
+        except Exception as e:
+            self.status.set('重载地形失败：%s' % e)
+
     def _mv_toggle_units(self):
         """勾上「单位」时，若缩放还没到 20 倍就自动放大到 20 倍（并说一句为什么）。"""
         st = self.mv_state
@@ -3787,6 +3918,47 @@ class App(tk.Tk):
                 out = []
         st['udata'] = out
         return out
+
+    def _mv_terr_text(self, x, y):
+        """信息栏补充文字：该格有没有 Terrain 对象（树/石/路牌）。"""
+        try:
+            t = self.doc.terrain_at(x, y) if self.doc else None
+        except Exception:
+            t = None
+        if not t:
+            return ''
+        return '　地形对象：%s（HP %s）' % (t.get('type'), t.get('hp'))
+
+    def _mv_draw_terrain(self, c):
+        """Terrain 对象（树 / 石头 / 路牌 / 花…）标记 —— 深绿圆点，勾选框「树/石」控制（默认关）。
+
+        ★§281：树/石头是**独立对象类**（CLSID `ce2d270e…`），不是覆盖物、也不是地形贴图，
+          但它**占格**（`+0x138` 的 `0x10` 位）⇒ 那格不能放单位/建筑。
+          默认关是因为量大（大档 3334 棵），全画会盖住地形。
+        """
+        if not (self.mv_terr.get() if hasattr(self, 'mv_terr') else False):
+            return 0
+        st = self.mv_state
+        s = int(st.get('scale') or 8)
+        if s < 2:                      # 1 倍时一格 1 像素，画不出东西
+            return 0
+        try:
+            ts = self.doc.terrain_objects()
+        except Exception:
+            return 0
+        if not ts:
+            return 0
+        d = max(3.0, min(s - 1, s * 0.66))
+        n = 0
+        for t in ts:
+            x, y = t.get('x'), t.get('y')
+            if not isinstance(x, int) or not isinstance(y, int):
+                continue
+            cx, cy = x * s + s / 2.0, y * s + s / 2.0
+            c.create_oval(cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0,
+                          fill='#1b6b33', outline='#9be3ac', width=1, tags=('terr',))
+            n += 1
+        return n
 
     def _mv_draw_units(self, c):
         """单位标记（只在 **≥20 倍** 且勾了「单位」时画）：琥珀色小方块 + 白描边，同格多台标 ×N。
@@ -3877,6 +4049,15 @@ class App(tk.Tk):
                         c.create_text(x * s + s / 2, y * s + s / 2, text=str(n),
                                       fill='#2f7d32', font=('Consolas', 7))
         try:
+            self._mv_draw_terrain(c)
+        except Exception:
+            pass
+        # §283：覆盖物标记（默认开；画在树/石之下、单位之上）
+        try:
+            self._mv_draw_overlays(c)
+        except Exception:
+            pass
+        try:
             self._mv_draw_units(c)
         except Exception:
             pass
@@ -3884,6 +4065,76 @@ class App(tk.Tk):
             x, y = st['sel']
             c.create_rectangle(x * s, y * s, (x + 1) * s, (y + 1) * s,
                                outline='#d9480f', width=2)
+
+    def _ovl_colors(self):
+        """覆盖物索引 → 颜色（按类别，一次算好给整张图用）。
+
+        ★颜色只按"**挡不挡路**"这一条分档（`overlay_blocks_placement` 是唯一判据）：
+          金 = 矿/宝石（不挡）／深灰 = 一切挡路的（墙·沙袋·铁丝网·石头·`Land=Rock`）
+          蓝 = 桥面·铁轨·低桥（改地块但能过）／浅灰 = 其它
+        """
+        out = {}
+        try:
+            info = self.doc.overlay_type_info(self._mv_rules_path()) or {}
+        except Exception:
+            info = {}
+        for idx in info:
+            try:
+                blocks = self.doc.overlay_blocks_placement(idx, self._mv_rules_path())
+            except Exception:
+                blocks = False
+            d = info.get(idx) or {}
+            if d.get('tiberium'):
+                col = '#eab308'          # 矿 / 宝石
+            elif blocks:
+                col = '#57534e'          # 挡路的一律深灰
+            elif d.get('overrides') or d.get('land'):
+                col = '#0284c7'          # 桥面 / 铁轨 / 低桥（改地块但能走）
+            else:
+                col = '#9ca3af'          # 其它
+            out[idx] = col
+        return out
+
+    def _mv_draw_overlays(self, c):
+        """覆盖物标记（§283）—— 勾了「覆盖物」就画，画在树/石之下、单位之上。
+
+        数据源 = 格对象 `+0x58`（存档自己记的），绝不从 .MAP 猜。
+        颜色见 `_ovl_colors()`：金=矿/宝石、深灰=墙/沙袋/铁丝网、褐=石头、蓝=桥面/铁轨。
+        1 倍时一格 1 像素画不出东西，`scale < 3` 直接不画。
+        """
+        if not (self.mv_ovl.get() if hasattr(self, 'mv_ovl') else True):
+            return 0
+        st = self.mv_state
+        s = int(st.get('scale') or 8)
+        if s < 3:
+            return 0
+        try:
+            cells = self.doc.overlay_cells()
+        except Exception:
+            return 0
+        if not cells:
+            return 0
+        try:
+            W, H = (st['mp']['size'] if st.get('mp') else self._mv_dims())
+        except Exception:
+            W, H = 160, 160
+        cols = self._ovl_colors()
+        d = max(2.0, min(s - 1, s * 0.5))
+        n = 0
+        for (x, y), idx in cells.items():
+            if not (0 <= x < W and 0 <= y < H):
+                continue
+            col = cols.get(idx, '#9ca3af')
+            cx, cy = x * s + s / 2.0, y * s + s / 2.0
+            if col == '#57534e':            # 墙类：实心方块（一眼看出"这格不能放"）
+                c.create_rectangle(cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0,
+                                   fill=col, outline='#e5e7eb', width=1, tags=('ovl',))
+            else:                            # 其它：圆点
+                c.create_oval(cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0,
+                              fill=col, outline='#ffffff' if col == '#eab308' else '',
+                              width=1, tags=('ovl',))
+            n += 1
+        return n
 
     def mv_render(self):
         import base64
@@ -3915,6 +4166,16 @@ class App(tk.Tk):
                 self._mv_draw_waypoints(c)
             except Exception:
                 pass
+        # ★§281：树/石标记（默认关；画在路径点之上、单位之下）
+        try:
+            self._mv_draw_terrain(c)
+        except Exception:
+            pass
+        # ★§283：覆盖物标记（默认开；画在树/石之下、单位之上）
+        try:
+            self._mv_draw_overlays(c)
+        except Exception:
+            pass
         # ★§267：单位标记（默认关；≥20 倍才画，画在路径点之上）
         try:
             self._mv_draw_units(c)
@@ -3975,6 +4236,8 @@ class App(tk.Tk):
                     head += '　⚠ 在蓝线外（游戏里不显示这块地图）'
             except Exception:
                 pass
+            head += self._mv_terr_text(x, y)
+            head += self._mv_ovl_text(x, y)
             head += '　建筑：%s' % bld[(x, y)] if (x, y) in bld else '　建筑：无'
             if (x, y) in unit:
                 head += '　单位：%s' % unit[(x, y)]
@@ -3997,6 +4260,8 @@ class App(tk.Tk):
                 head += '　⚠ 在蓝线外（游戏里不显示这块地图）'
         except Exception:
             pass
+        head += self._mv_terr_text(x, y)
+        head += self._mv_ovl_text(x, y)
         # ★§266：点到的格子若正好是路径点，直接把号说出来（填「出现于/运输机起始」时不用猜）
         try:
             mp_w, only_w = self._mv_wp_points()
@@ -4461,7 +4726,16 @@ class App(tk.Tk):
         L = []
         try:
             if d.cell_taken(cx, cy):
-                L.append('⚠ 该格已被占用（建筑地基或单位站着）')
+                _t = None
+                try:
+                    _t = d.terrain_at(cx, cy)
+                except Exception:
+                    _t = None
+                # ★§281：树/石头是 Terrain 对象，占格（+0x138 的 0x10 位），但不属于建筑/单位
+                if _t:
+                    L.append('⚠ 该格长着 %s（地形对象，会挡住单位/建筑）' % _t.get('type'))
+                else:
+                    L.append('⚠ 该格已被占用（建筑地基或单位站着）')
         except Exception:
             pass
         try:
@@ -4569,6 +4843,11 @@ class App(tk.Tk):
             messagebox.showwarning('提示', '请先在上面选一个单位类型')
             return
         tname = cur.split('（')[0].strip().upper()
+        # ★★§283 玩家 2026-10-26 定案：刷兵落点**什么都不必做** ——
+        #   「存档中添加刷兵，什么也不必做，刷到占地时游戏引擎会自动改到相邻格」。
+        #   ⇒ 墙/石头上照样写下去，**不拦也不挪**（挪了反而丢信息：引擎自己会在读档时挪，
+        #     而路径点本身仍是玩家指定的那一格）。只有"手动放置/粘贴/移动"才硬拦，
+        #     因为那是直接写单位记录，不会经过引擎的落点纠偏。
         ans = self._spawn_dialog(tname, (sel[0], sel[1]))
         if not ans:
             return
@@ -4762,6 +5041,70 @@ class App(tk.Tk):
             '%s了也看不见（等于白做）。%s\n\n仍要继续吗？'
             % (cell[0], cell[1], action, tip), icon='warning')
 
+    def _mv_ovl_text(self, x, y):
+        """信息栏补充文字：该格的**覆盖物**（矿/宝石/墙/桥面/铁轨…）—— 读格对象 `+0x58`（§283）。"""
+        try:
+            o = self.doc.cell_overlay_info(x, y, ini_path=self._mv_rules_path())
+        except Exception:
+            o = None
+        if not o:
+            return ''
+        s = o['name']
+        if o.get('category'):
+            s += ' · ' + o['category']
+        return '　覆盖物：%s' % s
+
+    def _mv_rules_path(self):
+        """当前规则文件（rulesmd.ini）路径 —— 覆盖物名字/类别都从这里查，查不到就留空。"""
+        memo = getattr(self, '_mv_rules', 'unset')
+        if memo != 'unset':
+            return memo
+        p = ''
+        try:
+            gt = self._rules_types()
+            p = getattr(gt, 'rules_path', '') or ''
+        except Exception:
+            p = ''
+        self._mv_rules = p
+        return p
+
+    def _mv_check_ovl(self, cell, action='放置'):
+        """目标格有**挡路的覆盖物**（墙/沙袋/铁丝网/石头）→ **直接不让放**；True = 放行。
+
+        ★§283 玩家 2026-10-26 定案：
+          > 「墙类应该不让放，强放上去会报错，地编中是不让放的；
+          >   但是刷兵不一样，刷兵刷到墙等占地时**会自动改到相邻格**」
+        ⇒ 手动放置/粘贴/移动 = **硬拦**（不改落点、不给"仍要继续"）；
+          刷兵走 `doc.overlay_free_cell_near()` **自动挪到相邻格**（见 `mv_spawn_team`）。
+        判据全部来自 `rules(md).ini`（`Wall=yes` / `IsARock` / 硬编码墙 CYCL·BARB·WOOD·FENC）。
+        矿/宝石不拦 —— 玩家裁定"矿不影响放置"。
+        """
+        try:
+            o = self.doc.cell_ovl_blocked(cell[0], cell[1],
+                                          ini_path=self._mv_rules_path(),
+                                          map_path=(getattr(self, 'mv_state', None) or {}).get('path'))
+        except Exception:
+            o = None
+        if not o:
+            return True
+        near = ''
+        try:
+            r = self.doc.overlay_free_cell_near(cell[0], cell[1], radius=8,
+                                                ini_path=self._mv_rules_path(),
+                                                map_path=(getattr(self, 'mv_state', None) or {}).get('path'))
+            if r and r[2] > 0:
+                near = '\n\n最近的空置格是 (%d,%d)（%d 格远），想放就点它。' % (r[0], r[1], r[2])
+        except Exception:
+            near = ''
+        messagebox.showwarning(
+            '这一格不能放',
+            '格 (%d,%d) 上有 **%s**。\n\n'
+            '墙/沙袋/铁丝网/石头这类覆盖物占格 —— 地编里也不允许往上放，\n'
+            '强放进去游戏读档会报错。%s没有替换这一格。%s'
+            % (cell[0], cell[1], o['label'], action, near), icon='error')
+        self.status.set('(%d,%d) 有挡路覆盖物 %s，未%s' % (cell[0], cell[1], o['name'], action))
+        return False
+
     def mv_copy_units(self):
         """把选中格的单位记进剪贴板（只记 类型/所属方/等级，不改存档）。"""
         got = self._mv_sel_cell(need_units=True)
@@ -4790,6 +5133,8 @@ class App(tk.Tk):
             return
         sel = got[0]
         if not self._mv_check_visible(sel, '粘贴'):
+            return
+        if not self._mv_check_ovl(sel, '粘贴'):
             return
         self.status.set('正在粘贴 %d 台单位到 (%d,%d)…' % (len(clip['units']), sel[0], sel[1]))
         self.update_idletasks()
@@ -4834,6 +5179,8 @@ class App(tk.Tk):
             messagebox.showinfo('提示', '源格和目标格是同一格')
             return
         if not self._mv_check_visible(sel, '移动'):
+            return
+        if not self._mv_check_ovl(sel, '移动'):
             return
         self.status.set('正在把 (%d,%d) 的单位移到 (%d,%d)…'
                         % (clip['cell'][0], clip['cell'][1], sel[0], sel[1]))
@@ -4950,6 +5297,8 @@ class App(tk.Tk):
             return
         if not self._mv_check_visible(sel, '放置'):
             return
+        if not self._mv_check_ovl(sel, '放置'):
+            return
         cur = self.mv_unit.get() if hasattr(self, 'mv_unit') else ''
         if not cur:
             messagebox.showwarning('提示', '本档没有可克隆的单位类型（先刷新类型）')
@@ -4961,10 +5310,15 @@ class App(tk.Tk):
         _nudge = bool(getattr(self, 'mv_u_nudge', None) and self.mv_u_nudge.get())
         # ★2026-10-18 新增：目标格被建筑/单位占着 ⇒ 主动**挪到最近的空地**（玩家要求）
         #   引擎的占用口径 = 建筑记录 + 地基（`cell_taken`），跟格表 +0xF8 不是一回事。
+        _tree = None
         try:
             taken = self.doc.cell_taken(sel[0], sel[1])
+            _tree = self.doc.terrain_at(sel[0], sel[1])
         except Exception:
             taken = False
+        _why = ('格 (%d,%d) 上长着一棵 %s（地形对象，飞机/步兵都过不去）'
+                % (sel[0], sel[1], _tree['type'])) if _tree else \
+               ('格 (%d,%d) 已被建筑/单位占用' % (sel[0], sel[1]))
         if taken:
             near = None
             try:
@@ -4972,13 +5326,12 @@ class App(tk.Tk):
             except Exception:
                 near = None
             if not near:
-                messagebox.showwarning('放置单位', '格 (%d,%d) 已被建筑/单位占用，附近 8 格内也没找到空地。'
-                                       % (sel[0], sel[1]))
+                messagebox.showwarning('放置单位', '%s，附近 8 格内也没找到空地。' % _why)
                 return
             if not messagebox.askyesno(
                     '放置单位',
-                    '格 (%d,%d) 已被建筑/单位占用（引擎会把它挤掉或直接销毁）。\n\n'
-                    '改放到最近的空地 (%d,%d) 吗？' % (sel[0], sel[1], near[0], near[1])):
+                    '%s（引擎会把它挤掉或直接销毁）。\n\n'
+                    '改放到最近的空地 (%d,%d) 吗？' % (_why, near[0], near[1])):
                 return
             sel = (near[0], near[1])
             st['sel'] = sel

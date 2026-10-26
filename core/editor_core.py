@@ -6568,9 +6568,42 @@ class SaveDoc(object):
     CELL_OCC_KIND_OFF = 312
     # ★§275：`+0x138`（=312）的取值语义（实测：载具 574/574 = 0x20、建筑 1088/1113 = 0x80、
     #   单步兵格 604/604 是单个 bit）。引擎读档靠它判断"这格能不能过"⇒ 删/搬单位必须同步。
+    CELL_KIND_INF_MASK = 0x0F          # ★§281：步兵只占低 4 位（0x1/0x2/0x4/0x8）
+    CELL_KIND_TERRAIN = 0x10           # ★§281：**Terrain 对象**（树/石头/路牌…）占这位
+    # ★★§282 `+0x100` = **地形变体索引**，**不是覆盖物**（这条已经证伪过一版，别再来一次）：
+    #   初看像 overlay（玩家测试档里 143 格 / 4 组、形状与地编截图里的长条/U 形吻合），
+    #   但按"同一 tile 下该字段是否恒定"一验就穿了 —— **tile 989→值3(1038/1038)、
+    #   tile 294→值1(779/779)、tile 969→99.6%、tile 422→93.6%**，全档确定性 0.99。
+    #   ⇒ 它跟 `+0x4C` 的 tile 一一对应，是**地形派生**（很可能就是 §279 那个"引擎挑的同族变体"）。
+    #   真正的覆盖物（沙袋/围墙/矿/铁丝网）**不在存档里**，见 `terrain_variant_cells()` 的类注释。
+    TERRAIN_VARIANT_OFF = 0x100
+    # ★★★2026-10-26 §283：**覆盖物就在存档里** —— 格对象 `+0x58` = `OverlayTypeIndex`（u32，
+    #   `0xFFFFFFFF` = 没有）。§282 那句"覆盖物不在存档里"是**错的**，作废。
+    #   证据（两条独立）：
+    #   ① `新建文件夹 (23)/ALL01UMD.sav` × `all01umd.map`（同一张图）：地图 `[OverlayPack]`
+    #      解出 1525 个覆盖物格，与格 `+0x58` 逐格 u32 比对 **1513/1525 = 99.2%** 全等
+    #      （剩 12 格是 0x1E 宝石被引擎清掉，不是偏移错）。
+    #   ② `SAVE4823.SAV` 的 `+0x58` 里 **14 个 0x70**，而 `2.map` 的 `[OverlayPack]` 正好是
+    #      **14 个 112(0x70) = TIB08 矿石**，形状同为一小片矿 ⇒ 玩家在 FA2 里画的矿进档了。
+    #   ⚠ 为什么 §282 扫漏了：那轮用"同一 tile 下该字段是否恒定"筛，而**覆盖物本来就跟地形
+    #     强相关**（矿只会长在特定 tile 上）⇒ 每个偏移都 0.99+，把真字段一起误杀。
+    #     教训：判"某字段是不是覆盖物/物件"必须用**地图真值逐格比**，不能用 tile 相关性。
+    CELL_OVERLAY_OFF = 0x58
+    CELL_OVERLAY_NONE = 0xFFFFFFFF
+    # 引擎里**没有 INI 段**、行为硬编码的墙类（`[OverlayTypes]` 里有名、rulesmd.ini 里查不到
+    #   `Wall=yes`）：链子网/铁刺/木栅栏/铁丝网。列在这里只用于"提示"，不做拦截、不当判据。
+    OVERLAY_HARD_WALLS = ('CYCL', 'BARB', 'WOOD', 'FENC')
     CELL_KIND_VEHICLE = 0x20
     CELL_KIND_BUILDING = 0x80
-    CELL_KIND_INF_MASK = 0x1F
+
+    # ===== §281 Terrain 对象（树 / 石头 / 路牌 / 花…）=====
+    #   玩家（2026-10-26 11:41）给了「什么也没有、只有三棵树」的档 `SAVE0029.SAV` 用来定案。
+    TERRAIN_GUID = bytes.fromhex('ce2d270e0f9cd111b70900a024ddafd1')
+    TERRAIN_SIZE = 244                 # 固定长度，**没有伴随对象**（3334 棵间距全 244）
+    TERRAIN_TYPE_OFF = 0xDC            # 类型指针（运行期地址，每档不同 ⇒ 必须在本档类型表里反查名字）
+    TERRAIN_HP_OFF = 0x80              # 当前 HP（TREE01 满血 200，与类型表里 Strength 一致）
+    TERRAIN_POS_X_OFF = 0xB0           # lepton `(格<<8)|0x80`
+    TERRAIN_POS_Y_OFF = 0xB4           # 同上（`+0xCC` 是 y 的孪生副本，全等）
     # 格子占用写法：None=不写 / 'key'=只写格+248（默认）/ 'full'=连标记与类型码一起写
     # ⚠ 'full' 实测会把载具克隆弄崩（V3 vs H3），别默认开。
     UNIT_CELL_OCC_MODE = 'key'
@@ -6674,6 +6707,420 @@ class SaveDoc(object):
     UNIT_CELLKEY_OFF = 224            # 格键（指向格对象自键）
     UNIT_CELLXY_OFF = (1392, 1394)    # u16 格坐标
 
+    # ================= §281 Terrain 对象（树 / 石头 / 路牌 / 花…） =================
+    #   玩家 2026-10-26 11:41 给了「什么也没有、只有三棵树」的 `SAVE0029.SAV` 用来定案：
+    #   · 记录固定 **244 字节**，**没有伴随对象**（3334 棵相邻间距全是 244）
+    #   · 坐标 `+0xB0/+0xB4`（lepton，`(格<<8)|0x80`），`+0xCC` 是 y 的孪生副本（全等）
+    #   · 类型 `+0xDC` = **运行期指针**（每档不同），名字要在本档的 TerrainType 表里反查
+    #   · HP `+0x80`（TREE01 满血 200，与类型表 Strength 一致）
+    #   · 格对象 `+0xF8` 记它的键、`+0x138` 的 **0x10** 位表示"这格有 Terrain"
+    #   与地图 `[Terrain]` 段交叉验证：小档 3/3、大档 3282/3334 坐标命中类型。
+
+    @staticmethod
+    def _cstr_at(pl, off, maxlen=32):
+        """读 `off` 处的 C 字符串（ASCII），读不到返回 ''。"""
+        if off < 0 or off >= len(pl):
+            return ''
+        b = pl[off:off + maxlen]
+        z = b.find(b'\x00')
+        if z <= 0:
+            return ''
+        try:
+            s = b[:z].decode('ascii')
+        except Exception:
+            return ''
+        return s
+
+    @staticmethod
+    def _looks_like_type_name(s):
+        """TerrainType 名字长这样：`TREE01` / `TIBTRE01` / `BLOSSOM03` / `HDSTN01` / `SIGN01`。"""
+        if not (3 <= len(s) <= 24):
+            return False
+        if not any('A' <= c <= 'Z' for c in s):
+            return False
+        return all(('A' <= c <= 'Z') or ('0' <= c <= '9') or c in '_-' for c in s)
+
+    def terrain_objects(self):
+        """所有 **Terrain 对象**（树/石头/路牌/花…）→ `[{'off','key','x','y','type','type_ptr','hp'}]`。
+
+        玩家口径：树不算"覆盖物"，它是**地形对象**——确实如此，它是独立对象类
+        （CLSID `ce2d270e…`），每棵一条 244 字节记录，会占格（`+0x138` 的 0x10 位）。
+        ★这跟"能不能放东西"直接相关：树格上放单位/建筑，游戏里会叠在一起或被挤掉。
+        """
+        memo = getattr(self, '_terrobjs', None)
+        if memo is not None and memo[0] == len(self.plain):
+            return memo[1]
+        pl = self.plain
+        g = self.TERRAIN_GUID
+        pos, i = [], 0
+        while True:
+            j = pl.find(g, i)
+            if j < 0:
+                break
+            pos.append(j)
+            i = j + 1
+        names = self.terrain_type_names([struct.unpack_from('<I', pl, p + self.TERRAIN_TYPE_OFF)[0]
+                                         for p in pos])
+        out = []
+        for p in pos:
+            tp = struct.unpack_from('<I', pl, p + self.TERRAIN_TYPE_OFF)[0]
+            out.append({
+                'off': p,
+                'key': struct.unpack_from('<I', pl, p + 16)[0],
+                'x': struct.unpack_from('<I', pl, p + self.TERRAIN_POS_X_OFF)[0] >> 8,
+                'y': struct.unpack_from('<I', pl, p + self.TERRAIN_POS_Y_OFF)[0] >> 8,
+                'type': names.get(tp) or ('?%08x' % tp),
+                'type_ptr': tp,
+                'hp': struct.unpack_from('<I', pl, p + self.TERRAIN_HP_OFF)[0],
+                'size': self.TERRAIN_SIZE,
+            })
+        self._terrobjs = (len(pl), out)
+        return out
+
+    def terrain_type_names(self, ptrs=None):
+        """`{类型指针: 类型名}` —— 从**本档明文里的 TerrainType 表**反查。
+
+        ★为什么不能写死表：`+0xDC` 是**运行期地址**（同一棵 TREE01 在小档是 `0x10253d30`、
+          在大档是 `0x104a44c0`）。但类型表结构固定：
+
+              [类型指针 u32] ........ +0x28 ........ 名字 "TREE01"\0 ... Image "Tree"\0 ...
+               ^-- 这个指针就在名字起点 **-0x28** 处（自引用）
+
+          实测：`all01umd.SAV` 里 "TREE01" @`0x247f710`，`u32@0x247f6e8` 正好 = `0x104a44c0`；
+          41 种类型全部按此法命中，且与地图 `[Terrain]` 逐个对得上。
+        算法：先用树记录收集所有类型指针 → 逐个在明文里找它的出现位置 → 检查该位置 **+0x28**
+        是不是合法类型名 → 命中即得映射。找不到的就留 `?xxxxxxxx`（不猜）。
+        """
+        pl = self.plain
+        if ptrs is None:
+            g = self.TERRAIN_GUID
+            ptrs, i = [], 0
+            while True:
+                j = pl.find(g, i)
+                if j < 0:
+                    break
+                ptrs.append(struct.unpack_from('<I', pl, j + self.TERRAIN_TYPE_OFF)[0])
+                i = j + 1
+        want = set(ptrs) - {0}
+        memo = getattr(self, '_terrnames', None)
+        if memo is not None and memo[0] == len(pl) and want <= set(memo[1]):
+            return memo[1]
+        names = dict(memo[1]) if (memo is not None and memo[0] == len(pl)) else {}
+        for pv in want - set(names):
+            pat = struct.pack('<I', pv)
+            q, found = 0, None
+            while True:
+                j = pl.find(pat, q)
+                if j < 0:
+                    break
+                q = j + 1
+                nm = self._cstr_at(pl, j + 0x28, 24)
+                if self._looks_like_type_name(nm):
+                    found = nm
+                    break
+            if found:
+                names[pv] = found
+        self._terrnames = (len(pl), names)
+        return names
+
+    def terrain_at(self, cx, cy):
+        """该格上的 Terrain 对象（树/石/路牌…）→ dict / None。"""
+        for t in self.terrain_objects():
+            if t['x'] == int(cx) and t['y'] == int(cy):
+                return t
+        return None
+
+    def terrain_count(self):
+        """Terrain 对象总数（树 + 石头 + 路牌…）。"""
+        return len(self.terrain_objects())
+
+    # ================= §282 覆盖物 Overlay：**存档里没有**（结论） =================
+    #   玩家 2026-10-26 11:41 给了「空图 + 只放覆盖物」的测试档并贴了地编截图，要求读出来。
+    #   排查过程（都做过，别重复）：
+    #   ① 把格对象 348 字节的**每一个偏移**都扫了一遍，统计"非零格数"和"同一 tile 下是否恒定"：
+    #      所有稀疏字段（非零 < 400 格）的 tile 确定性都是 **0.99~1.00** ⇒ 全是地形派生；
+    #   ② `+0x100` 一度很像 overlay（143 格 / 4 组 / 形状与截图吻合），但被 ① 证伪；
+    #   ③ 覆盖物**在存档里没有独立字段**：RA2 的 Overlay 是"格上的一层"，引擎读档时
+    #      从**地图文件**的 `[OverlayPack]`（LCW/Format80 压缩，512×512 数组）重建。
+    #   ⇒ 要显示覆盖物，只能解地图的 OverlayPack（见 docs §282，块结构已确认，指令流待调）。
+    #   唯一在存档里出现过的"覆盖物类对象"是隧道入口 TWNK1（CLSID `c32d270e…`）。
+
+    def overlay_names(self, ini_path=None):
+        """`{索引: 名字}` —— 从 `rules(md).ini` 的 `[OverlayTypes]` 段读（`N=名字`，N 就是索引）。
+
+        解出地图 OverlayPack 之后用它把索引翻成名字；没有规则文件就返回空表（不猜）。
+        实测 `E://YURI//rulesmd.ini` 250 项：1=GASAND(沙袋) 3=GAWALL(围墙) 5=WOOD(木墙)
+        9=DUMMY4 25=BRIDGE1 26=BRIDGE2 105..=TIB01(矿) 181..=CRATE 184..=FENCE01。
+        """
+        if not ini_path or not os.path.isfile(ini_path):
+            return {}
+        memo = getattr(self, '_ovl_names', None)
+        if memo is not None and memo[0] == ini_path:
+            return memo[1]
+        out = {}
+        try:
+            import map_ini
+            kv = map_ini.MapIni(ini_path).sections.get('overlaytypes') or {}
+            for k, v in kv.items():
+                try:
+                    n = int(k)
+                except Exception:
+                    continue
+                if v:
+                    out[n] = str(v).strip().upper()
+        except Exception:
+            out = {}
+        self._ovl_names = (ini_path, out)
+        return out
+
+    def terrain_variant_cells(self):
+        """`{(x,y): 值}` —— 格对象 `+0x100`（**地形变体索引**，与 tile 强相关）。
+
+        ★不是覆盖物（多次验证，见类注释）。目前用途：诊断"某个 tile 被引擎换成了哪个变体"，
+          对应 docs §279 的"1289 格同族变体"问题。
+        """
+        memo = getattr(self, '_ovl_memo', None)
+        if memo is not None and memo[0] == len(self.plain):
+            return memo[1]
+        pl = self.plain
+        out = {}
+        for xy, o in self.cell_offsets().items():
+            v = pl[o + self.TERRAIN_VARIANT_OFF]
+            if v:
+                out[xy] = v
+        self._ovl_memo = (len(pl), out)
+        return out
+
+    # ===== §283 覆盖物（沙袋/围墙/铁丝网/矿/宝石/桥面/铁轨/石头/箱子…）=====
+    def overlay_at(self, cx, cy):
+        """该格的**覆盖物类型索引**（进 `[OverlayTypes]` 的行号）→ int / None（没有/没这格）。"""
+        o = self.cell_offsets().get((int(cx), int(cy)))
+        if o is None:
+            return None
+        v = struct.unpack_from('<I', self.plain, o + self.CELL_OVERLAY_OFF)[0]
+        return None if v == self.CELL_OVERLAY_NONE else v
+
+    def overlay_cells(self):
+        """`{(x,y): 索引}` —— 全档有覆盖物的格（缓存，键 = 明文长度）。"""
+        memo = getattr(self, '_ovlcells', None)
+        if memo is not None and memo[0] == len(self.plain):
+            return memo[1]
+        pl = self.plain
+        out = {}
+        for xy, o in self.cell_offsets().items():
+            v = struct.unpack_from('<I', pl, o + self.CELL_OVERLAY_OFF)[0]
+            if v != self.CELL_OVERLAY_NONE:
+                out[xy] = v
+        self._ovlcells = (len(pl), out)
+        return out
+
+    def overlay_type_info(self, ini_path=None):
+        """`{索引: dict}` —— 覆盖物的**判定依据**，全部来自 `rules(md).ini`（不猜）。
+
+        索引 = `[OverlayTypes]` 里 `N=名字` 的 N（实测 250 项），名字再指向同名段取字段：
+          `Name` / `Image` / `Land`（改地块类型）/ `Tiberium=yes`（矿·宝石）/
+          `Wall=yes`（墙）/ `IsARock`（石头）/ `Overrides`（桥面覆盖）/ `NoUseTileLandType`
+        """
+        if not ini_path or not os.path.isfile(ini_path):
+            return {}
+        memo = getattr(self, '_ovl_info', None)
+        if memo is not None and memo[0] == ini_path:
+            return memo[1]
+        out = {}
+        try:
+            with open(ini_path, 'rb') as f:
+                text = f.read().decode('latin-1')
+        except Exception:
+            return {}
+
+        def sect(name):
+            key = '[' + name.lower() + ']'
+            low = text.lower()
+            i = low.find(key)
+            if i < 0:
+                return {}
+            j = low.find('\n[', i + 1)
+            body = text[i:j if j > 0 else len(text)]
+            kv = {}
+            for line in body.replace('\r', '').split('\n')[1:]:
+                if '=' not in line or line.lstrip().startswith(';'):
+                    continue
+                k, v = line.split('=', 1)
+                k = k.strip().lower()
+                v = v.split(';')[0].strip()
+                if k and k not in kv:
+                    kv[k] = v
+            return kv
+
+        for idx, nm in (self.overlay_names(ini_path) or {}).items():
+            kv = sect(nm)
+            land = (kv.get('land') or '').strip()
+            out[idx] = {
+                'name': nm,
+                'display': (kv.get('name') or '').strip(),
+                'land': land,
+                'tiberium': (kv.get('tiberium') or '').lower() == 'yes',
+                'wall': (kv.get('wall') or '').lower() == 'yes',
+                'is_rock': bool((kv.get('isarock') or '').strip()),
+                'overrides': (kv.get('overrides') or '').lower() == 'yes',
+                'has_section': bool(kv),
+            }
+        self._ovl_info = (ini_path, out)
+        return out
+
+    def overlay_label(self, idx, ini_path=None):
+        """把索引翻成一句人话（名字 + 类别），翻不出来就只给索引 —— **不编名字**。"""
+        if idx is None:
+            return ''
+        info = self.overlay_type_info(ini_path).get(idx) or {}
+        nm = info.get('name') or ''
+        if not nm:                       # 名字表里没有 ⇒ 只给索引，**不编名字**
+            return '#%d' % idx
+        kind = self.overlay_category(idx, ini_path)
+        disp = info.get('display') or ''
+        bits = ['%s（#%d' % (nm, idx)]
+        if disp and disp.upper() != nm.upper():
+            bits.append('，%s' % disp)
+        bits.append('）')
+        s = ''.join(bits)
+        if kind:
+            s += ' · %s' % kind
+        return s
+
+    def overlay_category(self, idx, ini_path=None):
+        """覆盖物的大类（中文）—— **只看 INI 字段**，缺字段的按已知硬编码墙名兜底并标注。"""
+        if idx is None:
+            return ''
+        info = self.overlay_type_info(ini_path).get(idx) or {}
+        nm = (info.get('name') or '').upper()
+        if info.get('tiberium'):
+            return '矿石/宝石（不挡路）'
+        if info.get('wall'):
+            return '墙（挡路）'
+        if info.get('overrides'):
+            return '桥面'
+        if info.get('is_rock'):
+            return '石头（挡路）'
+        if nm in self.OVERLAY_HARD_WALLS:
+            return '墙（引擎硬编码，挡路）'
+        land = info.get('land') or ''
+        if land:
+            return '覆盖地块：%s' % land
+        if not info.get('has_section') and nm:
+            return '无 INI 段（引擎硬编码）'
+        return ''
+
+    def map_overlay_at(self, cx, cy, map_path=None):
+        """**地图文件**里该格的覆盖物索引（解 `[OverlayPack]`，§283）→ int / None。
+
+        用途：存档里根本没有这个格对象时（地图外/虚空）拿它兜底；平时**以存档为准**。
+        地图读不出来就返回 None（不猜）。
+        """
+        if not map_path or not os.path.isfile(map_path):
+            return None
+        try:
+            import overlay_pack as _op
+        except Exception:
+            try:
+                from . import overlay_pack as _op       # 包内导入
+            except Exception:
+                return None
+        memo = getattr(self, '_ovl_map', None)
+        if memo is None or memo[0] != map_path:
+            types, _frames = _op.read_map_packs(map_path)
+            memo = (map_path, types)
+            self._ovl_map = memo
+        return _op.map_overlay_at(memo[1], int(cx), int(cy))
+
+    def overlay_blocks_placement(self, idx, ini_path=None):
+        """这个覆盖物索引**挡不挡路/挡不挡放置** → bool（§283 玩家裁定）。
+
+        判据全部来自 INI，四类：
+          · `Wall=yes`（沙袋/围墙/铁丝网…）
+          · `IsARock`（SROCK/TROCK/LUNRK）
+          · **`Land=Rock` / `Land=Water`** —— 这些覆盖物会把整格地块改成岩石/水面
+            （`FENCE01..22`、`PALET`、`DRUM`、`WCRATE` 都是这一档）⇒ 地面单位过不去
+          · 无 INI 段的硬编码墙 `CYCL/BARB/WOOD/FENC`
+        矿/宝石（`Tiberium=yes`）**不挡** —— 玩家明确"矿不影响放置单位和建筑"。
+        桥面（`Overrides=yes`）/`Land=Road`/`Railroad` 也不挡。
+        """
+        if idx is None:
+            return False
+        info = self.overlay_type_info(ini_path).get(idx) or {}
+        if info.get('wall') or info.get('is_rock'):
+            return True
+        if (info.get('land') or '').strip().lower() in ('rock', 'water'):
+            return True
+        return (info.get('name') or '').upper() in self.OVERLAY_HARD_WALLS
+
+    def cell_ovl_blocked(self, cx, cy, ini_path=None, map_path=None):
+        """该格是否被**挡路的覆盖物**占着 → 覆盖物信息 dict / None。
+
+        与 `cell_overlay_info` 的区别：这里只看墙/石头（矿不算），给"能不能放"用。
+        """
+        o = self.cell_overlay_info(cx, cy, ini_path=ini_path, map_path=map_path)
+        if not o or not o.get('blocks'):
+            return None
+        return o
+
+    def overlay_free_cell_near(self, cx, cy, radius=8, ini_path=None, map_path=None,
+                               need_empty=True):
+        """找离 (cx,cy) 最近的**没有挡路覆盖物**的格 → `(x, y, dist)` / None。
+
+        用途：**刷兵**。玩家 2026-10-26 定：刷兵落到墙/石头上时**引擎自己会改到相邻格**，
+        所以编辑器也照办（自动挪），而手动放置则是**直接不让放**。
+        `need_empty=True` 时还要求该格没被单位/建筑占着（`cell_taken`）。
+        """
+        sx, sy = int(cx), int(cy)
+        if not self.cell_ovl_blocked(sx, sy, ini_path, map_path):
+            if not need_empty or not self.cell_taken(sx, sy):
+                return (sx, sy, 0)
+        best = None
+        for d in range(1, int(radius) + 1):
+            cand = []
+            for dx in range(-d, d + 1):
+                for dy in range(-d, d + 1):
+                    if max(abs(dx), abs(dy)) != d:
+                        continue                     # 只看这一圈
+                    x, y = sx + dx, sy + dy
+                    if self.cell_offsets().get((x, y)) is None:
+                        continue                     # 存档里没这格（地图外）
+                    if self.cell_ovl_blocked(x, y, ini_path, map_path):
+                        continue
+                    if need_empty and self.cell_taken(x, y):
+                        continue
+                    cand.append((abs(dx) + abs(dy), dx, dy, x, y))
+            if cand:
+                cand.sort()
+                return (cand[0][3], cand[0][4], d)
+        return best
+
+    def cell_overlay_info(self, cx, cy, ini_path=None, map_path=None):
+        """信息栏/放置校验用：`{index,name,label,category,blocks,source}`。
+
+        `blocks` 只表示"**已知会挡路**"（墙/石头），**不改落点**，只拿来提示；
+        储存在格对象 `+0x58` 里；存档里这格没有覆盖物时不回退查地图（存档才是真相）。
+        """
+        idx = self.overlay_at(cx, cy)
+        src = 'save'
+        if idx is None:
+            if self.cell_offsets().get((int(cx), int(cy))) is not None:
+                return None            # 存档里有这格且是空的 ⇒ **以存档为准**，不查地图
+            idx = self.map_overlay_at(cx, cy, map_path)
+            src = 'map'
+            if idx is None:
+                return None
+        info = self.overlay_type_info(ini_path).get(idx) or {}
+        cat = self.overlay_category(idx, ini_path)
+        blocks = self.overlay_blocks_placement(idx, ini_path)   # ← 单一判据，别两处各写一份
+        return {'index': idx,
+                'name': info.get('name') or ('#%d' % idx),
+                'display': info.get('display') or '',
+                'label': self.overlay_label(idx, ini_path),
+                'category': cat,
+                'blocks': blocks,
+                'source': src}
+
     def cell_kind(self, cx, cy):
         """格对象的**占用种类掩码**（`+0x138`）→ int / None（没有该格对象）。
 
@@ -6683,8 +7130,13 @@ class SaveDoc(object):
         |---|---|---|
         | `0x20` | **有载具** | 574 台载具所在格 **574/574 全是 0x20** |
         | `0x80` | **有建筑** | 1113 栋建筑所在格 1088/1113 = 0x80 |
-        | `0x01..0x10` | **有步兵**（同格多个各占一位） | 单步兵格 604/604 是单个 bit（1/2/4/8/16） |
+        | `0x01..0x08` | **有步兵**（同格最多 4 个各占一位） | 步兵格实测只用 0x1/0x2/0x4/0x8 |
+        | `0x10` | **有 Terrain 对象**（树/石头/路牌…）★§281 | 2855 个纯 `0x10` 格里 **2855 个占用键都指向树** |
         | `0` | 空 | 35576/40653 空格是 0 |
+
+        ★§281 修正：旧注释把 `0x10` 算进"步兵第 5 位"是错的 —— 那是**树的位**。
+          依据：`all01umd.SAV` 3334 棵树，`+0x138` 全是 0x10 系（0x10/0x14/0x18/0x1c/0x90），
+          而步兵格的位只在 0x1/0x2/0x4/0x8 里组合（仅 6 个例外，是"步兵占了树的格键"）。
 
         ⇒ 只清 `+248`（占用者键）**不够**：引擎读档时靠这个掩码判断"这格能不能过"，
         掩码留着 `0x20` 就会**看不见的墙**——删掉的车、搬走的车都会留下这种幽灵。
@@ -7758,6 +8210,15 @@ class SaveDoc(object):
         for u in self.unit_records():
             if u['x'] is not None:
                 occ.add((u['x'], u['y']))
+        # ★§281：**Terrain 对象（树/石头/路牌）也占格** —— 玩家口径"树是地形对象"。
+        #   实测：格 +0x138 的 `0x10` 位就是它，2855 个纯 0x10 格的占用键**全部**指向树。
+        #   以前这里不含树 ⇒ `cell_taken()` 认不出（3 棵树 0/3、大档 2/3334），
+        #   于是编辑器允许把单位/建筑放到树上（游戏里会叠着或被挤掉）。
+        try:
+            for t in self.terrain_objects():
+                occ.add((t['x'], t['y']))
+        except Exception:
+            pass
         self._occ_memo = (len(self.plain), occ)
         return occ
 
@@ -7786,33 +8247,83 @@ class SaveDoc(object):
         return d
 
     def cell_terrain(self, cx, cy):
-        """(tile, sub, z, level) 或 None（地图里没有这一格 / 没找到地图）。"""
-        return self.map_cells().get((int(cx), int(cy)))
+        """(tile, sub, z, level) 或 None。
 
-    # ★2026-10-24 §231：存档的**格对象自带一份层高**
-    #   `格+0x12E` 的 u16 = `level | (X << 8)`，低字节就是层高；X 取 0/4/8/12（2 bit 结构标志）。
-    #   与地图 `IsoMapPack5` 的 level 实测一致率 98.22%（43080 格里 41695 一致），
-    #   不一致的全是 tile=0 的空白格（地图本来就没数据，存档给了引擎填充值）。
-    #   ⇒ 判"这一格地面在第几层"优先用这个（引擎读档时用的就是它），地图值作交叉校验。
-    CELL_LEVEL_OFF = 0x12E
+        ★§278：地图里没有这一格（或根本没找到地图）时，**回退用存档格对象的 tile**，
+          这样"没 .MAP 也能判地形"（level 本来就一直读存档）。
+        """
+        c = self.map_cells().get((int(cx), int(cy)))
+        if c:
+            return c
+        t = self.cell_tile(cx, cy)
+        if t is None:
+            return None
+        return (t, 0, 0, self.cell_level(cx, cy))
+
+    # ★★2026-10-26 §279 修：存档格对象自带层高，`格+0x12E` 的 u16 = `X | (level << 8)`
+    #   —— **层高在高字节（0x12F）**，低字节是最多 12 的小索引（0..12，疑似子格/结构标志）。
+    #   旧代码取的是 `& 0xFF`（低字节）⇒ **一直读错**：本档 level=8 的格读成 1..6。
+    #   实测（level≠0 的 200 格）：高字节 == 地图 level **200/200**，低字节只对 1/60。
+    #   ⚠ 旧注释里"与地图一致率 98.22%"是假象 —— 全档绝大多数格 level 本来就是 0。
+    CELL_LEVEL_OFF = 0x12E      # u16：低字节 = X(0..12)，**高字节 = level**
+    CELL_TILE_OFF = 0x4C        # u16：地形 tile 索引（与地图 IsoMapPack5 第 1 项一致率 97%）
 
     def cell_level(self, cx, cy):
-        """存档格对象里的层高（`格+0x12E` 低字节）；没有这格返回 None。
+        """存档格对象里的层高（`格+0x12F` 字节）；没有这格返回 None。
 
         0 = 地面；>0 = 高处/坡/桥面。桥面(1262)=11、(116,211)引桥(1203)=3 之类。
         """
         o = self.cell_offsets().get((int(cx), int(cy)))
         if o is None:
             return None
-        return struct.unpack_from('<H', self.plain, o + self.CELL_LEVEL_OFF)[0] & 0xFF
+        return struct.unpack_from('<H', self.plain, o + self.CELL_LEVEL_OFF)[0] >> 8
 
     def cell_levels(self):
         """{ (x,y): level } —— 全图存档层高（一次扫完，比逐格调 cell_level 快）。"""
         out = {}
         pl = self.plain
         for xy, o in self.cell_offsets().items():
-            out[xy] = struct.unpack_from('<H', pl, o + self.CELL_LEVEL_OFF)[0] & 0xFF
+            out[xy] = struct.unpack_from('<H', pl, o + self.CELL_LEVEL_OFF)[0] >> 8
         return out
+
+    def cell_tile(self, cx, cy):
+        """存档格对象里的**地形 tile 索引**（`格+0x4C` u16）；没有这格返回 None。"""
+        o = self.cell_offsets().get((int(cx), int(cy)))
+        if o is None:
+            return None
+        return struct.unpack_from('<H', self.plain, o + self.CELL_TILE_OFF)[0]
+
+    def terrain_from_save(self, theater=None):
+        """★★§278 只用**存档自己**重建地形 → 与 `map_render.parse_map()` 同形状的 dict。
+
+        `{'size': (W,H), 'terrain': {(x,y): (tile, sub, level)}, 'theater': …, 'has_terrain': True}`
+
+        为什么要它：玩家把存档挪进子文件夹后地图文件常常找不到，以前地图页就只剩网格。
+        实测（`SAVE4823` + `ALL01UMD.MAP`）：tile 一致率 **97.0%**（41612/42901）、
+        level **100%**；按它渲染再与 .MAP 渲染逐像素比，**只差 1.10%**。
+        ★差的那些不是我们读错：1289 格是引擎挑了"同族 tile 变体"（见 docs §279），
+          179 格是引擎补的 tile=0 空白格 —— 存档里的值才是游戏里真正显示的那个。
+        """
+        memo = getattr(self, '_terrsav', None)
+        if memo is not None and memo[0] == len(self.plain) and memo[1] == theater:
+            return memo[2]
+        cofs = self.cell_offsets()
+        pl = self.plain
+        terr = {}
+        for xy, o in cofs.items():
+            terr[xy] = (struct.unpack_from('<H', pl, o + self.CELL_TILE_OFF)[0],
+                        0,
+                        struct.unpack_from('<H', pl, o + self.CELL_LEVEL_OFF)[0] >> 8)
+        if cofs:
+            W = max(x for x, _ in cofs) + 1
+            H = max(y for _, y in cofs) + 1
+        else:
+            W = H = 0
+        mp = {'path': '<from-save>', 'size': (W, H), 'theater': theater or 'NEWURBAN',
+              'terrain': terr, 'has_terrain': bool(terr), 'structures': [],
+              'info': {}, 'name': ''}
+        self._terrsav = (len(pl), theater, mp)
+        return mp
 
     def bridge_like_tiles(self):
         """这份地图里"属于桥结构"的 tile 集合（tile 上有层高、且成片连续）。
@@ -13341,7 +13852,10 @@ class SaveDoc(object):
         for a in ('_objs', '_events', '_actions', '_ticks', '_celltags', '_ctimerlist',
                   '_instmaps', '_house_econ', '_custom_houses', '_house_keys_memo',
                   '_tagrecs', '_mapm', '_aiids', '_horder',
-                  '_tagobjs', '_wpbase_memo'):      # §273 两个全档扫描缓存
+                  '_tagobjs', '_wpbase_memo',        # §273 两个全档扫描缓存
+                  '_terrobjs', '_terrnames', '_terrsav', '_occ_memo',     # §281 Terrain
+                  '_ovlcells', '_ovl_info', '_ovl_map',                   # §283 覆盖物/地图包
+                  '_ovl_memo', '_ovl_names'):
             if hasattr(self, a):
                 setattr(self, a, None)
         if rescan:
