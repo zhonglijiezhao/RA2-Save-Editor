@@ -102,26 +102,40 @@ try:
     ck('纯数字名被拒', False, '没抛异常')
 except ValueError as e:
     ck('纯数字名被拒', '纯数字' in str(e), str(e)[:40])
+print('\n[3c] ★铁律（玩家 2026-10-27 00:20）：本工具不许写地图')
 import shutil                                     # noqa: E402
 import tempfile                                   # noqa: E402
+import hashlib                                    # noqa: E402
+
+
+def _md5(p):
+    return hashlib.md5(open(p, 'rb').read()).hexdigest()
+
+
 _mp = d.scenario_map_path()
 if _mp and os.path.exists(_mp):
     _tmp = os.path.join(tempfile.gettempdir(), '_ev175_map.map')
     shutil.copy(_mp, _tmp)
     if os.path.exists(_tmp + '.bak'):
         os.remove(_tmp + '.bak')
-    _orig3 = {i: n for (i, n, _dd) in ec.read_scenario_variables(_tmp)['items']}
-    d.set_local_var_name(3, '0')                  # 存档里塞个垃圾名
-    d.define_local_var(3, None, 0, map_path=_tmp)  # 不带名字 ⇒ 名字该取地图那份
-    _now3 = {i: n for (i, n, _dd) in ec.read_scenario_variables(_tmp)['items']}
-    ck('存档里的垃圾名不会覆盖地图好名',
-       _now3.get(3) == _orig3.get(3) and _now3.get(3) != '0',
-       '%r -> %r' % (_orig3.get(3), _now3.get(3)))
-    for _p in (_tmp, _tmp + '.bak'):
+    _before = _md5(_tmp)
+    d.set_local_var_name(3, 'GARBAGE')             # 存档里塞个名字
+    d.define_local_var(3, 'OKNAME', 1, map_path=_tmp)   # map_path 只作兼容，必须被忽略
+    d.ensure_local_var(4, 'OKNAME2', 1)
+    _after = _md5(_tmp)
+    ck('地图字节一字未改（md5 相同）', _before == _after, '%s -> %s' % (_before[:10], _after[:10]))
+    ck('没留下 .bak', not os.path.exists(_tmp + '.bak'))
+    try:
+        ec.write_scenario_variables(_tmp, [(3, 'X', 1)])
+        ck('write_scenario_variables 必须拒绝', False, '竟然没抛异常')
+    except ec.MapWriteForbidden:
+        ck('write_scenario_variables 必须拒绝', True, 'MapWriteForbidden')
+    ck('地图仍然没变', _md5(_tmp) == _before)
+    for _p in (_tmp, _tmp + '.bak', _tmp + '.tmp'):
         if os.path.exists(_p):
             os.remove(_p)
 else:
-    ck('存档里的垃圾名不会覆盖地图好名', True, '本档无地图，跳过')
+    ck('地图字节一字未改（md5 相同）', True, '本档无地图，跳过')
 
 print('\n[4] add_action(56) 写 +164 而不是 +0x48')
 d2 = ec.SaveDoc(SRC)
@@ -162,8 +176,8 @@ for i in range(40, 46):
 free = [(b['x'], b['y']) for b in d3.buildings() if not b.get('tag')][:2]
 rec = d3.make_local_var_recipe(free, [{'type': 125, 'name': 'GAPOWR',
                                        'cell': d3.free_cell_near(70, 88, 12, 3)}],
-                               var_start=40, var_name='T%d', per_name='P%d',
-                               write_map=False)      # 自检不许改玩家的地图
+                               var_start=40, var_name='T%d', per_name='P%d')
+# ★2026-10-27 铁律：write_map 参数已删除（本工具不写地图），传了它会 TypeError
 ck('返回 local_vars 字段', 'local_vars' in rec, list(rec.keys()))
 ck('变量已命名 T41/T42',
    [x['name'] for x in rec['local_vars']] == ['T41', 'T42'],

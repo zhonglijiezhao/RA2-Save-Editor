@@ -1238,11 +1238,14 @@ class App(tk.Tk):
                                            '（长度不够或内容异常），已拒绝编辑。')
             return
         w = tk.Toplevel(self)
-        w.title('局部变量（名字/默认值写地图，触发里的号 = 引擎索引）')
-        # ★§191：写地图时会**自动重算 [Digest]**（FA2sp 的完整性校验），
-        #   否则游戏会提示「地图被人修改」。首次改写留 .bak。
+        w.title('局部变量（只写存档 · 本工具不写地图）')
+        # ★★2026-10-27 铁律（玩家原话）："任何情况下存档编辑器都不允许有向地图中写入数据的能力"
+        #   ⇒ 原来那套"把名字/默认值写进地图 [VariableNames] + 重算 [Digest]"的功能**整体撤除**，
+        #     这里只剩"读地图"（显示这号在地图里原本叫什么）与"写存档"（名字/值）。
         w.transient(self)
-        w.geometry('760x640')
+        # ★2026-10-27：原来 760x640，实测 reqheight=686 ⇒ 底部三行脚注被挤掉（玩家根本没看到），
+        #   而且那三行正是"两处各管一段"的关键说明。放到 700。
+        w.geometry('760x700')
         pad = dict(padx=8, pady=3)
 
         # ---- 地图状态条 ----
@@ -1272,17 +1275,20 @@ class App(tk.Tk):
             except Exception:
                 mp = None
             if mp:
-                lbl_map.config(text='地图：%s（地编里能选中的变量 + 开局默认值在这；'
-                                    '存档里那份是运行态，读档以存档为准）' % mp,
-                               foreground='#065f46')
+                lbl_map.config(text='地图：%s —— 只读参考（本工具不写地图，一个字节都不改）'
+                                    % mp, foreground='#065f46')
             else:
                 lbl_map.config(
-                    text='⚠ 找不到地图文件（%s）——不影响存档运行（存档自足），但 FA2 里'
-                         '看不到这些变量、新开局也没有默认值' % self.doc.map_lookup_hint(),
+                    text='⚠ 找不到地图文件（%s）—— 不影响存档运行（存档自足）；'
+                         '本工具本来也不写地图' % self.doc.map_lookup_hint(),
                     foreground='#b91c1c')
 
-        ttk.Label(w, text='地编流程：先在这里写变量（名字 + 默认值）→ 再写触发时选它。'
-                          '　默认值就是"读档时它的值"；游戏里用行为 56/57 改它。',
+        ttk.Label(w, text='铁律：本工具只读地图、只写存档（玩家 2026-10-27 定：任何情况下都不允许向地图写数据）。\n'
+                          '这一页能做的：① 给某一号起名字　② 改它的当前值 —— 两个都只写进存档；'
+                          '事件 36/37 判的就是存档里这个值。\n'
+                          '做不到（也不许做）：把名字/默认值写进地图 [VariableNames]。要在地编里选得中，'
+                          '请你自己在 FA2 里加（或让地图作者加）。\n'
+                          '不写地图照样能跑：触发用的是引擎索引号，名字只是给人看的；读档以存档为准。',
                   foreground='#111827', wraplength=735, justify='left').pack(anchor='w', **pad)
 
         box = ttk.Frame(w)
@@ -1329,8 +1335,10 @@ class App(tk.Tk):
             n_map = len([r for r in rows if r['source'] == 'map' and r['index'] < 99])
             n_save = len([r for r in rows if r['source'] != 'map'
                           and r['name'] and r['index'] < 99])
-            lbl2.config(text='地图里已定义 %d 条；只在存档镜像里有名字的 %d 条'
-                             '（那些读档会消失）' % (n_map, n_save))
+            lbl2.config(text='地图里已定义 %d 条（只读参考）；名字只在存档里的 %d 条'
+                             '（这些照样能跑，只是 FA2 里选不中 —— 本工具不写地图，'
+                             '要在地编里选得中请自己在 FA2 里加）'
+                             % (n_map, n_save))
 
         def _cur():
             s = tv.selection()
@@ -1345,9 +1353,13 @@ class App(tk.Tk):
                 return
             cur = self.doc.local_var(i)
             dlg = tk.Toplevel(w)
-            dlg.title('定义变量 %d（写地图）' % i)
+            dlg.title('变量 %d：写名字 + 初值（只写存档）' % i)
             dlg.transient(w)
             dlg.grab_set()
+            f0 = ttk.Frame(dlg)
+            f0.pack(fill='x', padx=10, pady=(8, 2))
+            ttk.Label(f0, text='本工具不写地图：名字只存进存档，地编 FA2 里选不中（那一步请自己在 FA2 加）。',
+                      foreground='#b45309', wraplength=430, justify='left').pack(anchor='w')
             f1 = ttk.Frame(dlg)
             f1.pack(fill='x', padx=10, pady=6)
             ttk.Label(f1, text='名字').pack(side='left')
@@ -1356,8 +1368,8 @@ class App(tk.Tk):
             ttk.Entry(f1, textvariable=v_nm, width=22).pack(side='left', padx=6)
             f2 = ttk.Frame(dlg)
             f2.pack(fill='x', padx=10, pady=6)
-            ttk.Label(f2, text='默认值（读档后的初值 0..255）').pack(side='left')
-            v_dv = tk.StringVar(value=str(cur['default'] if cur['default'] is not None else 0))
+            ttk.Label(f2, text='这一档里的当前值（0..255）').pack(side='left')
+            v_dv = tk.StringVar(value=str(cur['value'] if cur['value'] is not None else 0))
             ttk.Entry(f2, textvariable=v_dv, width=8).pack(side='left', padx=6)
 
             def _ok():
@@ -1365,38 +1377,16 @@ class App(tk.Tk):
                     info = self.doc.define_local_var(
                         i, v_nm.get().strip(), int(v_dv.get().strip() or '0', 0))
                 except Exception as e:
-                    messagebox.showerror('写地图失败', str(e), parent=dlg)
+                    messagebox.showerror('写存档失败', str(e), parent=dlg)
                     return
                 dlg.destroy()
                 _fill()
-                self.status.set('变量 %d = %s（默认 %d）已写进地图 %s'
-                                % (i, info['name'], info['default'], info['map']))
+                self.status.set('变量 %d = %s（值 %d）已写进存档（没动地图）'
+                                % (i, info['name'], info['default']))
             fb = ttk.Frame(dlg)
             fb.pack(fill='x', padx=10, pady=8)
-            ttk.Button(fb, text='写入地图', command=_ok).pack(side='right')
+            ttk.Button(fb, text='写入存档', command=_ok).pack(side='right')
             ttk.Button(fb, text='取消', command=dlg.destroy).pack(side='right', padx=6)
-
-        def _setdef():
-            i = _cur()
-            if i is None:
-                return
-            cur = self.doc.local_var(i)
-            if cur['source'] != 'map':
-                messagebox.showinfo('提示', '这条还没在地图里定义，请先用「定义/改名…」写地图',
-                                    parent=w)
-                return
-            v = simpledialog.askinteger(
-                '默认值', '变量 %d（%s）读档后的初值：' % (i, cur['name']),
-                initialvalue=int(cur['default'] or 0), minvalue=0, maxvalue=255, parent=w)
-            if v is None:
-                return
-            try:
-                self.doc.set_local_var_default(i, v)
-            except Exception as e:
-                messagebox.showerror('写入失败', str(e), parent=w)
-                return
-            _fill()
-            self.status.set('变量 %d 默认值 = %d（已写进地图，读档即生效）' % (i, v))
 
         def _setval(val):
             i = _cur()
@@ -1419,31 +1409,32 @@ class App(tk.Tk):
             i = _cur()
             if i is None:
                 return
-            if not messagebox.askyesno('确认', '从地图里删掉"地编第 %d 条"的定义？' % (i + 1),
-                                       parent=w):
+            if not messagebox.askyesno('确认', '清空"地编第 %d 条"在**存档**里的名字和值？\n'
+                                              '（存档只改这一条；地图不动，本工具也不写地图）'
+                                              % (i + 1), parent=w):
                 return
             try:
-                self.doc.remove_local_var(i)
+                self.doc.clear_local_var(i)
             except Exception as e:
-                messagebox.showerror('删除失败', str(e), parent=w)
+                messagebox.showerror('清空失败', str(e), parent=w)
                 return
             _fill()
-            self.status.set('变量 %d 已从地图删除（存档镜像同步清空）' % i)
+            self.status.set('变量 %d 在存档里的名字和值已清空（地图没动）' % i)
 
         bar = ttk.Frame(w)
         bar.pack(fill='x', padx=8, pady=3)
-        ttk.Button(bar, text='✏ 定义/改名…（写地图）', command=_define).pack(side='left')
-        ttk.Button(bar, text='默认值…', command=_setdef).pack(side='left', padx=4)
-        ttk.Button(bar, text='存档值置 1', command=lambda: _setval(1)).pack(side='left')
+        ttk.Button(bar, text='✏ 写名字+初值…（写存档）', command=_define).pack(side='left')
+        ttk.Button(bar, text='存档值置 1', command=lambda: _setval(1)).pack(side='left', padx=4)
         ttk.Button(bar, text='存档值置 0', command=lambda: _setval(0)).pack(side='left', padx=4)
-        ttk.Button(bar, text='🗑 从地图删除', command=_del).pack(side='left', padx=8)
+        ttk.Button(bar, text='🧹 清空这一条（写存档）', command=_del).pack(side='left', padx=8)
         ttk.Button(bar, text='关闭', command=w.destroy).pack(side='right')
 
         lbl2 = ttk.Label(w, text='', foreground='#374151')
         lbl2.pack(anchor='w', padx=8, pady=(0, 2))
-        ttk.Label(w, text='※ 两处各管一段：**存档**那 100 槽是运行态（事件 36 判的就是它，'
-                          '读档不会被地图覆盖）；**地图 [VariableNames]** 决定"地编里能选中哪些'
-                          '变量 + 开局默认值"。所以本工具两边同时写。\n'
+        ttk.Label(w, text='※ 存档那 100 槽（0x248A）是运行态 —— 事件 36/37 判的就是它，读档以存档为准'
+                          '（§176 实测：地图默认 1、存档 0 时触发不响应）⇒ 改「存档值」当场就能用。\n'
+                          '※ 地图 [VariableNames] 只影响"FA2 里能选中哪些变量 + 新开局的初值"。'
+                          '本工具**只读不写**它；要在地编里选得中，请你自己在 FA2 里加。\n'
                           '※ 变量号怎么对：事件 36/37 参数 = 引擎索引（0 起，地编第 N 条 = N−1）；'
                           '行为 56/57 的变量号在行为对象 +164（工具已自动处理）。',
                   foreground='#6b7280', wraplength=735, justify='left').pack(anchor='w', padx=8)
@@ -1476,10 +1467,10 @@ class App(tk.Tk):
         ttk.Label(w, text='★ 汇总触发会自动带一条「13 流逝时间 1 秒」心跳：事件 36 是纯电平查询，'
                           '没有计时事件就不会被引擎轮询（§181 实测）',
                   foreground='#6B7280', wraplength=580, justify='left').pack(anchor='w', **pad)
-        # ★§191：**这个窗口绝不改地图文件**（玩家明确要求：工具不能动他的 .MAP）
-        ttk.Label(w, text='★ 本窗口**不会修改地图文件**：变量只写进存档镜像。'
-                          '若要在 FA2 里也能选中/给新开局默认值，请到「🔢 局部变量…」页显式写入地图'
-                          '（那里会自动重算地图的 [Digest]，不会让游戏提示「地图被修改」）',
+        # ★★2026-10-27 铁律：整个工具都**不写地图**（玩家：任何情况下都不允许向地图写数据）
+        ttk.Label(w, text='★ 铁律：本工具只读地图、只写存档 —— 变量名/值都只落在存档里。'
+                          '想在地编 FA2 里也能选中这些变量、或给新开局默认值，'
+                          '请你自己在 FA2 里加（本工具不代劳，也不会碰你的 .map）',
                   foreground='#b91c1c', wraplength=580, justify='left').pack(anchor='w', **pad)
 
         ttk.Label(w, text='① 参与的建筑格（每行一个，或逗号/分号分隔，如 73,87）',

@@ -181,7 +181,11 @@ def map_digest_of(raw):
 
 
 def refresh_map_digest(raw):
-    """把 `[Digest]` 段的值改成本次内容对应的正确值（没有该段就原样返回）。"""
+    """把 `[Digest]` 段的值改成本次内容对应的正确值（没有该段就原样返回）。
+
+    ★★2026-10-27 铁律之后：**本工具不再写地图**，这个函数只留下"如果哪天真要算"的
+      算法说明用途 —— `write_scenario_variables` 已改成直接抛 `MapWriteForbidden`。
+    """
     m = re.search(rb'(\[Digest\]\r?\n)1=([A-Za-z0-9+/=]+)', raw)
     if not m:
         return raw
@@ -189,60 +193,22 @@ def refresh_map_digest(raw):
     return raw[:m.start(2)] + want + raw[m.end(2):]
 
 
-def write_scenario_variables(path, items, backup=True):
-    """**原地改写地图的 `[VariableNames]`**（只动这一段，其余字节一字不改）→ dict。
+# ★★★★★★ 铁律（玩家 2026-10-27 00:20 原话）：
+#   「记住一个铁律！任何情况下存档编辑器都不允许有向地图中写入数据的能力」
+#   ⇒ 本工具对 `*.map / *.mmx / *.yrm / *.mpr` **只读**。任何"写地图"的入口一律禁止。
+#   历史：§174/§176 曾经提供"把局部变量名/默认值写进地图 [VariableNames]"的功能，
+#   现在**整体撤除** —— 函数留着只为让旧调用方立刻炸掉，而不是静默改文件。
+MAP_WRITE_REFUSED = ('铁律：本工具不允许向地图写入任何数据（玩家 2026-10-27 定）。'
+                     '需要改地图请在地编（FA2/FinalAlert）里做。')
 
-    `items` = `[(idx, name, default), …]`；`name` 为空 ⇒ 该号不写入（等于不定义）。
-    ★为什么"两边都要写"见文件头 §176 注释：地图这段 = **地编清单 + 开局默认值**，
-      存档 0x248A 那 100 槽 = **运行期权威值**（读档**不会**被地图覆盖，玩家实证）。
-    首次改写会留一份 `<地图>.bak`（已存在则不覆盖），便于回滚。
-    """
-    items = [(int(i), str(n or '').strip(), int(d or 0) & 0xFF)
-             for (i, n, d) in (items or [])]
-    items = [(i, n, d) for (i, n, d) in items if n]
-    for (i, n, _d) in items:
-        if not (0 <= i < LOCALVAR_COUNT):
-            raise ValueError('变量索引 %d 越界（引擎只认 0..%d）' % (i, LOCALVAR_COUNT - 1))
-        if any(c in n for c in ',\r\n='):
-            raise ValueError('变量名 %r 不能含逗号/等号/换行（那会破坏 INI）' % (n,))
-    items.sort(key=lambda t: t[0])
-    raw = open(path, 'rb').read()
-    lines = ['%d=%s,%d' % (i, n, d) for (i, n, d) in items]
-    block = ('\r\n'.join(lines) + ('\r\n' if lines else '')).encode('latin1')
-    sp = _cfg_span(raw, MAPVAR_SECTION)
-    if sp:
-        new = raw[:sp[1]] + block + raw[sp[2]:]
-        mode = 'replaced'
-    else:
-        head = ('[%s]\r\n' % MAPVAR_SECTION).encode('ascii')
-        add = head + block + b'\r\n'
-        anchor = _cfg_span(raw, 'Waypoints')
-        if anchor:                       # 尽量贴近 FA2 的位置（在 [Waypoints] 之前）
-            at = anchor[0]
-            while at > 0 and raw[at - 1:at] in (b'\r', b'\n'):
-                at -= 1
-            new = raw[:at] + b'\r\n\r\n' + add + raw[at:]
-        else:
-            new = raw + (b'\r\n' if not raw.endswith(b'\n') else b'') + add
-        mode = 'added'
-    bak = None
-    if backup:
-        bak = path + '.bak'
-        if not os.path.exists(bak):
-            with open(bak, 'wb') as f:
-                f.write(raw)
-    # ★§191：改完必须重算 [Digest]，否则游戏/FA2 会提示「地图被人修改」
-    dig_before = map_digest_of(raw)
-    new = refresh_map_digest(new)
-    dig_after = map_digest_of(new)
-    tmp = path + '.tmp'
-    with open(tmp, 'wb') as f:
-        f.write(new)
-    os.replace(tmp, path)
-    return {'path': path, 'mode': mode, 'count': len(items),
-            'digest_before': dig_before, 'digest_after': dig_after,
-            'backup': bak if (bak and os.path.exists(bak)) else None,
-            'items': items}
+
+class MapWriteForbidden(RuntimeError):
+    """任何试图改地图文件的调用都会抛这个（见 `MAP_WRITE_REFUSED`）。"""
+
+
+def write_scenario_variables(path=None, items=None, backup=True):
+    """★已废：地图只读。这里**只抛异常**，永不落盘（保留函数名是为了让旧调用当场报错）。"""
+    raise MapWriteForbidden(MAP_WRITE_REFUSED)
 
 
 # ---------------- 地图路径点（★2026-10-22：玩家要求"125 的落点要写进地图路径点"） ----------------
@@ -287,57 +253,13 @@ def read_scenario_waypoints(path):
     return {'path': path, 'items': parse_scenario_waypoints(raw), 'exists': True}
 
 
-def write_scenario_waypoints(path, items, backup=True):
-    """**原地改写地图的 `[Waypoints]`**（只动这一段）→ dict。
+def write_scenario_waypoints(path=None, items=None, backup=True):
+    """★已废：地图只读（玩家 2026-10-27 铁律）。这里**只抛异常**，永不落盘。
 
-    `items` = `{号: (x, y)}` 或 `[(号, (x,y)), …]`；编码写成 `号=y*1000+x`。
-    ★为什么要写：行为 125「把建筑建于路径点 N」的落点就是路径点坐标；
-      玩家实测口径 —— **建筑落在哪，那个格的路径点就得在（存档 + 地图都对得上）**。
-      存档里那份（`set_waypoint`）决定运行期落点，地图这份决定地编/重载时看得见。
-    首次改写留 `<地图>.bak`（已存在则不覆盖）。
+    历史：§125 落地时曾用"把路径点写进地图 [Waypoints]"让地编/重载看得见；
+    铁律之后一律不许——路径点只写存档（`set_waypoint()`），地图那份请玩家在地编里自己画。
     """
-    if isinstance(items, dict):
-        pairs = list(items.items())
-    else:
-        pairs = list(items or [])
-    clean = {}
-    for n, c in pairs:
-        if isinstance(c, (tuple, list)) and len(c) >= 2 and c[0] is not None and c[1] is not None:
-            x, y = int(c[0]), int(c[1])
-        elif isinstance(c, int) and c > 0:          # 直接给编码值
-            y, x = divmod(c, 1000)
-        else:
-            continue
-        if x <= 0 and y <= 0:
-            continue
-        clean[int(n)] = (x, y)
-    for n in clean:
-        if not (0 <= n < LOCALVAR_COUNT * 100):     # 上限宽松，只防负数/离谱值
-            raise ValueError('路径点号 %d 越界' % n)
-    raw = open(path, 'rb').read()
-    lines = ['%d=%d' % (n, y * 1000 + x) for n, (x, y) in sorted(clean.items())]
-    block = ('\r\n'.join(lines) + ('\r\n' if lines else '')).encode('latin1')
-    sp = _cfg_span(raw, WAYPOINT_SECTION)
-    if sp:
-        new = raw[:sp[1]] + block + raw[sp[2]:]
-        mode = 'replaced'
-    else:
-        head = ('[%s]\r\n' % WAYPOINT_SECTION).encode('ascii')
-        new = raw + (b'\r\n' if not raw.endswith(b'\n') else b'') + head + block + b'\r\n'
-        mode = 'added'
-    bak = None
-    if backup:
-        bak = path + '.bak'
-        if not os.path.exists(bak):
-            with open(bak, 'wb') as f:
-                f.write(raw)
-    tmp = path + '.tmp'
-    with open(tmp, 'wb') as f:
-        f.write(new)
-    os.replace(tmp, path)
-    return {'path': path, 'mode': mode, 'count': len(clean),
-            'backup': bak if (bak and os.path.exists(bak)) else None,
-            'items': dict(sorted(clean.items()))}
+    raise MapWriteForbidden(MAP_WRITE_REFUSED)
 
 
 def read_map_ini_size(path):
@@ -2118,41 +2040,19 @@ class SaveDoc(object):
         self.plain[off:off + LOCALVAR_SLOT] = b'\x00' * LOCALVAR_SLOT
         return self.local_var(idx)
 
-    def ensure_local_var(self, idx, name=None, value=None, write_map=False,
-                         extra_dirs=None):
-        """确保某号变量**在地图里已定义**：没定义就补一个（默认 `V<n>`），可顺手设默认值。
+    def ensure_local_var(self, idx, name=None, value=None, extra_dirs=None):
+        """确保某号变量**在存档里有名字**：没有就补一个（默认 `V<n>`），可顺手设值。
 
-        ★§176：定义写进地图 `[VariableNames]`（存档镜像同步）。
-          传 `write_map=False` 时退回"只改存档镜像"的老行为（读档会被覆盖，除未定义槽外）。
+        ★★2026-10-27 铁律后：**只写存档**（`0x248A` 那 100 槽），**绝不写地图**。
+          `write_map` 参数已删除 —— 旧代码传它会立刻 TypeError（宁可炸，不要静默改地图）。
+          地图里那份 `[VariableNames]` 只读，用来在地编侧显示"这号本来叫什么"。
         """
-        if write_map:
-            cur = self.local_var(idx)
-            # ★2026-10-22 修：**名字优先取"地图里的那份"**，别再优先取存档里的。
-            #   原因（实测踩坑）：某个存档 3 号槽存着垃圾名 `0`，而地图里是 `D`；
-            #   旧逻辑取存档名 ⇒ 把地图的 `D` 冲成 `0`（一处坏名污染整张图）。
-            #   地图那份才是地编显示/可选的那份，理应更权威；纯数字名一律丢弃。
-            nm = name
-            if nm is None:
-                for cand in (cur.get('name_map'), cur.get('name_save')):
-                    cs = str(cand or '').strip()
-                    if cs and not cs.isdigit():
-                        nm = cs
-                        break
-                else:
-                    nm = 'V%d' % (int(idx) + 1)
-            # ★已有地图默认值时不传 value 就原样保留（别把玩家 A=1 这类默认值冲掉）
-            dv = (int(value) if value is not None
-                  else int(cur['default'] if cur['default'] is not None else 0))
-            try:
-                return self.define_local_var(idx, nm, dv, extra_dirs=extra_dirs)
-            except RuntimeError:
-                pass                          # 地图找不到 → 退回镜像写法
         cur = self.local_var(idx)
         if name is not None:
             self.set_local_var_name(idx, name)
         elif not cur['name_save']:
             self.set_local_var_name(idx, 'V%d' % (int(idx) + 1))
-        # 注：地图里的默认值不动（那是"开局初值"，不是本次要改的东西）
+        # 注：地图里的默认值不动（那是"开局初值"，不是本次要改的东西；而且本工具不写地图）
         if value is not None:
             self.set_local_var_value(idx, value)
         return self.local_var(idx)
@@ -2240,118 +2140,50 @@ class SaveDoc(object):
             out['hint'] = self.map_lookup_hint()
         return out
 
-    def register_waypoints_to_map(self, nums=None, extra_dirs=None, map_path=None,
-                                  backup=True):
-        """**把存档里的路径点同步进地图 `[Waypoints]`** → dict。
+    def register_waypoints_to_map(self, *a, **kw):
+        """★已废：本工具不写地图（玩家 2026-10-27 铁律）。旧调用会立刻抛 `MapWriteForbidden`。
 
-        玩家口径（2026-10-22）：「125 触发是要有路径点的，你要把建筑落在那里，
-        **要写那里的路径点**」—— 存档里的 `set_waypoint` 管运行期落点，地图这份管
-        "地编里 / 重载时这个格确实是个路径点"。两边对得上才与地编手做的档一致。
-
-        `nums` = 要同步的号（None ⇒ 存档里**所有**已定义路径点）；只增不删：
-        地图里原有的号一律保留（存档同号以存档为准）。
-        返回 `{'path','mode','backup','added','updated','total','items'}`。
+        要做"地图里也有这个路径点"，请在地编里自己画（或在 FA2 里打开地图加）。
         """
-        mp = map_path or self.scenario_map_path(extra_dirs)
-        if not mp:
-            raise RuntimeError('找不到地图文件，无法同步路径点。' + self.map_lookup_hint())
-        save_wp = self.waypoints_save()
-        if not save_wp:
-            raise RuntimeError('存档里定位不到路径点表（不做猜测）')
-        cur = dict(read_scenario_waypoints(mp)['items'])
-        want = save_wp if nums is None else {
-            int(n): save_wp[int(n)] for n in nums if int(n) in save_wp}
-        if not want:
-            raise RuntimeError('要同步的路径点在存档里不存在')
-        added, updated = [], []
-        for n, c in want.items():
-            if n not in cur:
-                added.append(n)
-            elif cur[n] != c:
-                updated.append(n)
-            cur[n] = c
-        info = write_scenario_waypoints(mp, cur, backup=backup)
-        info.update({'added': sorted(added), 'updated': sorted(updated),
-                     'total': len(cur), 'items': dict(sorted(cur.items()))})
-        return info
+        raise MapWriteForbidden(MAP_WRITE_REFUSED)
 
-    def define_local_var(self, idx, name=None, default=0, write_map=False,
-                         extra_dirs=None, map_path=None):
-        """**定义（或改默认值）一个局部变量** —— 写进地图 `[VariableNames]`。
+    def define_local_var(self, idx, name=None, default=0, extra_dirs=None, map_path=None):
+        """**给某一号变量起名 / 给个初值 —— 只写存档**（`0x248A` 那 100 槽）。
 
-        这是"地编里先写局部变量"那一步。`name=None` 保留原名；`default` 是**读档时**的值。
-        ★为什么同时写地图：存档是**自足**的（读档不会被地图覆盖），但地编里"能选中的变量"
-          和"开局的默认值"来自地图 `[VariableNames]` ⇒ 只改存档时 FA2 里看不到这个变量、
-          新开一局也没有默认值。两边都写才与地编流程一致（地图首次改写会留 `.bak`）。
-        返回 `{'index','fa2','name','default','map','backup','value_in_save'}`。
+        ★★2026-10-27 铁律：本工具**不允许写地图**，所以这里**不再动 `[VariableNames]`**。
+          `extra_dirs` / `map_path` 只为兼容旧调用签名而保留，**一律忽略**。
+          ⇒ 名字只存在于存档里：本工具读得到、触发照跑（事件 36/37 判的是存档值），
+            但地编 FA2 里选不中 —— 那一步必须由玩家在地图里自己做（本工具不代劳）。
+        `name=None` ⇒ 保留原名（存档里没有就补 `V<n>`）；`default` 同时写进当前值。
+        返回 `{'index','fa2','name','default','value_in_save','map_written':False}`。
         """
         idx = int(idx)
         if not (0 <= idx < LOCALVAR_COUNT):
             raise ValueError('变量索引 %d 越界（引擎只认 0..%d）' % (idx, LOCALVAR_COUNT - 1))
-        # ★显式传入的纯数字名**先拒**（与地图在不在无关）：地编里变量名必须能被选中，
-        #   纯数字不是合法变量名。放在找地图之前，才能保证"参数非法"永远先报 ValueError。
         if name is not None:
             _n = str(name).strip()
-            if _n and _n.isdigit():
+            if _n.isdigit():
                 raise ValueError('变量名不能是纯数字（%r 不是合法变量名）' % (_n,))
-        mp = map_path or self.scenario_map_path(extra_dirs)
-        if write_map and not mp:
-            raise RuntimeError('找不到地图文件，无法定义变量。' + self.map_lookup_hint())
-        cur = {i: (n, d) for (i, n, d) in
-               ([(x['index'], x['name'], x['default']) for x in self.map_variables(
-                   extra_dirs)['items']] if write_map else [])}
-        nm = str(name).strip() if name is not None else cur.get(idx, ('', 0))[0]
-        # ★2026-10-22 修：**纯数字名是垃圾**（曾把一个存档里 3 号槽的 `0` 写进地图，
-        #   把玩家地图的 `3=D` 冲成 `3=0`）。地编里变量名必须能被选中，
-        #   纯数字不是合法变量名 ⇒ 显式传入时直接拒，推导出来的则退化成 `V<n>`。
-        if nm and nm.isdigit():
-            if name is not None:
-                raise ValueError('变量名不能是纯数字（%r 不是合法变量名）' % (nm,))
-            nm = ''
-        if not nm:
-            nm = 'V%d' % (idx + 1)
-        if name is not None or idx not in cur:
-            cur[idx] = (nm, int(default or 0))
-        elif default is not None:
-            cur[idx] = (nm, int(default or 0))
-        info = {}
-        if write_map:
-            info = write_scenario_variables(mp, [(i, n, d) for i, (n, d) in cur.items()])
-        # 顺手把存档镜像也对齐（工具自己回读、以及"未定义槽"的值都靠它）
-        self.set_local_var_name(idx, nm)
-        self.set_local_var_value(idx, cur[idx][1])
-        out = self.local_var(idx)          # 带 name/value/default/source/off
-        out.update({'map': mp, 'backup': info.get('backup'),
-                    'map_mode': info.get('mode'), 'value_in_save': cur[idx][1],
-                    'default': cur[idx][1]})
+            if _n:
+                self.set_local_var_name(idx, _n)
+        elif not self.local_var(idx)['name_save']:
+            self.set_local_var_name(idx, 'V%d' % (idx + 1))
+        v = int(default or 0) & 0xFF
+        self.set_local_var_value(idx, v)
+        out = self.local_var(idx)
+        out.update({'default': v, 'value_in_save': v, 'map_written': False})
         return out
 
-    def set_local_var_default(self, idx, value, extra_dirs=None, map_path=None):
-        """改某个**已定义**变量的默认值（= 读档后的初值）。未定义会抛错。"""
-        mp = map_path or self.scenario_map_path(extra_dirs)
-        if not mp:
-            raise RuntimeError('找不到地图文件。' + self.map_lookup_hint())
-        items = [(x['index'], x['name'], x['default']) for x in self.map_variables(extra_dirs)['items']]
-        if not any(i == int(idx) for (i, _n, _d) in items):
-            raise RuntimeError('变量 %d 还没在地图里定义，请先 define_local_var()' % int(idx))
-        v = int(value)
-        if not 0 <= v <= 255:
-            raise ValueError('变量值必须是 0..255：%r' % (value,))
-        items = [(i, n, (v if i == int(idx) else d)) for (i, n, d) in items]
-        info = write_scenario_variables(mp, items)
-        self.set_local_var_value(idx, v)
-        return {'index': int(idx), 'default': v, 'map': mp, 'backup': info.get('backup')}
+    def set_local_var_default(self, *a, **kw):
+        """★已废：默认值在地图里，而本工具不写地图（玩家 2026-10-27 铁律）。
 
-    def remove_local_var(self, idx, extra_dirs=None, map_path=None):
-        """从地图里删掉一个变量定义（存档镜像一并清空）。"""
-        mp = map_path or self.scenario_map_path(extra_dirs)
-        if not mp:
-            raise RuntimeError('找不到地图文件。' + self.map_lookup_hint())
-        items = [(x['index'], x['name'], x['default']) for x in self.map_variables(extra_dirs)['items']]
-        items = [(i, n, d) for (i, n, d) in items if i != int(idx)]
-        info = write_scenario_variables(mp, items)
-        self.clear_local_var(idx)
-        return {'index': int(idx), 'removed': True, 'map': mp, 'backup': info.get('backup')}
+        想改"这一档里它的值"，用 `set_local_var_value()`（按钮「存档值置 1/0」）。
+        """
+        raise MapWriteForbidden(MAP_WRITE_REFUSED)
+
+    def remove_local_var(self, *a, **kw):
+        """★已废：删除地图里的定义要改地图 —— 禁止。清存档侧请用 `clear_local_var()`。"""
+        raise MapWriteForbidden(MAP_WRITE_REFUSED)
 
 
     # ★★★ 2026-10-18 定案：**行为是链表** —— 行为对象 `obj + 0x3C` = 下一条行为的自键，
@@ -13512,7 +13344,7 @@ class SaveDoc(object):
     def make_local_var_recipe(self, targets, result_actions, var_start=0,
                               result_name='汇总条件', per_name=None, owner=None,
                               attach_all=True, attach_mode='zero', per_event=1,
-                              per_arg=0, var_name=None, write_map=False,
+                              per_arg=0, var_name=None,
                               heartbeat=True, heartbeat_sec=HEARTBEAT_SEC):
         """**一键「局部变量法」**（§158 配方，社区通行写法）→ dict。
 
@@ -13577,7 +13409,7 @@ class SaveDoc(object):
             try:
                 nm_var = (str(var_name) % (v + 1)) if var_name else None
                 lv = self.ensure_local_var(v, name=nm_var, value=None,
-                                           write_map=write_map)
+                                           )
                 out['local_vars'].append(lv)
                 if lv.get('source') == 'map' and (lv.get('default') or 0):
                     out['warnings'].append(
@@ -13758,7 +13590,14 @@ class SaveDoc(object):
         写入容器两条路：先试 `cfb_surgery`（原位改扇区/链，物理改动最小），
         写完**立即解码回验**；若回验不过（旧档 FAT 不干净会被它截断）则改用
         `cfb_write.rebuild`（从零重建容器）重写一遍 —— 两条路都回验，不允许静默写坏。
+
+        ★★2026-10-27 铁律：**本工具的写盘只允许落到存档（.SAV）**。这里先挡一道：
+          目标扩展名像地图（.map/.mmx/.yrm/.mpr）就直接抛 `MapWriteForbidden`，
+          免得任何人（包括我以后改代码）把"另存为"指到地图上把玩家的图冲掉。
         """
+        _low = str(out_path).lower()
+        if _low.endswith(('.map', '.mmx', '.yrm', '.mpr')):
+            raise MapWriteForbidden(MAP_WRITE_REFUSED + '（目标路径 %s 是地图文件）' % out_path)
         new_plain = bytes(self.plain)
         if bytes(self.plain) == self.plain_orig:
             raise RuntimeError('没有任何修改')
