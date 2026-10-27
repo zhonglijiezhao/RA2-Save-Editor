@@ -234,7 +234,9 @@ else:
 print('\n[10] GUI 符号（不建窗口）')
 src = open('RA2存档编辑器.py', encoding='utf-8').read()
 ck('有 local_var_editor 方法', 'def local_var_editor' in src)
-ck('触发页有「🔢 局部变量…」按钮', "text='🔢 局部变量…'" in src)
+# ★v1.3：触发页底部按钮收进「更多 ▾」菜单（原来 9 个按钮横排会溢出窗口）
+ck('触发页有「局部变量…」入口（按钮或「更多」菜单）',
+   "text='🔢 局部变量…'" in src or "label='局部变量…'" in src)
 ck('向导默认 var_start = 0', "var_v0 = tk.StringVar(value='0')" in src)
 ck('向导传 var_name 给配方', "var_name=(var_nm.get()" in src)
 ck('向导说明里写明 +164', '行为 56 的变量号写行为对象 +164' in src)

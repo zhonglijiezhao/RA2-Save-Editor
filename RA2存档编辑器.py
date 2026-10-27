@@ -26,11 +26,14 @@ from editor_core import (SaveDoc, MONEY_SIG, MIRROR_DELTA,   # noqa: E402
                          ENGINE_PTYPE_TEXT)
 import game_ini                                            # noqa: E402  规则文件（rules/art）
 import ai_objects                                          # noqa: E402  AI 三大件（小队/特遣/脚本）
+import ui_theme                                            # noqa: E402  ★v1.3 视觉主题层
 
 GAME_DIR_DEFAULT = r'E:\YURI'
-BG = '#f5f6f8'
-FG = '#1f2937'
-ACCENT = '#2563eb'
+BG = ui_theme.T['canvas']
+FG = ui_theme.T['ink']
+ACCENT = ui_theme.T['accent_deep']
+RAIL = ui_theme.T['rail']
+SURFACE = ui_theme.T['surface']
 UNIT_HOUSE_INHERIT = '（沿用模板）'      # 放单位时"不改主人"的选项（默认）
 UNIT_VET_INHERIT = '（沿用模板）'        # 放单位时"不改等级"的选项（默认）
 UNIT_VET_CHOICES = (UNIT_VET_INHERIT, '新兵', '老兵', '精英')
@@ -41,8 +44,8 @@ class App(tk.Tk):
     def __init__(self):
         tk.Tk.__init__(self)
         self.title('RA2 / 尤里的复仇 — 存档编辑器')
-        self.geometry('1180x720')
-        self.minsize(980, 600)
+        self.geometry('1280x820')
+        self.minsize(1120, 700)
         self.configure(bg=BG)
         self.doc = None
         self._warned_zero = False        # 「-无事件-」(0) 告警每次载入只弹一次
@@ -76,119 +79,191 @@ class App(tk.Tk):
 
     # ---------------- UI ----------------
     def _build_style(self):
-        st = ttk.Style(self)
-        try:
-            st.theme_use('clam')
-        except Exception:
-            pass
-        st.configure('.', background=BG, foreground=FG, font=('Microsoft YaHei UI', 9))
-        st.configure('TFrame', background=BG)
-        st.configure('TLabel', background=BG, foreground=FG)
-        st.configure('TButton', padding=(10, 5))
-        st.configure('Accent.TButton', padding=(10, 5))
-        st.configure('Treeview', rowheight=22, fieldbackground='white')
-        st.configure('Treeview.Heading', font=('Microsoft YaHei UI', 9, 'bold'))
-        st.configure('TLabelframe', background=BG)
-        st.configure('TLabelframe.Label', background=BG, foreground=ACCENT,
-                     font=('Microsoft YaHei UI', 9, 'bold'))
+        """★v1.3：样式全部下沉到 `core/ui_theme.py`（token + ttk 样式表）。
+
+        页面代码里不要再写死颜色；要调色/调间距只改 ui_theme.T。
+        """
+        self.style = ui_theme.apply(self)
 
     def _build_ui(self):
-        top = ttk.Frame(self, padding=(10, 8, 10, 4))
-        top.pack(fill='x')
-        ttk.Label(top, text='游戏目录').pack(side='left')
-        ttk.Entry(top, textvariable=self.game_dir, width=34).pack(side='left', padx=6)
-        ttk.Button(top, text='刷新列表', command=self.refresh_list).pack(side='left')
-        ttk.Button(top, text='打开存档…', command=self.open_dialog).pack(side='left', padx=6)
-        ttk.Separator(top, orient='vertical').pack(side='left', fill='y', padx=8)
-        self.btn_save_new = ttk.Button(top, text='另存为新文件', command=self.save_as,
-                                       state='disabled')
-        self.btn_save_new.pack(side='left')
-        self.btn_save_in = ttk.Button(top, text='原地保存(自动备份)', command=self.save_inplace,
-                                      state='disabled')
-        self.btn_save_in.pack(side='left', padx=6)
-        ttk.Separator(top, orient='vertical').pack(side='left', fill='y', padx=8)
-        self.btn_map_auto = ttk.Button(top, text='自动匹配地图', command=self.auto_map,
-                                       state='disabled')
+        T = ui_theme.T
+
+        # ── ① 应用头：品牌 / 标题 / 目录与开档 ──
+        head = tk.Frame(self, bg=T['surface'])
+        head.pack(fill='x')
+        tk.Frame(head, bg=T['line'], height=1).pack(side='bottom', fill='x')
+        hi = tk.Frame(head, bg=T['surface'])
+        hi.pack(fill='x', padx=14, pady=(10, 9))
+
+        tk.Label(hi, text='RA2', bg=T['rail'], fg=T['accent'],
+                 font=(ui_theme.FONT_UI, 10, 'bold'), padx=7, pady=2).pack(side='left')
+        tk.Label(hi, text='存档编辑器', bg=T['surface'], fg=T['ink'],
+                 font=(ui_theme.FONT_UI, 12, 'bold')).pack(side='left', padx=(9, 6))
+        tk.Label(hi, text='尤里的复仇', bg=T['surface'], fg=T['muted'],
+                 font=(ui_theme.FONT_UI, 9)).pack(side='left', pady=(4, 0))
+
+        # 右侧：目录 + 刷新 + 打开（从右往左 pack）
+        ttk.Button(hi, text='打开存档…', style='Secondary.TButton',
+                   command=self.open_dialog).pack(side='right')
+        ttk.Button(hi, text='刷新', style='Ghost.TButton',
+                   command=self.refresh_list).pack(side='right', padx=(2, 10))
+        ttk.Entry(hi, textvariable=self.game_dir, width=26).pack(side='right', padx=(6, 8))
+        tk.Label(hi, text='游戏目录', bg=T['surface'], fg=T['muted'],
+                 font=(ui_theme.FONT_UI, 9)).pack(side='right')
+
+        # ── ② 操作条：文件动作 / 地图动作 / 当前文件 ──
+        bar = tk.Frame(self, bg=T['surface_2'])
+        bar.pack(fill='x')
+        tk.Frame(bar, bg=T['line'], height=1).pack(side='bottom', fill='x')
+        bi = tk.Frame(bar, bg=T['surface_2'])
+        bi.pack(fill='x', padx=14, pady=7)
+
+        self.btn_save_in = ttk.Button(bi, text='原地保存', style='Primary.TButton',
+                                      command=self.save_inplace, state='disabled')
+        self.btn_save_in.pack(side='left')
+        self.btn_save_new = ttk.Button(bi, text='另存为…', style='Secondary.TButton',
+                                       command=self.save_as, state='disabled')
+        self.btn_save_new.pack(side='left', padx=(8, 0))
+        tk.Frame(bi, bg=T['line'], width=1, height=18).pack(side='left', padx=14)
+        self.btn_map_auto = ttk.Button(bi, text='自动匹配地图', style='Ghost.TButton',
+                                       command=self.auto_map, state='disabled')
         self.btn_map_auto.pack(side='left')
-        self.btn_map_pick = ttk.Button(top, text='选择地图…', command=self.choose_map,
-                                       state='disabled')
-        self.btn_map_pick.pack(side='left', padx=6)
+        self.btn_map_pick = ttk.Button(bi, text='选择地图…', style='Ghost.TButton',
+                                       command=self.choose_map, state='disabled')
+        self.btn_map_pick.pack(side='left', padx=(2, 0))
 
+        self.lbl_cur = tk.Label(bi, text='未打开存档', bg=T['surface_2'], fg=T['muted'],
+                                font=(ui_theme.FONT_UI, 9))
+        self.lbl_cur.pack(side='right')
+
+        # ── ③ 主体：存档列表（卡片） + 导航/内容 ──
         body = ttk.PanedWindow(self, orient='horizontal')
-        body.pack(fill='both', expand=True, padx=10, pady=6)
+        body.pack(fill='both', expand=True, padx=12, pady=(12, 8))
 
-        # 左：存档列表
-        left = ttk.Labelframe(body, text='存档列表', padding=6)
-        cols = ('file', 'title', 'time', 'money')
-        self.tree = ttk.Treeview(left, columns=cols, show='headings', height=20)
-        for c, t, w in (('file', '文件', 180), ('title', '任务', 150),
-                        ('time', '存档时间', 130), ('money', '金钱', 80)):
+        left = tk.Frame(body, bg=T['line'], width=340)
+        left.pack_propagate(False)
+        inner = tk.Frame(left, bg=T['surface'])
+        inner.pack(fill='both', expand=True, padx=1, pady=1)
+        lh = tk.Frame(inner, bg=T['surface'])
+        lh.pack(fill='x', padx=12, pady=(11, 0))
+        tk.Label(lh, text='存档列表', bg=T['surface'], fg=T['ink'],
+                 font=(ui_theme.FONT_UI, 10, 'bold')).pack(side='left')
+        self.lbl_list_count = tk.Label(lh, text='', bg=T['surface'], fg=T['muted'],
+                                       font=(ui_theme.FONT_UI, 9))
+        self.lbl_list_count.pack(side='right')
+        tk.Frame(inner, bg=T['line_soft'], height=1).pack(fill='x', padx=12, pady=(8, 0))
+
+        cols = ('file', 'time', 'money')
+        self.tree = ttk.Treeview(inner, columns=cols, show='headings', height=20)
+        for c, t, w in (('file', '文件', 178), ('time', '时间', 86),
+                        ('money', '金钱', 48)):
             self.tree.heading(c, text=t)
-            self.tree.column(c, width=w, anchor='w')
-        self.tree.pack(fill='both', expand=True)
+            self.tree.column(c, width=w, anchor='w' if c != 'money' else 'e')
+        self.tree.tag_configure('odd', background=T['surface_2'])
+        self.tree.pack(fill='both', expand=True, padx=(8, 14), pady=(6, 8))
         self.tree.bind('<Double-1>', lambda e: self.open_selected())
         self.tree.bind('<Return>', lambda e: self.open_selected())
-        left.pack(in_=body, side='left', fill='both', expand=False)
-        body.add(left)
+        body.add(left, weight=0)
 
-        # 右：功能页
-        nb = ttk.Notebook(body)
-        nb.pack(in_=body, side='left', fill='both', expand=True)
-        body.add(nb)
+        nb = ui_theme.NavRail(body)
+        body.add(nb, weight=1)
 
-        nb.add(self._tab_overview(nb), text='  概览 / 金钱  ')
-        nb.add(self._tab_houses(nb), text='  所属方金钱  ')
-        nb.add(self._tab_triggers(nb), text='  触发  ')
-        nb.add(self._tab_events(nb), text='  事件  ')
-        nb.add(self._tab_actions(nb), text='  行为  ')
-        nb.add(self._tab_attach(nb), text='  挂接  ')
-        nb.add(self._tab_mapview(nb), text='  地图 / 选位  ')
-        nb.add(self._tab_gift(nb), text='  赠送建筑  ')
-        nb.add(self._tab_search(nb), text='  明文搜索 / 浏览  ')
+        nb.add(self._tab_overview(nb), text='概览')
+        nb.add(self._tab_houses(nb), text='所属方金钱')
+        nb.add(self._tab_triggers(nb), text='触发')
+        nb.add(self._tab_events(nb), text='事件')
+        nb.add(self._tab_actions(nb), text='行为')
+        nb.add(self._tab_attach(nb), text='挂接')
+        nb.add(self._tab_mapview(nb), text='地图 · 选位')
+        nb.add(self._tab_gift(nb), text='赠送建筑')
+        nb.add(self._tab_search(nb), text='明文搜索')
         # ★2026-10-18 新增：AI 三大件（作战小队 / 特遣部队 / 动作脚本）—— 只读
-        nb.add(self._tab_ai(nb), text='  作战小队  ')
+        nb.add(self._tab_ai(nb), text='作战小队')
         self.nb = nb
         nb.bind('<<NotebookTabChanged>>', self._on_tab_changed)
+        nb.select(0)
 
-        bar = ttk.Frame(self, padding=(10, 4))
-        bar.pack(fill='x')
-        ttk.Label(bar, textvariable=self.status, foreground='#4b5563').pack(side='left')
-        self.pbar = ttk.Progressbar(bar, mode='indeterminate', length=140)
+        # ── ④ 状态栏 ──
+        sb = tk.Frame(self, bg=T['surface'])
+        sb.pack(fill='x')
+        tk.Frame(sb, bg=T['line'], height=1).pack(side='top', fill='x')
+        si = tk.Frame(sb, bg=T['surface'])
+        si.pack(fill='x', padx=14, pady=5)
+        tk.Label(si, textvariable=self.status, bg=T['surface'], fg=T['muted'],
+                 font=(ui_theme.FONT_UI, 9)).pack(side='left')
+        self.pbar = ttk.Progressbar(si, mode='indeterminate', length=132)
         self.pbar.pack(side='right')
 
     def _tab_overview(self, nb):
-        f = ttk.Frame(nb, padding=12)
+        T = ui_theme.T
+        f = tk.Frame(nb, bg=T['canvas'])
+        ui_theme.page_header(f, '概览', '存档头信息与金钱').pack(fill='x', padx=2, pady=(2, 10))
+
+        # ── ① 存档信息（整宽，双栏 6 行；高度随内容）──
+        card, body = ui_theme.card(f, '存档信息')
+        card.pack(fill='x')
+        for c in (1, 3):
+            body.columnconfigure(c, weight=1, uniform='v')
+
         self.info_labels = {}
         # ★§276：「任务名」读存档头部固定字段（0x1360 → 剥掉「军事行动：」前缀），
         #   「任务副标题」= 0x13DA（官方战役是「國家：章節」，自制图常是地图名）。
-        keys = ['文件', '文件大小', '明文大小', '块数', '任务名', '任务副标题',
-                '玩家阵营', '开始时间', '存档时间']
-        for i, k in enumerate(keys):
-            ttk.Label(f, text=k, width=10, anchor='e').grid(row=i, column=0, sticky='e', pady=3)
-            v = ttk.Label(f, text='-', anchor='w')
-            v.grid(row=i, column=1, sticky='w', padx=8)
+        keys = ['文件', '文件大小', '明文大小', '块数', '地图尺寸', '名字键',
+                '任务名', '任务副标题', '玩家阵营', '所属方数组', '开始时间', '存档时间']
+        for n, k in enumerate(keys):
+            r, col = divmod(n, 2)                    # 双栏：5 行 × 2 组
+            lab = ttk.Label(body, text=k, style='Field.TLabel', anchor='w', width=9)
+            lab.grid(row=r, column=col * 2, sticky='w', pady=6,
+                     padx=(0 if col == 0 else 40, 0))
+            v = ttk.Label(body, text='-', style='Value.TLabel', anchor='w')
+            v.grid(row=r, column=col * 2 + 1, sticky='w', padx=(14, 0), pady=6)
             self.info_labels[k] = v
 
-        mf = ttk.Labelframe(f, text='金钱', padding=10)
-        mf.grid(row=len(keys) + 1, column=0, columnspan=3, sticky='we', pady=(14, 4))
-        ttk.Label(mf, text='当前').grid(row=0, column=0, sticky='e')
-        self.lbl_money = ttk.Label(mf, text='-', foreground=ACCENT,
-                                   font=('Consolas', 12, 'bold'))
-        self.lbl_money.grid(row=0, column=1, sticky='w', padx=8)
-        ttk.Label(mf, text='改为').grid(row=1, column=0, sticky='e', pady=(8, 0))
-        self.ent_money = ttk.Entry(mf, width=16)
-        self.ent_money.grid(row=1, column=1, sticky='w', padx=8, pady=(8, 0))
-        ttk.Button(mf, text='应用', command=self.apply_money).grid(row=1, column=2, padx=6,
-                                                                   pady=(8, 0))
-        ttk.Label(mf, text='（范围 0 ~ 16,777,215；写入权威镜像与主字段）',
-                  foreground='#6b7280').grid(row=2, column=0, columnspan=3, sticky='w',
-                                             pady=(8, 0))
-        self.lbl_money_field = ttk.Label(f, text='', foreground='#6b7280')
-        self.lbl_money_field.grid(row=len(keys) + 2, column=0, columnspan=3, sticky='w')
+        # ── ② 金钱条（横向：当前值 / 改为 / 应用 / 说明）──
+        row2 = tk.Frame(f, bg=T['canvas'])
+        row2.pack(fill='x', pady=(12, 0))
+
+        mcard, mbody = ui_theme.card(row2, '金钱')
+        mcard.pack(side='left', fill='both', expand=True)
+
+        ttk.Label(mbody, text='当前', style='Field.TLabel', width=6).grid(
+            row=0, column=0, sticky='w')
+        self.lbl_money = ttk.Label(mbody, text='-', style='Num.TLabel')
+        self.lbl_money.grid(row=0, column=1, sticky='w', padx=(8, 0))
+        self.lbl_money_field = ttk.Label(mbody, text='', style='Field.TLabel',
+                                        font=(ui_theme.FONT_MONO, 8))
+        self.lbl_money_field.grid(row=0, column=2, sticky='e', padx=(16, 0))
+
+        ttk.Label(mbody, text='改为', style='Field.TLabel', width=6).grid(
+            row=1, column=0, sticky='w', pady=(12, 0))
+        self.ent_money = ttk.Entry(mbody, width=14)
+        self.ent_money.grid(row=1, column=1, sticky='w', padx=(8, 0), pady=(12, 0))
+        ttk.Button(mbody, text='应用', style='Primary.TButton',
+                   command=self.apply_money).grid(row=1, column=2, sticky='e',
+                                                  pady=(12, 0))
+
+        # ── ③ 地图与规则（贴铁律：本工具只读地图）──
+        gcard, gbody = ui_theme.card(row2, '地图与规则')
+        gcard.pack(side='left', fill='both', expand=True, padx=(12, 0))
+        for c in (1, 3):
+            gbody.columnconfigure(c, weight=1, uniform='v')
+        self.lbl_map = ttk.Label(gbody, text='-', style='Value.TLabel', anchor='w')
+        self.lbl_map_mode = ttk.Label(gbody, text='-', style='Value.TLabel', anchor='w')
+        for r, (lab, wid) in enumerate((('地图文件', self.lbl_map),
+                                        ('挂接方式', self.lbl_map_mode))):
+            col = 0
+            ttk.Label(gbody, text=lab, style='Field.TLabel', width=9).grid(
+                row=r, column=col, sticky='w', pady=6)
+            wid.grid(row=r, column=col + 1, sticky='w', padx=(14, 0), pady=6)
+        ttk.Label(gbody, text='本工具只读地图：不写 .map，一个字节都不改',
+                  style='Field.TLabel').grid(row=2, column=0, columnspan=4,
+                                             sticky='w', pady=(6, 0))
         return f
 
     def _tab_houses(self, nb):
         f = ttk.Frame(nb, padding=8)
+        _ph = ui_theme.page_header(f, '所属方金钱', '每个所属方的金钱；双击行可改')
+        _ph.pack(fill='x', padx=2, pady=(2, 8))
         cols = ('cn', 'short', 'money', 'note')
         self.th = ttk.Treeview(f, columns=cols, show='headings', height=14)
         for c, t, w in (('cn', '阵营', 90), ('short', '标识', 130),
@@ -225,16 +300,18 @@ class App(tk.Tk):
 
     def _tab_triggers(self, nb):
         f = ttk.Frame(nb, padding=8)
+        _ph = ui_theme.page_header(f, '触发', '启停 / 类型 / 备注；双击行切换启用')
+        _ph.pack(fill='x', padx=2, pady=(2, 8))
         # ★2026-10-20（交接 next-step 3）：**触发类型提成独立列**（以前只塞在状态文字尾部），
         #   顺手加「标签数」——一个触发可挂多个标签，标签数 >1 时类型取"任一为 2 算重复"。
         cols = ('id', 'name', 'kind', 'state', 'rep', 'tags', 'mapinfo', 'note')
         # 列变多了 ⇒ 给树加横竖滚动条（窄窗口也能看全）
         tvw = ttk.Frame(f, height=18)
         self.tt = ttk.Treeview(tvw, columns=cols, show='headings', height=18)
-        for c, t, w in (('id', '触发ID', 82), ('name', '名称', 176), ('kind', '类别', 52),
-                        ('state', '状态', 150), ('rep', '触发类型', 104),
-                        ('tags', '标签数', 54), ('mapinfo', '地图（条件/行为）', 130),
-                        ('note', '说明', 170)):
+        for c, t, w in (('id', '触发ID', 70), ('name', '名称', 142), ('kind', '类别', 44),
+                        ('state', '状态', 122), ('rep', '触发类型', 88),
+                        ('tags', '标签', 44), ('mapinfo', '地图（条件/行为）', 104),
+                        ('note', '说明', 118)):
             self.tt.heading(c, text=t)
             self.tt.column(c, width=w, anchor='w')
         self._tt_vsb = ttk.Scrollbar(tvw, orient='vertical', command=self.tt.yview)
@@ -293,19 +370,34 @@ class App(tk.Tk):
         #   进入事件挂 ≥2 对象是 BUG（§159）。
         # ★2026-10-22 §175：地编流程第一步「先写局部变量」——名称 + 值直接落在
         #   明文 0x248A 起的 100 个 41B 定长槽里（name[40] + value u8）。
-        ttk.Button(row, text='🔢 局部变量…',
-                   command=self.local_var_editor).pack(side='left', padx=6)
-        ttk.Button(row, text='🧩 局部变量配方…',
-                   command=self.local_var_wizard).pack(side='left', padx=6)
-        ttk.Button(row, text='🛠 修复缺组件触发…',
-                   command=self.repair_runtime_dialog).pack(side='left', padx=6)
-        # ★2026-10-18 交接任务 B：把 M1 验证过的「改已有触发的动作」产品化。
-        #   新建触发引擎不执行（内存取证已定案）⇒ 改已有触发是唯一游戏内验收过的刷建筑路子。
-        ttk.Button(row, text='🔧 改造选中触发的动作…',
-                   command=self.retarget_dialog).pack(side='left', padx=6)
-        ttk.Label(row, text='双击 / 空格 也可切换；选中多行可批量',
-                  foreground='#6b7280').pack(side='left', padx=10)
-        ttk.Label(f, text='启用 / 禁用 = 写触发对象里的 **1 个字节**：该对象含恒定「触发类 GUID」，'
+        mb = ttk.Menubutton(row, text='更多 ▾', style='Ghost.TButton')
+        menu = tk.Menu(mb, tearoff=0)
+        menu.add_command(label='局部变量…', command=self.local_var_editor)
+        menu.add_command(label='局部变量配方…', command=self.local_var_wizard)
+        menu.add_command(label='修复缺组件触发…', command=self.repair_runtime_dialog)
+        menu.add_command(label='改造选中触发的动作…', command=self.retarget_dialog)
+        mb['menu'] = menu
+        mb.pack(side='left', padx=(6, 0))
+        # ★2026-10-18 交接任务 B：改造选中触发的动作 —— 已并入「更多 ▾」菜单
+        self._trig_note_box = ttk.Frame(f)
+        self._trig_note_on = tk.BooleanVar(value=False)
+
+        def _toggle_note():
+            on = not self._trig_note_on.get()
+            self._trig_note_on.set(on)
+            if on:
+                self._trig_note_box.pack(fill='x', pady=(6, 0))
+            else:
+                self._trig_note_box.pack_forget()
+            self.btn_trig_note.config(text='说明 ▾' if on else '说明 ▸')
+
+        # 说明开关放页标题右侧（和别的页一致；放按钮行里会被挤成 1px）
+        self.btn_trig_note = ttk.Button(_ph, text='说明 ▸', style='Ghost.TButton',
+                                        command=_toggle_note)
+        self.btn_trig_note.pack(side='right')
+
+        ttk.Label(self._trig_note_box,
+                  text='启用 / 禁用 = 写触发对象里的 **1 个字节**：该对象含恒定「触发类 GUID」，'
                           '**GUID 前 8 字节**处即启用位（1=启用 / 0=禁用）。\n'
                           '    ★ 记录内偏移**随图变化**（实测新图 +236、旧图 +328）⇒ 用 GUID 当锚点定位，不写死偏移。\n'
                           '    ★ 证据：外挂禁用实验 T0/T1/T2 三档**只差这一字节**；旧图成对档 6691/6692 '
@@ -340,7 +432,8 @@ class App(tk.Tk):
                           '—— 缺这两个对象的触发引擎根本不会执行（症状：改事件/启用都没反应）。\n'
                           '       ⚠ 对「已经执行过」的单次型触发点修复 = 重新武装，'
                           '条件再满足会再触发一次（对话框里有红字名单 + 二次确认）。',
-                  foreground='#374151', wraplength=880, justify='left').pack(anchor='w', pady=(6, 0))
+                  foreground='#6b7280', font=(ui_theme.FONT_UI, 8),
+                  wraplength=880, justify='left').pack(anchor='w')
         return f
 
     def open_trigger_editor(self, sid=None):
@@ -1091,6 +1184,8 @@ class App(tk.Tk):
 
     def _on_tab_changed(self, _e=None):
         try:
+            # ★2026-10-27：用户切走 ⇒ 立刻作废后台元信息扫描（它每次要解压 12 个整档）
+            self._scan_gen = getattr(self, '_scan_gen', 0) + 1
             idx = self.nb.index(self.nb.select())
             if idx == 3:                                # 事件页（第4个标签）
                 self._highlight_events_for_trigger()
@@ -1103,10 +1198,13 @@ class App(tk.Tk):
                     _p = getattr(self, '_mv_defer_path', None) \
                         or (getattr(self, 'mv_state', None) or {}).get('path')
                     try:
+                        # ★§285：_p 为空 = 没有 .MAP ⇒ 也要画（地形来自存档格对象）
                         if _p:
                             self.status.set('正在解析地图 %s …' % os.path.basename(_p))
-                            self.update_idletasks()
-                            self.mv_load(_p)
+                        else:
+                            self.status.set('没有 .MAP：正在用存档格对象重建地形…')
+                        self.update_idletasks()
+                        self.mv_load(_p)
                     except Exception:
                         pass
         except Exception:
@@ -2254,6 +2352,8 @@ class App(tk.Tk):
 
     def _tab_events(self, nb):
         f = ttk.Frame(nb, padding=8)
+        _ph = ui_theme.page_header(f, '事件', '选中触发对应的事件链')
+        _ph.pack(fill='x', padx=2, pady=(2, 8))
         cols = ('idx', 'type', 'name', 'arg', 'argtext', 'owner', 'off')
         self.te = ttk.Treeview(f, columns=cols, show='headings', height=16)
         for c, t, w, a in (('idx', '#', 36, 'center'), ('type', '类型', 50, 'center'),
@@ -2581,6 +2681,8 @@ class App(tk.Tk):
     # ---------------- 行为 ----------------
     def _tab_actions(self, nb):
         f = ttk.Frame(nb, padding=8)
+        _ph = ui_theme.page_header(f, '行为', '选中触发对应的行为链')
+        _ph.pack(fill='x', padx=2, pady=(2, 8))
         cols = ('idx', 'type', 'name', 'arg', 'argtext', 'owner', 'off')
         self.ta = ttk.Treeview(f, columns=cols, show='headings', height=16)
         for c, t, w, a in (('idx', '#', 36, 'center'), ('type', '类型', 50, 'center'),
@@ -2810,7 +2912,11 @@ class App(tk.Tk):
 
     def _tab_attach(self, nb):
         f = ttk.Frame(nb, padding=8)
-        ttk.Label(f, text='触发 ↔ 建筑挂接（2026-10-14 五轮实验定案，游戏内实测通过）。'
+        _ph = ui_theme.page_header(f, '挂接', '触发 ↔ 对象挂接统计')
+        _ph.pack(fill='x', padx=2, pady=(2, 8))
+        _note, self._note_btn_attach = ui_theme.note_box(f, _ph)
+        self._note_box_attach = _note          # 折叠说明的容器（默认不 pack）
+        ttk.Label(_note, text='触发 ↔ 建筑挂接（2026-10-14 五轮实验定案，游戏内实测通过）。'
                           '★③ 可挂建筑**以存档为准**（挂接键为 0 的建筑），不需要地图；'
                           '地图只用来补"地图建筑ID"（①② 解建筑类型仍靠地图）。',
                   foreground='#374151', wraplength=900, justify='left').pack(anchor='w')
@@ -3312,187 +3418,220 @@ class App(tk.Tk):
     # ---------------- 地图视图 / 选位（2026-10-15） ----------------
     def _tab_mapview(self, nb):
         f = ttk.Frame(nb, padding=8)
-        ttk.Label(f, text='地图俯视图 + 落位判定　★安全闸：以不变量判定「存档 ↔ 地图」是否同一张图'
+        _ph = ui_theme.page_header(f, '地图 · 选位', '地图只读；拖放 / 移动单位与建筑')
+        _ph.pack(fill='x', padx=2, pady=(2, 8))
+        # 「规则来源」是全局信息（不是某张卡的操作）⇒ 固定挂在页头右侧常显，
+        #   免得挤占本来就只有 ~620px 的卡内宽度
+        self.mv_urule = tk.Label(_ph, text='', bg=ui_theme.T['canvas'],
+                                 fg=ui_theme.T['muted'], font=(ui_theme.FONT_UI, 8))
+        self.mv_urule.pack(side='right', padx=(0, 10))
+        _note, self._note_btn_mapview = ui_theme.note_box(f, _ph)
+        self._note_box_mapview = _note          # 折叠说明的容器（默认不 pack）
+        ttk.Label(_note, text='地图俯视图 + 落位判定　★安全闸：以不变量判定「存档 ↔ 地图」是否同一张图'
                           '——主判据是「地图 [Map] Size == 存档自带尺寸」（存档固定头部 0x348E 的 (W,H)），'
                           '与建筑是否被摧毁无关（后期档建筑大量被毁也照常匹配）；'
                           '建筑重合率只作参考提示，不参与放行。尺寸读不出时才退化为「建筑是否都在图上」。',
-                  foreground='#374151', wraplength=980, justify='left').pack(anchor='w')
+                  foreground='#374151', wraplength=700, justify='left').pack(anchor='w')
         self.mv_warn = ttk.Label(
-            f, text='⚠ 只要地图尺寸与存档尺寸一致，本工具就认定是同一张图 —— 动手改之前请先备份存档'
-                    '（点右边「备份存档」一键搞定；改完也建议先另存为新文件再进游戏验证）。',
-            foreground='#b91c1c', wraplength=980, justify='left')
+            _note, text='⚠ 只要地图尺寸与存档尺寸一致，本工具就认定是同一张图 —— 动手改之前请先备份存档'
+                        '（点右边「备份存档」一键搞定；改完也建议先另存为新文件再进游戏验证）。',
+            foreground='#b91c1c', wraplength=700, justify='left')
         self.mv_warn.pack(anchor='w', pady=(4, 0))
-        row = ttk.Frame(f)
-        row.pack(fill='x', pady=(6, 2))
-        ttk.Button(row, text='选择地图…', command=self.mv_choose).pack(side='left')
-        ttk.Button(row, text='自动匹配', command=self.mv_auto).pack(side='left', padx=6)
-        ttk.Button(row, text='🗺 用地编打开', command=self.fa2_open).pack(side='left', padx=6)
-        ttk.Button(row, text='备份存档', command=self.mv_backup).pack(side='left', padx=6)
-        self.mv_lbl = ttk.Label(row, text='未加载地图', foreground='#6b7280')
-        self.mv_lbl.pack(side='left', padx=6)
+        ttk.Label(_note,
+                  text='放置建筑：勾「触发法」= 引擎自己造（有建造动画、模型完整，悬崖 / 水面等不可建'
+                       '地形会被引擎拒绝）；不勾 = 直接落成（立即写档、可指定所属方，引擎仍会播一遍'
+                       '建造动画，读档后 1~2 秒长出来）。\n'
+                       '修旧楼 = 存档在 Buildup 播完前保存 ⇒ 重载后模型显示不全；'
+                       '用「修成完成态 / 扫描卡住 / 补齐动画」修。\n'
+                       '图例：红 = 该格已被占 ｜ 深红细线 = 与邻格有高度差（悬崖/斜坡）'
+                       '｜ 暗色 = 地图外（边界填充格）。',
+                  foreground='#374151', wraplength=700, justify='left').pack(anchor='w', pady=(4, 0))
+        # ★§289：原来 7 行散控件（30+ 个控件挤一页，多个按钮被窗口右缘切掉）
+        #   ⇒ 四张「横条式分区」：地图 / 视图 / 放置 / 选中格。
+        #   section() 的标题在左侧竖列 ⇒ 分组只多吃 4 条 3px 色条，不像四张普通卡片
+        #   那样各多一行标题。低频操作（修旧楼 3 个 / 刷单位 / 学习模板 / 模板库 / 规则目录）
+        #   收进两个 ▾ 菜单 —— 和触发页「更多 ▾」同一个口径。
+        SUF = 'Surface.TFrame'          # 卡片内：白底
+        LB = 'Surface.TLabel'
+        MU = 'Muted.TLabel'
+        SM = (ui_theme.FONT_UI, 8)
+        PAD = 4                          # 同行控件间距；工作区只有 ~740px，别调大
 
-        row2 = ttk.Frame(f)
-        row2.pack(fill='x', pady=(2, 2))
-        ttk.Label(row2, text='缩放：').pack(side='left')
-        ttk.Button(row2, text='－', width=3, command=lambda: self.mv_zoom(-1)).pack(side='left')
-        ttk.Button(row2, text='＋', width=3, command=lambda: self.mv_zoom(1)).pack(side='left', padx=3)
-        ttk.Button(row2, text='适应窗口', command=self.mv_fit).pack(side='left', padx=6)
-        self.mv_grid = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text='网格', variable=self.mv_grid,
-                        command=self.mv_render).pack(side='left', padx=6)
-        # ★§266：路径点叠加显示（默认开）—— 绿底白字 = 地图 [Waypoints] 里定义的；
-        #   空心蓝框 = 只有存档里有（引擎运行期生成的），两边对不上时一眼就能看出来。
-        self.mv_wp = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text='路径点', variable=self.mv_wp,
-                        command=self.mv_render).pack(side='left', padx=(0, 6))
-        # ★§267：单位标记 —— **默认不勾**；勾上会自动把缩放提到 20 倍（低于 20 倍一律不画，
-        #   不然几百个单位糊成一片红点，反而看不清地形）。
-        self.mv_units = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row2, text='单位（≥20 倍）', variable=self.mv_units,
-                        command=self._mv_toggle_units).pack(side='left', padx=(0, 6))
-        # ★★§280：地形来源（玩家："地形是不会变的，能不能把 map 的地形直接映射过来"）
-        #   · 地图（默认）—— 完全用 .MAP 的 `[IsoMapPack5]`，**与存档无关**：换哪份存档都是同一张地形
-        #   · 地图+存档补格 —— 地图为主，地图里没有的格（本档 179 个）用存档格对象补上，消掉空洞
-        #   · 存档 —— 只用存档格对象的 `+0x4C/+0x12F`（游戏运行期算完的结果，与游戏画面最接近）
-        #   没 .MAP（或解析失败）时**自动**降级到"存档"，并在标题栏写明。
-        # ★§281：Terrain 对象（树/石头/路牌）标记 —— 默认**关**（一张图动辄 3000+ 棵），
-        #   勾上就在地形图上画深绿圆点。树会占格（+0x138 的 0x10 位），跟"能不能放东西"直接相关。
-        self.mv_terr = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row2, text='树/石', variable=self.mv_terr,
-                        command=self.mv_render).pack(side='left', padx=(0, 6))
-        # ★§283：覆盖物标记 —— 默认**开**（玩家 2026-10-26："画出来"）。
-        #   金黄点=矿/宝石、灰块=墙/沙袋/铁丝网、褐色点=石头、蓝线=桥面/铁轨，其余小灰点。
-        self.mv_ovl = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text='覆盖物', variable=self.mv_ovl,
-                        command=self.mv_render).pack(side='left', padx=(0, 6))
-        ttk.Label(row2, text='地形：').pack(side='left', padx=(8, 0))
+        # ── ① 地图：选图 / 匹配 / 备份 ＋ 地形数据源与剧场 ──
+        _s, b1 = ui_theme.section(f, '地图', '只读')
+
+        r = ttk.Frame(b1, style=SUF)
+        r.pack(fill='x')
+        ttk.Button(r, text='选择地图…', command=self.mv_choose).pack(side='left')
+        ttk.Button(r, text='自动匹配', command=self.mv_auto).pack(side='left', padx=(PAD, 0))
+        ttk.Button(r, text='🗺 用地编打开', command=self.fa2_open).pack(side='left', padx=(PAD, 0))
+        ttk.Button(r, text='备份存档', command=self.mv_backup).pack(side='left', padx=(PAD, 0))
+        self.mv_lbl = ttk.Label(r, text='未加载地图', style=MU)
+        self.mv_lbl.pack(side='left', padx=(8, 0))
+
+        r = ttk.Frame(b1, style=SUF)
+        r.pack(fill='x', pady=(6, 0))
+        ttk.Label(r, text='地形数据源', style=LB).pack(side='left')
+        # ★★§280：地图（默认）／地图+存档补格／存档
         self.mv_terr_src = tk.StringVar(value='地图')
-        _cb_terr = ttk.Combobox(row2, textvariable=self.mv_terr_src, width=13,
-                                state='readonly', values=('地图', '地图+存档补格', '存档'))
-        _cb_terr.pack(side='left')
+        ttk.Combobox(r, textvariable=self.mv_terr_src, width=12, state='readonly',
+                     values=('地图', '地图+存档补格', '存档')).pack(side='left', padx=(6, 0))
         self.mv_terr_src.trace_add('write', self._mv_on_terr_src)
-        # 兼容旧代码/自检：`mv_src_save` 现在由下拉派生（True ⇔ 档位 = "存档"），不再单独占界面
+        # ★§285：tile 索引按剧场取色，而存档里没有剧场字段（搜 TEMPERATE/URBAN/SNOW/
+        #   Theater/[Basic] 全无）⇒ 有 .MAP 用地图 [Basic] Theater，没有就靠这个下拉。
+        #   只影响**配色**：格子归属、层高、选位、放建筑都不看剧场。
+        ttk.Label(r, text='剧场', style=LB).pack(side='left', padx=(12, 0))
+        self.mv_theater_var = tk.StringVar(value='TEMPERATE')
+        self._cb_theater = ttk.Combobox(
+            r, textvariable=self.mv_theater_var, width=10, state='readonly',
+            values=('TEMPERATE', 'SNOW', 'URBAN', 'NEWURBAN', 'DESERT', 'LUNAR'))
+        self._cb_theater.pack(side='left', padx=(6, 0))
+        self._cb_theater.bind('<<ComboboxSelected>>', lambda e: self._mv_on_theater())
+        self.lbl_terr_hint = ttk.Label(
+            r, text='没 .MAP 时地形取自存档；剧场只影响配色',
+            style=MU, font=SM)
+        self.lbl_terr_hint.pack(side='left', padx=(10, 0))
+        # 兼容旧代码/自检：`mv_src_save` 由下拉派生（True ⇔ 档位 = "存档"），不再单独占界面
         self.mv_src_save = tk.BooleanVar(value=False)
         self.mv_src_save.trace_add('write', self._mv_on_src_save)
-        ttk.Button(row2, text='重绘', command=self.mv_render).pack(side='left', padx=6)
-        ttk.Label(row2, text='（点格子选位：红=已占 / 深红细线=高度差(悬崖/斜坡) / 暗色=地图外）',
-                  foreground='#6b7280').pack(side='left', padx=8)
 
-        rowp = ttk.Frame(f)
-        rowp.pack(fill='x', pady=(2, 2))
-        ttk.Label(rowp, text='放置建筑（直接落成）：').pack(side='left')
-        self.mv_type = ttk.Combobox(rowp, width=22, state='readonly')
-        self.mv_type.pack(side='left')
-        ttk.Button(rowp, text='刷新类型', command=self._fill_type_lists).pack(side='left', padx=4)
-        # ★2026-10-17 新增：**所属方**选择（写建筑记录载荷 +336/+544 的 House 键）
-        ttk.Label(rowp, text='所属方：').pack(side='left', padx=(10, 0))
-        self.mv_house = ttk.Combobox(rowp, width=16, state='readonly')
-        self.mv_house.pack(side='left')
-        ttk.Button(rowp, text='⬛ 放置建筑到选中格', command=self.mv_place).pack(side='left', padx=6)
-        ttk.Button(rowp, text='❌ 删除选中格建筑',
-                   command=self.mv_delete).pack(side='left', padx=6)
-        ttk.Button(rowp, text='🏳 改选中格建筑所属方',
-                   command=self.mv_set_owner).pack(side='left', padx=6)
+        # ── ② 视图：缩放 ＋ 叠加开关（低频三个收进「叠加 ▾」，勾选状态照样看得见）──
+        _s, b2 = ui_theme.section(f, '视图')
 
-        # ★2026-10-22 §169/§183：这一排是**修旧楼**用的（放置时已自动播一遍建造动画，
-        #   不需要再手动"重播"——那个按钮 §183 按玩家要求删掉了，能力留在 core：
-        #   `make_building_buildup()`）。
-        rowa = ttk.Frame(f)
-        rowa.pack(fill='x', pady=(0, 2))
-        ttk.Button(rowa, text='⏩ 修成完成态（选中格）',
-                   command=self.mv_fix_anim).pack(side='left')
-        ttk.Button(rowa, text='🔍 扫描全档卡住的建筑',
-                   command=self.mv_scan_anim).pack(side='left', padx=6)
-        ttk.Button(rowa, text='✨ 补齐建筑动画(anim)',
-                   command=self.mv_add_anim).pack(side='left', padx=6)
-        ttk.Label(rowa, text='修的是旧楼：存档在 Buildup 播完前保存 ⇒ 重载后显示不全',
-                  foreground='#6b7280').pack(side='left', padx=6)
+        r = ttk.Frame(b2, style=SUF)
+        r.pack(fill='x')
+        ttk.Label(r, text='缩放', style=LB).pack(side='left')
+        ttk.Button(r, text='－', width=3,
+                   command=lambda: self.mv_zoom(-1)).pack(side='left', padx=(6, 0))
+        ttk.Button(r, text='＋', width=3,
+                   command=lambda: self.mv_zoom(1)).pack(side='left', padx=(3, 0))
+        ttk.Button(r, text='适应窗口', command=self.mv_fit).pack(side='left', padx=(6, 0))
+        self.mv_grid = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r, text='网格', variable=self.mv_grid, command=self.mv_render,
+                        style='Surface.TCheckbutton').pack(side='left', padx=(14, 0))
+        # ★§283：覆盖物 —— 默认开（金黄=矿/宝石、灰块=挡路、蓝线=桥/铁轨）
+        self.mv_ovl = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r, text='覆盖物', variable=self.mv_ovl, command=self.mv_render,
+                        style='Surface.TCheckbutton').pack(side='left', padx=(8, 0))
+        # ★§266/§267/§281：路径点 / 单位 / 树石 —— 低频，收进菜单
+        self.mv_wp = tk.BooleanVar(value=True)
+        self.mv_units = tk.BooleanVar(value=False)
+        self.mv_terr = tk.BooleanVar(value=False)
+        _mb0 = ttk.Menubutton(r, text='叠加 ▾', style='Ghost.TButton')
+        _m0 = tk.Menu(_mb0, tearoff=0)
+        _m0.add_checkbutton(label='路径点（地图 [Waypoints] + 存档）',
+                            variable=self.mv_wp, command=self.mv_render)
+        _m0.add_checkbutton(label='单位（≥20 倍才画）',
+                            variable=self.mv_units, command=self._mv_toggle_units)
+        _m0.add_checkbutton(label='树/石（Terrain 对象）',
+                            variable=self.mv_terr, command=self.mv_render)
+        _mb0['menu'] = _m0
+        _mb0.pack(side='left', padx=(10, 0))
+        ttk.Button(r, text='重绘', command=self.mv_render).pack(side='left', padx=(10, 0))
 
-        # ★2026-10-17 玩家定案：放置建筑**默认走触发法**（引擎自己造）
-        #   好处：① 有建造动画、模型完整（不会"无头"）；② 不可建造的地形（悬崖边/水面）引擎会直接拒绝。
-        # ★2026-10-21 17:50 另一条路也已**游戏内完整验收**：不勾 = 直接落成
-        #   （立即出现、可指定所属方、光棱塔实测正常开火）—— 只是不自动避开悬崖/水面，
-        #   所以放进 require_free 的占用检查来兜底。
-        rowq = ttk.Frame(f)
-        rowq.pack(fill='x', pady=(0, 2))
-        self.mv_via = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rowq, text='⚡ 触发法（引擎自己造）',
-                        variable=self.mv_via).pack(side='left')
-        ttk.Label(rowq, text='事件：').pack(side='left', padx=(10, 0))
-        self.mv_ev = ttk.Combobox(rowq, width=15, state='readonly',
-                                  values=('流逝时间 1 秒', '任何事件(立即)', '流逝时间 5 秒'))
-        self.mv_ev.current(0)                       # ★默认 1 秒：实测唯一稳的那条
-        self.mv_ev.pack(side='left')
-        ttk.Label(rowq, text='有建造动画/模型完整；悬崖水面等不可建地形会被引擎拒绝',
-                  foreground='#6b7280').pack(side='left', padx=4)
-        ttk.Label(f, text='　不勾 = 直接落成：立即写进档案、可指定所属方、已验收可正常开火'
-                          '（不会自动避开悬崖/水面，靠占用检查兜底）',
-                  foreground='#6b7280').pack(anchor='w')
-        # ★2026-10-22 §188 定案（玩家 T16 实测）：直接落成 = **播一遍建造动画，播完模型完整**。
-        #   开关是配方里的 `+0x6E4=0`；继承了 1 就会"不播 + 显示不全"（§187/T16-B 栋）。
-        ttk.Label(f, text='　直接落成 = 引擎播一遍建造动画（读档后 1~2 秒长出来，播完模型完整）。'
-                          '只能加本档已有的类型，且模板必须健康（§184）',
-                  foreground='#1d4ed8', wraplength=980, justify='left').pack(anchor='w', pady=(0, 4))
+        # ── ③ 放置：建筑 / 单位 / 触发法（都作用于选中格）──
+        _s, b3 = ui_theme.section(f, '放置', '作用于选中格')
 
-        # ★2026-10-17 新增：**放单位**（同类型克隆；U2 游戏内验收通过）
-        rowu = ttk.Frame(f)
-        rowu.pack(fill='x', pady=(0, 2))
-        ttk.Label(rowu, text='放置单位：').pack(side='left')
-        self.mv_unit = ttk.Combobox(rowu, width=30, state='readonly')
-        self.mv_unit.pack(side='left')
+        r = ttk.Frame(b3, style=SUF)
+        r.pack(fill='x')
+        ttk.Label(r, text='建筑', style=LB).pack(side='left')
+        self.mv_type = ttk.Combobox(r, width=15, state='readonly')
+        self.mv_type.pack(side='left', padx=(5, 0))
+        ttk.Button(r, text='↻', width=3,
+                   command=self._fill_type_lists).pack(side='left', padx=(3, 0))
+        ttk.Label(r, text='所属', style=LB).pack(side='left', padx=(6, 0))
+        # ★2026-10-17：写建筑记录载荷 +336/+544 的 House 键
+        self.mv_house = ttk.Combobox(r, width=9, state='readonly')
+        self.mv_house.pack(side='left', padx=(5, 0))
+        ttk.Button(r, text='放置', command=self.mv_place).pack(side='left', padx=(8, 0))
+        ttk.Button(r, text='删除建筑',
+                   command=self.mv_delete).pack(side='left', padx=(4, 0))
+        ttk.Button(r, text='改所属方',
+                   command=self.mv_set_owner).pack(side='left', padx=(4, 0))
+
+        r = ttk.Frame(b3, style=SUF)
+        r.pack(fill='x', pady=(4, 0))
+        ttk.Label(r, text='单位', style=LB).pack(side='left')
+        self.mv_unit = ttk.Combobox(r, width=13, state='readonly')
+        self.mv_unit.pack(side='left', padx=(5, 0))
         self.mv_unit.bind('<<ComboboxSelected>>', lambda e: self._unit_sel_info())
-        # ★2026-10-17 新增：单位**所属方**（写记录 +352/+560 的 House 键）——
-        #   默认「沿用模板」，选别的阵营就是**给对面刷兵**。
-        ttk.Label(rowu, text='所属方：').pack(side='left', padx=(10, 0))
-        self.mv_u_house = ttk.Combobox(rowu, width=18, state='readonly',
+        # ★2026-10-17：单位所属方（写记录 +352/+560 的 House 键）—— 默认沿用模板
+        ttk.Label(r, text='所属', style=LB).pack(side='left', padx=(5, 0))
+        self.mv_u_house = ttk.Combobox(r, width=9, state='readonly',
                                        values=(UNIT_HOUSE_INHERIT,))
         self.mv_u_house.current(0)
-        self.mv_u_house.pack(side='left')
-        # ★2026-10-18 新增：单位**等级**（记录 +0x150 int / +0x164 float，成对改写）
-        #   ★游戏内验收（21:43）：显示等级**只由 +0x150 决定**。默认选「新兵」——
-        #     档里的模板常是 Neutral/平民的**精英**兵（三级），沿用模板会莫名其妙出三颗星。
-        ttk.Label(rowu, text='等级：').pack(side='left', padx=(10, 0))
-        self.mv_u_vet = ttk.Combobox(rowu, width=12, state='readonly',
+        self.mv_u_house.pack(side='left', padx=(5, 0))
+        # ★2026-10-18：等级**只由 +0x150 决定**（+0x164 绝对不能碰）；默认「新兵」
+        ttk.Label(r, text='等级', style=LB).pack(side='left', padx=(5, 0))
+        self.mv_u_vet = ttk.Combobox(r, width=6, state='readonly',
                                      values=UNIT_VET_CHOICES)
-        self.mv_u_vet.current(1)                    # 默认「新兵」
-        self.mv_u_vet.pack(side='left')
-        ttk.Button(rowu, text='🪖 放单位到选中格',
-                   command=self.mv_putunit).pack(side='left', padx=6)
-        # ★★§252（玩家： 「我指定是平地，你选的地方反而更危险」）：
-        #   默认**不挪位** —— 你选中哪格就放哪格。这个勾是"我宁可你帮我挪到最近平地"。
+        self.mv_u_vet.current(1)
+        self.mv_u_vet.pack(side='left', padx=(5, 0))
+        ttk.Button(r, text='放单位',
+                   command=self.mv_putunit).pack(side='left', padx=(6, 0))
+        # ★★§252：默认**不挪位** —— 你选中哪格就放哪格
         self.mv_u_nudge = tk.BooleanVar(value=False)
-        ttk.Checkbutton(rowu, text='自动挪到平地', variable=self.mv_u_nudge).pack(side='left', padx=(2, 6))
-        # ★§216：单位模板库（学习 / 查看），跨型号放置不再依赖"手边得有一份含该型号的存档"
-        ttk.Button(rowu, text='🔫 刷单位(小队法)',
-                   command=self.mv_spawn_team).pack(side='left', padx=6)
-        ttk.Button(rowu, text='📚 学习模板',
-                   command=self.mv_learn_sig).pack(side='left', padx=6)
-        ttk.Button(rowu, text='模板库…',
-                   command=self.mv_show_sig).pack(side='left')
-        self.mv_urule = ttk.Label(rowu, text='', foreground='#6b7280')
-        self.mv_urule.pack(side='left', padx=6)
-        ttk.Button(rowu, text='规则目录…',
-                   command=self.mv_pick_rules).pack(side='left')
+        ttk.Checkbutton(r, text='挪平地', variable=self.mv_u_nudge,
+                        style='Surface.TCheckbutton').pack(side='left', padx=(5, 0))
+        # ★§216：单位模板库（学习/查看）、刷单位 —— 低频，收进菜单
+        _mb = ttk.Menubutton(r, text='更多 ▾', style='Ghost.TButton')
+        _m = tk.Menu(_mb, tearoff=0)
+        _m.add_command(label='🔫 刷单位（小队法）…', command=self.mv_spawn_team)
+        _m.add_separator()
+        _m.add_command(label='📚 学习模板（从本档学）', command=self.mv_learn_sig)
+        _m.add_command(label='模板库…', command=self.mv_show_sig)
+        _m.add_command(label='规则目录…', command=self.mv_pick_rules)
+        _mb['menu'] = _m
+        _mb.pack(side='left', padx=(5, 0))
 
-        # ★§268（玩家 2026-10-25）：「选中格 → 复制 / 粘贴 / 移动」，按**格**操作，不做多选框选
-        rowc = ttk.Frame(f)
-        rowc.pack(fill='x', pady=(0, 2))
-        ttk.Label(rowc, text='单位操作（作用于选中格）：').pack(side='left')
-        ttk.Button(rowc, text='📋 复制该格', command=self.mv_copy_units).pack(side='left', padx=(2, 4))
-        ttk.Button(rowc, text='📌 粘贴到此格', command=self.mv_paste_units).pack(side='left', padx=4)
-        ttk.Button(rowc, text='➡ 把源格单位移到此格',
-                   command=self.mv_move_units).pack(side='left', padx=4)
-        ttk.Button(rowc, text='🗑 删除该格单位',
-                   command=self.mv_delete_units).pack(side='left', padx=4)
+        r = ttk.Frame(b3, style=SUF)
+        r.pack(fill='x', pady=(4, 0))
+        # ★2026-10-17 玩家定案：放置建筑默认走**触发法**（引擎自己造 ⇒ 有动画、模型完整、
+        #   不可建地形会被拒）；★2026-10-21 不勾=直接落成也已游戏内验收。
+        self.mv_via = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r, text='⚡ 触发法（引擎自己造）', variable=self.mv_via,
+                        style='Surface.TCheckbutton').pack(side='left')
+        ttk.Label(r, text='事件', style=LB).pack(side='left', padx=(8, 0))
+        self.mv_ev = ttk.Combobox(r, width=13, state='readonly',
+                                  values=('流逝时间 1 秒', '任何事件(立即)', '流逝时间 5 秒'))
+        self.mv_ev.current(0)                       # ★默认 1 秒：实测唯一稳的那条
+        self.mv_ev.pack(side='left', padx=(5, 0))
+        # ★2026-10-22 §169/§183：修旧楼（放置时已自动播建造动画，这里只修"旧楼"）
+        _mb2 = ttk.Menubutton(r, text='修旧楼 ▾', style='Ghost.TButton')
+        _m2 = tk.Menu(_mb2, tearoff=0)
+        _m2.add_command(label='⏩ 修成完成态（选中格）', command=self.mv_fix_anim)
+        _m2.add_command(label='🔍 扫描全档卡住的建筑', command=self.mv_scan_anim)
+        _m2.add_command(label='✨ 补齐建筑动画(anim)', command=self.mv_add_anim)
+        _mb2['menu'] = _m2
+        _mb2.pack(side='left', padx=(10, 0))
+        ttk.Label(r, text='勾 = 引擎造 / 不勾 = 直接落成',
+                  style=MU, font=SM).pack(side='left', padx=(10, 0))
+
+        # ── ④ 选中格：单位级操作（按格，不做框选）★§268 ──
+        _s, b4 = ui_theme.section(f, '选中格', '单位操作')
+
+        r = ttk.Frame(b4, style=SUF)
+        r.pack(fill='x')
+        ttk.Button(r, text='📋 复制该格',
+                   command=self.mv_copy_units).pack(side='left')
+        ttk.Button(r, text='📌 粘贴到此格',
+                   command=self.mv_paste_units).pack(side='left', padx=(PAD, 0))
+        ttk.Button(r, text='➡ 把源格单位移到此格',
+                   command=self.mv_move_units).pack(side='left', padx=(PAD, 0))
+        ttk.Button(r, text='🗑 删除该格单位',
+                   command=self.mv_delete_units).pack(side='left', padx=(PAD, 0))
         self.mv_clip = None
-        self.mv_clip_lbl = ttk.Label(rowc, text='剪贴板：空', foreground='#6b7280')
-        self.mv_clip_lbl.pack(side='left', padx=8)
+        self.mv_clip_lbl = ttk.Label(r, text='剪贴板：空', style=MU)
+        self.mv_clip_lbl.pack(side='left', padx=(10, 0))
 
         cw = ttk.Frame(f)
         cw.pack(fill='both', expand=True, pady=(6, 4))
         self.mv_canvas = tk.Canvas(cw, bg='#12141a', highlightthickness=0)
-        vs = ttk.Scrollbar(cw, orient='vertical', command=self.mv_canvas.yview)
-        hs = ttk.Scrollbar(cw, orient='horizontal', command=self.mv_canvas.xview)
+        # ★§286：画布是深色，用专用深色滚动条（原来浅色 thumb 贴在深底上分不清）
+        vs = ttk.Scrollbar(cw, orient='vertical', command=self.mv_canvas.yview,
+                           style='Map.Vertical.TScrollbar')
+        hs = ttk.Scrollbar(cw, orient='horizontal', command=self.mv_canvas.xview,
+                           style='Map.Horizontal.TScrollbar')
         self.mv_canvas.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
         self.mv_canvas.grid(row=0, column=0, sticky='nsew')
         vs.grid(row=0, column=1, sticky='ns')
@@ -3502,7 +3641,7 @@ class App(tk.Tk):
         self.mv_canvas.bind('<Button-1>', self.mv_click)
 
         self.mv_info = ttk.Label(f, text='', foreground='#111827', justify='left',
-                                 wraplength=980)
+                                 wraplength=700)   # ★§289：原来 980 > 工作区 722 ⇒ 被裁
         self.mv_info.pack(anchor='w')
         self.mv_state = {'mp': None, 'ok': False, 'scale': 8, 'img': None,
                          'blds': [], 'occ': {}, 'sel': None, 'path': None,
@@ -3520,6 +3659,23 @@ class App(tk.Tk):
                    'wpdata': None, 'udata': None})
         self.mv_canvas.delete('all')
         self.mv_info.config(text='')
+        if self.doc and not (p and os.path.exists(p)):
+            # ★§285：没有 .MAP ⇒ 地形来自存档；同样推迟到切页时再渲染
+            st['path'] = None
+            if lazy:
+                self.mv_deferred = True
+                self._mv_defer_path = None
+                try:
+                    self.mv_lbl.config(text='没有 .MAP ｜ 切到本页时用**存档**画地形',
+                                       foreground='#b45309')
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.mv_load(None)
+                except Exception:
+                    pass
+            return
         if self.doc and p and os.path.exists(p):
             if lazy:
                 # ★§272：**连地图解析也推迟** —— `parse_map()` 对任务图要 10.3 秒，
@@ -3533,7 +3689,7 @@ class App(tk.Tk):
             else:
                 self.mv_load(p)
         else:
-            self.mv_lbl.config(text='未加载地图（网格模式：可直接点选格子；放置建筑不需要地图）'
+            self.mv_lbl.config(text='未加载地图 · 网格模式可点选'
                                    + self._mv_ready_text(),
                                foreground='#6b7280')
             if self.doc:
@@ -3596,6 +3752,12 @@ class App(tk.Tk):
         旧行为（`messagebox.showwarning` 弹框 + 不加载）已移除。
         """
         st = self.mv_state
+        # ★§285：没有 .MAP（path 为空 / 文件不在了）也照样能画 —— 地形改用存档格对象。
+        if path and not os.path.exists(str(path)):
+            st['map_err'] = '地图文件不在了：%s' % os.path.basename(str(path))
+            path = None
+        if not path:
+            st['map_err'] = st.get('map_err') or '没有 .MAP 文件'
         st['path'] = path
         st['map_err'] = None
         mode = self._mv_terr_mode()          # 'map' / 'merge' / 'save'
@@ -3607,22 +3769,31 @@ class App(tk.Tk):
             except Exception:
                 theater = None
         if not theater:
-            theater = getattr(self, 'mv_theater', None) or 'NEWURBAN'
+            # 没有地图 ⇒ 用下拉里选的（默认 TEMPERATE：游戏自己的默认剧场）
+            theater = (getattr(self, 'mv_theater', None)
+                       or (self.mv_theater_var.get() if hasattr(self, 'mv_theater_var')
+                           else None)
+                       or 'TEMPERATE')
         self.mv_theater = theater
+        try:
+            self.mv_theater_var.set(theater)
+        except Exception:
+            pass
         st['gdata'] = None          # 换地图/换档 ⇒ 缓存的建筑/单位/路径点全部作废
         st['wpdata'] = None
         st['udata'] = None
         self.status.set('正在校验「地图 ↔ 存档」…')
         self.update_idletasks()
         try:
-            mt = self.doc.map_match(path)
+            mt = (self.doc.map_match(path) if path
+                  else {'ok': False, 'msg': '无 .MAP（地形取自存档）'})
         except Exception as e:
             mt = {'ok': False, 'msg': '匹配校验没跑通（不影响使用）：%s' % e}
         import map_render as mr
         mp = None
         src = mode
         filled = 0
-        if mode != 'save':
+        if mode != 'save' and path:
             try:
                 mp = mr.parse_map(path)
             except Exception as e:
@@ -3675,29 +3846,37 @@ class App(tk.Tk):
         ok = bool(mt.get('ok'))
         _srctxt = ''
         if src == 'save':
-            _srctxt = (' ｜ ⚠ 地形取自**存档**（%s；theater 按 %s）'
-                       % ('没读到 .MAP: ' + st['map_err'] if st.get('map_err') else '手动选择', theater))
+            _srctxt = (' ｜ 地形取自**存档**（%s；剧场 %s —— 存档里没这个字段，'
+                       '只影响配色，选位/放建筑不受影响）'
+                       % ('没读到 .MAP: ' + st['map_err'] if st.get('map_err') else '你选的', theater))
             ok = False
         elif src == 'merge':
             _srctxt = ' ｜ 地形 = .MAP 底图 + 存档补 %d 格' % filled
         else:
             _srctxt = ' ｜ 地形取自 .MAP（与存档无关）'
         st['filled'] = filled
-        self.mv_lbl.config(text='%s ｜ %s%s%s' % (os.path.basename(path), mt.get('msg', ''),
-                                                 _srctxt, self._mv_ready_text()),
+        _nm = os.path.basename(path) if path else '（无 .MAP）'
+        # ★§289：卡内只留短状态（原来 50+ 字的拼接把这一行顶出窗口右缘）；
+        #   完整口径（匹配消息 / 地形来源 / 就绪）进状态栏 +「说明 ▸」
+        self.mv_lbl.config(text='%s%s' % (_nm, ' ✓' if ok else ' ⚠'),
                            foreground='#0b6b3a' if ok else '#b45309')
+        # 状态栏只说"哪张图 / 对不对"；地形来源与就绪状态在卡内（下拉 + 说明）看得到
+        self._map_full_text = '%s ｜ %s%s' % (_nm, mt.get('msg', ''), _srctxt)
+        _srcshort = {'save': '地形：存档', 'merge': '地形：地图+存档补格',
+                     'map': '地形：地图'}.get(src, '')
+        self.status.set(' ｜ '.join(x for x in (_nm, mt.get('msg', ''), _srcshort) if x))
         if lazy:
             # ★§272：开档时不渲染（生成地形图 + PNG 要 9 秒），切到本页再画
             self.mv_deferred = True
             st['img'] = None
-            self.mv_lbl.config(
-                text='%s ｜ %s（切到本页时再渲染）' % (os.path.basename(path), mt.get('msg', '')))
+            self.mv_lbl.config(text='%s ✓' % _nm if ok else '%s ⚠' % _nm)
+            self._map_full_text = '%s ｜ %s（切到本页时再渲染）' % (_nm, mt.get('msg', ''))
+            self.status.set(self._map_full_text)
         else:
             self.mv_deferred = False
             self.mv_fit()
-        self.mv_info.config(text=('提示：点地图上的格子选位，然后在上方「放置建筑」选类型点放置；'
-                                 '下方会给出落位判定。（写入已开放：直接放好 = U2 配方，游戏内验证通过）'
-                                 + ('' if ok else '　⚠ 地图与存档的匹配只是提示，不影响任何操作。')))
+        self.mv_info.config(text=('点格子选位 → 上方「放置」选类型 → 放置；下方给出落位判定'
+                                 + ('' if ok else '　⚠ 地图与存档的匹配只是提示，不影响任何操作')))
         # ★挂上地图后规则来源变了（大型任务的自制单位/建筑规则写在地图 INI 里）⇒ 刷新下拉与说明
         try:
             self._refresh_unit_rule_label()
@@ -3832,6 +4011,21 @@ class App(tk.Tk):
             return 'merge'
         return 'map'
 
+    def _mv_on_theater(self):
+        """★§285：换剧场只变配色（tile→颜色/贴图映射），格子数据不动 ⇒ 直接重载地形。"""
+        if getattr(self, '_mv_terr_sync', False):
+            return
+        self.mv_theater = self.mv_theater_var.get()
+        p = (getattr(self, 'mv_state', None) or {}).get('path')
+        try:
+            if p:
+                self.mv_load(p)        # 有地图：地图的 [Basic] Theater 优先，这里只是提醒
+            else:
+                self.mv_load(None)
+            self.status.set('剧场已切到 %s（只改配色，格子/选位/放置不受影响）' % self.mv_theater)
+        except Exception as e:
+            self.status.set('切剧场失败：%s' % e)
+
     def _mv_on_terr_src(self, *_):
         """下拉变了 ⇒ 同步旧 BooleanVar，然后重载地形。"""
         if getattr(self, '_mv_terr_sync', False):
@@ -3863,10 +4057,10 @@ class App(tk.Tk):
     def _mv_reload_terrain(self):
         """切换地形来源 ⇒ 重新装载地形（同一个地图文件不动）。"""
         p = (getattr(self, 'mv_state', None) or {}).get('path')
-        if not p or not self.doc:
+        if not self.doc:
             return
         try:
-            self.mv_load(p)
+            self.mv_load(p)          # ★§285：p 可以为空（= 只用存档地形）
         except Exception as e:
             self.status.set('重载地形失败：%s' % e)
 
@@ -4459,44 +4653,57 @@ class App(tk.Tk):
 
     def _tab_gift(self, nb):
         f = ttk.Frame(nb, padding=8)
-        ttk.Label(f, text='给玩家赠送一座建筑（2026-10-16 游戏内验收通过：**新开载入 ✅ / 游戏内重载 ✅**）。\n'
+        _ph = ui_theme.page_header(f, '赠送建筑', '按模板批量添加建筑')
+        _ph.pack(fill='x', padx=2, pady=(2, 8))
+        _note, self._note_btn_gift = ui_theme.note_box(f, _ph)
+        self._note_box_gift = _note          # 折叠说明的容器（默认不 pack）
+        ttk.Label(_note, text='给玩家赠送一座建筑（2026-10-16 游戏内验收通过：**新开载入 ✅ / 游戏内重载 ✅**）。\n'
                           '· 直接放好：立即出现在指定格子（记录 + 三张登记表全登 + 格子占用 + 实例 ID 唯一化）。\n'
                           '· 就绪未落地：侧栏直接出现"就绪"图标，进游戏自己找位置放。\n'
                           '　仅支持**可生产建筑（TechLevel≥1）**——建造场等不可生产类型会拒送，请用直接放好。\n'
                           '· 档里没有的类型也能放（跨类型克隆：自动改类型键/美术尺寸/耐久，数据来自存档语料库）。\n'
                           '★ 直接放好 = **进游戏播一遍建造动画，播完模型完整**（§188 定案，T16 实测）。\n'
+                          '· 高级「槽2 偏移」= 工厂反引槽 2 的 hex 值：**只有同一会话内的档**需要填；'
+                          '跨档一般留空（只写槽 1），具体待游戏验证。\n'
                           '★ 改完会提示另存为新文件，进游戏前请先备份。',
-                  foreground='#374151', wraplength=980, justify='left').pack(anchor='w')
+                  foreground='#374151', wraplength=700, justify='left').pack(anchor='w')
+        # ★§289：原来把「类型 / 刷新 / 两种模式 / 坐标 / 所属方」全塞一行（需 ~1010px
+        #   ⇒ 右半截被窗口裁掉）⇒ 拆成「类型＋所属方」「模式＋坐标」「动画＋高级」三行。
         row = ttk.Frame(f)
         row.pack(fill='x', pady=(8, 2))
         ttk.Label(row, text='建筑类型：').pack(side='left')
         self.gift_type = ttk.Combobox(row, width=24, state='readonly')
-        self.gift_type.pack(side='left')
-        ttk.Button(row, text='刷新类型列表', command=self._gift_fill_types).pack(side='left', padx=6)
-        self.gift_mode = tk.StringVar(value='ready')
-        ttk.Radiobutton(row, text='就绪未落地（推荐）', variable=self.gift_mode,
-                        value='ready').pack(side='left', padx=(12, 4))
-        ttk.Radiobutton(row, text='直接放好 → 格 X:', variable=self.gift_mode,
-                        value='placed').pack(side='left', padx=(12, 2))
-        self.gift_x = ttk.Spinbox(row, from_=0, to=999, width=5)
-        self.gift_x.pack(side='left')
-        ttk.Label(row, text=' Y:').pack(side='left')
-        self.gift_y = ttk.Spinbox(row, from_=0, to=999, width=5)
-        self.gift_y.pack(side='left')
+        self.gift_type.pack(side='left', padx=(4, 0))
+        ttk.Button(row, text='刷新类型列表',
+                   command=self._gift_fill_types).pack(side='left', padx=(6, 0))
         # ★2026-10-17：所属方（仅「直接放好」分支生效；就绪未落地固定为玩家阵营）
-        ttk.Label(row, text='　所属方：').pack(side='left')
+        ttk.Label(row, text='所属方：').pack(side='left', padx=(16, 0))
         self.gift_house = ttk.Combobox(row, width=14, state='readonly')
-        self.gift_house.pack(side='left')
+        self.gift_house.pack(side='left', padx=(4, 0))
+
+        row_mode = ttk.Frame(f)
+        row_mode.pack(fill='x', pady=(6, 2))
+        self.gift_mode = tk.StringVar(value='ready')
+        ttk.Radiobutton(row_mode, text='就绪未落地（推荐）', variable=self.gift_mode,
+                        value='ready').pack(side='left')
+        ttk.Radiobutton(row_mode, text='直接放好 → 格', variable=self.gift_mode,
+                        value='placed').pack(side='left', padx=(16, 4))
+        ttk.Label(row_mode, text='X:').pack(side='left')
+        self.gift_x = ttk.Spinbox(row_mode, from_=0, to=999, width=5)
+        self.gift_x.pack(side='left', padx=(2, 0))
+        ttk.Label(row_mode, text='Y:').pack(side='left', padx=(8, 0))
+        self.gift_y = ttk.Spinbox(row_mode, from_=0, to=999, width=5)
+        self.gift_y.pack(side='left', padx=(2, 0))
+
         row2 = ttk.Frame(f)
         row2.pack(fill='x', pady=(2, 2))
         # ★2026-10-22 §188 定案：带建造动画（配方含 6E4=0）⇒ 进游戏播一遍、播完模型完整。
         self.gift_buildup = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text='带建造动画（默认：进游戏播一遍，播完模型/炮塔完整）',
-                        variable=self.gift_buildup).pack(side='left', padx=(0, 12))
-        ttk.Label(row2, text='高级：工厂反引槽2 偏移（hex，仅同会话档需要；'
-                             '跨档留空 = 只写槽1，待游戏验证）：').pack(side='left')
-        self.gift_slot2 = ttk.Entry(row2, width=14)
-        self.gift_slot2.pack(side='left', padx=4)
+        ttk.Checkbutton(row2, text='带建造动画（进游戏播一遍，播完模型/炮塔完整）',
+                        variable=self.gift_buildup).pack(side='left')
+        ttk.Label(row2, text='高级：槽2 偏移(hex)').pack(side='left', padx=(16, 0))
+        self.gift_slot2 = ttk.Entry(row2, width=12)
+        self.gift_slot2.pack(side='left', padx=(4, 0))
         row3 = ttk.Frame(f)
         row3.pack(fill='x', pady=(6, 2))
         ttk.Button(row3, text='🎁 赠送并另存为…', command=self._gift_do).pack(side='left')
@@ -5947,7 +6154,41 @@ class App(tk.Tk):
         st['blds'] = self.doc.buildings()
         st['sel'] = None
         self.mv_render()
-        self.status.set('✅ ' + r['note'])
+        # ★★§287：残留键 = 进游戏必弹框（加载器的键归并断言）⇒ 必须让玩家看见
+        _left = r.get('leftover_refs') or {}
+        if _left:
+            _txt = '、'.join('%08X@%#x' % (k, v[0]) for k, v in list(_left.items())[:4])
+            if messagebox.askyesno(
+                    '⚠ 还有残留引用 —— 要不要现在清掉？',
+                    '这栋建筑的键在存档里还能找到：\n\n    %s\n\n'
+                    '正常应该是 0 处。**带着残留进游戏必弹 Internal error**'
+                    '（加载器做键归并时对不上）。\n\n'
+                    '点「是」我立刻把这 %d 处剔干净；点「否」这次改动就不许存盘。\n'
+                    '（参考：stray_swept=%s）'
+                    % (_txt, len(_left), r.get('stray_swept'))):
+                try:
+                    _n = self.doc.sweep_key_refs(set(_left))
+                except Exception as e:
+                    _n = 0
+                    messagebox.showerror('清理失败', str(e))
+                _left2 = self.doc.leftover_refs(set(_left))
+                if _n and not _left2:
+                    self.doc._unsafe_leftover = None
+                    messagebox.showinfo(
+                        '已清理',
+                        '剔掉 %d 处残留引用，现在这份档可以存了（进游戏前建议先备份）。' % _n)
+                    self.status.set('✅ 已清理残留引用 %d 处，可以另存为新文件' % _n)
+                else:
+                    messagebox.showwarning(
+                        '仍有残留',
+                        '去掉 %d 处，但仍剩 %d 处清不掉 —— 这次改动我不会让你存盘，\n'
+                        '请把下面这段话发给我：\n\n  leftover=%s'
+                        % (_n, len(_left2), _left2))
+                    self.status.set('⚠ 仍有残留引用 %d 处（禁止存盘）' % len(_left2))
+            else:
+                self.status.set('⚠ 删除后仍有残留引用 %d 处（已禁止存盘）' % len(_left))
+        else:
+            self.status.set('✅ ' + r['note'] + '（已核对：无残留引用）')
         self.mv_info.config(
             text='✅ %s\n（还剩 %d 栋；点上方「另存为新文件」写盘，原档不受影响）'
                  % (r['note'], r['count']))
@@ -6008,6 +6249,8 @@ class App(tk.Tk):
 
     def _tab_search(self, nb):
         f = ttk.Frame(nb, padding=8)
+        _ph = ui_theme.page_header(f, '明文搜索', '在明文里搜字符串 / 偏移')
+        _ph.pack(fill='x', padx=2, pady=(2, 8))
         row = ttk.Frame(f)
         row.pack(fill='x')
         ttk.Label(row, text='查找').pack(side='left')
@@ -6035,22 +6278,37 @@ class App(tk.Tk):
             if n.lower().endswith(('.sav', '.sav.bak')):
                 files.append(os.path.join(d, n))
         files.sort(key=lambda p: -os.path.getmtime(p))
-        for p in files[:200]:
-            self.tree.insert('', 'end', iid=p, values=(os.path.basename(p), '', '', ''),
-                             tags=())
+        for i, p in enumerate(files[:200]):
+            self.tree.insert('', 'end', iid=p, values=(os.path.basename(p), '', ''),
+                             tags=('odd',) if i % 2 else ())
         self.status.set('共 %d 个存档（按时间倒序）' % len(files))
+        try:
+            self.lbl_list_count.config(text='%d 个' % len(files))
+        except Exception:
+            pass
         self._scan_meta(list(self.tree.get_children())[:12])
 
     def _scan_meta(self, items):
         """后台读取前 N 个存档的元信息（任务名/时间/金钱需要完整解码，较慢）。
-        ★ 同一时刻只跑一个扫描线程（重复点刷新不再堆积）。"""
+        ★ 同一时刻只跑一个扫描线程（重复点刷新不再堆积）。
+
+        ★★2026-10-27（玩家报「添加行为会卡、然后触发编辑器闪退」）：
+          这里对**前 12 个存档**逐个 `SaveDoc(p)` 全量解码，每个 3~9 秒、39MB 大档 460+ 块 LZO，
+          而且明文全留在内存里。玩家开程序时它在后台跑，一进触发编辑器点「添加」就假死。
+          ⇒ ① 带代号，用户切页签即作废（离开存档列表页就不该再扫）；
+             ② 每档之间 sleep 让出 GIL；③ 读完 `del doc` 释放明文。
+        """
         if getattr(self, '_scanning', False):
             return
         self._scanning = True
+        self._scan_gen = getattr(self, '_scan_gen', 0) + 1
+        _gen = self._scan_gen
 
         def work():
             try:
                 for p in items[:12]:
+                    if _gen != getattr(self, '_scan_gen', _gen):
+                        return          # 用户已经切走/换了目录 ⇒ 别再抢 CPU
                     try:
                         raw = open(p, 'rb').read()
                         from cfb import CFB
@@ -6068,8 +6326,10 @@ class App(tk.Tk):
                         doc = SaveDoc(p)
                         self.q.put(('row', p, doc.info.get('任务名', '-'), t,
                                     doc.info.get('金钱')))
+                        del doc                 # ★明文别攒着（12 份大档几百 MB）
                     except Exception:
                         self.q.put(('row', p, '?', '?', None))
+                    time.sleep(0.05)            # ★让主线程有喘息机会
             finally:
                 self._scanning = False
         threading.Thread(target=work, daemon=True).start()
@@ -6084,7 +6344,8 @@ class App(tk.Tk):
                 if kind == 'row':
                     p, title, t, money = msg[1:]
                     if self.tree.exists(p):
-                        self.tree.item(p, values=(os.path.basename(p), title, t,
+                        self.tree.item(p, values=(os.path.basename(p),
+                                                  t or title,
                                                   '' if money is None else money))
                 elif kind == 'status':
                     self.status.set(msg[1])
@@ -6170,6 +6431,25 @@ class App(tk.Tk):
             lbl.config(text=str(self.doc.info.get(k, '-')))
         self.lbl_money.config(text=str(self.doc.info.get('金钱')))
         self.lbl_money_field.config(text='字段: %s' % self.doc.info.get('金钱字段', ''))
+        try:
+            mp = ''
+            try:
+                mp = self.doc.scenario_map_path() or ''
+            except Exception:
+                mp = ''
+            self.lbl_map.config(text=os.path.basename(mp) if mp else '（未挂接）')
+            self.lbl_map_mode.config(text={'auto': '自动匹配', 'manual': '手动指定',
+                                           'no_map': '未找到地图'}.get(
+                getattr(self, '_map_mode', ''), getattr(self, '_map_mode', '-') or '-'))
+        except Exception:
+            pass
+        # ★v1.3：操作条右侧显示当前打开的存档（原来只能看状态栏）
+        try:
+            self.lbl_cur.config(text='已打开　%s' % os.path.basename(self.doc.path)
+                                if getattr(self.doc, 'path', '') else '已打开',
+                                fg=ui_theme.T['ink'])
+        except Exception:
+            pass
 
     def _st_records(self):
         """② 触发表（大档最慢的一步之一）。"""
@@ -6601,6 +6881,8 @@ class App(tk.Tk):
           选小队 → 特遣/脚本页里它的那两条会被选中；选特遣 → 反查哪些小队在用。
         """
         f = ttk.Frame(nb, padding=8)
+        _ph = ui_theme.page_header(f, '作战小队', '小队 / 特遣 / 脚本（只读）')
+        _ph.pack(fill='x', padx=2, pady=(2, 8))
         qrow = ttk.Frame(f)
         qrow.pack(fill='x', pady=(0, 6))
         ttk.Label(qrow, text='搜索：').pack(side='left')
@@ -8679,7 +8961,8 @@ class TriggerEditor(tk.Toplevel):
         self.doc = app.doc
         self.title('触发编辑器（仿地编）')
         self.transient(app)
-        self.geometry('880x740')
+        # ★2026-10-27：以前写死 880x740，实测内容要 989x813 ⇒ 底部「保存/关闭」整排被裁掉
+        #   （玩家截图里根本看不到保存按钮）。改到 `_build()` 之后按内容自适应。
         self.minsize(780, 640)
         self._sids = []
         self._cur = None
@@ -8703,6 +8986,18 @@ class TriggerEditor(tk.Toplevel):
             #   打开只是进入"新建模式"（摆好默认值），**一个字节都不写**；
             #   真要建，点窗口里的「新建」。
             self._enter_new_mode()
+        # ★★2026-10-27：内容宽度要等**列表灌满小队名**之后才定（实测 880→995）
+        #   ⇒ 尺寸放到 idle 里再量一次，否则底部「保存/关闭」那排会被裁掉。
+        self.after_idle(self._fit_window)
+
+    def _fit_window(self):
+        """按内容把窗口缩放到“至少装得下所有控件”（底部保存/关闭按钮永不被裁）。"""
+        try:
+            self.update_idletasks()
+            self.geometry('%dx%d' % (max(880, self.winfo_reqwidth()),
+                                     max(740, self.winfo_reqheight())))
+        except Exception:
+            pass
 
     # ---------------- 构建 ----------------
     def _build(self):
@@ -8869,6 +9164,10 @@ class TriggerEditor(tk.Toplevel):
         btnbox = ttk.Frame(bar)
         btnbox.pack(side='right')
         ttk.Button(btnbox, text='关闭', width=8, command=self.destroy).pack(side='right')
+        # ★2026-10-27 玩家要求「编辑完可以点保存」：直接从这儿把整个存档写盘
+        #   （走主窗口同一条路：自动备份到 _备份存档、文件名过长会先提醒）
+        ttk.Button(btnbox, text='💾 保存到文件', width=14,
+                   command=self.save_to_file).pack(side='right', padx=(0, 2))
         ttk.Button(btnbox, text='✔ 保存该触发', width=14,
                    command=self.save_doc).pack(side='right', padx=(0, 8))
         ttk.Label(bar, text='改动先落在存档内存里（新建模式=真正创建这条触发）；'
@@ -9061,7 +9360,8 @@ class TriggerEditor(tk.Toplevel):
                 elif _rs['executed']:
                     state += ' · ✔ 已执行（挂载数归零、标签已销毁）'
                 else:
-                    state += ' · 未执行（节点还在，剩余挂载 %s）' % _rs['remain']
+                    state += (' · 未执行（节点还在，剩余挂载 %s）'
+                              % (_rs['remain'] if _rs['remain'] is not None else '—'))
                 if _rs['ev_fired']:
                     state += '·事件已满足'
                 # 持久 1 才有意义：把"还差几个"直接摆出来
@@ -9261,10 +9561,12 @@ class TriggerEditor(tk.Toplevel):
 
     def _ac_text(self, atype, arg, team=0, waypoint=0):
         """「参数含义」列的文字：80/107 显示「小队名 · 路径点」。"""
-        if atype in self.doc.SPAWN_ACTIONS:
+        if self.doc.is_team_action(atype):
             nm = next((lab for lab, k in self._team_choices() if k == team), '')
-            return '%s · 路径点 %s' % (
-                nm or ('小队 %08X' % team if team else '（没选小队）'), waypoint)
+            nm = nm or ('小队 %08X' % team if team else '（没选小队）')
+            if atype in self.doc.SPAWN_ACTIONS:
+                return '%s · 路径点 %s' % (nm, waypoint)
+            return nm
         return self.doc._arg_text(action_ptype(atype), arg)
 
     def _fill_actions(self):
@@ -9287,6 +9589,11 @@ class TriggerEditor(tk.Toplevel):
             argcol = a['arg']
             if a.get('type') in self.doc.SPAWN_ACTIONS:
                 argcol = a.get('waypoint', 0)
+            elif self.doc.is_team_action(a.get('type')):
+                # ★§283.9：小队型（4/5/7）参数列显示**小队 ID**（不是 0，避免看着像空的）
+                _tk = a.get('team_key') or a.get('team') or 0
+                argcol = next((t['sid'] for t in (self.doc.team_types() or [])
+                               if t.get('key') == _tk), _tk)
             self.tv_ac.insert('', 'end', iid=str(i), values=(
                 i, a['type'], a['name'], argcol,
                 self._ac_text(a['type'], a['arg'],
@@ -9625,15 +9932,18 @@ class TriggerEditor(tk.Toplevel):
 
     def _ac_payload(self, atype):
         """按行为类型算提交用的 `(arg, kwargs)` —— 80/107 走「小队 + 路径点」。"""
-        if atype in self.doc.SPAWN_ACTIONS:
+        if self.doc.is_team_action(atype):
+            # ★§283.9：小队型（4 建立 / 5 解散 / 7 援军 / 80 / 107）—— 参数 = 小队键（+0x44）
             tkey = self._team_key_from_text(self.var_acarg.get())
             if not tkey:
-                raise ValueError('援军型行为要先在「参数」里选一支作战小队')
-            try:
-                wp = int((self.var_wp.get() or '0').strip())
-            except ValueError:
-                raise ValueError('路径点必须是整数')
-            return 0, {'team': tkey, 'waypoint': wp}
+                raise ValueError('这条行为的参数是「作战小队」—— 先在「参数」里选一支')
+            if atype in self.doc.SPAWN_ACTIONS:
+                try:
+                    wp = int((self.var_wp.get() or '0').strip())
+                except ValueError:
+                    raise ValueError('路径点必须是整数')
+                return 0, {'team': tkey, 'waypoint': wp}
+            return 0, {'team': tkey}
         return self._parse_arg(self.var_acarg.get()), {}
 
     def _ac_hint(self):
@@ -9650,22 +9960,29 @@ class TriggerEditor(tk.Toplevel):
                 nt = action_note(self._ac_keys[j]) or ''
         # 参数下拉：按当前类型的参数类型填（所属方型 ⇒ 阵营顺序）
         try:
+            # ★★2026-10-27：以前这里只看**列表里那行**的类型，于是「选中某行 → 在上面的
+            #   下拉里改成别的类型」时，参数下拉还停在旧类型的候选上（改 4/7 时看着像
+            #   “选不了小队”）。现在：下拉里的类型和行类型不一致 ⇒ 以**下拉**为准。
             k = None
+            k_row = None
             sel2 = self.tv_ac.focus()
             acts2 = (self._det or {}).get('actions') or []
             if sel2 and 0 <= int(sel2) - 1 < len(acts2):
-                k = acts2[int(sel2) - 1]['type']
-            elif self.cb_ac.current() >= 0:
-                k = self._ac_keys[self.cb_ac.current()]
+                k_row = acts2[int(sel2) - 1]['type']
+            k_cb = (self._ac_keys[self.cb_ac.current()]
+                    if self.cb_ac.current() >= 0 else None)
+            k = k_cb if (k_row is None or k_cb != k_row) else k_row
             if k is not None:
                 pt = action_ptype(k)
-                if k in self.doc.SPAWN_ACTIONS:
-                    # ★§255：80/107 的「参数」= 小队（不是数字），另给一个路径点输入
+                if self.doc.is_team_action(k):
+                    # ★§283.9：小队型（4/5/7/80/107）的「参数」= 作战小队；
+                    #   只有 80/107 另外带一个路径点输入。
                     _ch = self._fill_team_values(
                         self.cb_acarg, self._team_key_from_text(self.var_acarg.get())) or []
-                    self._show_wp(True)
-                    nt = ('援军型：**「参数」下拉 = 作战小队**（本档地图定义的小队 %d 个）；'
-                          '「路径点」= 刷出来的位置' % len(_ch)) + \
+                    _spawn = k in self.doc.SPAWN_ACTIONS
+                    self._show_wp(_spawn)
+                    nt = ('小队型：参数下拉 = 作战小队（本档 %d 个）' % len(_ch)) + \
+                         ('；「路径点」= 刷出来的位置' if _spawn else '') + \
                          ('　' + nt if nt else '')
                 else:
                     try:
@@ -9710,11 +10027,12 @@ class TriggerEditor(tk.Toplevel):
             self.cb_ac.current(self._ac_keys.index(a['type']))
         else:
             self.cb_ac.set('%d  %s' % (a['type'], a.get('name') or ''))
-        if a['type'] in self.doc.SPAWN_ACTIONS:
-            # ★§255：援军型 —— 回填"小队 + 路径点"（参数槽里不是数字）
+        if self.doc.is_team_action(a['type']):
+            # ★§283.9：小队型（4/5/7/80/107）—— 小队键在 +0x44；只有 80/107 有路径点
             self._fill_team_values(self.cb_acarg,
                                    a.get('team') or a.get('team_key') or 0)
-            self.var_wp.set(str(a.get('waypoint') or 0))
+            self.var_wp.set(str(a.get('waypoint') or 0)
+                            if a['type'] in self.doc.SPAWN_ACTIONS else '')
         else:
             self.var_acarg.set(str(a['arg']))
             self.var_wp.set('')
@@ -9810,10 +10128,23 @@ class TriggerEditor(tk.Toplevel):
             messagebox.showwarning('提示', str(e), parent=self)
             return
         try:
+            # ★2026-10-27：插入一条行为要重扫全档记录（本档约 2.5 秒）——
+            #   先把光标变忙、状态栏写一句并把界面刷出来，别让玩家以为程序死了。
+            self.config(cursor='watch')
+            self.app.status.set('正在插入行为…（大档约 2 秒）')
+            self.app.update_idletasks()
+        except Exception:
+            pass
+        try:
             self.doc.add_action(self._cur, _t, arg, **kw)
         except Exception as e:
             messagebox.showerror('添加失败', str(e), parent=self)
             return
+        finally:
+            try:
+                self.config(cursor='')
+            except Exception:
+                pass
         self.after_change('已添加行为：%s（%s）'
                           % (ACTION_TYPES[_t][0],
                              self._ac_text(_t, arg, kw.get('team') or 0,
@@ -10045,6 +10376,18 @@ class TriggerEditor(tk.Toplevel):
         return out['v']
 
     # ---------------- 保存 ----------------
+    def save_to_file(self):
+        """「💾 保存到文件」——把**整个存档**写盘（§283.9，玩家 2026-10-27 要求）。
+
+        走主窗口「原地保存(自动备份)」同一条路：先弹确认、自动备份到 `_备份存档`、
+        文件名过长（GBK>50B，实测会读档报错）会先拦一下。本对话框不重载存档，
+        保存后可以继续编辑。
+        """
+        if not self.doc or not getattr(self.doc, 'path', None):
+            messagebox.showwarning('提示', '还没有打开存档', parent=self)
+            return
+        self.app.save_inplace()
+
     def save_doc(self):
         """「✔ 保存该触发」——**把这一条触发保存进存档内存**，不是保存整个存档文件。
 

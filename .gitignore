@@ -9,6 +9,8 @@ build_work/*
 # 打包脚本要跟着仓库走（spec 里用 SPECPATH 算绝对路径，放哪都能跑）
 # ★只放行 spec 一个文件：写成 !build_work/ 会把整个目录（1.1GB 中间产物）都放进来
 !build_work/RA2存档编辑器.spec
+# 发布打包脚本（顶层 exe + _internal；跳玩家文件；保留 base_library.zip）
+!build_work/make_release_zip.py
 _build_bak/
 *.spec.bak
 __pycache__/

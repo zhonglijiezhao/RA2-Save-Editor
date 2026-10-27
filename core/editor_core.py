@@ -2790,14 +2790,24 @@ class SaveDoc(object):
             st['attached'] = self.trigger_attach_count(sid)
         except Exception:
             pass
+        # ★★2026-10-27（玩家："添加行为会卡，然后闪退"）：
+        #   `remain` / `live` 都要跑 `attach_overview()`（对每个 CellTag 全档 find，
+        #   本档 7.5 秒），而这两个数**只对"持久 1"有意义**（还差几个离场 / 漏账）。
+        #   持久 0 和 2 的触发算了也白算 ⇒ 只在 repeat == '1' 时算，其余留 None
+        #   （界面显示"—"）。这一改把编辑器每次刷新从 8 秒降到毫秒级。
         try:
-            st['remain'] = self.semi_persist_remaining(sid)
+            st['repeat'] = str((self.trigger_detail(sid) or {}).get('repeat') or '0')
         except Exception:
-            pass
-        try:
-            st['live'] = self.attach_live_count(sid)
-        except Exception:
-            pass
+            st['repeat'] = '1'          # 读不到就按"需要算"处理（保守，不丢信息）
+        if st['repeat'] == '1':
+            try:
+                st['remain'] = self.semi_persist_remaining(sid)
+            except Exception:
+                pass
+            try:
+                st['live'] = self.attach_live_count(sid)
+            except Exception:
+                pass
         if st['remain'] is not None and st['live'] is not None:
             st['leak'] = st['remain'] - st['live']
         if o['ev'] is not None and o['ev'] + 0x6C <= len(pl):
@@ -3457,6 +3467,11 @@ class SaveDoc(object):
             return '所属方#%d' % v
         if ptype == 6:
             return str(v)
+        if ptype == 7:                     # ★§283.9 小队型：翻成「ID 名称」（走缓存表）
+            lab = self._team_label_map().get(v)
+            if lab:
+                return lab
+            return ('小队 %08X' % v) if v else ''
         return str(v)
 
     def set_event(self, ev, etype=None, arg=None):
@@ -5028,7 +5043,15 @@ class SaveDoc(object):
         return out
 
     def team_types(self):
-        """列出全部作战小队：[{off,key,sid,name,tf_key,country_key,priority,max,veteran,script_key}]。"""
+        """列出全部作战小队：[{off,key,sid,name,tf_key,country_key,priority,max,veteran,script_key}]。
+
+        ★★2026-10-27 性能：**必须缓存**。`_obj_group` 每次都全档 find + 解压，
+          实测单次 ~25ms；而 `_arg_text()`（每行行为都调）与 GUI 的 `_team_choices()`
+          会把它调上千次 ⇒ 一次「添加行为」卡 45 秒。键 = 明文长度（增删字节自动失效）。
+        """
+        memo = getattr(self, '_teamtypes', None)
+        if memo is not None and memo[0] == len(self.plain):
+            return [dict(x) for x in memo[1]]
         g = self._obj_group(self.TEAM_CLS, self.TEAM_SIZE, '作战小队')
         pl = self.plain
         out = []
@@ -5048,6 +5071,23 @@ class SaveDoc(object):
                         #   ↔ `+0xB4=3 / +0xC8=5 / +0xCC=5`。
                         'veteran': u(0xB4),
                         'script_key': u(0xF4), 'tf_key': u(0xF8)})
+        self._teamtypes = (len(self.plain), out)
+        return [dict(x) for x in out]
+
+    def _team_label_map(self):
+        """`{小队键: "ID 名称"}` —— 给 `_arg_text(ptype=7)` 用（同样按明文长度缓存）。"""
+        memo = getattr(self, '_teamlbl', None)
+        if memo is not None and memo[0] == len(self.plain):
+            return memo[1]
+        out = {}
+        try:
+            for t in (self.team_types() or []):
+                k = t.get('key')
+                if k:
+                    out[k] = ('%s %s' % (t.get('sid') or '', t.get('name') or '')).strip()
+        except Exception:
+            out = {}
+        self._teamlbl = (len(self.plain), out)
         return out
 
     def clone_taskforce(self, units, tpl_sid=None, name=None, sid=None):
@@ -5506,6 +5546,18 @@ class SaveDoc(object):
     #   （`+0x40` 类型、`+0x44` 小队键、`+0x58` 路径点，`+0x48` 恒 0），
     #   已用 SAVE0029 的 47 个 80 号 + 250 个 107 号真对象逐一核对。
     SPAWN_ACTIONS = (80, 107)
+    # ★★§283.9：**小队型行为**（地编口径参数类型 7）= 4 建立 / 5 解散 / 7 援军 / 80 / 107。
+    #   实测（Z17 档，386 支小队）：4/7 的小队键和 80/107 一样写在行为对象 **`+0x44`**，
+    #   `+0x48` 恒 0 ⇒ 以前只认 SPAWN_ACTIONS，导致 4/7 读出来 team=0、界面上选不了小队。
+    TEAM_ACTIONS = (4, 5, 7, 80, 107)
+
+    @staticmethod
+    def is_team_action(atype):
+        """该行为的「参数」是不是**作战小队**（4/5/7/80/107）—— 小队键都在 `+0x44`。"""
+        try:
+            return int(atype) in SaveDoc.TEAM_ACTIONS or action_ptype(int(atype)) == 7
+        except Exception:
+            return False
 
     def spawn_units_by_trigger(self, type_name, count=1, cell=None, waypoint=None,
                                house=None, trigger_name=None, max_teams=1,
@@ -7969,6 +8021,62 @@ class SaveDoc(object):
             except Exception:
                 continue
         return None
+
+    def sweep_key_refs(self, keys):
+        """把若干**对象键**从所有认得出的登记表里剔掉 → 剔了几处。
+
+        ★§288：删建筑/删单位之后，只要还有一处残留，游戏加载器就会在"键归并"那步
+          断言失败 ⇒ 玩家看到的就是 `Internal error` 弹框。所以这件事必须做到底，
+          而且要能独立调用（GUI 的「清理残留引用」、自检都用它）。
+        """
+        pl = self.plain
+        removed = 0
+        for _round in range(2000):
+            hit = None
+            for k in sorted(keys, reverse=True):
+                pat = struct.pack('<I', k)
+                # a) 认得出的键表（段长 == 段首计数）
+                for tb in self._key_tables(k):
+                    ent, cpos, n = tb['first'], tb['count_pos'], tb['n']
+                    for i in range(n):
+                        if struct.unpack_from('<I', pl, ent + 4 * i)[0] == k:
+                            hit = (ent + 4 * i, cpos, k)
+                            break
+                    if hit:
+                        break
+                if hit:
+                    break
+                # b) 单条键表 `[u32 1][key]`
+                i = bytes(pl).find(pat)
+                while i >= 0:
+                    if i >= 4 and struct.unpack_from('<I', pl, i - 4)[0] == 1:
+                        hit = (i, i - 4, k)
+                        break
+                    i = bytes(pl).find(pat, i + 1)
+                if hit:
+                    break
+            if not hit:
+                break
+            pos, cpos, k = hit
+            cnt = struct.unpack_from('<I', pl, cpos)[0]
+            struct.pack_into('<I', pl, cpos, cnt - 1 if cnt > 1 else 0)
+            del pl[pos:pos + 4]
+            removed += 1
+        return removed
+
+    def leftover_refs(self, keys):
+        """这些键在明文里还剩几处（>0 ⇒ 载入必弹框）。"""
+        pl = bytes(self.plain)
+        out = {}
+        for k in keys:
+            pat = struct.pack('<I', k)
+            hits, i = [], pl.find(pat)
+            while i >= 0 and len(hits) < 4:
+                hits.append(i)
+                i = pl.find(pat, i + 1)
+            if hits:
+                out[k] = hits
+        return out
 
     def _key_tables(self, key):
         """包含该对象键的「指针表」→ [{'count_pos','first','n'}]（加载器归并断言要求 A⊆B）。
@@ -12169,6 +12277,55 @@ class SaveDoc(object):
                     break
                 i = pl.find(pat, i + 1)
         out['single_tables_trimmed'] = singles
+        # ---------------- ⑥ ★2026-10-27 §287 兜底扫尾：混合登记表 ----------------
+        # 主逻辑按「表里含 ≥8 个不同建筑键」筛表，而**混合表**（本档 228 条）里
+        # 可能只有一两个建筑键 ⇒ 整张被滤掉 ⇒ 该键残留 ⇒ 载入时加载器的键归并断言失败
+        # ⇒ 玩家看到的就是"删完建筑进游戏弹框"（INT_DIVIDE_BY_ZERO 是 MSVC 的断言陷阱）。
+        # 这里对每个待删键，把 `_key_tables()` 认得出的表（段首计数==段长）全过一遍，剔干净。
+        swept = 0
+        for _round in range(400):
+            victim = None
+            for k in sorted(drop, reverse=True):
+                for tb in self._key_tables(k):
+                    ent, cpos, cnt_n = tb['first'], tb['count_pos'], tb['n']
+                    for i in range(cnt_n):
+                        if struct.unpack_from('<I', pl, ent + 4 * i)[0] == k:
+                            victim = (ent + 4 * i, cpos, k)
+                            break
+                    if victim:
+                        break
+                if victim:
+                    break
+            if not victim:
+                break
+            pos, cpos, k = victim
+            struct.pack_into('<I', pl, cpos,
+                             struct.unpack_from('<I', pl, cpos)[0] - 1)
+            del pl[pos:pos + 4]
+            swept += 1
+            found_any.add(k)
+        out['stray_swept'] = swept
+        # 扫尾后再算"残留"：任何表里还能找到的键 = 载入必炸，直接报出来
+        leftover = {}
+        for k in sorted(drop):
+            blob = bytes(pl)
+            pat = struct.pack('<I', k)
+            hits, i = [], blob.find(pat)
+            while i >= 0 and len(hits) < 4:
+                hits.append(i)
+                i = blob.find(pat, i + 1)
+            if hits:
+                leftover[k] = hits
+        # ★§288：扫尾可能仍有漏网（新表型 / 旧档）⇒ 用 sweep_key_refs 再剔一遍
+        if leftover:
+            _n2 = self.sweep_key_refs(set(leftover))
+            if _n2:
+                out['swept2'] = _n2
+                leftover = self.leftover_refs(drop)
+        if leftover:
+            # 清不掉就别让它悄悄存盘（进游戏必弹框）
+            self._unsafe_leftover = dict(leftover)
+        out['leftover_refs'] = leftover
         out['untabled_keys'] = sorted(drop - found_any)   # 任何表里都没找到的键（正常应为空）
         self._blds = None
         self.pending_bld = True
@@ -12616,7 +12773,8 @@ class SaveDoc(object):
                 argv = struct.unpack_from('<I', pl, a + ACT_VAR_OFF)[0]
             # ★§255：行为 80/107（援军 / 超时空援军）的**小队键在 `+0x44`**
             #   （`+0x48` 不是！§218 实证）。这里统一回填，触发编辑器才能反查出小队名。
-            team = struct.unpack_from('<I', pl, a + 0x44)[0] if atp in self.SPAWN_ACTIONS else 0
+            # ★§283.9：4/5/7 也是小队型（小队键同样在 +0x44），别只认 80/107
+            team = struct.unpack_from('<I', pl, a + 0x44)[0] if self.is_team_action(atp) else 0
             out.append({'ordinal': i + 1,
                         'index': r['start'] + i,
                         'action_off': a,
@@ -13598,6 +13756,14 @@ class SaveDoc(object):
         _low = str(out_path).lower()
         if _low.endswith(('.map', '.mmx', '.yrm', '.mpr')):
             raise MapWriteForbidden(MAP_WRITE_REFUSED + '（目标路径 %s 是地图文件）' % out_path)
+        # ★§288：上一次编辑留下了"清不掉的键引用" ⇒ 这份档进游戏必弹框，不许写盘
+        _left = getattr(self, '_unsafe_leftover', None)
+        if _left:
+            raise RuntimeError(
+                '拒绝保存：还有 %d 处对象键引用没剔干净（%s）。\n'
+                '带着它们进游戏会弹 Internal error。请用「清理残留引用」重试，'
+                '或者撤销这次改动后换新版重新操作。'
+                % (len(_left), '、'.join('%08X' % k for k in list(_left)[:3])))
         new_plain = bytes(self.plain)
         if bytes(self.plain) == self.plain_orig:
             raise RuntimeError('没有任何修改')
@@ -13690,10 +13856,14 @@ class SaveDoc(object):
         """把"跟着明文偏移走"的缓存全部作废（增删字节后必须调）。"""
         for a in ('_objs', '_events', '_actions', '_ticks', '_celltags', '_ctimerlist',
                   '_instmaps', '_house_econ', '_custom_houses', '_house_keys_memo',
-                  '_tagrecs', '_mapm', '_aiids', '_horder',
+                  '_tagrecs', '_mapm', '_aiids',
+                  # ★2026-10-27：`_horder` 只是 [{'short','cn','is_player'}]，**与偏移无关**，
+                  #   以前每次增删对象都清它 ⇒ 下次 `_arg_text` 要重算 1.3 秒（本档）。
+                  #   实测这是「添加行为」里最大的一笔浪费，故从清理表里移除。
                   '_tagobjs', '_wpbase_memo',        # §273 两个全档扫描缓存
                   '_terrobjs', '_terrnames', '_terrsav', '_occ_memo',     # §281 Terrain
                   '_ovlcells', '_ovl_info', '_ovl_map',                   # §283 覆盖物/地图包
+                  '_teamtypes', '_teamlbl',                              # §283.9 小队表缓存
                   '_ovl_memo', '_ovl_names'):
             if hasattr(self, a):
                 setattr(self, a, None)
@@ -13836,10 +14006,19 @@ class SaveDoc(object):
                 d['ticks'] = int.from_bytes(pl[o['node'] + NODE_TICKS_OFF:
                                                o['node'] + NODE_TICKS_OFF + 4], 'little')
         if o['cell_key'] is not None:
-            for b in self.attach_overview() or []:
-                if b.get('x') == o['cell_key']:
-                    d['attached'] = b.get('count') or 0
-                    break
+            # ★★2026-10-27（玩家："添加行为会卡，然后闪退"）：
+            #   这里只需要"这一格挂接了 N 个对象"，以前却去调 `attach_overview()` ——
+            #   那个函数对**每个 CellTag 节点**都在全档明文里 find 一次键（本档 200 节点 × 6MB
+            #   ≈ 8 秒），而且它的缓存键是"明文长度"，我们每插一条行为长度就变 ⇒ 缓存全废
+            #   ⇒ 编辑器里每点一次「添加」就卡 8 秒，看着像卡死。
+            #   `celltag_nodes()` 本身就带 `count`，而且只按 GUID 扫、有缓存（毫秒级）。
+            try:
+                for nd in (self.celltag_nodes() or []):
+                    if nd.get('x') == o['cell_key']:
+                        d['attached'] = nd.get('count') or 0
+                        break
+            except Exception:
+                pass
         evs = self.events()
         byk = {a.get('key'): a for a in self.actions()}
         # ★2026-10-20：事件对象 `+0x50..+0x68` 是**运行期指针区**：
@@ -13861,9 +14040,12 @@ class SaveDoc(object):
                 # ★§219.8：行为 80/107（援军类）的真正参数**不在默认槽**：
                 #   小队键在 `+0x44`、路径点在 `+0x58`（`+0x48` 恒 0）。
                 #   GUI 原来只显示 +0x48 ⇒ 看着"参数 0、什么都没有"，玩家找不到小队/路径点。
-                if a.get('type') in (80, 107):
+                # ★★§283.9：4 建立 / 5 解散 / 7 援军 也是**小队型**（小队键同样在 +0x44），
+                #   以前只认 80/107 ⇒ 触发编辑器里这三类"选不了小队"。
+                if self.is_team_action(a.get('type')):
                     tk = int.from_bytes(pl[obj + 0x44:obj + 0x48], 'little')
-                    wp = int.from_bytes(pl[obj + 0x58:obj + 0x5C], 'little')
+                    wp = (int.from_bytes(pl[obj + 0x58:obj + 0x5C], 'little')
+                          if a.get('type') in self.SPAWN_ACTIONS else 0)
                     tmn = ''
                     if tk:
                         for _t in self.team_types():
@@ -13876,11 +14058,16 @@ class SaveDoc(object):
                         cell = None
                     a = dict(a)
                     a['team_key'] = tk
+                    a['team'] = tk
                     a['waypoint'] = wp
                     a['cell'] = cell
-                    a['arg_text'] = ('小队 %s%s @ 路径点 %s%s'
-                                     % ('%08X' % tk, ('「%s」' % tmn) if tmn else '',
-                                        wp, (' 格%s' % (cell,)) if cell else ''))
+                    if a.get('type') in self.SPAWN_ACTIONS:
+                        a['arg_text'] = ('小队 %s%s @ 路径点 %s%s'
+                                         % ('%08X' % tk, ('「%s」' % tmn) if tmn else '',
+                                            wp, (' 格%s' % (cell,)) if cell else ''))
+                    else:
+                        a['arg_text'] = ('小队 %s%s'
+                                         % ('%08X' % tk, ('「%s」' % tmn) if tmn else ''))
                 d['actions'].append(a)
         if not d['editable']:
             d['note'] = '这条记录在本档里只有「触发定义」，没有运行期实例 ⇒ 只能看'
@@ -14123,17 +14310,20 @@ class SaveDoc(object):
                 waypoint = wp
             buf[104:112] = str(name).upper().encode('ascii', 'ignore')[:8].ljust(8, b'\x00')
             buf[88:92] = struct.pack('<I', int(waypoint))
-        if atype in self.SPAWN_ACTIONS:
+        if self.is_team_action(atype):
             # ★§253：行为 80「援军」/107「超时空传送援军」——「触发挂载作战小队」。
             #   布局（§218 实测，两者相同）：`+0x40` 类型 / **`+0x44` 小队键** /
             #   `+0x58` 路径点 / `+0x48` 恒 0。注意小队键**不是** `+0x48`（工具默认参数槽）。
+            # ★★§283.9（2026-10-27）：**4 建立 / 5 解散 / 7 援军 也是小队型**，小队键同样在
+            #   `+0x44`（Z17 档实测 8/8 命中本档 Team 键），只是**没有路径点**。
+            #   以前这里只认 SPAWN_ACTIONS ⇒ 添加 4/7 时 team 参数被**静默丢掉**、`+0x44` 写 0。
             if team is None:
-                raise RuntimeError('行为 %d（援军/超时空援军）必须给 team（小队键 / 小队 ID / 名称）'
+                raise RuntimeError('行为 %d 要挂作战小队：必须给 team（小队键 / 小队 ID / 名称）'
                                    % atype)
             tkey = self.team_key_of(team)
             if not tkey:
                 raise RuntimeError('认不出小队 %r（可用小队 ID / 名称 / 键）' % (team,))
-            if waypoint is None:
+            if atype in self.SPAWN_ACTIONS and waypoint is None:
                 if cell is None:
                     raise RuntimeError('行为 %d 还要给 waypoint（路径点号）或 cell=(x,y)' % atype)
                 waypoint = self.ensure_waypoint_at(int(cell[0]), int(cell[1]))
@@ -14141,7 +14331,8 @@ class SaveDoc(object):
                     raise RuntimeError('格 %s 处建不了路径点（号段用满且无近点可复用）' % (cell,))
             buf[0x44:0x48] = struct.pack('<I', tkey)
             buf[0x48:0x4C] = b'\x00' * 4
-            buf[0x58:0x5C] = struct.pack('<I', int(waypoint))
+            if atype in self.SPAWN_ACTIONS:
+                buf[0x58:0x5C] = struct.pack('<I', int(waypoint))
         pl[pos:pos] = bytes(buf)
         self.invalidate_caches(rescan=True)
         pl = self.plain

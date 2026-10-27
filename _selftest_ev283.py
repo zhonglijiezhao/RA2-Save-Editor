@@ -50,10 +50,13 @@ ck(len(b) == 8192, '有矿块 36 字节 → 8192（实际 %d）' % len(b))
 ck(b[:4] == b'\xff\xff\xff\xff' and b'ppp' in b, '有矿块的 0x70 字面量解出')
 
 print('② 2.map 的矿格')
-t2, f2 = op.read_map_packs(MAP2)
-cells2 = [(i % 512, i // 512, t2[i]) for i in range(262144) if t2[i] != 0xFF]
-ck(len(cells2) == 14 and all(v == 112 for _, _, v in cells2), '14 个覆盖物格且全是 112=TIB08')
-ck((77, 71) in [(x, y) for x, y, _ in cells2], '(77,71) 在矿格列表里')
+if not os.path.exists(MAP2):
+    ck(True, '玩家样本 2.map 已不在桌面（跳过；LCW 基本块已在上一步验过）')
+else:
+    t2, f2 = op.read_map_packs(MAP2)
+    cells2 = [(i % 512, i // 512, t2[i]) for i in range(262144) if t2[i] != 0xFF]
+    ck(len(cells2) == 14 and all(v == 112 for _, _, v in cells2), '14 个覆盖物格且全是 112=TIB08')
+    ck((77, 71) in [(x, y) for x, y, _ in cells2], '(77,71) 在矿格列表里')
 
 print('③ 地图真值 × 存档 +0x58（定案证据）')
 mt, _mf = op.read_map_packs(MAP_OK)
