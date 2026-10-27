@@ -1192,6 +1192,8 @@ class App(tk.Tk):
             elif idx == 4:                              # ★行为页（第5个标签）
                 self._highlight_actions_for_trigger()
             elif idx == 6:                              # 地图 / 选位页（第7个）
+                # ★§290：切进来就把建筑/单位下拉填好（原来要点「↻」）
+                self._mv_ensure_types()
                 # ★§272：开档时为了快，地图是"延迟渲染"的 ⇒ 第一次切到本页才画
                 if getattr(self, 'mv_deferred', False):
                     self.mv_deferred = False
@@ -3535,13 +3537,13 @@ class App(tk.Tk):
         r = ttk.Frame(b3, style=SUF)
         r.pack(fill='x')
         ttk.Label(r, text='建筑', style=LB).pack(side='left')
-        self.mv_type = ttk.Combobox(r, width=15, state='readonly')
+        # ★§290：类型列表改成"切到本页就填好"（见 _mv_ensure_types），
+        #   原来那个 ↻ 刷新按钮去掉了；combo 相应加宽补回空间
+        self.mv_type = ttk.Combobox(r, width=19, state='readonly')
         self.mv_type.pack(side='left', padx=(5, 0))
-        ttk.Button(r, text='↻', width=3,
-                   command=self._fill_type_lists).pack(side='left', padx=(3, 0))
         ttk.Label(r, text='所属', style=LB).pack(side='left', padx=(6, 0))
         # ★2026-10-17：写建筑记录载荷 +336/+544 的 House 键
-        self.mv_house = ttk.Combobox(r, width=9, state='readonly')
+        self.mv_house = ttk.Combobox(r, width=13, state='readonly')
         self.mv_house.pack(side='left', padx=(5, 0))
         ttk.Button(r, text='放置', command=self.mv_place).pack(side='left', padx=(8, 0))
         ttk.Button(r, text='删除建筑',
@@ -3557,7 +3559,7 @@ class App(tk.Tk):
         self.mv_unit.bind('<<ComboboxSelected>>', lambda e: self._unit_sel_info())
         # ★2026-10-17：单位所属方（写记录 +352/+560 的 House 键）—— 默认沿用模板
         ttk.Label(r, text='所属', style=LB).pack(side='left', padx=(5, 0))
-        self.mv_u_house = ttk.Combobox(r, width=9, state='readonly',
+        self.mv_u_house = ttk.Combobox(r, width=13, state='readonly',
                                        values=(UNIT_HOUSE_INHERIT,))
         self.mv_u_house.current(0)
         self.mv_u_house.pack(side='left', padx=(5, 0))
@@ -3653,6 +3655,14 @@ class App(tk.Tk):
         st = getattr(self, 'mv_state', None)
         if st is None:
             return
+        # ★§290：换档 ⇒ 建筑类型列表要重填；如果玩家当前就停在本页（不会有切页事件），
+        #   用 after_idle 立刻补上，免得下拉里还留着上一份档的类型
+        self._mv_types_loaded = False
+        try:
+            if self.nb.index(self.nb.select()) == 6:
+                self.after_idle(self._mv_ensure_types)
+        except Exception:
+            pass
         p = getattr(getattr(self.doc, '_map', None), 'path', st.get('path')) if self.doc else None
         st.update({'mp': None, 'ok': False, 'img': None, 'blds': [],
                    'occ': {}, 'sel': None, 'path': p, 'gdata': None, 'dims': None,
@@ -4740,6 +4750,33 @@ class App(tk.Tk):
             names = {n for n in art if n in all_types} | inst
         names |= inst
         return sorted(names)
+
+    def _mv_ensure_types(self):
+        """切到「地图 · 选位」时把三个下拉填好（每份档只做一次）。
+
+        ★§290（玩家 2026-10-27）：原来要手动点「↻」才有建筑类型可选 —— 那个按钮已删除。
+        只做便宜的：建筑类型（~70ms）+ 单位类型（~0ms）；`_fill_house_lists()` 要 ~600ms
+        （内部 `doc.houses()` 扫全档），而开档路径已经填过 ⇒ 这里只在**空**时兜底。
+        """
+        if not self.doc or getattr(self, '_mv_types_loaded', False):
+            return
+        try:
+            names = self._bld_type_names()
+            vals = ['%s（%s）' % (n, self._type_disp(n)) for n in names]
+            self.mv_type['values'] = vals
+            # 赠送建筑页用同一个列表（那边也就不用先点「刷新类型列表」）
+            if not self.gift_type.cget('values'):
+                self.gift_type['values'] = vals
+            try:
+                self.mv_unit['values'] = self._unit_type_names()
+            except Exception:
+                pass
+            if not self.mv_house.cget('values'):
+                self._fill_house_lists(log=False)
+            self._mv_types_loaded = True
+        except Exception:
+            # 填不上不算错（玩家还能用「模板库」那条路），别打断切页
+            pass
 
     def _fill_type_lists(self):
         if not self.doc:

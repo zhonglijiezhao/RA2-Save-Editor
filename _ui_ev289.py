@@ -155,6 +155,30 @@ for i in range(len(app.nb.tabs())):
         print('   页 %d 切换失败：%r' % (i, e))
 ck(ok, '10 页逐页切换无异常')
 
+# ── ⑨ §290：切进来就把「建筑类型」填好，↻ 刷新按钮已删除 ──
+app.nb.select(6)
+for _ in range(8):
+    app.update()
+_vals = list(app.mv_type.cget('values'))
+ck(len(_vals) > 0, '切到地图页自动填好建筑类型 %d 项（不用点刷新）' % len(_vals))
+ck(len(app.mv_unit.cget('values')) > 0,
+   '单位下拉也填好了 %d 项' % len(app.mv_unit.cget('values')))
+ck(len(app.mv_house.cget('values')) > 0,
+   '所属方下拉 %d 项' % len(app.mv_house.cget('values')))
+# 只查**地图页**这几张卡里还有没有 ↻（别处窗口的刷新按钮不算）
+_refresh = []
+for _t, _body in sections:
+    for _row in _body.winfo_children():
+        for _c in _row.winfo_children():
+            try:
+                if _c.cget('text') == '↻':
+                    _refresh.append(_c)
+            except Exception:
+                pass
+ck(not _refresh, '「↻ 刷新」按钮已从地图页删除')
+_src = io.open(os.path.join(HERE, 'RA2存档编辑器.py'), encoding='utf-8').read()
+ck('def _mv_ensure_types' in _src, '切页自动填充入口 _mv_ensure_types 在')
+
 app.destroy()
 print('\n结果：%d 通过 / %d 失败' % (len(PASS), len(FAIL)))
 if FAIL:
