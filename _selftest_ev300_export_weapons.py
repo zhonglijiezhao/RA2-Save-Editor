@@ -140,7 +140,69 @@ ck(os.path.dirname(os.path.abspath(p3)) == os.path.dirname(os.path.abspath(SRC))
 ck('武器表' in os.path.basename(p3), '默认文件名带「武器表」：%s' % os.path.basename(p3))
 ck(n3 == n_all, '默认路径导出的行数与显式路径一致')
 
-for p in (tmp, tmp2, p3):
+# ---------------- ⑨ INI 导出（★玩家要求：更符合红警格式）----------------
+tmpi = os.path.join(HERE, '_ev300_out.ini')
+tmpi2 = os.path.join(HERE, '_ev300_diff.ini')
+for p in (tmpi, tmpi2):
+    if os.path.exists(p):
+        os.remove(p)
+
+ni, pi = doc.export_weapons_ini(tmpi)
+raw = open(pi, 'rb').read()
+ck(ni == len(ws), 'INI 段数 = %d 把（实际 %d）' % (len(ws), ni))
+# 红警是 ANSI 程序 ⇒ 期望 GBK、无 BOM、全 CRLF；编不了才退回 UTF-8+BOM
+try:
+    itxt = raw.decode('gbk')
+    ck(not raw.startswith(b'\xef\xbb\xbf'), 'INI 是 GBK 且无 BOM（红警原生，贴进 rulesmd.ini 不会因 BOM 出错）')
+except UnicodeDecodeError:
+    ck(raw.startswith(b'\xef\xbb\xbf'), 'INI 退回 UTF-8 时带 BOM')
+    itxt = raw.decode('utf-8-sig')
+ck(raw.count(b'\n') == raw.count(b'\r\n'), 'INI 全是 CRLF（没有裸 LF）')
+ck(itxt.startswith(';'), '首行是注释（不会让引擎把 BOM/注释当段名）')
+
+secs = [l.strip() for l in itxt.split('\r\n') if l.startswith('[')]
+ck(len(secs) == ni, '段行数 %d = 返回段数 %d' % (len(secs), ni))
+# 只看**真段行** —— 头注释里会出现「[WeaponTypes]」这个词，不能被当成段
+ck('[WeaponTypes]' not in secs, '不写 [WeaponTypes] 注册表（写错会让整个武器表错位）')
+ck(sorted(s[1:-1] for s in secs) == sorted(w['name'] for w in ws),
+   '段名集合 = weapon_objects() 的名字集合')
+
+# 逐段核对数值（抽 8 段，避免太慢）
+blocks = {}
+cur = None
+for line in itxt.split('\r\n'):
+    s = line.strip()
+    if s.startswith('[') and s.endswith(']'):
+        cur = s[1:-1]
+        blocks[cur] = {}
+    elif cur and '=' in s and not s.startswith(';'):
+        k, v = s.split('=', 1)
+        blocks[cur][k.strip()] = v.strip()
+by = {w['name']: w for w in ws}
+bad = []
+for nm, kv in list(blocks.items())[:8]:
+    w = by[nm]
+    if int(kv.get('Damage', -1)) != w['damage']:
+        bad.append('%s 伤害' % nm)
+    if int(kv.get('ROF', -1)) != w['rof']:
+        bad.append('%s 射速' % nm)
+    if abs(float(kv.get('Range', -1)) - w['range_cells']) > 0.005:
+        bad.append('%s 射程' % nm)
+ck(not bad, '抽 8 段核对 Damage/ROF/Range 与存档一致（不符：%s）' % bad[:3])
+ck(all(('Verses' not in kv)
+       or len([x for x in kv['Verses'].split(',') if x.strip()]) == 11
+       for kv in blocks.values()),
+   'Verses 要么不写、要么正好 11 项')
+ck(any('Warhead' in kv for kv in blocks.values()), '有段写了 Warhead=')
+
+ni2, pi2 = doc.export_weapons_ini(tmpi2, only_diff=True)
+itxt2 = open(pi2, 'rb').read().decode('gbk', errors='replace')
+secs2 = {l.strip()[1:-1] for l in itxt2.split('\r\n')
+         if l.startswith('[') and l.strip().endswith(']')}
+ck(secs2 == got, '差异 INI 的段名 = 差异武器集合（%d 段）' % len(secs2))
+ck(hashlib.sha256(doc.plain).hexdigest() == h0, 'INI 导出同样没碰明文')
+
+for p in (tmp, tmp2, p3, tmpi, tmpi2):
     try:
         os.remove(p)
     except Exception:

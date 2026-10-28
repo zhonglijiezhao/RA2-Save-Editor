@@ -12803,6 +12803,111 @@ class SaveDoc(object):
                 wr.writerow(r)
         return len(rows), out_path
 
+    def export_weapons_ini(self, out_path=None, only_diff=False):
+        """把武器表导出成**红警 INI 格式**（每把一段）→ `(段数, 路径)`。
+
+        ★2026-10-28（玩家要求）：CSV 便于对照，但要拿回游戏 / 贴进 rulesmd.ini 时
+          INI 才是原生格式 —— 段名 `[Vulcan]`、键值 `Damage=`、百分比 `Verses=100%,…`，
+          跟 rules 里长得一模一样，复制粘贴就能用。
+
+        输出是**覆盖片段**，不是完整 rulesmd.ini：
+          贴某个段进 rulesmd.ini 只会覆盖同名武器，不会动别的；也不会写
+          `[WeaponTypes]` 注册表（那一段一旦写错会让整个武器表错位）。
+          头注释里说明这一点，并给出本档的注册顺序供参考。
+        """
+        rules = self._rules_all() or {}
+        whmap = self.weapon_warhead_map()
+        verses = {x['name']: x['verses'] for x in self.warhead_objects()}
+
+        def num(kv, key):
+            try:
+                return float(str(kv.get(key, '')).split(';')[0].strip())
+            except Exception:
+                return None
+
+        def fmt_num(v):
+            """rules 里就爱写 `5.75` / `4` 这种，别输出 `5.750000`。"""
+            s = ('%.3f' % v).rstrip('0').rstrip('.')
+            return s or '0'
+
+        ws = sorted(self.weapon_objects(), key=lambda x: x['off'])
+        blocks, order = [], []
+        for i, w in enumerate(ws):
+            nm = w['name']
+            order.append((i, nm))
+            kv = rules.get(nm) or {}
+            od, orf, org = num(kv, 'Damage'), num(kv, 'ROF'), num(kv, 'Range')
+            diff = []
+            if od is not None and int(od) != w['damage']:
+                diff.append('伤害 %g→%d' % (od, w['damage']))
+            if orf is not None and int(orf) != w['rof']:
+                diff.append('射速 %g→%d' % (orf, w['rof']))
+            if org is not None and abs(org - w['range_cells']) > 0.01:
+                diff.append('射程 %g→%s' % (org, fmt_num(w['range_cells'])))
+            if only_diff and not diff:
+                continue
+
+            L = ['[%s]' % nm]
+            if diff:
+                L.append('; 与官方不同：%s' % '；'.join(diff))
+                if od is not None:
+                    L.append('; 官方：Damage=%g  ROF=%g  Range=%g'
+                             % (od, orf if orf is not None else 0,
+                                org if org is not None else 0))
+            else:
+                L.append('; 与官方一致')
+            L.append('Damage=%d' % w['damage'])
+            L.append('ROF=%d' % w['rof'])
+            L.append('Range=%s' % fmt_num(w['range_cells']))
+            whn = whmap.get(nm, '')
+            if whn:
+                L.append('Warhead=%s' % whn)
+            vs = verses.get(whn) or verses.get(nm) or []
+            if vs:
+                L.append('Verses=%s' % ','.join('%d%%' % round(v * 100) for v in vs))
+            blocks.append('\n'.join(L))
+
+        if out_path is None:
+            base = os.path.splitext(self.path)[0]
+            out_path = base + ('_武器表_非原版.ini' if only_diff else '_武器表.ini')
+
+        src = self.rules_source() or {}
+        head = [
+            '; ' + '=' * 66,
+            '; RA2 / 尤里的复仇 —— 存档武器表（%d 段%s）'
+            % (len(blocks), '，只含与官方不同的' if only_diff else ''),
+            '; 存档     : %s' % os.path.basename(self.path),
+            '; 对照规则 : %s' % (src.get('rules') or '（没找到 rulesmd.ini，无官方对照）'),
+            '; 导出时间 : %s' % datetime.datetime.now().strftime('%Y-%m-%d %H:%M'),
+            ';',
+            '; 这张表来自**存档内部**，是存盘那一刻真正生效的数值。',
+            '; 它和 rulesmd.ini 不一致是正常的：地图内联 INI、MIX 覆盖都算进去了。',
+            ';',
+            '; ★这是一份**覆盖片段**，不是完整的 rulesmd.ini：',
+            ';   把某个 [武器名] 段落贴进你的 rulesmd.ini，就会覆盖同名武器，不动别的。',
+            ';   想改**这一份存档**，请用本工具 —— 改 rules 对已经存盘的档不生效。',
+            ';',
+            '; ★没有写 [WeaponTypes] 注册表：那一段一旦顺序错，整个武器表会错位。',
+            ';   下面是本档的注册顺序，需要做完整 rules 时照着核。',
+        ]
+        # 注册顺序放注释里（一行 8 个，别把文件撑得太长）
+        for i in range(0, len(order), 8):
+            head.append(';   ' + ' '.join('%d=%s' % (k, n) for k, n in order[i:i + 8]))
+        head.append('; ' + '=' * 66)
+
+        text = '\n'.join(head) + '\n\n' + '\n\n'.join(blocks) + '\n'
+        # ★编码：红警是 ANSI 程序，rulesmd.ini 一直是 GBK。这里优先写 GBK
+        #   （记事本、UE、游戏本体都认，贴进 rulesmd.ini 也不会因为 BOM 出错）；
+        #   万一注释里有 GBK 编不了的字，再退回「UTF-8 带 BOM」——至少不乱码。
+        data = text.replace('\r\n', '\n').replace('\n', '\r\n')
+        try:
+            payload = data.encode('gbk')
+        except UnicodeEncodeError:
+            payload = b'\xef\xbb\xbf' + data.encode('utf-8')
+        with open(out_path, 'wb') as f:
+            f.write(payload)
+        return len(blocks), out_path
+
     def warhead_objects(self):
         """→ `[{'name','off','verses':[11 个系数]}]`（只读）。
 

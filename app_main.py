@@ -1844,28 +1844,48 @@ def setweapon_cmd(args, kind='weapon'):
 
 
 def export_weapons_cmd(args):
-    """`--export-weapons <存档> [输出.csv] [--diff]`：把武器表导出成 CSV（只读）。
+    """`--export-weapons <存档> [输出.ini|.csv] [--diff] [--format ini|csv]`
 
-    ★2026-10-28（玩家问「这个存档里的武器能提取出来吗，尤其是非原版的」）：
-      存档里的武器表是**存盘当时生效的那份**（地图 INI / MIX 覆盖也算），
-      所以它跟散装 rulesmd.ini 不一定一致 —— 导出来才能拿去比对 / 发帖 / 给 mod 作者。
-      `--diff` 只导与 rules 不一致的那些（"非原版"那批）。
+    把武器表导出成**红警 INI**（默认，每把一段，能直接贴进 rulesmd.ini）
+    或 CSV（便于对照/发帖）。只读。
+
+    ★2026-10-28：先做的是 CSV，玩家说「应该导出成 INI 格式，更符合红警的格式」
+      —— 于是默认改成 INI，CSV 保留（按输出文件扩展名自动判断，也能用 --format 指定）。
     """
-    only_diff, rest = False, []
-    for a in args:
+    only_diff, fmt, rest = False, None, []
+    i = 0
+    while i < len(args):
+        a = args[i]
         if a in ('--diff', '--only-diff', '-d'):
             only_diff = True
+            i += 1
+            continue
+        if a in ('--format', '-f') and i + 1 < len(args):
+            fmt = args[i + 1].strip().lower()
+            i += 2
             continue
         rest.append(a)
+        i += 1
     if not rest:
-        _write_report('EXPORT FAIL\n用法: --export-weapons <存档> [输出.csv] [--diff]')
+        _write_report('EXPORT FAIL\n用法: --export-weapons <存档> [输出.ini|.csv] '
+                      '[--diff] [--format ini|csv]')
         return 2
     src = rest[0]
     out = rest[1] if len(rest) > 1 else None
+    if fmt not in ('ini', 'csv', None):
+        _write_report('EXPORT FAIL\n--format 只能是 ini 或 csv')
+        return 2
+    if fmt is None:
+        # 按扩展名判断；没给输出路径时默认 INI（红警原生格式）
+        ext = os.path.splitext(out)[1].lower() if out else ''
+        fmt = 'csv' if ext == '.csv' else 'ini'
     try:
         from editor_core import SaveDoc
         d = SaveDoc(src)
-        n, path = d.export_weapons_csv(out, only_diff=only_diff)
+        if fmt == 'csv':
+            n, path = d.export_weapons_csv(out, only_diff=only_diff)
+        else:
+            n, path = d.export_weapons_ini(out, only_diff=only_diff)
     except Exception as e:
         _write_report('EXPORT FAIL\n%s' % e)
         return 1
@@ -1873,9 +1893,11 @@ def export_weapons_cmd(args):
     _write_report('EXPORT PASS\n'
                   '存档 : %s\n'
                   '导出 : %s\n'
-                  '行数 : %d%s\n'
+                  '格式 : %s\n'
+                  '%s : %d%s\n'
                   '规则 : %s' % (
-                      src, path, n,
+                      src, path, 'INI（红警规则格式）' if fmt == 'ini' else 'CSV（表格）',
+                      '段数' if fmt == 'ini' else '行数', n,
                       ('（只含与 rules 不同的 %d 把 / 共 %d 把）' % (n, total))
                       if only_diff else '（全部 %d 把）' % total,
                       (d.rules_source() or {}).get('rules')

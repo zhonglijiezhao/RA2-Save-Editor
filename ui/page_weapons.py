@@ -65,8 +65,9 @@ class WeaponsPage(object):
         self.lbl_wpn_count = ttk.Label(bot, text='', foreground=T['muted'],
                                        font=(ui_theme.FONT_UI, 8))
         self.lbl_wpn_count.pack(side='left')
-        # ★2026-10-28：导出（玩家问「能不能把存档里的武器提取出来」）
-        ttk.Button(bot, text='导出 CSV', width=9,
+        # ★2026-10-28：导出（玩家问「能不能把存档里的武器提取出来」；
+        #   随后又要求「导出成 INI，更符合红警的格式」⇒ 一个按钮 + 文件类型选格式）
+        ttk.Button(bot, text='导出…', width=9,
                    command=self._wpn_export).pack(side='right')
 
         # ── 右：详情 + 编辑 ──
@@ -147,35 +148,58 @@ class WeaponsPage(object):
         return f
 
     def _wpn_export(self):
-        """导出武器表 CSV（★2026-10-28：玩家问「存档里的武器能提取出来吗」）。
+        """导出武器表（★2026-10-28：玩家要求 INI 格式，更符合红警）。
 
-        勾着「只看 ≠rules」时默认就导那批 —— 也就是"非原版"的数值。
+        - **INI**（默认）：每把武器一段，`[Vulcan] Damage=… ROF=… Range=… Verses=…`，
+          跟 rulesmd.ini 长得一样，能直接贴进去覆盖同名武器；GBK + CRLF，红警原生。
+        - **CSV**：表格，便于跟官方值逐列对照 / 发帖。
+
+        按输出文件的扩展名走，不用点两次。
         """
         if not getattr(self, 'doc', None):
             messagebox.showwarning('提示', '请先打开一个存档', parent=self)
             return
         base = os.path.splitext(os.path.basename(self.doc.path))[0]
         only = bool(self._wpn_only_diff.get())
+        suffix = '_武器表_非原版' if only else '_武器表'
         p = filedialog.asksaveasfilename(
-            title='导出武器表（CSV）', defaultextension='.csv',
-            initialfile=base + ('_武器表_非原版.csv' if only else '_武器表.csv'),
+            title='导出武器表', defaultextension='.ini',
+            initialfile=base + suffix + '.ini',
             initialdir=os.path.dirname(self.doc.path),
-            filetypes=[('CSV 表格', '*.csv'), ('所有文件', '*.*')])
+            filetypes=[('INI（红警规则格式，可直接贴进 rulesmd.ini）', '*.ini'),
+                       ('CSV 表格（Excel 打开）', '*.csv'),
+                       ('所有文件', '*.*')])
         if not p:
             return
+        is_csv = p.lower().endswith('.csv')
         try:
-            n, path = self.doc.export_weapons_csv(p, only_diff=only)
+            if is_csv:
+                n, path = self.doc.export_weapons_csv(p, only_diff=only)
+            else:
+                n, path = self.doc.export_weapons_ini(p, only_diff=only)
         except Exception as e:
             messagebox.showerror('导出失败', '%s' % e, parent=self)
             return
-        self.status.set('已导出 %d 把武器 → %s' % (n, os.path.basename(path)))
-        messagebox.showinfo(
-            '导出完成',
-            '已导出 %d 把武器%s。\n\n%s\n\n'
-            'Excel 双击就能打开（UTF-8 带 BOM，中文不乱码）。\n'
-            '表里带官方规则的对照值，「差异」那一列非空的就是与 rules 不一致的。'
-            % (n, '（只含与 rules 不同的）' if only else '', path),
-            parent=self)
+        self.status.set('已导出%s %d %s → %s'
+                        % ('CSV' if is_csv else 'INI', n,
+                           '行' if is_csv else '段', os.path.basename(path)))
+        if is_csv:
+            messagebox.showinfo(
+                '导出完成',
+                '已导出 %d 把武器%s。\n\n%s\n\n'
+                'Excel 双击就能打开（UTF-8 带 BOM，中文不乱码）。\n'
+                '「与官方规则的差异」那一列非空的，就是跟 rules 不一致的。'
+                % (n, '（只含与 rules 不同的）' if only else '', path),
+                parent=self)
+        else:
+            messagebox.showinfo(
+                '导出完成',
+                '已导出 %d 个武器段%s。\n\n%s\n\n'
+                '格式跟 rulesmd.ini 一样（GBK + CRLF，红警原生编码）。\n'
+                '想改游戏规则就把对应段落贴进 rulesmd.ini；\n'
+                '只想改这一份存档，用左边的输入框改就行（改 rules 对已存盘的档不生效）。'
+                % (n, '（只含与 rules 不同的）' if only else '', path),
+                parent=self)
 
     def _wpn_users(self, weapon):
         """rules 里哪些型号把 `weapon` 当主/副/精英武器 → ['E1 GI（Primary）', …]。"""

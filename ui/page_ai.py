@@ -87,7 +87,10 @@ class AiPage(object):
         # ① 作战小队
         f1 = ttk.Frame(sub, padding=4)
         c1 = ('id', 'name', 'house', 'max', 'pri', 'vet', 'grp', 'wp', 'tf', 'sc', 'n', 'flag')
-        self.tat = ttk.Treeview(f1, columns=c1, show='headings', height=10)
+        # ★2026-10-28（玩家要求）：小队一多就没滚动条，只能靠滚轮 ⇒ 换成带横竖条的容器，
+        #   跟触发页 / 事件页同一套（`_tree_scrolled`），列宽超出时也能拖。
+        wrap1, self.tat = self._tree_scrolled(f1, c1, 10)
+        wrap1.pack(fill='both', expand=True)
         for c, t, w, a in (('id', '小队ID', 84, 'w'), ('name', '名称', 240, 'w'),
                            ('house', '国家', 92, 'w'), ('max', 'Max', 42, 'e'),
                            ('pri', '优先', 42, 'e'), ('vet', '等级', 42, 'e'),
@@ -97,7 +100,6 @@ class AiPage(object):
                            ('flag', '标志', 220, 'w')):
             self.tat.heading(c, text=t)
             self.tat.column(c, width=w, anchor=a)
-        self.tat.pack(fill='both', expand=True)
         self.tat.bind('<<TreeviewSelect>>', lambda e: self._ai_pick('team'))
         # ★§264 玩家要求：**双击一行 ⇒ 直接打开「作战小队」对话框改这一支**
         self.tat.bind('<Double-1>', self._ai_team_dblclick)
@@ -107,13 +109,14 @@ class AiPage(object):
         # ② 特遣部队
         f2 = ttk.Frame(sub, padding=4)
         c2 = ('id', 'name', 'grp', 'n', 'mem')
-        self.tft = ttk.Treeview(f2, columns=c2, show='headings', height=10)
+        # ★2026-10-28：同上，特遣部队列表也加横竖滚动条（成员列一宽就看不全）
+        wrap2, self.tft = self._tree_scrolled(f2, c2, 10)
+        wrap2.pack(fill='both', expand=True)
         for c, t, w, a in (('id', '特遣ID', 84, 'w'), ('name', '名称', 300, 'w'),
                            ('grp', '编组', 50, 'e'), ('n', '种数', 50, 'e'),
                            ('mem', '成员', 460, 'w')):
             self.tft.heading(c, text=t)
             self.tft.column(c, width=w, anchor=a)
-        self.tft.pack(fill='both', expand=True)
         self.tft.bind('<<TreeviewSelect>>', lambda e: self._ai_pick('tf'))
         # ★§264 双击 ⇒ 直接改这一支特遣部队
         self.tft.bind('<Double-1>', self._ai_tf_dblclick)
