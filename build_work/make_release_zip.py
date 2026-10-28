@@ -17,7 +17,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='repla
 
 ROOT = r'C:/Users/zhao5/Desktop/1RA2存档分析工具/RA2存档编辑器'
 SRC = os.path.join(ROOT, 'build_dist', 'RA2存档编辑器')
-VER = sys.argv[1] if len(sys.argv) > 1 else '1.3.0'
+VER = sys.argv[1] if len(sys.argv) > 1 else '1.4.0'
 OUT = os.path.join(os.path.dirname(ROOT), 'RA2SaveEditor-v%s-win64.zip' % VER)
 
 # 玩家自己的东西：不进包
