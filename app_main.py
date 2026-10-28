@@ -1890,6 +1890,22 @@ def export_weapons_cmd(args):
         _write_report('EXPORT FAIL\n%s' % e)
         return 1
     total = len(d.weapon_objects())
+    if fmt == 'ini':
+        # INI 是三段齐全的：武器 + 它用到的弹头 + 抛射体。
+        # 报"段数"时要分清里面有多少是武器，别写成"61 把武器"。
+        try:
+            txt = open(path, 'rb').read().decode('gbk', errors='replace')
+            n_w = sum(1 for l in txt.split('\n') if l.strip().endswith(';武器'))
+        except Exception:
+            n_w = n
+        detail = '（%d 段 = %d 把武器 + %d 个弹头/抛射体%s）' % (
+            n, n_w, n - n_w,
+            '；只取与 rules 不同的武器' if only_diff else '')
+        label = '段数'
+    else:
+        detail = ('（只含与 rules 不同的 %d 把 / 共 %d 把）' % (n, total)
+                  if only_diff else '（全部 %d 把）' % total)
+        label = '行数'
     _write_report('EXPORT PASS\n'
                   '存档 : %s\n'
                   '导出 : %s\n'
@@ -1897,9 +1913,7 @@ def export_weapons_cmd(args):
                   '%s : %d%s\n'
                   '规则 : %s' % (
                       src, path, 'INI（红警规则格式）' if fmt == 'ini' else 'CSV（表格）',
-                      '段数' if fmt == 'ini' else '行数', n,
-                      ('（只含与 rules 不同的 %d 把 / 共 %d 把）' % (n, total))
-                      if only_diff else '（全部 %d 把）' % total,
+                      label, n, detail,
                       (d.rules_source() or {}).get('rules')
                       or '（没找到 rulesmd.ini，官方三列为空）'))
     return 0
