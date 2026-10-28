@@ -12633,6 +12633,17 @@ class SaveDoc(object):
     # 弹头对象里两个 float：`+0x100` CellSpread、`+0x108` PercentAtMax（各 48/48 命中）
     WARHEAD_SPREAD_OFF = 0x100
     WARHEAD_PCTMAX_OFF = 0x108
+    # ★抛射体对象（2026-10-28 二次探测，玩家纠正之后）：
+    #   +0x1D4 Image（64 字节 ASCII）      命中 36/38
+    #   +0x272 SubjectToCliffs             22/23
+    #   +0x273 SubjectToElevation          23/24
+    #   +0x274 SubjectToWalls              23/23（100%）
+    #   +0x277 Arcing                       4/4
+    PROJECTILE_IMAGE_OFF = 0x1D4
+    PROJECTILE_FLAGS = (('Arcing', 0x277),
+                        ('SubjectToCliffs', 0x272),
+                        ('SubjectToElevation', 0x273),
+                        ('SubjectToWalls', 0x274))
     VERSES_COUNT = 11
 
     def _type_objects(self):
@@ -13030,23 +13041,37 @@ class SaveDoc(object):
                     L.append('%s=%s' % (key, v))
             wh_blocks.append('\n'.join(L))
 
-        # ---- 抛射体段：存档里只有名字、没有参数，整段照抄 rules ----
+        # ---- 抛射体段：Image / Arcing / SubjectTo* 读存档，其余照抄 rules ----
         pj_blocks = []
+        pjobj = {x['name']: x for x in self.projectile_objects()}
+        PJ_FROM_SAVE = ('Image', 'Arcing', 'SubjectToCliffs', 'SubjectToElevation',
+                        'SubjectToWalls')
         for pjn in sorted(pj_used):
             kv = rules.get(pjn) or {}
+            o = pjobj.get(pjn)
             L = ['[%s];抛射体' % pjn]
-            # ★2026-10-28 探测结论（别删，这是"为什么抄 rules"的依据）：
-            #   抛射体对象在档内**只是个名字壳** —— 拿 `Arcing=yes` 的 MARIOSTAR 和
-            #   `Arcing=no` 的 InvisibleHighA 对比，+0x80..+0x1A0 **0 处字节不同**，
-            #   两者全 0；59 个抛射体对象里 57 个在 +0x80 之后没有任何非零槽。
-            #   引擎读档时按名字从 rules 重建这些参数，所以这里只能抄。
-            L.append('; 注意：抛射体参数不落盘（读档时按名字从 rules 重建），以下取自 rules')
-            if not kv:
-                L.append('; 当前 rules 里也没有这一节 —— 只能给个空段，需要你自己补参数')
+            if o:
+                L.append('; Image / Arcing / SubjectTo* = **存档实读**；其余照抄 rules')
             else:
-                for k, v in kv.items():
-                    if isinstance(v, str) and v.strip():
-                        L.append('%s=%s' % (k, v.strip()))
+                L.append('; 存档里没找到这个抛射体对象，以下全部照抄 rules')
+            # Image：存档优先（空则退回 rules —— 空表示"用 art 里同名条目"）
+            img = (o or {}).get('image')
+            if img:
+                L.append('Image=%s' % img)
+            elif rs(kv, 'Image'):
+                L.append('Image=%s' % rs(kv, 'Image'))
+            # 四个开关：有对象就用对象里的（0/1 → no/yes）
+            for key, _dd in self.PROJECTILE_FLAGS:
+                if o and o.get(key) is not None:
+                    L.append('%s=%s' % (key, 'yes' if o[key] else 'no'))
+                elif rs(kv, key):
+                    L.append('%s=%s' % (key, rs(kv, key)))
+            # 其余键照抄 rules（跳过上面已处理的）
+            for k, v in kv.items():
+                if k in PJ_FROM_SAVE:
+                    continue
+                if isinstance(v, str) and v.strip():
+                    L.append('%s=%s' % (k, v.strip()))
             pj_blocks.append('\n'.join(L))
 
         if out_path is None:
@@ -13097,6 +13122,67 @@ class SaveDoc(object):
         with open(out_path, 'wb') as f:
             f.write(payload)
         return len(parts), out_path
+
+    def _projectile_name_set(self):
+        """rules 里 `Projectile=` 引用过的名字集合（= 抛射体类型名）。"""
+        memo = getattr(self, '_pjnames_memo', None)
+        if memo is not None:
+            return memo
+        out = set()
+        for kv in (self._rules_all() or {}).values():
+            v = (kv.get('Projectile') or '').strip()
+            if v:
+                out.add(v)
+        self._pjnames_memo = out
+        return out
+
+    def projectile_objects(self):
+        """→ `[{'name','off','image','Arcing','SubjectToCliffs','SubjectToElevation',
+               'SubjectToWalls'}]`（只读）。
+
+        ★★2026-10-28（**我上一轮判断错了，玩家用实验纠正的**）：
+          上一轮我 dump 抛射体对象只看到 `+0x100` 就下结论"参数不落盘"，写了
+          "引擎读档时按名字从 rules 重建"。玩家随后做了实验：**把 rules 删掉，
+          读档照样能打** —— 说明参数确实在档里。
+
+          重新按整块 0x30C 挖，字段在 `+0x1D4` 之后（我之前根本没 dump 到那儿）：
+
+          | 偏移 | 字段 | 命中 |
+          |---|---|---|
+          | `+0x1D4` | Image（64 字节 ASCII） | 36/38 |
+          | `+0x272` | SubjectToCliffs | 22/23 |
+          | `+0x273` | SubjectToElevation | 23/24 |
+          | `+0x274` | SubjectToWalls | **23/23** |
+          | `+0x277` | Arcing | 4/4 |
+
+          对象固定 **780 字节**（0x30C）一块，间距实测 35/39 正好 780。
+
+        名字来源仍是 rules 的 `Projectile=`（档内没有独立注册表），
+        没有 rules 时返回空列表 —— 宁可没有，也不瞎猜。
+        """
+        pl = self.plain
+        want = self._projectile_name_set()
+        if not want:
+            return []
+        out, seen = [], set()
+        for off, nm in self._type_objects():
+            if nm not in want or nm in seen:
+                continue
+            try:
+                raw = pl[off + self.PROJECTILE_IMAGE_OFF:
+                         off + self.PROJECTILE_IMAGE_OFF + 64].split(b'\x00')[0]
+            except Exception:
+                continue
+            image = raw.decode('ascii', 'ignore')
+            rec = {'name': nm, 'off': off, 'image': image}
+            for key, dd in self.PROJECTILE_FLAGS:
+                try:
+                    rec[key] = bool(pl[off + dd])
+                except Exception:
+                    rec[key] = None
+            out.append(rec)
+            seen.add(nm)
+        return out
 
     def warhead_objects(self):
         """→ `[{'name','off','verses':[11 个系数]}]`（只读）。

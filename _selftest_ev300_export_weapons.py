@@ -233,8 +233,50 @@ bad_v = [n for n in whsec
          if 'Verses' in (blocks.get(n) or {})
          and len([x for x in blocks[n]['Verses'].split(',') if x.strip()]) != 11]
 ck(not bad_v, '弹头段 Verses 都是 11 项（不符：%s）' % bad_v[:3])
-ck(all(('Image' in (blocks.get(n) or {})) or ('Arcing' in (blocks.get(n) or {}))
-       or (';' in itxt) for n in pjsec), '抛射体段从 rules 抄到了字段')
+# 少数抛射体在 rules 里本来就没有 Image / Arcing（如 ASWVirt），允许缺
+_miss = [n for n in pjsec
+         if not (('Image' in (blocks.get(n) or {}))
+                 or ('Arcing' in (blocks.get(n) or {})))]
+ck(len(_miss) <= max(2, len(pjsec) // 10),
+   '抛射体段基本都写了 Image/Arcing（缺 %d 个：%s）' % (len(_miss), _miss[:3]))
+
+# ---- 抛射体字段：2026-10-28 二次探测后改为**存档实读**，这里钉住准确性 ----
+pjs = {x['name']: x for x in doc.projectile_objects()}
+ck(bool(pjs), 'projectile_objects() 返回 %d 个对象' % len(pjs))
+
+
+def _b(kv, k):
+    v = (kv.get(k) or '').strip().lower()
+    if v in ('yes', 'true', '1'):
+        return 1
+    if v in ('no', 'false', '0'):
+        return 0
+    return None
+
+
+_pr = doc._rules_all() or {}
+tot = hit = 0
+for nm, o in pjs.items():
+    kv = _pr.get(nm) or {}
+    for key in ('Arcing', 'SubjectToCliffs', 'SubjectToElevation', 'SubjectToWalls'):
+        want = _b(kv, key)
+        if want is None:
+            continue
+        tot += 1
+        if (1 if o.get(key) else 0) == want:
+            hit += 1
+ck(tot >= 8 and hit / tot >= 0.8,
+   '抛射体 4 个开关与 rules 一致 %d/%d' % (hit, tot))
+
+ti = hi = 0
+for nm, o in pjs.items():
+    want = (_pr.get(nm) or {}).get('Image', '').strip()
+    if not want or want.lower() in ('none', ''):
+        continue
+    ti += 1
+    if (o.get('image') or '').upper() == want.upper():
+        hi += 1
+ck(ti >= 5 and hi / ti >= 0.8, '抛射体 Image 与 rules 一致 %d/%d' % (hi, ti))
 ck(all(('CellSpread' in (blocks.get(n) or {})) for n in whsec[:20]),
    '弹头段都有 CellSpread=')
 
