@@ -36,7 +36,9 @@ for _n in ('rulesmd.ini', 'artmd.ini'):
 
 a = Analysis(
     [os.path.join(_ROOT, 'app_main.py')],
-    pathex=[_CORE],
+    # ★2026-10-28（P2-8）：页签拆成 `ui/` 包（在项目根，不在 core/）⇒ 搜索路径
+    #   必须同时含项目根，否则 PyInstaller 追不到 `ui.page_*`，exe 一开页就 ImportError。
+    pathex=[_ROOT, _CORE],
     binaries=[],
     datas=_datas,
     hiddenimports=['editor_core', 'cfb', 'cfb_write', 'map_render', 'map_ini', 'game_ini',

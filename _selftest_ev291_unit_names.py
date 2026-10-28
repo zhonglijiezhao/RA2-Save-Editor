@@ -32,6 +32,25 @@ spec.loader.exec_module(m)
 
 PASS, FAIL = [], []
 
+def ui_source():
+    """主程序 + ui/ 下所有页面的源码（★P2-8 拆页后，文本断言必须扫全部）。
+
+    以前只读 `RA2存档编辑器.py`；页签方法搬到 `ui/page_*.py` 之后，
+    只读主文件就什么都找不到了（会静默地"断言失败"，而不是报错）。
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    parts = []
+    p = os.path.join(root, 'RA2存档编辑器.py')
+    if os.path.exists(p):
+        parts.append(io.open(p, encoding='utf-8').read())
+    udir = os.path.join(root, 'ui')
+    if os.path.isdir(udir):
+        for n in sorted(os.listdir(udir)):
+            if n.endswith('.py'):
+                parts.append(io.open(os.path.join(udir, n), encoding='utf-8').read())
+    return '\n'.join(parts)
+
+
 
 def ck(cond, msg):
     (PASS if cond else FAIL).append(msg)
@@ -44,8 +63,7 @@ if not os.path.exists(SRC):
 
 # ── ① 只应有一个 _unit_type_names ──────────────────────────────
 # 用源码文本判断（importlib 动态加载的模块 inspect.getsource 拿不到）
-with open(os.path.join(HERE, 'RA2存档编辑器.py'), encoding='utf-8') as _f:
-    _src = _f.read()
+_src = ui_source()
 n_def = _src.count('def _unit_type_names')
 ck(n_def == 1, 'App 里 `_unit_type_names` 只定义 1 次（实际 %d 次）' % n_def)
 

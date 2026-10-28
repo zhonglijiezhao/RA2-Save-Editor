@@ -23,6 +23,21 @@ PASS = []
 FAIL = []
 
 
+def ui_source():
+    """主程序 + ui/ 下所有页面的源码（★P2-8 拆页后，文本断言必须扫全部）。"""
+    root = os.path.dirname(os.path.abspath(__file__))
+    parts = []
+    p = os.path.join(root, 'RA2存档编辑器.py')
+    if os.path.exists(p):
+        parts.append(io.open(p, encoding='utf-8').read())
+    udir = os.path.join(root, 'ui')
+    if os.path.isdir(udir):
+        for n in sorted(os.listdir(udir)):
+            if n.endswith('.py'):
+                parts.append(io.open(os.path.join(udir, n), encoding='utf-8').read())
+    return '\n'.join(parts)
+
+
 def ck(cond, msg):
     (PASS if cond else FAIL).append(msg)
     print('  [%s] %s' % ('PASS' if cond else 'FAIL', msg))
@@ -176,7 +191,7 @@ for _t, _body in sections:
             except Exception:
                 pass
 ck(not _refresh, '「↻ 刷新」按钮已从地图页删除')
-_src = io.open(os.path.join(HERE, 'RA2存档编辑器.py'), encoding='utf-8').read()
+_src = ui_source()
 ck('def _mv_ensure_types' in _src, '切页自动填充入口 _mv_ensure_types 在')
 
 app.destroy()
