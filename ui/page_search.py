@@ -15,9 +15,9 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
         sys.path.insert(0, _p)
 
 from editor_core import SaveDoc
-from tkinter import filedialog
-from tkinter import messagebox
-from tkinter import simpledialog
+from ui.msg import filedialog
+from ui.msg import messagebox
+from ui.msg import simpledialog
 from tkinter import ttk
 import json
 import os

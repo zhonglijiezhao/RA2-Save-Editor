@@ -15,8 +15,8 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
         sys.path.insert(0, _p)
 
 from editor_core import SaveDoc
-from tkinter import filedialog
-from tkinter import messagebox
+from ui.msg import filedialog
+from ui.msg import messagebox
 from tkinter import ttk
 from ui.const import UNIT_HOUSE_INHERIT
 from ui.const import UNIT_VET_CHOICES

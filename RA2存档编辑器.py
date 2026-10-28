@@ -15,7 +15,9 @@
 import os, sys, re, struct, threading, queue, time, traceback
 import json, subprocess
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk
+# ★P2-8：对话框走共享代理，测试打补丁才能对全部页面生效（见 ui/msg.py）
+from ui.msg import filedialog, messagebox, simpledialog   # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, 'core'))

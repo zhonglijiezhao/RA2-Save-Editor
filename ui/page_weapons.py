@@ -15,7 +15,7 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
         sys.path.insert(0, _p)
 
 from editor_core import SaveDoc
-from tkinter import messagebox
+from ui.msg import messagebox
 from tkinter import ttk
 import tkinter as tk
 import ui_theme

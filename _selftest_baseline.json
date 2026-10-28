@@ -1,0 +1,702 @@
+{
+ "_selftest": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_ai": {
+  "failed": 0,
+  "passed": 70,
+  "status": "ok"
+ },
+ "_selftest_attach": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_country_param": {
+  "failed": 2,
+  "passed": 5,
+  "status": "red"
+ },
+ "_selftest_ctrig": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_del_big": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_destroy4": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_ev13": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_ev168": {
+  "failed": 0,
+  "passed": 0,
+  "status": "ok"
+ },
+ "_selftest_ev169": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_ev170": {
+  "failed": 13,
+  "passed": 34,
+  "status": "red"
+ },
+ "_selftest_ev171": {
+  "failed": 1,
+  "passed": 55,
+  "status": "red"
+ },
+ "_selftest_ev174": {
+  "failed": 0,
+  "passed": 59,
+  "status": "ok"
+ },
+ "_selftest_ev175": {
+  "failed": 5,
+  "passed": 47,
+  "status": "red"
+ },
+ "_selftest_ev183": {
+  "failed": 3,
+  "passed": 11,
+  "status": "red"
+ },
+ "_selftest_ev184": {
+  "failed": 0,
+  "passed": 14,
+  "status": "ok"
+ },
+ "_selftest_ev192": {
+  "failed": 0,
+  "passed": 23,
+  "status": "ok"
+ },
+ "_selftest_ev193": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_ev194": {
+  "failed": 0,
+  "passed": 12,
+  "status": "ok"
+ },
+ "_selftest_ev195": {
+  "failed": 0,
+  "passed": 31,
+  "status": "ok"
+ },
+ "_selftest_ev197": {
+  "failed": 0,
+  "passed": 25,
+  "status": "ok"
+ },
+ "_selftest_ev200": {
+  "failed": 0,
+  "passed": 20,
+  "status": "ok"
+ },
+ "_selftest_ev202": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_ev203": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_ev204": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_ev205": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_ev206": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_ev210": {
+  "failed": 0,
+  "passed": 18,
+  "status": "ok"
+ },
+ "_selftest_ev211": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_ev215": {
+  "failed": 0,
+  "passed": 26,
+  "status": "ok"
+ },
+ "_selftest_ev216": {
+  "failed": 0,
+  "passed": 24,
+  "status": "ok"
+ },
+ "_selftest_ev217": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_ev218": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_ev222": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_ev224": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_ev234": {
+  "failed": 0,
+  "passed": 17,
+  "status": "ok"
+ },
+ "_selftest_ev235": {
+  "failed": 0,
+  "passed": 31,
+  "status": "ok"
+ },
+ "_selftest_ev246": {
+  "failed": 0,
+  "passed": 28,
+  "status": "ok"
+ },
+ "_selftest_ev247": {
+  "failed": 0,
+  "passed": 18,
+  "status": "ok"
+ },
+ "_selftest_ev249": {
+  "failed": 0,
+  "passed": 10,
+  "status": "ok"
+ },
+ "_selftest_ev251": {
+  "failed": 0,
+  "passed": 10,
+  "status": "ok"
+ },
+ "_selftest_ev252": {
+  "failed": 3,
+  "passed": 16,
+  "status": "red"
+ },
+ "_selftest_ev253": {
+  "failed": 0,
+  "passed": 22,
+  "status": "ok"
+ },
+ "_selftest_ev254": {
+  "failed": 0,
+  "passed": 24,
+  "status": "ok"
+ },
+ "_selftest_ev255": {
+  "failed": 0,
+  "passed": 15,
+  "status": "ok"
+ },
+ "_selftest_ev259": {
+  "failed": 0,
+  "passed": 28,
+  "status": "ok"
+ },
+ "_selftest_ev260": {
+  "failed": 0,
+  "passed": 20,
+  "status": "ok"
+ },
+ "_selftest_ev261": {
+  "failed": 0,
+  "passed": 33,
+  "status": "ok"
+ },
+ "_selftest_ev263": {
+  "failed": 0,
+  "passed": 24,
+  "status": "ok"
+ },
+ "_selftest_ev264": {
+  "failed": 0,
+  "passed": 25,
+  "status": "ok"
+ },
+ "_selftest_ev265": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_ev271": {
+  "failed": 17,
+  "passed": 7,
+  "status": "red"
+ },
+ "_selftest_ev272": {
+  "failed": 0,
+  "passed": 21,
+  "status": "ok"
+ },
+ "_selftest_ev273": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_ev274": {
+  "failed": 0,
+  "passed": 44,
+  "status": "ok"
+ },
+ "_selftest_ev276": {
+  "failed": 0,
+  "passed": 24,
+  "status": "ok"
+ },
+ "_selftest_ev277": {
+  "failed": 0,
+  "passed": 28,
+  "status": "ok"
+ },
+ "_selftest_ev279": {
+  "failed": 1,
+  "passed": 20,
+  "status": "red"
+ },
+ "_selftest_ev280": {
+  "failed": 2,
+  "passed": 24,
+  "status": "red"
+ },
+ "_selftest_ev281": {
+  "failed": 1,
+  "passed": 34,
+  "status": "red"
+ },
+ "_selftest_ev283": {
+  "failed": 0,
+  "passed": 29,
+  "status": "ok"
+ },
+ "_selftest_ev288": {
+  "failed": 0,
+  "passed": 13,
+  "status": "ok"
+ },
+ "_selftest_ev289": {
+  "failed": 0,
+  "passed": 11,
+  "status": "ok"
+ },
+ "_selftest_ev291_unit_names": {
+  "failed": 0,
+  "passed": 11,
+  "status": "ok"
+ },
+ "_selftest_ev292_unsaved": {
+  "failed": 0,
+  "passed": 23,
+  "status": "ok"
+ },
+ "_selftest_ev293_dpi": {
+  "failed": 0,
+  "passed": 14,
+  "status": "ok"
+ },
+ "_selftest_ev294_saveas_scroll": {
+  "failed": 0,
+  "passed": 28,
+  "status": "ok"
+ },
+ "_selftest_ev295_weapon_table": {
+  "failed": 0,
+  "passed": 34,
+  "status": "ok"
+ },
+ "_selftest_ev296_setweapon": {
+  "failed": 0,
+  "passed": 39,
+  "status": "ok"
+ },
+ "_selftest_ev297_weapon_tab": {
+  "failed": 0,
+  "passed": 35,
+  "status": "ok"
+ },
+ "_selftest_ev298_meta_cache": {
+  "failed": 0,
+  "passed": 15,
+  "status": "ok"
+ },
+ "_selftest_game_ini": {
+  "failed": 3,
+  "passed": 24,
+  "status": "red"
+ },
+ "_selftest_house": {
+  "failed": 1,
+  "passed": 36,
+  "status": "red"
+ },
+ "_selftest_houses": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_lzo": {
+  "failed": 0,
+  "passed": 38,
+  "status": "ok"
+ },
+ "_selftest_map_readonly": {
+  "failed": 0,
+  "passed": 17,
+  "status": "ok"
+ },
+ "_selftest_mapmatch": {
+  "failed": 5,
+  "passed": 3,
+  "status": "red"
+ },
+ "_selftest_mix_encrypted": {
+  "failed": 0,
+  "passed": 17,
+  "status": "ok"
+ },
+ "_selftest_mktrig": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_multi": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_newtrig": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_newtrig_pieces": {
+  "failed": 1,
+  "passed": 18,
+  "status": "red"
+ },
+ "_selftest_persist_write": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_record_kind": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_remove": {
+  "failed": 0,
+  "passed": 0,
+  "status": "ok"
+ },
+ "_selftest_remove2": {
+  "failed": 0,
+  "passed": 0,
+  "status": "ok"
+ },
+ "_selftest_repair": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_repeat_edit": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_retarget": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_selftest_runtime_state": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_sell3": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_soft_disable": {
+  "failed": 0,
+  "passed": 13,
+  "status": "ok"
+ },
+ "_selftest_template": {
+  "failed": 2,
+  "passed": 11,
+  "status": "red"
+ },
+ "_selftest_trig_editor_gui": {
+  "failed": 1,
+  "passed": 62,
+  "status": "red"
+ },
+ "_selftest_trig_type_col": {
+  "failed": 1,
+  "passed": 23,
+  "status": "red"
+ },
+ "_selftest_trigger_editor": {
+  "failed": 1,
+  "passed": 27,
+  "status": "red"
+ },
+ "_selftest_trigger_executed": {
+  "failed": 0,
+  "passed": 22,
+  "status": "ok"
+ },
+ "_selftest_trigger_highlight": {
+  "failed": 0,
+  "passed": 11,
+  "status": "ok"
+ },
+ "_selftest_trigowner": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_trigplace": {
+  "failed": 0,
+  "passed": 35,
+  "status": "ok"
+ },
+ "_selftest_unit_place": {
+  "failed": 0,
+  "passed": 88,
+  "status": "ok"
+ },
+ "_selftest_units": {
+  "failed": 0,
+  "passed": 10,
+  "status": "ok"
+ },
+ "_selftest_var_persist": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_selftest_waypoints": {
+  "failed": 0,
+  "passed": 10,
+  "status": "ok"
+ },
+ "_selftest_waypoints_save": {
+  "failed": 0,
+  "passed": 27,
+  "status": "ok"
+ },
+ "_ui_ev176": {
+  "failed": 0,
+  "passed": 12,
+  "status": "ok"
+ },
+ "_ui_ev193": {
+  "failed": 0,
+  "passed": 10,
+  "status": "ok"
+ },
+ "_ui_ev202": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_ui_ev203": {
+  "failed": 1,
+  "passed": 1,
+  "status": "red"
+ },
+ "_ui_ev204": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_ui_ev206": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_ui_ev208": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_ui_ev216": {
+  "failed": 0,
+  "passed": 0,
+  "status": "skip"
+ },
+ "_ui_ev221": {
+  "failed": 1,
+  "passed": 8,
+  "status": "red"
+ },
+ "_ui_ev222": {
+  "failed": 1,
+  "passed": 4,
+  "status": "red"
+ },
+ "_ui_ev223": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_ui_ev225": {
+  "failed": 1,
+  "passed": 0,
+  "status": "red"
+ },
+ "_ui_ev226": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_ui_ev235": {
+  "failed": 2,
+  "passed": 8,
+  "status": "red"
+ },
+ "_ui_ev247": {
+  "failed": 0,
+  "passed": 11,
+  "status": "ok"
+ },
+ "_ui_ev253": {
+  "failed": 1,
+  "passed": 18,
+  "status": "red"
+ },
+ "_ui_ev254": {
+  "failed": 0,
+  "passed": 8,
+  "status": "ok"
+ },
+ "_ui_ev255": {
+  "failed": 0,
+  "passed": 21,
+  "status": "ok"
+ },
+ "_ui_ev256": {
+  "failed": 1,
+  "passed": 11,
+  "status": "red"
+ },
+ "_ui_ev257": {
+  "failed": 0,
+  "passed": 15,
+  "status": "ok"
+ },
+ "_ui_ev258": {
+  "failed": 1,
+  "passed": 34,
+  "status": "red"
+ },
+ "_ui_ev259": {
+  "failed": 0,
+  "passed": 19,
+  "status": "ok"
+ },
+ "_ui_ev262": {
+  "failed": 0,
+  "passed": 19,
+  "status": "ok"
+ },
+ "_ui_ev264": {
+  "failed": 0,
+  "passed": 20,
+  "status": "ok"
+ },
+ "_ui_ev265": {
+  "failed": 0,
+  "passed": 20,
+  "status": "ok"
+ },
+ "_ui_ev266": {
+  "failed": 0,
+  "passed": 14,
+  "status": "ok"
+ },
+ "_ui_ev267": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_ui_ev268": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_ui_ev269": {
+  "failed": 0,
+  "passed": 0,
+  "status": "error"
+ },
+ "_ui_ev283": {
+  "failed": 0,
+  "passed": 13,
+  "status": "ok"
+ },
+ "_ui_ev284": {
+  "failed": 0,
+  "passed": 15,
+  "status": "ok"
+ },
+ "_ui_ev285": {
+  "failed": 0,
+  "passed": 18,
+  "status": "ok"
+ },
+ "_ui_ev286": {
+  "failed": 0,
+  "passed": 33,
+  "status": "ok"
+ },
+ "_ui_ev287": {
+  "failed": 0,
+  "passed": 17,
+  "status": "ok"
+ },
+ "_ui_ev289": {
+  "failed": 0,
+  "passed": 49,
+  "status": "ok"
+ }
+}

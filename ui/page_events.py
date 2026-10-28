@@ -17,7 +17,7 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
 from editor_core import EVENT_TYPES
 from editor_core import event_name
 from editor_core import event_note
-from tkinter import messagebox
+from ui.msg import messagebox
 from tkinter import ttk
 import tkinter as tk
 import ui_theme

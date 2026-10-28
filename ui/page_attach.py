@@ -14,7 +14,7 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tkinter import messagebox
+from ui.msg import messagebox
 from tkinter import ttk
 import ui_theme
 

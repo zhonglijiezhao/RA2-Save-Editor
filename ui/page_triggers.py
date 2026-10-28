@@ -17,8 +17,8 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
 from editor_core import ACTION_TYPES
 from editor_core import action_name
 from editor_core import event_name
-from tkinter import filedialog
-from tkinter import messagebox
+from ui.msg import filedialog
+from ui.msg import messagebox
 from tkinter import ttk
 from ui.trigger_editor import TriggerEditor
 import os

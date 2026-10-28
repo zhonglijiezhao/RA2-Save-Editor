@@ -21,7 +21,7 @@ from editor_core import action_ptype
 from editor_core import event_name
 from editor_core import event_note
 from editor_core import event_ptype
-from tkinter import messagebox
+from ui.msg import messagebox
 from tkinter import ttk
 from ui.const import REPEAT_LABEL
 import tkinter as tk

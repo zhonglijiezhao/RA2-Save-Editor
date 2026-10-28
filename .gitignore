@@ -9,6 +9,9 @@ build_work/*
 # 打包脚本要跟着仓库走（spec 里用 SPECPATH 算绝对路径，放哪都能跑）
 # ★只放行 spec 一个文件：写成 !build_work/ 会把整个目录（1.1GB 中间产物）都放进来
 !build_work/RA2存档编辑器.spec
+# ★2026-10-28：build.py 是**唯一的打包入口**（文档里也是这么写的），
+#   以前被 build_work/* 一起忽略了 ⇒ 从 GitHub clone 下来没法打包、CI 也没法用。
+!build_work/build.py
 # 发布打包脚本（顶层 exe + _internal；跳玩家文件；保留 base_library.zip）
 !build_work/make_release_zip.py
 _build_bak/
@@ -80,6 +83,8 @@ _*.py
 !_probe_primary.py
 _*.txt
 _*.json
+# ★例外（P4-18）：自检基线 —— 它是「改完有没有退化」的唯一判据，必须跟仓库走
+!_selftest_baseline.json
 _*.cmd
 
 # ================= 内部交接档 / 草稿 =================

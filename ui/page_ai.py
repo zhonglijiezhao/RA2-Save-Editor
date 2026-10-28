@@ -16,8 +16,8 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
 
 from editor_core import SCRIPT_PARAM_TYPES
 from editor_core import script_action_name
-from tkinter import filedialog
-from tkinter import messagebox
+from ui.msg import filedialog
+from ui.msg import messagebox
 from tkinter import ttk
 import ai_objects
 import os
