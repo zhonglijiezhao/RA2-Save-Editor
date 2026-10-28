@@ -27,6 +27,7 @@ import json
 import os
 import re
 import sys
+import time
 
 # ★2026-10-17 玩家定案：**规则必须跟着"存档所在目录"走**，不能猜别的安装目录。
 #   顺序：手动指定 → 存档目录（含上一级）→ **内置规则**（本工程打包的原版快照）。
@@ -297,12 +298,214 @@ def _pair_in_mix(d):
     return (d, rules, art, fn_r)
 
 
+# ---------------- 自动探测游戏安装目录（★2026-10-28 玩家要求） ----------------
+#
+# 为什么需要：新电脑上玩家把存档放在桌面，游戏装在别的盘 ⇒
+#   「存档目录 / 上一级 / MIX」三层全落空，工具退化到内置快照（能显示，但
+#   "非原版"判定和可建造判定全失效）。以前只能手动去地图页菜单里选目录。
+#
+# 判据用 **gamemd.exe / ra2md.exe**，不是 "有没有 rulesmd.ini" ——
+#   原版安装根本没有散装 rules，规则都在 MIX 里；拿到候选后再由
+#   `find_sources` 按「散装 → 内容认 → MIX 抽」逐层验证。
+
+_GAME_EXES = ('gamemd.exe', 'ra2md.exe', 'ra2.exe', 'yuri.exe')
+_AUTO_CACHE = None
+
+
+def _config_game_dir():
+    """`config.json` 里的 `game_dir`（玩家手动指定过）→ 路径 或 None。
+
+    ★2026-10-28：以前 `config_path()` 只有"决定写到哪"，**没人读** ——
+      地图页菜单「规则目录…」写了 `game_dir`，但 `find_sources` 只看传进来的
+      `explicit`（来自 GUI 输入框），于是**下次启动不生效**。这里补上读的一侧。
+    """
+    p = config_path()
+    try:
+        with open(p, encoding='utf-8') as f:
+            d = (json.load(f) or {}).get('game_dir')
+        if isinstance(d, str) and d.strip() and os.path.isdir(d.strip()):
+            return d.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _registry_game_dirs():
+    """注册表里的安装目录 → [路径]。只读、静默失败（非 Windows / 无权限都返回 []）。"""
+    out = []
+    try:
+        import winreg
+    except Exception:
+        return out
+    keys = (
+        r'SOFTWARE\WOW6432Node\EA Games\Red Alert 2',
+        r'SOFTWARE\EA Games\Red Alert 2',
+        r'SOFTWARE\WOW6432Node\Westwood\Red Alert 2',
+        r'SOFTWARE\Westwood\Red Alert 2',
+        r'SOFTWARE\WOW6432Node\Electronic Arts\Red Alert 2',
+        r'SOFTWARE\Electronic Arts\Red Alert 2',
+        r'SOFTWARE\WOW6432Node\EA Games\Command and Conquer Red Alert II',
+        r'SOFTWARE\EA Games\Command and Conquer Red Alert II',
+    )
+    val_names = ('Install Dir', 'InstallDir', 'Install Path', 'InstallPath',
+                 'Path', 'GameDir', 'Directory')
+    for hk in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for k in keys:
+            try:
+                with winreg.OpenKey(hk, k) as key:
+                    vals = {}
+                    for i in range(winreg.QueryInfoKey(key)[1]):
+                        try:
+                            nm, val, _t = winreg.EnumValue(key, i)
+                            if isinstance(val, str):
+                                vals[nm] = val
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+            for nm in val_names:
+                d = vals.get(nm)
+                if d and d.strip():
+                    out.append(d.strip().rstrip('\\/'))
+    return out
+
+
+def _scan_game_dirs(max_sub=40):
+    """各盘符根 + 名字相关的子目录里找游戏 exe → [路径]。
+
+    ★性能（2026-10-28 实测）：全量扫"每盘 80 个子目录 × 4 个 exe 名"要 **2.5 秒**，
+      会拖慢启动。改成：
+        ① 根目录必扫（26 盘 × 4 次 stat，几十毫秒）；
+        ② 子目录**先按名字筛**（`ra2 / yuri / red alert / cnc / 命令` 之类），
+           再只对这几个查 exe —— 名字毫不相关的目录不 stat。
+      配合下面的磁盘缓存，正常启动不会触发扫描。
+    """
+    import string
+    out = []
+    for ch in string.ascii_uppercase:
+        root = '%s:\\' % ch
+        try:
+            if not os.path.isdir(root):
+                continue
+        except Exception:
+            continue
+        for fn in _GAME_EXES:
+            try:
+                if os.path.isfile(os.path.join(root, fn)):
+                    out.append(root.rstrip('\\'))
+                    break
+            except Exception:
+                continue
+        subs = []
+        try:
+            with os.scandir(root) as it:
+                for e in it:
+                    if len(subs) >= max_sub:
+                        break
+                    try:
+                        if not e.is_dir(follow_symlinks=False):
+                            continue
+                    except Exception:
+                        continue
+                    nm = e.name.lower()
+                    if any(h in nm for h in _SUB_HINTS):
+                        subs.append(e.path)
+        except Exception:
+            continue
+        for d in subs:
+            for fn in _GAME_EXES:
+                try:
+                    if os.path.isfile(os.path.join(d, fn)):
+                        out.append(d)
+                        break
+                except Exception:
+                    continue
+    return out
+
+
+_SUB_HINTS = ('ra2', 'redalert', 'red alert', 'red-alert', 'yuri', 'yr', 'cnc',
+              'command', 'westwood', 'ea games', '红色', '命令', '尤里', 'mod')
+
+
+def _auto_cache_path():
+    base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+    d = os.path.join(base, 'RA2SED_cache')
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        return None
+    return os.path.join(d, 'game_dirs.json')
+
+
+def auto_detect_game_dirs(force=False):
+    """自动找红警目录 → [目录...]（结果缓存到磁盘，7 天内不再扫）。
+
+    缓存的意义：扫描要几百毫秒到几秒，而"游戏装在哪"极少变。
+    玩家换了安装位置时，界面上手动指定一次就会写进 `config.json`（优先级更高）。
+    """
+    global _AUTO_CACHE
+    if _AUTO_CACHE is not None and not force:
+        return _AUTO_CACHE
+    p = _auto_cache_path()
+    if p and not force and os.path.isfile(p):
+        try:
+            with open(p, 'r', encoding='utf-8') as f:
+                j = json.load(f) or {}
+            ts, dirs = float(j.get('ts') or 0), (j.get('dirs') or [])
+            if time.time() - ts < 7 * 86400 and isinstance(dirs, list):
+                dirs = [d for d in dirs if isinstance(d, str) and os.path.isdir(d)]
+                _AUTO_CACHE = dirs
+                return dirs
+        except Exception:
+            pass
+    out, seen = [], set()
+    for d in _registry_game_dirs() + _scan_game_dirs():
+        if not d:
+            continue
+        try:
+            k = os.path.normcase(os.path.abspath(d))
+        except Exception:
+            continue
+        if k in seen or not os.path.isdir(d):
+            continue
+        seen.add(k)
+        out.append(d)
+    _AUTO_CACHE = out
+    if p:
+        try:
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump({'ts': time.time(), 'dirs': out}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    return out
+
+
+def detect_game_dir():
+    """自动探测并**验证能用**的第一个目录 → 目录 或 None。
+
+    ★先只试「散装 ini」（毫秒级），全都不行才去解 MIX（每个候选几秒）——
+      否则一个没有散装 rules 的候选就能把启动拖到好几秒。
+    """
+    dirs = auto_detect_game_dirs()
+    for d in dirs:
+        if _pair_in(d) or _pair_in_hashed(d):
+            return d
+    for d in dirs:
+        if _pair_in_mix(d):
+            return d
+    return None
+
+
 def find_sources(save_dir=None, explicit=None):
     """按优先级找规则 → (来源, 目录, rules路径, art路径)。
 
     来源：'user'（手动指定） / 'save'（存档所在目录或其上一级） /
-          **'mix'（同一目录的 MIX 归档里抽出来的）** / 'builtin'（内置） / None
+          **'mix'（同一目录的 MIX 归档里抽出来的）** /
+          **'auto'（注册表 / 盘符扫描自动探测到的游戏目录）** /
+          'builtin'（内置） / None
     """
+    if not explicit:
+        explicit = _config_game_dir()      # config.json 里手动指定过的
     p = _pair_in(explicit)
     if p:
         return ('user',) + p
@@ -327,6 +530,17 @@ def find_sources(save_dir=None, explicit=None):
         p = _pair_in_mix(d)
         if p:
             return ('mix', p[0], p[1], p[2])
+    # ★★2026-10-28：存档不在游戏目录（新电脑常见：存档放桌面，游戏在 D 盘）
+    #   ⇒ 自动探测（注册表 + 盘符扫描）。先全试"散装"（快），再试 MIX（慢）。
+    autos = auto_detect_game_dirs()
+    for d in autos:
+        p = _pair_in(d) or _pair_in_hashed(d)
+        if p:
+            return ('auto',) + p
+    for d in autos:
+        p = _pair_in_mix(d)
+        if p:
+            return ('auto', p[0], p[1], p[2])
     p = _pair_in(BUILTIN_DIR)
     if p:
         return ('builtin',) + p

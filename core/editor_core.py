@@ -9708,7 +9708,18 @@ class SaveDoc(object):
     def rules_source(cls):
         """规则文件实际来自哪（给界面显示 / 诊断用）。"""
         rp, ap = cls._resolve_rule_files()
-        return {'rules': rp, 'art': ap, 'game_dir': cls.GAME_DIR, 'ok': bool(rp)}
+        # ★来源类型（user/save/mix/auto/builtin）—— 界面要能说清"你选的目录到底用上没"，
+        #   否则玩家选了 A 目录、实际用了自动探测到的 B 目录，只会看到一条奇怪的路径。
+        kind = None
+        try:
+            import game_ini
+            kind = game_ini.find_sources(
+                cls._recent_save_dirs[0] if cls._recent_save_dirs else None,
+                cls.GAME_DIR)[0]
+        except Exception:
+            pass
+        return {'rules': rp, 'art': ap, 'game_dir': cls.GAME_DIR,
+                'ok': bool(rp), 'source': kind}
 
     @classmethod
     def _rules_all(cls):

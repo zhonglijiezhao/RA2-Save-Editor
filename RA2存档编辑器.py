@@ -64,8 +64,23 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
         self._warned_zero = False        # 「-无事件-」(0) 告警每次载入只弹一次
         # ★2026-10-28（审查 P4-21）：游戏目录以前写死 E:\YURI 且从不记住，
         #   玩家每次启动都要重新输一遍。现在读配置、并在刷新/开档时回写。
-        self.game_dir = tk.StringVar(
-            value=(self._cfg_get('game_dir', '') or GAME_DIR_DEFAULT))
+        # ★2026-10-28（玩家要求）：新电脑上别指望它猜对 —— 按
+        #   ① 上次记住的  ② config.json 手写的  ③ 自动探测（注册表/盘符，带磁盘缓存）
+        #   ④ 开发机老默认（仅当该目录真的存在）  的顺序定初值。
+        _gd = self._cfg_get('game_dir', '') or ''
+        if not _gd:
+            try:
+                _gd = game_ini._config_game_dir() or ''
+            except Exception:
+                _gd = ''
+        if not _gd:
+            try:
+                _gd = game_ini.detect_game_dir() or ''
+            except Exception:
+                _gd = ''
+        if not _gd and os.path.isdir(GAME_DIR_DEFAULT):
+            _gd = GAME_DIR_DEFAULT
+        self.game_dir = tk.StringVar(value=_gd)
         self.status = tk.StringVar(value='就绪')
         self.q = queue.Queue()
         # 后台任务状态 —— 用于「看门狗」，避免进度条永远转（见 _poll）
@@ -153,6 +168,9 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
                    command=self.open_dialog).pack(side='right')
         ttk.Button(hi, text='刷新', style='Ghost.TButton',
                    command=self.refresh_list).pack(side='right', padx=(2, 10))
+        # ★2026-10-28（玩家要求）：主界面直接能选红警目录，不用去地图页菜单里翻
+        ttk.Button(hi, text='…', style='Ghost.TButton', width=0,
+                   command=self.pick_game_dir).pack(side='right', padx=(0, 4))
         ttk.Entry(hi, textvariable=self.game_dir, width=26).pack(side='right', padx=(6, 8))
         tk.Label(hi, text='游戏目录', bg=T['surface'], fg=T['muted'],
                  font=(ui_theme.FONT_UI, 9)).pack(side='right')
@@ -246,6 +264,77 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
     # ★2026-10-28（审查 P2-8）：11 个页签的方法体原样搬到了 ui/page_*.py，
     #   由多继承挂回来。这里只剩外壳：窗口装配 + 存档列表 + 状态栏 + 后台轮询。
 # 触发编辑器已拆到 ui/trigger_editor.py（P2-8）
+
+
+    def pick_game_dir(self):
+        """主界面：手动指定红警安装目录。
+
+        ★2026-10-28（玩家要求）：新电脑上存档常在桌面、游戏在别的盘，
+          以前只能去地图页「更多 ▾ → 规则目录…」里找，藏得深。
+        """
+        cur = (self.game_dir.get() or '').strip()
+        d = filedialog.askdirectory(
+            title='选择红警安装目录（含 gamemd.exe / ra2md.mix 或 rulesmd.ini 的那一层）',
+            initialdir=cur if cur and os.path.isdir(cur) else None)
+        if not d:
+            return
+        self.apply_game_dir(d)
+
+    def apply_game_dir(self, d, persist=True):
+        """填输入框 → 交给 core → 记住（两处配置）→ 刷新所有依赖规则的地方。
+
+        两处配置都写，是因为它们各管一头：
+          · `%APPDATA%\\RA2SED\\editor_config.json` —— 界面下次启动带出来
+          · exe 旁边的 `config.json` —— `game_ini` 找规则时读（也可以手写）
+        """
+        d = (d or '').strip().replace('/', '\\').rstrip('\\')
+        self.game_dir.set(d)
+        try:
+            self._sync_game_dir(persist=persist)        # → SaveDoc.set_game_dir + 界面配置
+        except Exception:
+            pass
+        try:
+            game_ini.clear_cache()
+        except Exception:
+            pass
+        if persist and d:
+            try:
+                cfg = game_ini.config_path()
+                data = {}
+                if os.path.exists(cfg):
+                    with open(cfg, encoding='utf-8') as f:
+                        data = json.load(f) or {}
+                data['game_dir'] = d
+                with open(cfg, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+        src = SaveDoc.rules_source() or {}
+        rp = src.get('rules')
+        kind = src.get('source')
+        if not rp:
+            self.status.set('⚠ 这个目录里没找到 rules —— 请选游戏安装根目录'
+                            '（含 gamemd.exe / ra2md.mix 的那一层）')
+        elif kind == 'builtin':
+            self.status.set('⚠ 只在程序内置副本里找到规则（%s）—— 你选的那个目录没用上' % rp)
+        elif kind == 'auto':
+            # 最常见的一种困惑：选了目录但那里没 rules，结果自动探测到别的游戏目录顶上
+            self.status.set('⚠ %s 里没找到 rules；自动探测到 %s 并已使用'
+                            '（要指定就选含 gamemd.exe 的那一层）' % (d, rp))
+        else:
+            self.status.set('规则已生效：%s' % rp)
+        # 地图页右上角的「规则：…」标签、赠礼页的单位下拉都跟着刷
+        for fn in ('_refresh_unit_rule_label',):
+            try:
+                getattr(self, fn)()
+            except Exception:
+                pass
+        try:
+            if getattr(self, 'doc', None):
+                self.mv_unit['values'] = self._unit_type_names()
+        except Exception:
+            pass
+        return bool(rp)
 
 
 def crash_log_path():

@@ -286,30 +286,16 @@ class GiftPage(object):
                                  foreground=ui_theme.T['danger'])
 
     def mv_pick_rules(self):
-        """手动指定游戏目录（含 rulesmd.ini / artmd.ini）→ 写 config.json 并刷新。"""
-        d = filedialog.askdirectory(title='选择游戏目录（含 rulesmd.ini / artmd.ini）')
+        """手动指定游戏目录（含 rulesmd.ini / artmd.ini）→ 写 config.json 并刷新。
+
+        ★2026-10-28：主界面现在有「…」按钮了（`App.pick_game_dir`），
+          这里改成直接复用同一条路径 —— 免得两处各自写配置、各自刷新。
+        """
+        d = filedialog.askdirectory(
+            title='选择游戏目录（含 rulesmd.ini / artmd.ini 或 ra2md.mix 的那一层）')
         if not d:
             return
-        cfg = game_ini.config_path()
-        data = {}
-        if os.path.exists(cfg):
-            try:
-                with open(cfg, 'r', encoding='utf-8') as f:
-                    data = json.load(f) or {}
-            except Exception:
-                data = {}
-        data['game_dir'] = d
-        try:
-            with open(cfg, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            messagebox.showerror('保存失败', str(e))
-            return
-        game_ini.clear_cache()
-        self._refresh_unit_rule_label()
-        if self.doc:
-            self.mv_unit['values'] = self._unit_type_names()
-        self._gift_log('规则目录改为 %s（%s）' % (d, self._rules_types(d).source()))
+        self.apply_game_dir(d)
 
     def _unit_sel_info(self):
         """选中型号时，把 rules 里的属性摘要写到下面的信息栏。"""

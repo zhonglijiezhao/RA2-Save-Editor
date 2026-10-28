@@ -369,6 +369,11 @@
   "passed": 13,
   "status": "ok"
  },
+ "_selftest_ev302_game_dir": {
+  "failed": 0,
+  "passed": 9,
+  "status": "ok"
+ },
  "_selftest_game_ini": {
   "failed": 3,
   "passed": 24,
