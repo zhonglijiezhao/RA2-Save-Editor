@@ -1843,6 +1843,46 @@ def setweapon_cmd(args, kind='weapon'):
     return 0 if ok else 1
 
 
+def export_weapons_cmd(args):
+    """`--export-weapons <存档> [输出.csv] [--diff]`：把武器表导出成 CSV（只读）。
+
+    ★2026-10-28（玩家问「这个存档里的武器能提取出来吗，尤其是非原版的」）：
+      存档里的武器表是**存盘当时生效的那份**（地图 INI / MIX 覆盖也算），
+      所以它跟散装 rulesmd.ini 不一定一致 —— 导出来才能拿去比对 / 发帖 / 给 mod 作者。
+      `--diff` 只导与 rules 不一致的那些（"非原版"那批）。
+    """
+    only_diff, rest = False, []
+    for a in args:
+        if a in ('--diff', '--only-diff', '-d'):
+            only_diff = True
+            continue
+        rest.append(a)
+    if not rest:
+        _write_report('EXPORT FAIL\n用法: --export-weapons <存档> [输出.csv] [--diff]')
+        return 2
+    src = rest[0]
+    out = rest[1] if len(rest) > 1 else None
+    try:
+        from editor_core import SaveDoc
+        d = SaveDoc(src)
+        n, path = d.export_weapons_csv(out, only_diff=only_diff)
+    except Exception as e:
+        _write_report('EXPORT FAIL\n%s' % e)
+        return 1
+    total = len(d.weapon_objects())
+    _write_report('EXPORT PASS\n'
+                  '存档 : %s\n'
+                  '导出 : %s\n'
+                  '行数 : %d%s\n'
+                  '规则 : %s' % (
+                      src, path, n,
+                      ('（只含与 rules 不同的 %d 把 / 共 %d 把）' % (n, total))
+                      if only_diff else '（全部 %d 把）' % total,
+                      (d.rules_source() or {}).get('rules')
+                      or '（没找到 rulesmd.ini，官方三列为空）'))
+    return 0
+
+
 def weapons_cmd(args):
     """--weapons <存档> [--type 型号] [--n 60]：列出存档里的**武器 / 弹头**数值（只读）。
 
@@ -2072,6 +2112,9 @@ def main():
     if '--gift' in sys.argv:
         i = sys.argv.index('--gift')
         return gift(sys.argv[i + 1:])
+    if '--export-weapons' in sys.argv:
+        i = sys.argv.index('--export-weapons')
+        return export_weapons_cmd(sys.argv[i + 1:])
     if '--weapons' in sys.argv:
         i = sys.argv.index('--weapons')
         return weapons_cmd(sys.argv[i + 1:])

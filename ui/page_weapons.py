@@ -15,7 +15,7 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
         sys.path.insert(0, _p)
 
 from editor_core import SaveDoc
-from ui.msg import messagebox
+from ui.msg import filedialog, messagebox
 from tkinter import ttk
 import tkinter as tk
 import ui_theme
@@ -60,9 +60,14 @@ class WeaponsPage(object):
             self.tw.column(c, width=w, anchor=a)
         self.tw.tag_configure('diff', foreground=T['danger'])
         self.tw.bind('<<TreeviewSelect>>', self._wpn_pick)
-        self.lbl_wpn_count = ttk.Label(lf, text='', foreground=T['muted'],
+        bot = ttk.Frame(lf)
+        bot.pack(fill='x', pady=(4, 0))
+        self.lbl_wpn_count = ttk.Label(bot, text='', foreground=T['muted'],
                                        font=(ui_theme.FONT_UI, 8))
-        self.lbl_wpn_count.pack(fill='x', pady=(4, 0))
+        self.lbl_wpn_count.pack(side='left')
+        # ★2026-10-28：导出（玩家问「能不能把存档里的武器提取出来」）
+        ttk.Button(bot, text='导出 CSV', width=9,
+                   command=self._wpn_export).pack(side='right')
 
         # ── 右：详情 + 编辑 ──
         rt = tk.Frame(body, bg=T['canvas'])
@@ -140,6 +145,37 @@ class WeaponsPage(object):
                                       font=(ui_theme.FONT_UI, 9))
         self.lbl_verse_msg.pack(side='left', padx=6)
         return f
+
+    def _wpn_export(self):
+        """导出武器表 CSV（★2026-10-28：玩家问「存档里的武器能提取出来吗」）。
+
+        勾着「只看 ≠rules」时默认就导那批 —— 也就是"非原版"的数值。
+        """
+        if not getattr(self, 'doc', None):
+            messagebox.showwarning('提示', '请先打开一个存档', parent=self)
+            return
+        base = os.path.splitext(os.path.basename(self.doc.path))[0]
+        only = bool(self._wpn_only_diff.get())
+        p = filedialog.asksaveasfilename(
+            title='导出武器表（CSV）', defaultextension='.csv',
+            initialfile=base + ('_武器表_非原版.csv' if only else '_武器表.csv'),
+            initialdir=os.path.dirname(self.doc.path),
+            filetypes=[('CSV 表格', '*.csv'), ('所有文件', '*.*')])
+        if not p:
+            return
+        try:
+            n, path = self.doc.export_weapons_csv(p, only_diff=only)
+        except Exception as e:
+            messagebox.showerror('导出失败', '%s' % e, parent=self)
+            return
+        self.status.set('已导出 %d 把武器 → %s' % (n, os.path.basename(path)))
+        messagebox.showinfo(
+            '导出完成',
+            '已导出 %d 把武器%s。\n\n%s\n\n'
+            'Excel 双击就能打开（UTF-8 带 BOM，中文不乱码）。\n'
+            '表里带官方规则的对照值，「差异」那一列非空的就是与 rules 不一致的。'
+            % (n, '（只含与 rules 不同的）' if only else '', path),
+            parent=self)
 
     def _wpn_users(self, weapon):
         """rules 里哪些型号把 `weapon` 当主/副/精英武器 → ['E1 GI（Primary）', …]。"""

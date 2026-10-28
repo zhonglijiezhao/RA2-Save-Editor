@@ -12733,6 +12733,76 @@ class SaveDoc(object):
                         'range': rng, 'range_cells': rng / 256.0})
         return out
 
+    def export_weapons_csv(self, out_path=None, only_diff=False):
+        """把存档里的武器表导出成 CSV → `(行数, 实际路径)`。
+
+        ★2026-10-28（玩家问「这个存档里的武器能提取出来吗，尤其是非原版的」）：
+          存档里这张表是**存盘当时真正生效的那份**（地图 INI / MIX 覆盖后的结果），
+          和散装 rulesmd.ini 不一定一致。导成 CSV 是为了能拿去比对、发帖、
+          交给 mod 作者 —— 而不是只能在本机界面上看。
+
+        列：序号 / 武器 / 伤害 / 射速 / 射程(格) / 射程(lepton) / 弹头 /
+            11 项 Verses / 官方三值 / 差异说明。
+        编码 `utf-8-sig`（Excel 双击不乱码），换行 `\\r\\n`（记事本也正常）。
+
+        `only_diff=True` 只写与当前 rules 不一致的那些 —— 也就是"非原版"那批。
+        """
+        import csv
+
+        rules = self._rules_all() or {}
+        whmap = self.weapon_warhead_map()
+        verses = {x['name']: x['verses'] for x in self.warhead_objects()}
+
+        def num(kv, key):
+            try:
+                return float(str(kv.get(key, '')).split(';')[0].strip())
+            except Exception:
+                return None
+
+        rows = []
+        for i, w in enumerate(sorted(self.weapon_objects(), key=lambda x: x['off']), 1):
+            nm = w['name']
+            kv = rules.get(nm) or {}
+            od, orf, org = num(kv, 'Damage'), num(kv, 'ROF'), num(kv, 'Range')
+            diff = []
+            if od is not None and int(od) != w['damage']:
+                diff.append('伤害 %g→%d' % (od, w['damage']))
+            if orf is not None and int(orf) != w['rof']:
+                diff.append('射速 %g→%d' % (orf, w['rof']))
+            if org is not None and abs(org - w['range_cells']) > 0.01:
+                diff.append('射程 %g→%.2f' % (org, w['range_cells']))
+            if only_diff and not diff:
+                continue
+            whn = whmap.get(nm, '')
+            vs = verses.get(whn) or verses.get(nm) or []
+            rows.append([
+                i, nm, w['damage'], w['rof'], '%.2f' % w['range_cells'], w['range'],
+                whn,
+                '; '.join('%.0f%%' % (v * 100) for v in vs) if vs else '',
+                '' if od is None else '%g' % od,
+                '' if orf is None else '%g' % orf,
+                '' if org is None else '%g' % org,
+                '; '.join(diff),
+            ])
+
+        if out_path is None:
+            base = os.path.splitext(self.path)[0]
+            out_path = base + ('_武器表_非原版.csv' if only_diff else '_武器表.csv')
+        head = ['序号', '武器', '伤害', '射速', '射程(格)', '射程(lepton)', '弹头',
+                '弹头 Verses（11 项）', '官方伤害', '官方射速', '官方射程',
+                '与官方规则的差异']
+        src = self.rules_source() or {}
+        with open(out_path, 'w', encoding='utf-8-sig', newline='') as f:
+            wr = csv.writer(f)
+            # 头三行是"这份表从哪来"，免得贴出去以后没人知道基准是什么
+            wr.writerow(['# 存档', os.path.basename(self.path)])
+            wr.writerow(['# 对照规则', src.get('rules') or '（没找到 rulesmd.ini，官方三列为空）'])
+            wr.writerow(['# 数值含义', '伤害=点；射速=帧(越小越快)；射程 1 格 = 256 lepton'])
+            wr.writerow(head)
+            for r in rows:
+                wr.writerow(r)
+        return len(rows), out_path
+
     def warhead_objects(self):
         """→ `[{'name','off','verses':[11 个系数]}]`（只读）。
 
