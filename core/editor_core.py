@@ -12740,6 +12740,81 @@ class SaveDoc(object):
                         'range': rng, 'range_cells': rng / 256.0})
         return out
 
+    _official_cache = None
+
+    @classmethod
+    def _official_rules(cls):
+        """**官方原版** rules → `{节名: {键: 值}}`（读 `core/ini_builtin/rulesmd.ini`）。
+
+        ★2026-10-28（玩家在 `E:/YURI/rulesmd.ini` 里自造了武器 `9875285A` 之后踩到的坑）：
+          拿"当前 rules"当基准判"非原版"会**彻底失效** —— 玩家自己写进 rules 的武器，
+          值和 rules 当然一致 ⇒ 全被判成"原版"，`--diff` 导出 0 段，
+          等于这个功能对自定义武器完全没用。
+
+          真正的"非原版"应该对照**官方快照**：官方里压根没有这把武器，
+          或者三值和官方对不上 —— 都算非原版。
+        """
+        if SaveDoc._official_cache is not None:
+            return SaveDoc._official_cache
+        out = {}
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'ini_builtin', 'rulesmd.ini')
+        try:
+            raw = open(p, 'rb').read()
+            txt = None
+            for enc in ('utf-16', 'utf-8', 'gbk'):
+                try:
+                    txt = raw.decode(enc)
+                    if '[' in txt:
+                        break
+                except Exception:
+                    continue
+            cur = None
+            for line in (txt or '').splitlines():
+                line = line.split(';')[0].strip()
+                if not line:
+                    continue
+                if line.startswith('[') and line.endswith(']'):
+                    cur = line[1:-1].strip()
+                    out.setdefault(cur, {})
+                    continue
+                if cur and '=' in line:
+                    k, v = line.split('=', 1)
+                    out[cur].setdefault(k.strip(), v.strip())
+        except Exception:
+            out = {}
+        cls._official_cache = out
+        return out
+
+    def _weapon_diff(self, name, damage, rof, range_cells):
+        """与**官方原版**比 → `(差异描述 list, 官方是否有这把武器)`。
+
+        `官方原版没有这把武器` 也算一条差异 —— 玩家自造/别的 mod 新增的武器，
+        靠这一条才认得出来（它们的值可能和当前 rules 一模一样，按值比永远比不出）。
+        """
+        off = self._official_rules() or {}
+        if not off:
+            return [], True
+        kv = off.get(name)
+        if not kv:
+            return ['官方原版没有这把武器（新增 / 别名）'], False
+        out = []
+
+        def num(key):
+            try:
+                return float(str(kv.get(key, '')).split(';')[0].strip())
+            except Exception:
+                return None
+
+        od, orf, org = num('Damage'), num('ROF'), num('Range')
+        if od is not None and int(od) != damage:
+            out.append('伤害 %g→%d' % (od, damage))
+        if orf is not None and int(orf) != rof:
+            out.append('射速 %g→%d' % (orf, rof))
+        if org is not None and abs(org - range_cells) > 0.01:
+            out.append('射程 %g→%.2f' % (org, range_cells))
+        return out, True
+
     def export_weapons_csv(self, out_path=None, only_diff=False):
         """把存档里的武器表导出成 CSV → `(行数, 实际路径)`。
 
@@ -12769,17 +12844,15 @@ class SaveDoc(object):
         rows = []
         for i, w in enumerate(sorted(self.weapon_objects(), key=lambda x: x['off']), 1):
             nm = w['name']
-            kv = rules.get(nm) or {}
-            od, orf, org = num(kv, 'Damage'), num(kv, 'ROF'), num(kv, 'Range')
-            diff = []
-            if od is not None and int(od) != w['damage']:
-                diff.append('伤害 %g→%d' % (od, w['damage']))
-            if orf is not None and int(orf) != w['rof']:
-                diff.append('射速 %g→%d' % (orf, w['rof']))
-            if org is not None and abs(org - w['range_cells']) > 0.01:
-                diff.append('射程 %g→%.2f' % (org, w['range_cells']))
+            # ★差异基准 = **官方快照**，不是当前 rules。
+            #   玩家自己写进 rules 的武器，值和 rules 当然一致 —— 按当前 rules 比
+            #   会把它们全判成"原版"，`--diff` 直接导出 0 段（2026-10-28 实测踩到）。
+            diff, _is_official = self._weapon_diff(nm, w['damage'], w['rof'],
+                                                   w['range_cells'])
             if only_diff and not diff:
                 continue
+            kv = (self._official_rules() or {}).get(nm) or {}
+            od, orf, org = num(kv, 'Damage'), num(kv, 'ROF'), num(kv, 'Range')
             whn = whmap.get(nm, '')
             vs = verses.get(whn) or verses.get(nm) or []
             rows.append([
@@ -12799,11 +12872,16 @@ class SaveDoc(object):
                 '弹头 Verses（11 项）', '官方伤害', '官方射速', '官方射程',
                 '与官方规则的差异']
         src = self.rules_source() or {}
+        offp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'ini_builtin', 'rulesmd.ini')
         with open(out_path, 'w', encoding='utf-8-sig', newline='') as f:
             wr = csv.writer(f)
-            # 头三行是"这份表从哪来"，免得贴出去以后没人知道基准是什么
+            # 头几行是"这份表从哪来、跟谁比"，免得贴出去以后没人知道基准是什么
             wr.writerow(['# 存档', os.path.basename(self.path)])
-            wr.writerow(['# 对照规则', src.get('rules') or '（没找到 rulesmd.ini，官方三列为空）'])
+            wr.writerow(['# 对照规则（原版基准）',
+                         offp if os.path.exists(offp)
+                         else '（缺 ini_builtin/rulesmd.ini，官方三列为空）'])
+            wr.writerow(['# 当前游戏规则', src.get('rules') or '（没找到 rulesmd.ini）'])
             wr.writerow(['# 数值含义', '伤害=点；射速=帧(越小越快)；射程 1 格 = 256 lepton'])
             wr.writerow(head)
             for r in rows:
@@ -12867,28 +12945,10 @@ class SaveDoc(object):
         for w in ws:
             nm = w['name']
             kv = rules.get(nm) or {}
-            od = rs(kv, 'Damage')
-            orf = rs(kv, 'ROF')
-            org = rs(kv, 'Range')
-            diff = []
-            if od is not None:
-                try:
-                    if int(float(od)) != w['damage']:
-                        diff.append('伤害 %g→%d' % (float(od), w['damage']))
-                except Exception:
-                    pass
-            if orf is not None:
-                try:
-                    if int(float(orf)) != w['rof']:
-                        diff.append('射速 %g→%d' % (float(orf), w['rof']))
-                except Exception:
-                    pass
-            if org is not None:
-                try:
-                    if abs(float(org) - w['range_cells']) > 0.01:
-                        diff.append('射程 %g→%s' % (float(org), fmtf(w['range_cells'])))
-                except Exception:
-                    pass
+            # ★差异基准 = **官方快照**（不是当前 rules）—— 见 `_weapon_diff` 的注释：
+            #   玩家自造的武器在 rules 里值和存档一致，按当前 rules 比会被判成"原版"。
+            diff, _is_official = self._weapon_diff(nm, w['damage'], w['rof'],
+                                                   w['range_cells'])
             if only_diff and not diff:
                 continue
 
@@ -12993,7 +13053,13 @@ class SaveDoc(object):
             '; RA2 / 尤里的复仇 —— 存档武器表（%d 把武器 · %d 种弹头 · %d 种抛射体）'
             % (len(wblocks), len(wh_blocks), len(pj_blocks)),
             '; 存档     : %s' % os.path.basename(self.path),
-            '; 对照规则 : %s' % (src.get('rules') or '（没找到 rulesmd.ini，无官方对照）'),
+            '; 对照规则（原版基准）: %s'
+            % os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'ini_builtin', 'rulesmd.ini'),
+            '; 当前游戏规则        : %s'
+            % (src.get('rules') or '（没找到 rulesmd.ini）'),
+            '; 上面「与官方不同」的那些注释，是拿**官方原版**比出来的；'
+            '官方没有的武器会被标成「新增」。',
             '; 导出时间 : %s' % datetime.datetime.now().strftime('%Y-%m-%d %H:%M'),
             ';',
             '; 格式照原版 rules 的写法：每把武器一段，后面跟它用到的抛射体段、弹头段。',

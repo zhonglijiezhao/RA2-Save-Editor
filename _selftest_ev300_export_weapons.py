@@ -63,22 +63,23 @@ ck(os.path.exists(p_all), '全表文件真的落盘了')
 
 with io.open(p_all, encoding='utf-8-sig', newline='') as f:
     rows = list(csv.reader(f))
-head = rows[3]
+head = rows[4]
 ck(len(head) == 12, '表头 12 列（实际 %d）' % len(head))
 ck(head[1] == '武器' and '差异' in head[-1], '表头含「武器」「差异」：%s' % head[-1])
-ck(all(r[0].startswith('#') for r in rows[:3]), '前 3 行是来源注释（存档/规则/单位说明）')
-body = [r for r in rows[4:] if r]
+ck(all(r[0].startswith('#') for r in rows[:4]), '前 4 行是来源注释（存档/原版基准/当前规则/单位说明）')
+body = [r for r in rows[5:] if r]
 ck(len(body) == n_all, '数据行 %d = 导出行数 %d' % (len(body), n_all))
 
 # ---------------- ② / ③ 差异表 ----------------
 n_diff, p_diff = doc.export_weapons_csv(tmp2, only_diff=True)
 with io.open(p_diff, encoding='utf-8-sig', newline='') as f:
-    drows = [r for r in list(csv.reader(f))[4:] if r]
+    drows = [r for r in list(csv.reader(f))[5:] if r]   # 头 4 行 + 表头 1 行
 ck(len(drows) == n_diff, '差异表行数 %d = 返回的 %d' % (len(drows), n_diff))
 ck(all(r[-1].strip() for r in drows), '差异表每一行的「差异」列都非空')
 
 # 独立复算：不复用 export_weapons_csv 的任何判断
-rules = doc._rules_all() or {}
+# ★基准必须是**官方快照**（导出就是这么算的），不是当前 rules
+rules = doc._official_rules() or {}
 
 
 def _num(kv, key):
@@ -91,6 +92,9 @@ def _num(kv, key):
 expect = set()
 for w in ws:
     kv = rules.get(w['name']) or {}
+    if not kv:                      # 官方原版没有这把武器 ⇒ 也算差异（新增）
+        expect.add(w['name'])
+        continue
     od, orf, org = _num(kv, 'Damage'), _num(kv, 'ROF'), _num(kv, 'Range')
     if ((od is not None and int(od) != w['damage'])
             or (orf is not None and int(orf) != w['rof'])

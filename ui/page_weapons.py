@@ -47,7 +47,7 @@ class WeaponsPage(object):
         ent.bind('<KeyRelease>', lambda e: self.refresh_weapons())
         ent.bind('<Escape>', lambda e: (self._q_wpn.set(''), self.refresh_weapons()))
         self._wpn_only_diff = tk.BooleanVar(value=False)
-        ttk.Checkbutton(qrow, text='只看 ≠rules', variable=self._wpn_only_diff,
+        ttk.Checkbutton(qrow, text='只看 ≠原版', variable=self._wpn_only_diff,
                         command=self.refresh_weapons).pack(side='left', padx=(6, 0))
 
         cols = ('name', 'dmg', 'rof', 'rng', 'wh')
@@ -189,7 +189,7 @@ class WeaponsPage(object):
                 '已导出 %d 把武器%s。\n\n%s\n\n'
                 'Excel 双击就能打开（UTF-8 带 BOM，中文不乱码）。\n'
                 '「与官方规则的差异」那一列非空的，就是跟 rules 不一致的。'
-                % (n, '（只含与 rules 不同的）' if only else '', path),
+                % (n, '（只含与原版不同的）' if only else '', path),
                 parent=self)
         else:
             messagebox.showinfo(
@@ -200,7 +200,7 @@ class WeaponsPage(object):
                 '编码 GBK + CRLF（红警原生），贴进 rulesmd.ini 就能用。\n\n'
                 '· Damage/ROF/Range/Burst、弹头的 CellSpread/Verses 是**这份存档的真实值**\n'
                 '· Projectile/Speed/Report/Anim 和整段抛射体是**照 rules 抄的**（存档不存这些）'
-                % (n, '（只含与 rules 不同的武器）' if only else '', path),
+                % (n, '（只含与原版不同的武器）' if only else '', path),
                 parent=self)
 
     def _wpn_users(self, weapon):
@@ -216,23 +216,18 @@ class WeaponsPage(object):
         return out
 
     def _wpn_diff_of(self, w):
-        """和 rulesmd.ini 比 → 差异描述（空串 = 一致）。"""
-        r = (SaveDoc._rules_all() or {}).get(w['name']) or {}
-        marks = []
+        """和**官方原版**比 → 差异描述（空串 = 一致）。
 
-        def _f(v):
-            try:
-                return float(v)
-            except Exception:
-                return None
-        rd, rr, rg = _f(r.get('Damage')), _f(r.get('ROF')), _f(r.get('Range'))
-        if rd is not None and int(rd) != w['damage']:
-            marks.append('伤害 %g→%d' % (rd, w['damage']))
-        if rr is not None and int(rr) != w['rof']:
-            marks.append('射速 %g→%d' % (rr, w['rof']))
-        if rg is not None and abs(rg * 256 - w['range']) > 2:
-            marks.append('射程 %g→%.2f格' % (rg, w['range_cells']))
-        return '；'.join(marks)
+        ★2026-10-28：基准从"当前 rules"改成"官方快照"。玩家自己写进 rules 的武器
+          值和 rules 一致，按当前 rules 比会被判成"原版" —— 那"只看 ≠rules"就永远
+          筛不出他自己加的武器。官方里没有的，这里会标「新增」。
+        """
+        try:
+            marks, _official = self.doc._weapon_diff(
+                w['name'], w['damage'], w['rof'], w['range_cells'])
+            return '；'.join(marks)
+        except Exception:
+            return ''
 
     def _wpn_refresh_if_visible(self):
         """当前正停在武器页时立刻重填（换档后 `nb.select(同一页)` 不触发事件）。
@@ -284,7 +279,7 @@ class WeaponsPage(object):
             n += 1
         ndiff = sum(1 for w in ws if self._wpn_diff_of(w))
         self.lbl_wpn_count.config(
-            text='%d / %d 把（%d 把 ≠rules）' % (n, len(ws), ndiff))
+            text='%d / %d 把（%d 把 ≠原版）' % (n, len(ws), ndiff))
         # 恢复选中：优先保持原来那把；它被搜索/过滤藏掉了才退回第一行
         target = keep if (keep and self.tw.exists(keep)) else (
             self.tw.get_children()[0] if self.tw.get_children() else None)
@@ -307,7 +302,7 @@ class WeaponsPage(object):
         self.lbl_wpn_name.config(text='%s   →   弹头 %s' % (name, whname))
         d = self._wpn_diff_of(w)
         self.lbl_wpn_diff.config(
-            text=('与 rulesmd.ini 不同：' + d) if d else '与 rulesmd.ini 一致',
+            text=('与官方原版不同：' + d) if d else '与官方原版一致',
             fg=(ui_theme.T['danger'] if d else ui_theme.T['ok']))
         self._wpn_var['damage'].set(str(w['damage']))
         self._wpn_var['rof'].set(str(w['rof']))
