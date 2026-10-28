@@ -793,9 +793,13 @@ def read_isomap(map_path):
 
 
 class SaveDoc(object):
-    def __init__(self, path):
+    def __init__(self, path, write_cache=True):
         self.path = path
         self.error = None
+        # ★2026-10-28（审查 P3-13）：`write_cache=False` 时**只读不写**明文磁盘缓存。
+        #   给"只扫元信息"的后台线程用：那里前 12 个档各写一份 26MB ⇒ 光启动就 300MB 磁盘写，
+        #   而扫完就 `del doc`，缓存根本不会被复用。
+        self.write_cache = bool(write_cache)
         # ★2026-10-28：记下"这份档在哪个目录"，让 core 能就近找到 rules/art
         #   （玩家把游戏装在任意位置时，可建造判定 / Foundation / Power 才不会静默失效）
         try:
@@ -839,7 +843,7 @@ class SaveDoc(object):
             except Exception:
                 pass
         plain, ranges = self._decode(cc)
-        if cp:
+        if cp and getattr(self, 'write_cache', True):
             try:
                 with open(cp, 'wb') as f:
                     f.write(self._CACHE_MAGIC + struct.pack('<I', len(ranges)))
@@ -1552,7 +1556,33 @@ class SaveDoc(object):
         money_offs = 写入时要一起改的全部偏移：
           · AI 阵营 = 经济结构里的两份副本
           · 当前玩家 = 镜像字段（+ 经济结构副本），写时另加主字段
+
+        ★2026-10-28（审查 P3-14）：加 memo。实测本档 182 ms / 大任务档 604 ms，
+          而 GUI 一次刷新要调 8 次 ⇒ 地图页切页从"卡一下"变成 0。
+          缓存的是**结构**（偏移/阵营/宽度），`money` 每次调用现读
+          （12 个 3~4 字节读，μs 级）—— 这样"改完钱再读"永远是新值，
+          不必在 set_money / set_house_money 里额外维护失效。
+          偏移会变的场景（增删字节）由 `invalidate_caches()` 统一清。
         """
+        memo = getattr(self, '_houses_memo', None)
+        if memo is None:
+            memo = self._houses_impl()
+            self._houses_memo = memo
+        rows, widths = memo
+        pl = self.plain
+        out = []
+        for d, w in zip(rows, widths):
+            e = dict(d)                 # 返回副本：调用方改 dict 不会污染缓存
+            o = e.get('off')
+            if o is None or o + w > len(pl):
+                e['money'] = None
+            else:
+                e['money'] = int.from_bytes(pl[o:o + w], 'little')
+            out.append(e)
+        return out
+
+    def _houses_impl(self):
+        """`houses()` 的实算部分 → (rows, 每行金钱字段宽度)。只在 memo 未命中时跑。"""
         pl = self.plain
         me = self.player_house()
         hk = self.house_keys()          # ★2026-10-17：阵营短名 → House 对象键（写"所属方"要用）
@@ -1580,7 +1610,8 @@ class SaveDoc(object):
                                  'is_player': x['is_player'], 'verified': True})
                 rows.sort(key=lambda d: (0 if d['is_player'] else 1,
                                          d['money_offs'][0]))
-                return rows
+                # 自定义阵营的钱是大整数（u32，Civilian 类能到 10 万以上）
+                return rows, [4] * len(rows)
         arr = self.find_house_array()
         out = []
         for short in HOUSE_ORDER:
@@ -1606,7 +1637,8 @@ class SaveDoc(object):
                         'is_player': is_player, 'verified': bool(offs)})
         idx = {n: i for i, n in enumerate(HOUSE_ORDER)}
         out.sort(key=lambda d: (0 if d['is_player'] else 1, idx.get(d['short'], 99)))
-        return out
+        # 标准阵营：玩家镜像字段是 u24，所以按 3 字节读
+        return out, [3] * len(out)
 
     def player_house(self):
         """当前玩家阵营短名（info 尚未建立时返回 None）。
@@ -4288,6 +4320,7 @@ class SaveDoc(object):
         self._instmaps = None
         self._house_econ = self._custom_houses = None
         self._house_keys_memo = None
+        self._houses_memo = None        # ★P3-14：阵营结构 memo（偏移会变）
         self._tagrecs = None            # ★2026-10-20：标签记录缓存也要失效（否则新建触发的类型读不出）
         self.records = self._scan_records()
         if self._map:
@@ -5893,7 +5926,7 @@ class SaveDoc(object):
         self.plain = pl
         for attr in ('_objs', '_events', '_actions', '_ticks', '_celltags', '_ctimerlist',
                      '_instmaps', '_tagobjs', '_tagrecs', '_blds', '_house_econ',
-                     '_custom_houses', '_house_keys_memo'):
+                     '_custom_houses', '_house_keys_memo', '_houses_memo'):
             if hasattr(self, attr):
                 setattr(self, attr, None)
         o2 = self.trigger_objects(sid)
@@ -13824,6 +13857,7 @@ class SaveDoc(object):
         self._house_econ = None
         self._custom_houses = None
         self._house_keys_memo = None
+        self._houses_memo = None        # ★P3-14
         self._tagrecs = None            # ★2026-10-20：同上，新建触发的标签也要能被认出
         self._instmaps = None           # ★2026-10-20：不失效它 ⇒ 新触发"没有运行期实例"，
         #                                  接着 add_action/copy 全部失败（自检抓到）
@@ -14433,6 +14467,7 @@ class SaveDoc(object):
         """把"跟着明文偏移走"的缓存全部作废（增删字节后必须调）。"""
         for a in ('_objs', '_events', '_actions', '_ticks', '_celltags', '_ctimerlist',
                   '_instmaps', '_house_econ', '_custom_houses', '_house_keys_memo',
+                  '_houses_memo',          # ★P3-14：houses() 的结构 memo
                   '_tagrecs', '_mapm', '_aiids',
                   # ★2026-10-27：`_horder` 只是 [{'short','cn','is_player'}]，**与偏移无关**，
                   #   以前每次增删对象都清它 ⇒ 下次 `_arg_text` 要重算 1.3 秒（本档）。

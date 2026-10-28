@@ -325,12 +325,12 @@ class App(tk.Tk):
         ttk.Button(box, text=' − ', width=4,
                    command=lambda: self.bump_house(-1)).pack(side='left', padx=4)
         ttk.Label(box, text='可按住 Ctrl 多选；玩家上限 16,777,215，自定义任务 AI 方上限更大（u32）',
-                  foreground='#6b7280').pack(side='left', padx=8)
+                  foreground=ui_theme.T['muted']).pack(side='left', padx=8)
 
         ttk.Label(f, text='说明：每个所属方的金钱存在「经济结构」里 —— 60 字节固定模板 → 阵营位掩码(=1<<注册序) → 3 字节金额，'
                           '其后 +304 字节还有一份副本，写入时两份一起改。当前玩家另写它自己的镜像字段与主字段。'
                           '定位方法已用「独特金额 + 重开新档」实测验证（值与该阵营在地图里的 Credits×100 逐一吻合）。',
-                  foreground='#6b7280', wraplength=880, justify='left').pack(anchor='w', pady=(8, 0))
+                  foreground=ui_theme.T['muted'], wraplength=880, justify='left').pack(anchor='w', pady=(8, 0))
         return f
 
     def _tab_triggers(self, nb):
@@ -373,10 +373,10 @@ class App(tk.Tk):
         #   它们和触发共用"8 位 ID + 名字"的记录容器，以前会冒充成"灰色触发"。
         ttk.Checkbutton(qrow, text='显示「标签/AI」记录', variable=self._show_tags,
                         command=self._fill_trig_tree).pack(side='left')
-        self.lbl_trig_count = ttk.Label(qrow, text='', foreground='#6b7280')
+        self.lbl_trig_count = ttk.Label(qrow, text='', foreground=ui_theme.T['muted'])
         self.lbl_trig_count.pack(side='left', padx=10)
         ttk.Label(qrow, text='（Esc 清空；可按 触发ID / 名称 / 说明 / 状态 / 触发类型 搜）',
-                  foreground='#9ca3af').pack(side='left')
+                  foreground=ui_theme.T['muted_soft']).pack(side='left')
         tvw.pack(fill='both', expand=True)
         self.tt.bind('<Double-1>', lambda e: self.toggle_selected())
         self.tt.bind('<space>', lambda e: self.toggle_selected())
@@ -467,7 +467,7 @@ class App(tk.Tk):
                           '—— 缺这两个对象的触发引擎根本不会执行（症状：改事件/启用都没反应）。\n'
                           '       ⚠ 对「已经执行过」的单次型触发点修复 = 重新武装，'
                           '条件再满足会再触发一次（对话框里有红字名单 + 二次确认）。',
-                  foreground='#6b7280', font=(ui_theme.FONT_UI, 8),
+                  foreground=ui_theme.T['muted'], font=(ui_theme.FONT_UI, 8),
                   wraplength=880, justify='left').pack(anchor='w')
         return f
 
@@ -713,9 +713,9 @@ class App(tk.Tk):
             return
         self.tt.delete(*self.tt.get_children())
         try:
-            self.tt.tag_configure('nort', foreground='#9ca3af')      # 无运行期组件 ⇒ 灰
-            self.tt.tag_configure('done', foreground='#b91c1c')      # 已执行 ⇒ 红（改不了）
-            self.tt.tag_configure('warn', foreground='#b45309')      # 已挂钩/可能已触发 ⇒ 橙
+            self.tt.tag_configure('nort', foreground=ui_theme.T['muted_soft'])      # 无运行期组件 ⇒ 灰
+            self.tt.tag_configure('done', foreground=ui_theme.T['danger'])      # 已执行 ⇒ 红（改不了）
+            self.tt.tag_configure('warn', foreground=ui_theme.T['warn'])      # 已挂钩/可能已触发 ⇒ 橙
         except Exception:
             pass
         q = ((self._q_trig.get() if hasattr(self, '_q_trig') else '') or '').strip().lower()
@@ -773,7 +773,7 @@ class App(tk.Tk):
         frm = ttk.Frame(dlg, padding=12)
         frm.grid(sticky='nsew')
         ttk.Label(frm, text='以下触发缺少运行期组件，引擎不会执行它们（改事件/启用都无效）：',
-                  foreground='#b91c1c').grid(row=0, column=0, columnspan=2, sticky='w')
+                  foreground=ui_theme.T['danger']).grid(row=0, column=0, columnspan=2, sticky='w')
         cols = ('sel', 'name', 'id', 'st', 'rep', 'node', 'cell', 'ticks')
         tv = ttk.Treeview(frm, columns=cols, show='headings', height=9)
         for c, t, w in (('sel', '修复', 42), ('name', '触发名', 140), ('id', 'ID', 76),
@@ -784,8 +784,8 @@ class App(tk.Tk):
             tv.column(c, width=w, anchor='w' if c in ('name', 'st', 'rep') else 'center')
         tv.grid(row=1, column=0, columnspan=2, sticky='nsew', pady=(6, 4))
         try:
-            tv.tag_configure('risk', foreground='#b91c1c')     # 确定已执行 ⇒ 再触发风险
-            tv.tag_configure('mid', foreground='#b45309')      # 分不清/类型未读出 ⇒ 仍可能再触发
+            tv.tag_configure('risk', foreground=ui_theme.T['danger'])     # 确定已执行 ⇒ 再触发风险
+            tv.tag_configure('mid', foreground=ui_theme.T['warn'])      # 分不清/类型未读出 ⇒ 仍可能再触发
         except Exception:
             pass
         self._repair_iids = []
@@ -810,7 +810,7 @@ class App(tk.Tk):
         ttk.Button(frm, text='全选/反选', command=toggle_sel).grid(
             row=2, column=0, sticky='w', padx=(0, 6))
         ttk.Label(frm, text='计时帧数按该触发当前事件自动算（13 流逝时间 → 秒×15）。',
-                  foreground='#6b7280').grid(row=2, column=1, sticky='w')
+                  foreground=ui_theme.T['muted']).grid(row=2, column=1, sticky='w')
 
         # ★2026-10-20（交接 next-step 2）：**已执行警示** —— 对跑过的单次型触发点修复
         #   = 重新武装，条件再满足会**再触发一次**。以前这里一声不响，容易把玩家坑了。
@@ -821,12 +821,12 @@ class App(tk.Tk):
                  '　（刷建筑 / 给钱 / 放援军都会再来一遍）。\n'
                  '　 橙字行 = 组件全无或重复类型读不出，分不清跑没跑过 —— 同样可能再触发。\n'
                  '　 修复前会二次确认，并列出具体是哪几条。',
-            foreground='#b91c1c', justify='left').grid(
+            foreground=ui_theme.T['danger'], justify='left').grid(
                 row=3, column=0, columnspan=2, sticky='w', pady=(6, 0))
         if n_risk or n_mid:
             ttk.Label(frm, text='本档：确定已执行 %d 条　分不清/类型未读出 %d 条（共 %d 条缺组件）'
                                 % (n_risk, n_mid, len(bad)),
-                      foreground='#374151').grid(
+                      foreground=ui_theme.T['ink_2']).grid(
                 row=4, column=0, columnspan=2, sticky='w', pady=(4, 0))
 
         def do_repair():
@@ -1007,8 +1007,8 @@ class App(tk.Tk):
             pass
 
     # ---------------- 触发 ↔ 事件/行为 高亮（★2026-10-20） ----------------
-    HIT_BG = '#fde68a'          # 命中行底色（浅琥珀，浅色主题下足够醒目）
-    HIT_FG = '#7c2d12'
+    HIT_BG = ui_theme.MAP['hit_bg']          # 命中行底色（浅琥珀，浅色主题下足够醒目）
+    HIT_FG = ui_theme.MAP['hit_fg']
 
     def _mark_hits(self, tree, rows, hits, tag='hit'):
         """给命中的行打高亮标签，未命中的行清掉（保留原有的 bad 等标签）。
@@ -1116,7 +1116,7 @@ class App(tk.Tk):
             self.status.set('「%s」定位不到行为（这份档里它可能没有运行期组件，引擎不会执行它）' % nm)
             if hasattr(self, 'lbl_ac_count'):
                 self.lbl_ac_count.config(
-                    text='「%s」在这份档里没有可定位的行为' % nm, foreground='#b45309')
+                    text='「%s」在这份档里没有可定位的行为' % nm, foreground=ui_theme.T['warn'])
             return
         # 搜索过滤可能把这些行藏起来了 ⇒ 先清空过滤再选中
         try:
@@ -1132,7 +1132,7 @@ class App(tk.Tk):
             self.lbl_ac_count.config(
                 text='显示 %d / %d 条' % (len(self.ta.get_children()),
                                           len(getattr(self, '_ac_rows', []))),
-                foreground='#6b7280')
+                foreground=ui_theme.T['muted'])
         order = sorted(hits, key=lambda x: int(x))
         self.ta.selection_set(order)
         self.ta.focus(order[0])
@@ -1167,7 +1167,7 @@ class App(tk.Tk):
             self.status.set('「%s」定位不到事件（这份档里它可能没有运行期组件，引擎不会执行它）' % nm)
             if hasattr(self, 'lbl_ev_count'):
                 self.lbl_ev_count.config(
-                    text='「%s」在这份档里没有可定位的事件' % nm, foreground='#b45309')
+                    text='「%s」在这份档里没有可定位的事件' % nm, foreground=ui_theme.T['warn'])
             return
         # 搜索过滤可能把这些行藏起来了 ⇒ 先清空过滤再选中
         try:
@@ -1183,7 +1183,7 @@ class App(tk.Tk):
             self.lbl_ev_count.config(
                 text='显示 %d / %d 条' % (len(self.te.get_children()),
                                           len(getattr(self, '_ev_rows', []))),
-                foreground='#6b7280')
+                foreground=ui_theme.T['muted'])
         order = sorted(hits, key=lambda x: int(x))
         self.te.selection_set(order)
         self.te.focus(order[0])
@@ -1229,7 +1229,7 @@ class App(tk.Tk):
         # ---- 地图状态条 ----
         mrow = ttk.Frame(w)
         mrow.pack(fill='x', **pad)
-        lbl_map = ttk.Label(mrow, text='', foreground='#111827', wraplength=520,
+        lbl_map = ttk.Label(mrow, text='', foreground=ui_theme.T['ink'], wraplength=520,
                             justify='left')
         lbl_map.pack(side='left')
 
@@ -1254,12 +1254,12 @@ class App(tk.Tk):
                 mp = None
             if mp:
                 lbl_map.config(text='地图：%s —— 只读参考（本工具不写地图，一个字节都不改）'
-                                    % mp, foreground='#065f46')
+                                    % mp, foreground=ui_theme.T['ok'])
             else:
                 lbl_map.config(
                     text='⚠ 找不到地图文件（%s）—— 不影响存档运行（存档自足）；'
                          '本工具本来也不写地图' % self.doc.map_lookup_hint(),
-                    foreground='#b91c1c')
+                    foreground=ui_theme.T['danger'])
 
         ttk.Label(w, text='铁律：本工具只读地图、只写存档（玩家 2026-10-27 定：任何情况下都不允许向地图写数据）。\n'
                           '这一页能做的：① 给某一号起名字　② 改它的当前值 —— 两个都只写进存档；'
@@ -1267,7 +1267,7 @@ class App(tk.Tk):
                           '做不到（也不许做）：把名字/默认值写进地图 [VariableNames]。要在地编里选得中，'
                           '请你自己在 FA2 里加（或让地图作者加）。\n'
                           '不写地图照样能跑：触发用的是引擎索引号，名字只是给人看的；读档以存档为准。',
-                  foreground='#111827', wraplength=735, justify='left').pack(anchor='w', **pad)
+                  foreground=ui_theme.T['ink'], wraplength=735, justify='left').pack(anchor='w', **pad)
 
         box = ttk.Frame(w)
         box.pack(fill='both', expand=True, padx=8, pady=4)
@@ -1285,9 +1285,9 @@ class App(tk.Tk):
         tv.configure(yscrollcommand=vs.set)
         tv.pack(side='left', fill='both', expand=True)
         vs.pack(side='right', fill='y')
-        tv.tag_configure('undef', foreground='#9ca3af')
-        tv.tag_configure('set', foreground='#047857')
-        tv.tag_configure('maponly', foreground='#1d4ed8')
+        tv.tag_configure('undef', foreground=ui_theme.T['muted_soft'])
+        tv.tag_configure('set', foreground=ui_theme.T['ok'])
+        tv.tag_configure('maponly', foreground=ui_theme.T['info'])
 
         def _fill(keep=None):
             sel = keep if keep is not None else (tv.selection() or [None])[0]
@@ -1337,7 +1337,7 @@ class App(tk.Tk):
             f0 = ttk.Frame(dlg)
             f0.pack(fill='x', padx=10, pady=(8, 2))
             ttk.Label(f0, text='本工具不写地图：名字只存进存档，地编 FA2 里选不中（那一步请自己在 FA2 加）。',
-                      foreground='#b45309', wraplength=430, justify='left').pack(anchor='w')
+                      foreground=ui_theme.T['warn'], wraplength=430, justify='left').pack(anchor='w')
             f1 = ttk.Frame(dlg)
             f1.pack(fill='x', padx=10, pady=6)
             ttk.Label(f1, text='名字').pack(side='left')
@@ -1407,7 +1407,7 @@ class App(tk.Tk):
         ttk.Button(bar, text='🧹 清空这一条（写存档）', command=_del).pack(side='left', padx=8)
         ttk.Button(bar, text='关闭', command=w.destroy).pack(side='right')
 
-        lbl2 = ttk.Label(w, text='', foreground='#374151')
+        lbl2 = ttk.Label(w, text='', foreground=ui_theme.T['ink_2'])
         lbl2.pack(anchor='w', padx=8, pady=(0, 2))
         ttk.Label(w, text='※ 存档那 100 槽（0x248A）是运行态 —— 事件 36/37 判的就是它，读档以存档为准'
                           '（§176 实测：地图默认 1、存档 0 时触发不响应）⇒ 改「存档值」当场就能用。\n'
@@ -1415,7 +1415,7 @@ class App(tk.Tk):
                           '本工具**只读不写**它；要在地编里选得中，请你自己在 FA2 里加。\n'
                           '※ 变量号怎么对：事件 36/37 参数 = 引擎索引（0 起，地编第 N 条 = N−1）；'
                           '行为 56/57 的变量号在行为对象 +164（工具已自动处理）。',
-                  foreground='#6b7280', wraplength=735, justify='left').pack(anchor='w', padx=8)
+                  foreground=ui_theme.T['muted'], wraplength=735, justify='left').pack(anchor='w', padx=8)
         _refresh_map_label()
         _fill()
 
@@ -1444,18 +1444,18 @@ class App(tk.Tk):
         pad = dict(padx=8, pady=3)
         ttk.Label(w, text='★ 汇总触发会自动带一条「13 流逝时间 1 秒」心跳：事件 36 是纯电平查询，'
                           '没有计时事件就不会被引擎轮询（§181 实测）',
-                  foreground='#6B7280', wraplength=580, justify='left').pack(anchor='w', **pad)
+                  foreground=ui_theme.T['muted'], wraplength=580, justify='left').pack(anchor='w', **pad)
         # ★★2026-10-27 铁律：整个工具都**不写地图**（玩家：任何情况下都不允许向地图写数据）
         ttk.Label(w, text='★ 铁律：本工具只读地图、只写存档 —— 变量名/值都只落在存档里。'
                           '想在地编 FA2 里也能选中这些变量、或给新开局默认值，'
                           '请你自己在 FA2 里加（本工具不代劳，也不会碰你的 .map）',
-                  foreground='#b91c1c', wraplength=580, justify='left').pack(anchor='w', **pad)
+                  foreground=ui_theme.T['danger'], wraplength=580, justify='left').pack(anchor='w', **pad)
 
         ttk.Label(w, text='① 参与的建筑格（每行一个，或逗号/分号分隔，如 73,87）',
-                  foreground='#111827').pack(anchor='w', **pad)
+                  foreground=ui_theme.T['ink']).pack(anchor='w', **pad)
         tbox = tk.Text(w, height=6, width=58, wrap='word')
         tbox.pack(fill='x', padx=8)
-        ttk.Label(w, text='③ 汇总满足后要执行的行为', foreground='#111827').pack(anchor='w', **pad)
+        ttk.Label(w, text='③ 汇总满足后要执行的行为', foreground=ui_theme.T['ink']).pack(anchor='w', **pad)
         r1 = ttk.Frame(w)
         r1.pack(fill='x', padx=8)
         cb_a = ttk.Combobox(r1, width=34, state='readonly')
@@ -1480,7 +1480,7 @@ class App(tk.Tk):
         cb_pe.current(0)
         cb_pe.pack(side='left', padx=6)
         ttk.Label(rp, text='←「每栋被打掉一个变量」选 48',
-                  foreground='#6b7280').pack(side='left')
+                  foreground=ui_theme.T['muted']).pack(side='left')
 
         r2 = ttk.Frame(w)
         r2.pack(fill='x', **pad)
@@ -1507,7 +1507,7 @@ class App(tk.Tk):
         var_rn = tk.StringVar(value='汇总条件')
         ttk.Entry(r3, textvariable=var_rn, width=14).pack(side='left', padx=4)
 
-        lbl = ttk.Label(w, text='', foreground='#374151', wraplength=590, justify='left')
+        lbl = ttk.Label(w, text='', foreground=ui_theme.T['ink_2'], wraplength=590, justify='left')
         lbl.pack(anchor='w', padx=8, pady=(6, 0))
 
         def _cells():
@@ -1536,17 +1536,17 @@ class App(tk.Tk):
         def _preview():
             cs = _cells()
             if not cs:
-                lbl.config(text='⚠ 还没填建筑格', foreground='#b91c1c')
+                lbl.config(text='⚠ 还没填建筑格', foreground=ui_theme.T['danger'])
                 return None
             a_i = cb_a.current()
             if a_i < 0:
-                lbl.config(text='⚠ 先选结果行为', foreground='#b91c1c')
+                lbl.config(text='⚠ 先选结果行为', foreground=ui_theme.T['danger'])
                 return None
             try:
                 v0 = int(var_v0.get().strip() or '1', 0)
                 aa = int(var_aa.get().strip() or '0', 0)
             except ValueError:
-                lbl.config(text='⚠ 变量号/参数必须是整数', foreground='#b91c1c')
+                lbl.config(text='⚠ 变量号/参数必须是整数', foreground=ui_theme.T['danger'])
                 return None
             pe_t = pe_opts[cb_pe.current()][0] if cb_pe.current() >= 0 else 1
             nmp = var_nm.get().strip() or 'V%d'
@@ -1563,7 +1563,7 @@ class App(tk.Tk):
                             action_name(akeys[a_i]), aa))
             lines.append('※ 同一触发内多事件恒为 AND；持久性强制 0（§157 实测 1 = 永不触发）。')
             lines.append('※ §175：行为 56 的变量号写行为对象 +164（引擎读这里，不是 +0x48）。')
-            lbl.config(text='\n'.join(lines), foreground='#374151')
+            lbl.config(text='\n'.join(lines), foreground=ui_theme.T['ink_2'])
             return cs, akeys[a_i], aa
 
         def _go():
@@ -1616,7 +1616,7 @@ class App(tk.Tk):
                           '—— 这是社区通行写法，绕开「持久 1 + 多对象」的引擎 BUG（§158/§159）。'
                           '★§181：那条 13 不能省（事件 36 是纯电平查询，没有计时事件就不进'
                           '「定时触发器挂接表」⇒ 读档后永不评估）。',
-                  foreground='#6b7280', wraplength=590, justify='left').pack(anchor='w', padx=8)
+                  foreground=ui_theme.T['muted'], wraplength=590, justify='left').pack(anchor='w', padx=8)
 
     def retarget_dialog(self):
         """🔧 改造选中触发的动作 —— 把 M1（游戏内已验证）那条路做成界面。
@@ -1672,11 +1672,11 @@ class App(tk.Tk):
         frm.grid(sticky='nsew')
         ttk.Label(frm, text='触发：%s　%s（序号 %d，动作偏移 %d）'
                            % (rec.sid, rec.name, cur['index'], cur['action_off']),
-                  foreground='#1f2937').grid(row=0, column=0, columnspan=3, sticky='w')
+                  foreground=ui_theme.T['ink']).grid(row=0, column=0, columnspan=3, sticky='w')
         ttk.Label(frm, text='现状：行为 %d　参数 %d　建筑名 %r　路径点 %d → %s'
                            % (cur['type'], cur['arg'], cur['name'] or '（空）',
                               cur['waypoint'], cur['cell']),
-                  foreground='#6b7280').grid(row=1, column=0, columnspan=3, sticky='w', pady=(2, 8))
+                  foreground=ui_theme.T['muted']).grid(row=1, column=0, columnspan=3, sticky='w', pady=(2, 8))
         ttk.Label(frm, text='建筑类型：').grid(row=2, column=0, sticky='w')
         cb = ttk.Combobox(frm, width=34, state='readonly', values=vals)
         if ac_name in names:
@@ -1694,7 +1694,7 @@ class App(tk.Tk):
             ex.insert(0, str(sel_cell[0]))
             ey.insert(0, str(sel_cell[1]))
         ttk.Label(frm, text='（地图页点过格子就自动填好；该格没有路径点会自动补一个）',
-                  foreground='#6b7280').grid(row=4, column=1, columnspan=2, sticky='w')
+                  foreground=ui_theme.T['muted']).grid(row=4, column=1, columnspan=2, sticky='w')
         ttk.Label(frm, text='行为类型：').grid(row=5, column=0, sticky='w', pady=(6, 0))
         rowt = ttk.Frame(frm)
         rowt.grid(row=5, column=1, columnspan=2, sticky='w', pady=(6, 0))
@@ -1702,7 +1702,7 @@ class App(tk.Tk):
         ea.insert(0, '125')
         ea.pack(side='left')
         ttk.Label(rowt, text='（125 = 将建筑建于…；改成别的类型就不需要建筑名/格子）',
-                  foreground='#6b7280').pack(side='left', padx=6)
+                  foreground=ui_theme.T['muted']).pack(side='left', padx=6)
         cb_ai = ttk.Combobox(frm, width=34, state='readonly',
                              values=['第 %d 条：%s %s @%s' % (r['ordinal'], r['type'],
                                      r['name'] or '（空）', r['cell']) for r in rows])
@@ -1713,7 +1713,7 @@ class App(tk.Tk):
         ttk.Label(frm, text='⚠ 这是**唯一**游戏内验收过的刷建筑路子（M1）：新写触发引擎不执行。\n'
                             '    改完请「另存为新文件」，进游戏后**等该触发自己的计时到期**才会看到建筑；\n'
                             '    悬崖/水面等不可建地形仍会被引擎拒绝。',
-                  foreground='#b91c1c', justify='left').grid(row=6, column=0, columnspan=3,
+                  foreground=ui_theme.T['danger'], justify='left').grid(row=6, column=0, columnspan=3,
                                                              sticky='w', pady=(10, 4))
 
         def _aci():
@@ -1853,7 +1853,7 @@ class App(tk.Tk):
                             '同一触发内的多个事件**始终是全部成立才执行**。\n'
                             '⚠ 已执行（红字）的单次型触发改成 2，'
                             '能否让它"复活"取决于引擎 —— 需要你进游戏验证。',
-                  foreground='#374151', wraplength=430, justify='left'
+                  foreground=ui_theme.T['ink_2'], wraplength=430, justify='left'
                   ).grid(row=3, column=0, columnspan=2, sticky='w', pady=(8, 0))
 
         def ok():
@@ -1976,7 +1976,7 @@ class App(tk.Tk):
                             '⚠ 这里只改内存，点你自己的保存流程才写盘。'
                   % (h['count'], h['persist_dist'] or {}, len(h['idx_bad']),
                      len(h['dup_sid']), len(h['bad_vt'])),
-                  foreground='#374151', justify='left', wraplength=560).grid(
+                  foreground=ui_theme.T['ink_2'], justify='left', wraplength=560).grid(
             row=2, column=0, columnspan=3, sticky='w', pady=(8, 0))
         ttk.Button(frm, text='关闭', command=dlg.destroy).grid(
             row=3, column=0, columnspan=3, pady=(8, 0))
@@ -2028,7 +2028,7 @@ class App(tk.Tk):
         ttk.Label(frm, text='★事件 13「流逝时间」的参数 = 秒数；\n'
                             '行为 56/57 的参数 = 局部变量号（引擎索引，0 起）。\n'
                             '新增的事件会接在**链尾**（不会抢走第一位的"心跳"）。',
-                  foreground='#374151', justify='left').grid(
+                  foreground=ui_theme.T['ink_2'], justify='left').grid(
             row=3, column=0, columnspan=2, sticky='w', pady=(8, 0))
 
         def ok():
@@ -2272,10 +2272,10 @@ class App(tk.Tk):
         ttk.Button(qrow, text='✕', width=3,
                    command=lambda: (self._q_ev.set(''), self._fill_ev_tree())
                    ).pack(side='left', padx=(2, 8))
-        self.lbl_ev_count = ttk.Label(qrow, text='', foreground='#6b7280')
+        self.lbl_ev_count = ttk.Label(qrow, text='', foreground=ui_theme.T['muted'])
         self.lbl_ev_count.pack(side='left')
         self._te_wrap.pack(fill='both', expand=True)      # ★带滚动条的容器（位置同原来的表格）
-        self.te.tag_configure('bad', foreground='#b91c1c')
+        self.te.tag_configure('bad', foreground=ui_theme.T['danger'])
         self.te.bind('<Double-1>', lambda e: self.edit_event())
         self.te.bind('<Return>', lambda e: self.edit_event())
 
@@ -2294,8 +2294,8 @@ class App(tk.Tk):
                    command=self.remove_sel_event).pack(side='left', padx=6)
         ttk.Button(row, text='➕ 添加事件…',
                    command=self.add_event_dialog).pack(side='left', padx=6)
-        ttk.Label(row, text='双击一行也可修改', foreground='#6b7280').pack(side='left', padx=10)
-        self.lbl_map_ev = ttk.Label(f, text='', foreground='#6b7280', wraplength=880,
+        ttk.Label(row, text='双击一行也可修改', foreground=ui_theme.T['muted']).pack(side='left', padx=10)
+        self.lbl_map_ev = ttk.Label(f, text='', foreground=ui_theme.T['muted'], wraplength=880,
                                     justify='left')
         self.lbl_map_ev.pack(anchor='w', pady=(6, 0))
         return f
@@ -2375,7 +2375,7 @@ class App(tk.Tk):
             shown += 1
         if hasattr(self, 'lbl_ev_count'):
             self.lbl_ev_count.config(text='显示 %d / %d 条' % (shown, len(rows)),
-                                     foreground='#6b7280')
+                                     foreground=ui_theme.T['muted'])
         # ★2026-10-20：重填（搜索/刷新）后把触发页选中项的高亮补回来
         self._mark_hits(self.te, rows, getattr(self, '_ev_hits', set()))
 
@@ -2455,7 +2455,7 @@ class App(tk.Tk):
         if _inst_off is not None and _node_off is None:
             rt = tk.StringVar(value='⚠ 该事件所属触发缺运行期组件（TagNode）——'
                                    '引擎不会执行它，修改不会生效。应用后可一键修复。')
-            rtc = '#b91c1c'
+            rtc = ui_theme.T['danger']
         else:
             ticks = None
             if _node_off is not None:
@@ -2464,7 +2464,7 @@ class App(tk.Tk):
             rt = tk.StringVar(value='' if ticks is None else
                               '运行期正常：该触发按 TagNode %d 帧计时（= %g 秒）。'
                               % (ticks, ticks / 15.0))
-            rtc = '#6b7280'
+            rtc = ui_theme.T['muted']
 
         ttk.Label(dlg, text='事件类型').grid(row=0, column=0, sticky='e', padx=(12, 6), pady=(12, 4))
         cvar = tk.StringVar()
@@ -2482,10 +2482,10 @@ class App(tk.Tk):
                   justify='left').grid(row=2, column=0, columnspan=2, sticky='w',
                                        padx=12, pady=(4, 0))
 
-        hint = ttk.Label(dlg, text='', foreground='#6b7280', wraplength=430, justify='left')
+        hint = ttk.Label(dlg, text='', foreground=ui_theme.T['muted'], wraplength=430, justify='left')
         hint.grid(row=3, column=0, columnspan=2, sticky='w', padx=12, pady=(4, 0))
 
-        tk_lbl = ttk.Label(dlg, text='', foreground='#0b6b3a', wraplength=430, justify='left')
+        tk_lbl = ttk.Label(dlg, text='', foreground=ui_theme.T['ok'], wraplength=430, justify='left')
         tk_lbl.grid(row=4, column=0, columnspan=2, sticky='w', padx=12, pady=(4, 10))
 
         def time_hint(*_a):
@@ -2505,11 +2505,11 @@ class App(tk.Tk):
             if t is None:
                 tk_lbl.config(text='⚠ 未找到该触发自己的「运行期帧数」（TagNode）——'
                                    '该触发当前不会被引擎执行；应用后可一键修复。',
-                              foreground='#b91c1c')
+                              foreground=ui_theme.T['danger'])
             else:
                 tk_lbl.config(text='该触发实际按「%d 帧」计时（= %g 秒，游戏逻辑 %d 帧/秒）；'
                                    '保存时会一并改成 %d 帧。'
-                                   % (t, t / 15.0, 15, v * 15), foreground='#0b6b3a')
+                                   % (t, t / 15.0, 15, v * 15), foreground=ui_theme.T['ok'])
 
         def upd(*_a):
             k = keys[cb.current()]
@@ -2532,7 +2532,7 @@ class App(tk.Tk):
         upd()
         if ev['type'] == 0:
             hint.config(text='⚠ 当前类型是「-无事件-」(0)：地编里的占位项，没有任何用处，\n'
-                             '实测带它的档读档会崩。请改成正常的事件类型。', foreground='#b91c1c')
+                             '实测带它的档读档会崩。请改成正常的事件类型。', foreground=ui_theme.T['danger'])
 
         def ok():
             try:
@@ -2602,10 +2602,10 @@ class App(tk.Tk):
         ttk.Button(qrow, text='✕', width=3,
                    command=lambda: (self._q_ac.set(''), self._fill_ac_tree())
                    ).pack(side='left', padx=(2, 8))
-        self.lbl_ac_count = ttk.Label(qrow, text='', foreground='#6b7280')
+        self.lbl_ac_count = ttk.Label(qrow, text='', foreground=ui_theme.T['muted'])
         self.lbl_ac_count.pack(side='left')
         self._ta_wrap.pack(fill='both', expand=True)      # ★带滚动条的容器
-        self.ta.tag_configure('bad', foreground='#b91c1c')
+        self.ta.tag_configure('bad', foreground=ui_theme.T['danger'])
         self.ta.bind('<Double-1>', lambda e: self.edit_action())
         self.ta.bind('<Return>', lambda e: self.edit_action())
 
@@ -2621,8 +2621,8 @@ class App(tk.Tk):
                    command=self.remove_sel_action).pack(side='left', padx=6)
         ttk.Button(row, text='➕ 添加行为…',
                    command=self.add_action_dialog).pack(side='left', padx=6)
-        ttk.Label(row, text='双击一行也可修改', foreground='#6b7280').pack(side='left', padx=10)
-        self.lbl_map_ac = ttk.Label(f, text='', foreground='#6b7280', wraplength=880,
+        ttk.Label(row, text='双击一行也可修改', foreground=ui_theme.T['muted']).pack(side='left', padx=10)
+        self.lbl_map_ac = ttk.Label(f, text='', foreground=ui_theme.T['muted'], wraplength=880,
                                     justify='left')
         self.lbl_map_ac.pack(anchor='w', pady=(6, 0))
         return f
@@ -2686,7 +2686,7 @@ class App(tk.Tk):
             shown += 1
         if hasattr(self, 'lbl_ac_count'):
             self.lbl_ac_count.config(text='显示 %d / %d 条' % (shown, len(rows)),
-                                     foreground='#6b7280')
+                                     foreground=ui_theme.T['muted'])
         # ★2026-10-20：重填（搜索/刷新）后把触发页选中项的高亮补回来
         self._mark_hits(self.ta, rows, getattr(self, '_ac_hits', set()))
 
@@ -2769,7 +2769,7 @@ class App(tk.Tk):
         ent = ttk.Entry(dlg, textvariable=avar, width=18)
         ent.grid(row=1, column=1, sticky='w', padx=(0, 12))
 
-        hint = ttk.Label(dlg, text='', foreground='#6b7280', wraplength=430, justify='left')
+        hint = ttk.Label(dlg, text='', foreground=ui_theme.T['muted'], wraplength=430, justify='left')
         hint.grid(row=2, column=0, columnspan=2, sticky='w', padx=12, pady=(4, 0))
 
         def upd(*_a):
@@ -2818,12 +2818,12 @@ class App(tk.Tk):
         ttk.Label(_note, text='触发 ↔ 建筑挂接（2026-10-14 五轮实验定案，游戏内实测通过）。'
                           '★③ 可挂建筑**以存档为准**（挂接键为 0 的建筑），不需要地图；'
                           '地图只用来补"地图建筑ID"（①② 解建筑类型仍靠地图）。',
-                  foreground='#374151', wraplength=900, justify='left').pack(anchor='w')
+                  foreground=ui_theme.T['ink_2'], wraplength=900, justify='left').pack(anchor='w')
         # 上：挂接概览（含**未挂接**的标签 —— 新建的触发挂接数为 0 时也能在这里选中挂建筑）
         ttk.Label(f, text='① 存档里的挂接标签（选中一行查看/操作其建筑；挂接数 0 的是可挂上去的新触发）。'
                           '★列表末尾还会列出「有标签、但没有 CellTag 节点」的触发 —— '
                           '一次性触发执行完引擎会把节点销毁，它们就只剩标签（这些行不能挂/解，只看）',
-                  foreground='#6b7280', wraplength=900, justify='left').pack(anchor='w', pady=(6, 2))
+                  foreground=ui_theme.T['muted'], wraplength=900, justify='left').pack(anchor='w', pady=(6, 2))
         # ★§208（玩家要求）：① 加搜索框 —— 大档 130+ 条触发，按 ID / 名字 / 标签ID 过滤
         _sf = ttk.Frame(f)
         _sf.pack(fill='x', pady=(0, 2))
@@ -2832,7 +2832,7 @@ class App(tk.Tk):
         self.ent_attach_trig.pack(side='left', padx=4)
         self.ent_attach_trig.bind('<KeyRelease>', lambda e: self._attach_fill_trig())
         ttk.Label(_sf, text='（空格可分词，多个词全中才显示）',
-                  foreground='#6b7280').pack(side='left')
+                  foreground=ui_theme.T['muted']).pack(side='left')
         cols = ('trig', 'tag', 'cnt', 'blds')
         tfrm = ttk.Frame(f)
         tfrm.pack(fill='both', expand=False)
@@ -2848,7 +2848,7 @@ class App(tk.Tk):
         self.tma.bind('<<TreeviewSelect>>', lambda e: self._attach_show_blds())
         # 中：选中标签的建筑明细
         ttk.Label(f, text='② 该标签挂接的建筑（选中一行可解除）',
-                  foreground='#6b7280').pack(anchor='w', pady=(6, 2))
+                  foreground=ui_theme.T['muted']).pack(anchor='w', pady=(6, 2))
         cols = ('kind', 'typ', 'pos', 'hp', 'mid', 'off')
         self.tb = ttk.Treeview(f, columns=cols, show='headings', height=5)
         for c, t, w in (('kind', '种类', 60), ('typ', '建筑/单位类型', 210), ('pos', '格坐标', 100),
@@ -2891,7 +2891,7 @@ class App(tk.Tk):
                           'YACOMD 记着 01000438，存档里却是 0），以存档为准；'
                           '挂接直接写建筑记录里的字段（不再依赖坐标反查）。\n'
                           '改完请「另存为新文件」或「原地保存」。',
-                  foreground='#374151', wraplength=900, justify='left').pack(anchor='w', pady=(6, 0))
+                  foreground=ui_theme.T['ink_2'], wraplength=900, justify='left').pack(anchor='w', pady=(6, 0))
         return f
 
     # ---------------- 挂接 ----------------
@@ -3330,11 +3330,11 @@ class App(tk.Tk):
                           '——主判据是「地图 [Map] Size == 存档自带尺寸」（存档固定头部 0x348E 的 (W,H)），'
                           '与建筑是否被摧毁无关（后期档建筑大量被毁也照常匹配）；'
                           '建筑重合率只作参考提示，不参与放行。尺寸读不出时才退化为「建筑是否都在图上」。',
-                  foreground='#374151', wraplength=700, justify='left').pack(anchor='w')
+                  foreground=ui_theme.T['ink_2'], wraplength=700, justify='left').pack(anchor='w')
         self.mv_warn = ttk.Label(
             _note, text='⚠ 只要地图尺寸与存档尺寸一致，本工具就认定是同一张图 —— 动手改之前请先备份存档'
                         '（点右边「备份存档」一键搞定；改完也建议先另存为新文件再进游戏验证）。',
-            foreground='#b91c1c', wraplength=700, justify='left')
+            foreground=ui_theme.T['danger'], wraplength=700, justify='left')
         self.mv_warn.pack(anchor='w', pady=(4, 0))
         ttk.Label(_note,
                   text='放置建筑：勾「触发法」= 引擎自己造（有建造动画、模型完整，悬崖 / 水面等不可建'
@@ -3344,7 +3344,7 @@ class App(tk.Tk):
                        '用「修成完成态 / 扫描卡住 / 补齐动画」修。\n'
                        '图例：红 = 该格已被占 ｜ 深红细线 = 与邻格有高度差（悬崖/斜坡）'
                        '｜ 暗色 = 地图外（边界填充格）。',
-                  foreground='#374151', wraplength=700, justify='left').pack(anchor='w', pady=(4, 0))
+                  foreground=ui_theme.T['ink_2'], wraplength=700, justify='left').pack(anchor='w', pady=(4, 0))
         # ★§289：原来 7 行散控件（30+ 个控件挤一页，多个按钮被窗口右缘切掉）
         #   ⇒ 四张「横条式分区」：地图 / 视图 / 放置 / 选中格。
         #   section() 的标题在左侧竖列 ⇒ 分组只多吃 4 条 3px 色条，不像四张普通卡片
@@ -3525,7 +3525,7 @@ class App(tk.Tk):
 
         cw = ttk.Frame(f)
         cw.pack(fill='both', expand=True, pady=(6, 4))
-        self.mv_canvas = tk.Canvas(cw, bg='#12141a', highlightthickness=0)
+        self.mv_canvas = tk.Canvas(cw, bg=ui_theme.MAP['canvas'], highlightthickness=0)
         # ★§286：画布是深色，用专用深色滚动条（原来浅色 thumb 贴在深底上分不清）
         vs = ttk.Scrollbar(cw, orient='vertical', command=self.mv_canvas.yview,
                            style='Map.Vertical.TScrollbar')
@@ -3539,7 +3539,7 @@ class App(tk.Tk):
         cw.columnconfigure(0, weight=1)
         self.mv_canvas.bind('<Button-1>', self.mv_click)
 
-        self.mv_info = ttk.Label(f, text='', foreground='#111827', justify='left',
+        self.mv_info = ttk.Label(f, text='', foreground=ui_theme.T['ink'], justify='left',
                                  wraplength=700)   # ★§289：原来 980 > 工作区 722 ⇒ 被裁
         self.mv_info.pack(anchor='w')
         self.mv_state = {'mp': None, 'ok': False, 'scale': 8, 'img': None,
@@ -3574,7 +3574,7 @@ class App(tk.Tk):
                 self._mv_defer_path = None
                 try:
                     self.mv_lbl.config(text='没有 .MAP ｜ 切到本页时用**存档**画地形',
-                                       foreground='#b45309')
+                                       foreground=ui_theme.T['warn'])
                 except Exception:
                     pass
             else:
@@ -3592,13 +3592,13 @@ class App(tk.Tk):
                 self.mv_deferred = True
                 self._mv_defer_path = p
                 self.mv_lbl.config(text='%s（切到本页再解析渲染，开档更快）'
-                                        % os.path.basename(p), foreground='#6b7280')
+                                        % os.path.basename(p), foreground=ui_theme.T['muted'])
             else:
                 self.mv_load(p)
         else:
             self.mv_lbl.config(text='未加载地图 · 网格模式可点选'
                                    + self._mv_ready_text(),
-                               foreground='#6b7280')
+                               foreground=ui_theme.T['muted'])
             if self.doc:
                 self.mv_fit()          # 无地图 ⇒ 画坐标网格
 
@@ -3735,7 +3735,7 @@ class App(tk.Tk):
                 st['mp'] = None
                 self.mv_fit()              # 落回网格模式
                 self.mv_lbl.config(text='地图读取失败，已退回网格模式（放建筑不受影响）：%s' % e,
-                                   foreground='#b91c1c')
+                                   foreground=ui_theme.T['danger'])
                 self.status.set('地图读取失败：%s' % e)
                 return
         st['src'] = src
@@ -3766,7 +3766,7 @@ class App(tk.Tk):
         # ★§289：卡内只留短状态（原来 50+ 字的拼接把这一行顶出窗口右缘）；
         #   完整口径（匹配消息 / 地形来源 / 就绪）进状态栏 +「说明 ▸」
         self.mv_lbl.config(text='%s%s' % (_nm, ' ✓' if ok else ' ⚠'),
-                           foreground='#0b6b3a' if ok else '#b45309')
+                           foreground=ui_theme.T['ok'] if ok else ui_theme.T['warn'])
         # 状态栏只说"哪张图 / 对不对"；地形来源与就绪状态在卡内（下拉 + 说明）看得到
         self._map_full_text = '%s ｜ %s%s' % (_nm, mt.get('msg', ''), _srctxt)
         _srcshort = {'save': '地形：存档', 'merge': '地形：地图+存档补格',
@@ -3889,18 +3889,18 @@ class App(tk.Tk):
                 continue
             cx, cy = x * s + s / 2.0, y * s + s / 2.0
             c.create_oval(cx - r, cy - r, cx + r, cy + r,
-                          fill='#1f7a33', outline='#ffffff', width=1,
+                          fill=ui_theme.MAP['wp'], outline=ui_theme.T['on_dark'], width=1,
                           tags=('wp',))
-            c.create_text(cx, cy, text=str(n), fill='#ffffff',
+            c.create_text(cx, cy, text=str(n), fill=ui_theme.T['on_dark'],
                           font=('Consolas', fs, 'bold'), tags=('wp',))
         for n, (x, y) in sorted(only.items()):
             if not (0 <= x < W and 0 <= y < H):
                 continue
             cx, cy = x * s + s / 2.0, y * s + s / 2.0
             c.create_rectangle(cx - 4, cy - 4, cx + 4, cy + 4,
-                               outline='#1d4ed8', width=1, tags=('wp',))
+                               outline=ui_theme.T['info'], width=1, tags=('wp',))
             if s >= 12:
-                c.create_text(cx, cy - 9, text=str(n), fill='#1d4ed8',
+                c.create_text(cx, cy - 9, text=str(n), fill=ui_theme.T['info'],
                               font=('Consolas', 7), tags=('wp',))
 
     # ---------------- 地形来源（§280） ----------------
@@ -4048,7 +4048,7 @@ class App(tk.Tk):
                 continue
             cx, cy = x * s + s / 2.0, y * s + s / 2.0
             c.create_oval(cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0,
-                          fill='#1b6b33', outline='#9be3ac', width=1, tags=('terr',))
+                          fill=ui_theme.MAP['terrain'], outline=ui_theme.MAP['terrain_line'], width=1, tags=('terr',))
             n += 1
         return n
 
@@ -4082,10 +4082,10 @@ class App(tk.Tk):
             if not (0 <= x < W and 0 <= y < H):
                 continue
             cx, cy = x * s + s / 2.0, y * s + s / 2.0
-            c.create_rectangle(cx - r, cy - r, cx + r, cy + r, fill='#f59e0b',
-                               outline='#ffffff', width=1, tags=('unit',))
+            c.create_rectangle(cx - r, cy - r, cx + r, cy + r, fill=ui_theme.MAP['unit'],
+                               outline=ui_theme.T['on_dark'], width=1, tags=('unit',))
             if cnt > 1:
-                c.create_text(cx, cy - r - 6, text='×%d' % cnt, fill='#111827',
+                c.create_text(cx, cy - r - 6, text='×%d' % cnt, fill=ui_theme.T['ink'],
                               font=('Consolas', 8, 'bold'), tags=('unit',))
             n += 1
         return n
@@ -4099,7 +4099,7 @@ class App(tk.Tk):
             try:
                 self.mv_canvas.delete('all')
                 self.mv_canvas.create_text(
-                    16, 16, anchor='nw', fill='#b91c1c', width=880, justify='left',
+                    16, 16, anchor='nw', fill=ui_theme.T['danger'], width=880, justify='left',
                     text='网格绘制出错（请把这段发给开发者）：\n\n' + traceback.format_exc()[-900:])
             except Exception:
                 pass
@@ -4114,21 +4114,21 @@ class App(tk.Tk):
         bld, unit, wp = self._mv_grid_data()
         c.delete('all')
         c.configure(scrollregion=(0, 0, W * s, H * s))
-        c.create_rectangle(0, 0, W * s, H * s, fill='#f7f7f3', outline='')
+        c.create_rectangle(0, 0, W * s, H * s, fill=ui_theme.MAP['ground'], outline='')
         for x in range(0, W + 1):
-            c.create_line(x * s, 0, x * s, H * s, fill='#dcdcd4' if x % 10 else '#b9b9ae')
+            c.create_line(x * s, 0, x * s, H * s, fill=ui_theme.MAP['grid'] if x % 10 else ui_theme.MAP['grid_major'])
         for y in range(0, H + 1):
-            c.create_line(0, y * s, W * s, y * s, fill='#dcdcd4' if y % 10 else '#b9b9ae')
+            c.create_line(0, y * s, W * s, y * s, fill=ui_theme.MAP['grid'] if y % 10 else ui_theme.MAP['grid_major'])
         for x in range(0, W, 10):
             c.create_text(x * s + 2, 2, text=str(x), anchor='nw',
-                          fill='#8a8a80', font=('Consolas', 7))
+                          fill=ui_theme.MAP['grid_text'], font=('Consolas', 7))
         for y in range(0, H, 10):
             c.create_text(2, y * s + 2, text=str(y), anchor='nw',
-                          fill='#8a8a80', font=('Consolas', 7))
+                          fill=ui_theme.MAP['grid_text'], font=('Consolas', 7))
         for (x, y), t in bld.items():
             if x < W and y < H:
                 c.create_rectangle(x * s, y * s, (x + 1) * s, (y + 1) * s,
-                                   fill='#e8927c', outline='', stipple='gray50')
+                                   fill=ui_theme.MAP['building'], outline='', stipple='gray50')
         # ★§267：单位标记改成与地图模式同一套画法（默认关 + ≥20 倍才画），
         #   原来"一直画蓝椭圆"的行为撤掉 —— 小比例下几百个单位糊成一片，看不出东西。
         # ★§266：路径点（与地图模式同一套画法：绿圆=地图定义，蓝框=只有存档有）
@@ -4139,7 +4139,7 @@ class App(tk.Tk):
                 for n, (x, y) in wp.items():
                     if x < W and y < H:
                         c.create_text(x * s + s / 2, y * s + s / 2, text=str(n),
-                                      fill='#2f7d32', font=('Consolas', 7))
+                                      fill=ui_theme.MAP['wp_text'], font=('Consolas', 7))
         try:
             self._mv_draw_terrain(c)
         except Exception:
@@ -4156,7 +4156,7 @@ class App(tk.Tk):
         if st.get('sel'):
             x, y = st['sel']
             c.create_rectangle(x * s, y * s, (x + 1) * s, (y + 1) * s,
-                               outline='#d9480f', width=2)
+                               outline=ui_theme.MAP['cursor'], width=2)
 
     def _ovl_colors(self):
         """覆盖物索引 → 颜色（按类别，一次算好给整张图用）。
@@ -4177,13 +4177,13 @@ class App(tk.Tk):
                 blocks = False
             d = info.get(idx) or {}
             if d.get('tiberium'):
-                col = '#eab308'          # 矿 / 宝石
+                col = ui_theme.MAP['ore']          # 矿 / 宝石
             elif blocks:
-                col = '#57534e'          # 挡路的一律深灰
+                col = ui_theme.MAP['block']          # 挡路的一律深灰
             elif d.get('overrides') or d.get('land'):
-                col = '#0284c7'          # 桥面 / 铁轨 / 低桥（改地块但能走）
+                col = ui_theme.MAP['bridge']          # 桥面 / 铁轨 / 低桥（改地块但能走）
             else:
-                col = '#9ca3af'          # 其它
+                col = ui_theme.T['muted_soft']          # 其它
             out[idx] = col
         return out
 
@@ -4216,14 +4216,14 @@ class App(tk.Tk):
         for (x, y), idx in cells.items():
             if not (0 <= x < W and 0 <= y < H):
                 continue
-            col = cols.get(idx, '#9ca3af')
+            col = cols.get(idx, ui_theme.T['muted_soft'])
             cx, cy = x * s + s / 2.0, y * s + s / 2.0
-            if col == '#57534e':            # 墙类：实心方块（一眼看出"这格不能放"）
+            if col == ui_theme.MAP['block']:            # 墙类：实心方块（一眼看出"这格不能放"）
                 c.create_rectangle(cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0,
-                                   fill=col, outline='#e5e7eb', width=1, tags=('ovl',))
+                                   fill=col, outline=ui_theme.MAP['outline_soft'], width=1, tags=('ovl',))
             else:                            # 其它：圆点
                 c.create_oval(cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0,
-                              fill=col, outline='#ffffff' if col == '#eab308' else '',
+                              fill=col, outline=ui_theme.T['on_dark'] if col == ui_theme.MAP['ore'] else '',
                               width=1, tags=('ovl',))
             n += 1
         return n
@@ -4443,11 +4443,11 @@ class App(tk.Tk):
         try:
             os.makedirs(d, exist_ok=True)
         except Exception:
-            return os.path.join(App._app_dir(), 'editor_config.json')
+            return os.path.join(self._app_dir(), 'editor_config.json')
         p = os.path.join(d, 'editor_config.json')
         if not os.path.exists(p):
             # 迁移老位置（程序目录）里的配置，别让老用户丢设置
-            old = os.path.join(App._app_dir(), 'editor_config.json')
+            old = os.path.join(self._app_dir(), 'editor_config.json')
             if os.path.exists(old):
                 try:
                     with open(old, encoding='utf-8') as f:
@@ -4616,7 +4616,7 @@ class App(tk.Tk):
                           '· 高级「槽2 偏移」= 工厂反引槽 2 的 hex 值：**只有同一会话内的档**需要填；'
                           '跨档一般留空（只写槽 1），具体待游戏验证。\n'
                           '★ 改完会提示另存为新文件，进游戏前请先备份。',
-                  foreground='#374151', wraplength=700, justify='left').pack(anchor='w')
+                  foreground=ui_theme.T['ink_2'], wraplength=700, justify='left').pack(anchor='w')
         # ★§289：原来把「类型 / 刷新 / 两种模式 / 坐标 / 所属方」全塞一行（需 ~1010px
         #   ⇒ 右半截被窗口裁掉）⇒ 拆成「类型＋所属方」「模式＋坐标」「动画＋高级」三行。
         row = ttk.Frame(f)
@@ -4657,8 +4657,8 @@ class App(tk.Tk):
         row3 = ttk.Frame(f)
         row3.pack(fill='x', pady=(6, 2))
         ttk.Button(row3, text='🎁 赠送并另存为…', command=self._gift_do).pack(side='left')
-        self.gift_out = tk.Text(f, height=9, bg='#0b0e14', fg='#d8e0ea',
-                                insertbackground='#d8e0ea')
+        self.gift_out = tk.Text(f, height=9, bg=ui_theme.MAP['terminal'], fg=ui_theme.MAP['terminal_text'],
+                                insertbackground=ui_theme.MAP['terminal_text'])
         self.gift_out.pack(fill='both', expand=True, pady=(6, 0))
         return f
 
@@ -4851,10 +4851,10 @@ class App(tk.Tk):
             return
         g = self._rules_types()
         if g.ok():
-            self.mv_urule.config(text='规则：' + g.source(), foreground='#0b6b3a')
+            self.mv_urule.config(text='规则：' + g.source(), foreground=ui_theme.T['ok'])
         else:
             self.mv_urule.config(text='⚠ 没找到 rules(md).ini（显示名改用存档自带）',
-                                 foreground='#b91c1c')
+                                 foreground=ui_theme.T['danger'])
 
     def mv_pick_rules(self):
         """手动指定游戏目录（含 rulesmd.ini / artmd.ini）→ 写 config.json 并刷新。"""
@@ -4950,7 +4950,7 @@ class App(tk.Tk):
                   font='', wraplength=440, justify='left'
                   ).grid(row=0, column=0, columnspan=2, sticky='w')
         ttk.Label(frm, text=self._cell_brief(cell[0], cell[1]),
-                  wraplength=440, justify='left', foreground='#b45309'
+                  wraplength=440, justify='left', foreground=ui_theme.T['warn']
                   ).grid(row=1, column=0, columnspan=2, sticky='w', pady=(2, 8))
         ttk.Label(frm, text='数量：').grid(row=2, column=0, sticky='w')
         sp = ttk.Spinbox(frm, from_=1, to=60, width=6)
@@ -4976,7 +4976,7 @@ class App(tk.Tk):
                         variable=scr, value=2
                         ).grid(row=7, column=1, sticky='w')
         ttk.Label(frm, text='触发器用「13 流逝时间 1 秒」⇒ 读档约 1 秒后出兵。',
-                  foreground='#6b7280'
+                  foreground=ui_theme.T['muted']
                   ).grid(row=7, column=0, columnspan=2, sticky='w', pady=(8, 0))
         ret = {}
         row = ttk.Frame(frm)
@@ -5125,7 +5125,7 @@ class App(tk.Tk):
         dlg.geometry('760x460')
         dlg.transient(self)
         ttk.Label(dlg, text='文件：%s' % signature_cache_path(),
-                  foreground='#6b7280').pack(anchor='w', padx=8, pady=(8, 2))
+                  foreground=ui_theme.T['muted']).pack(anchor='w', padx=8, pady=(8, 2))
         cols = ('t', 'loco', 'cls', 'votes', 'p270', 'p51c', 'p940', 'p948', 'src')
         tv = ttk.Treeview(dlg, columns=cols, show='headings')
         for col, txt, w in (('t', '型号', 90), ('loco', '移动方式', 80), ('cls', '类别', 80),
@@ -5290,7 +5290,7 @@ class App(tk.Tk):
                         'units': [{'type': r['type'],
                                    'house': r.get('house') or '',
                                    'veterancy': r.get('veterancy')} for r in recs]}
-        self.mv_clip_lbl.config(text=self._mv_clip_text(), foreground='#1d4ed8')
+        self.mv_clip_lbl.config(text=self._mv_clip_text(), foreground=ui_theme.T['info'])
         self.status.set('已复制格 (%d,%d) 的 %d 台单位' % (sel[0], sel[1], len(recs)))
         self.mv_info.config(text='📋 已复制格 (%d,%d) 的 %d 台单位：%s\n'
                                  '下一步：点目标格 → 「📌 粘贴到此格」（复制一份）'
@@ -5371,7 +5371,7 @@ class App(tk.Tk):
         self.mv_render()
         old = clip['cell']
         clip['cell'] = tuple(sel)          # 源格跟过去，方便连续微调位置
-        self.mv_clip_lbl.config(text=self._mv_clip_text(), foreground='#1d4ed8')
+        self.mv_clip_lbl.config(text=self._mv_clip_text(), foreground=ui_theme.T['info'])
         self.mv_info.config(text='✅ 已把 %d 台单位从格 (%d,%d) 移到 (%d,%d)'
                                  '（位置 6 处副本全部重写，格占用已跟着换）'
                                  % (res['count'], old[0], old[1], sel[0], sel[1]))
@@ -6559,7 +6559,7 @@ class App(tk.Tk):
         self.ent_search.pack(side='left', padx=6)
         ttk.Button(row, text='搜索', command=self.do_search).pack(side='left')
         ttk.Label(row, text='（支持中文/英文，或十六进制如 5C197E00）',
-                  foreground='#6b7280').pack(side='left', padx=8)
+                  foreground=ui_theme.T['muted']).pack(side='left', padx=8)
         self.lst_hits = tk.Listbox(f, height=8, font=('Consolas', 9))
         self.lst_hits.pack(fill='x', pady=6)
         self.lst_hits.bind('<<ListboxSelect>>', self.on_hit_select)
@@ -6604,6 +6604,48 @@ class App(tk.Tk):
             pass
         self._scan_meta(list(self.tree.get_children())[:12])
 
+    # ---- 列表元信息缓存（★2026-10-28 审查 P3-13）----
+    # 为什么要有：列表只显示「时间 / 任务名 / 金钱」，但**任务名和金钱只能全量解码**才拿得到。
+    # 前 12 个档逐个 `SaveDoc()` ⇒ 启动后台烧 ~15 秒 CPU（实测 1.28s/档，大档更久），
+    # 还每份顺手写 26MB 明文缓存 ⇒ 光启动≈300MB 磁盘写，而扫完就 `del doc`，那份缓存根本没人用。
+    # 现在：键 =(路径, mtime, size) → 命中直接填表，一次解码都不做；未命中才解码，
+    # 且 `write_cache=False`（不产生那 26MB）。
+    _META_CACHE_NAME = 'meta.json'
+
+    def _meta_cache_path(self):
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        d = os.path.join(base, 'RA2SED_cache')
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            return None
+        return os.path.join(d, self._META_CACHE_NAME)
+
+    def _meta_cache_load(self):
+        p = self._meta_cache_path()
+        if not p or not os.path.exists(p):
+            return {}
+        try:
+            with open(p, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}                       # 损坏就当没有，别让列表打不开
+
+    def _meta_cache_save(self, cache):
+        """原子写（tmp + replace）；顺手丢掉已不存在的存档条目，别让它无限长。"""
+        p = self._meta_cache_path()
+        if not p:
+            return
+        try:
+            live = {k: v for k, v in cache.items() if os.path.exists(k)}
+            tmp = p + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(live, f, ensure_ascii=False)
+            os.replace(tmp, p)
+        except Exception:
+            pass
+
     def _scan_meta(self, items):
         """后台读取前 N 个存档的元信息（任务名/时间/金钱需要完整解码，较慢）。
         ★ 同一时刻只跑一个扫描线程（重复点刷新不再堆积）。
@@ -6613,6 +6655,9 @@ class App(tk.Tk):
           而且明文全留在内存里。玩家开程序时它在后台跑，一进触发编辑器点「添加」就假死。
           ⇒ ① 带代号，用户切页签即作废（离开存档列表页就不该再扫）；
              ② 每档之间 sleep 让出 GIL；③ 读完 `del doc` 释放明文。
+
+        ★★2026-10-28（审查 P3-13）：先查 `meta.json` 缓存。命中就不解码 ——
+          第二次开程序这个后台线程基本是"零成本"（只 stat 12 个文件）。
         """
         if getattr(self, '_scanning', False):
             return
@@ -6621,10 +6666,22 @@ class App(tk.Tk):
         _gen = self._scan_gen
 
         def work():
+            cache = self._meta_cache_load()
+            dirty = 0
             try:
                 for p in items[:12]:
                     if _gen != getattr(self, '_scan_gen', _gen):
                         return          # 用户已经切走/换了目录 ⇒ 别再抢 CPU
+                    try:
+                        _stt = os.stat(p)
+                        _mt, _sz = int(_stt.st_mtime), int(_stt.st_size)
+                    except Exception:
+                        _mt = _sz = None
+                    hit = cache.get(p)
+                    if (hit and _mt is not None and len(hit) >= 5
+                            and hit[0] == _mt and hit[1] == _sz):
+                        self.q.put(('row', p, hit[2], hit[3], hit[4]))
+                        continue                    # ★命中：不解码、不写盘
                     try:
                         raw = open(p, 'rb').read()
                         from cfb import CFB
@@ -6639,14 +6696,21 @@ class App(tk.Tk):
                                     ).strftime('%m-%d %H:%M')
                         st = c.open('Last Save Time') or b''
                         t = ft(struct.unpack_from('<Q', st + b'\0' * 8, 0)[0])
-                        doc = SaveDoc(p)
-                        self.q.put(('row', p, doc.info.get('任务名', '-'), t,
-                                    doc.info.get('金钱')))
+                        # ★扫元信息不写 26MB 明文缓存（见上面 P3-13 说明）
+                        doc = SaveDoc(p, write_cache=False)
+                        _title = doc.info.get('任务名', '-')
+                        _money = doc.info.get('金钱')
+                        self.q.put(('row', p, _title, t, _money))
+                        if _mt is not None:
+                            cache[p] = [_mt, _sz, _title, t, _money]
+                            dirty += 1
                         del doc                 # ★明文别攒着（12 份大档几百 MB）
                     except Exception:
                         self.q.put(('row', p, '?', '?', None))
                     time.sleep(0.05)            # ★让主线程有喘息机会
             finally:
+                if dirty:
+                    self._meta_cache_save(cache)
                 self._scanning = False
         threading.Thread(target=work, daemon=True).start()
 
@@ -7366,8 +7430,8 @@ class App(tk.Tk):
         ttk.Label(qrow, text='（Yuri - Infantry - M2 那批是引擎按 rules 自动生成的，'
                              '99% 的任务用不到；地图作者写的在 010 开头那批里，'
                              '本工具新写的也会显示）',
-                  foreground='#9ca3af').pack(side='left', padx=(4, 0))
-        self.lbl_ai_count = ttk.Label(qrow, text='', foreground='#6b7280')
+                  foreground=ui_theme.T['muted_soft']).pack(side='left', padx=(4, 0))
+        self.lbl_ai_count = ttk.Label(qrow, text='', foreground=ui_theme.T['muted'])
         self.lbl_ai_count.pack(side='left', padx=10)
         ttk.Button(qrow, text='导出 CSV…', command=self._ai_export).pack(side='right')
 
@@ -7376,7 +7440,7 @@ class App(tk.Tk):
         #   这一排是把它**拆开单独用**，并且补上"给已有触发挂小队"这一步。
         nrow = ttk.Frame(f)
         nrow.pack(fill='x', pady=(0, 6))
-        ttk.Label(nrow, text='新建：', foreground='#1d4ed8').pack(side='left')
+        ttk.Label(nrow, text='新建：', foreground=ui_theme.T['info']).pack(side='left')
         ttk.Button(nrow, text='＋ 特遣部队',
                    command=self._ai_new_tf).pack(side='left', padx=2)
         ttk.Button(nrow, text='＋ 动作脚本',
@@ -7388,7 +7452,7 @@ class App(tk.Tk):
                    command=self._ai_attach_team).pack(side='left', padx=(14, 2))
         ttk.Label(nrow, text='（挂小队 = 给触发器写「80 援军 / 107 超时空援军」行为：'
                              '小队键 +0x44、路径点 +0x58，与刷兵是同一条路）',
-                  foreground='#6b7280').pack(side='left', padx=6)
+                  foreground=ui_theme.T['muted']).pack(side='left', padx=6)
 
         sub = ttk.Notebook(f)
         sub.pack(fill='both', expand=True)
@@ -7472,7 +7536,7 @@ class App(tk.Tk):
         ttk.Button(rowTF, text='清空（=删小队）',
                    command=self._ai_clear_tf).pack(side='left', padx=(12, 4))
         ttk.Label(rowTF, text='只写槽位/种数这几个 dword，记录长度不变',
-                  foreground='#6b7280').pack(side='left', padx=6)
+                  foreground=ui_theme.T['muted']).pack(side='left', padx=6)
         sub.add(f2, text='  特遣部队 TaskForce  ')
 
         # ③ 动作脚本
@@ -7514,7 +7578,7 @@ class App(tk.Tk):
         self.ai_script.pack(side='left')
         ttk.Button(rowE, text='改脚本', command=self._ai_apply_script).pack(side='left', padx=4)
         ttk.Label(rowE, text='（选「（空）」= 与地编「脚本留空」一致：引擎按无脚本小队处理）',
-                  foreground='#6b7280').pack(side='left', padx=2)
+                  foreground=ui_theme.T['muted']).pack(side='left', padx=2)
         # ★2026-10-19 第五步：预装载（+0xB9，1 字节）
         self.ai_load = tk.BooleanVar(value=False)
         ttk.Checkbutton(rowE, text='预装载', variable=self.ai_load).pack(side='left', padx=(10, 2))
@@ -7523,13 +7587,13 @@ class App(tk.Tk):
         ttk.Button(rowE, text='标志…', command=self._ai_flags_dialog).pack(side='left', padx=(8, 2))
         ttk.Button(rowE, text='关联标签…', command=self._ai_tag_dialog).pack(side='left', padx=2)
         ttk.Label(rowE, text='只改 +0xB4/+0xB9/+0xD8/+0xE8/+0xE4，长度不变',
-                  foreground='#b45309').pack(side='left', padx=6)
+                  foreground=ui_theme.T['warn']).pack(side='left', padx=6)
 
         ttk.Label(f, text='选中任一页里的一行 ⇒ 下方显示明细，并在另外两页里高亮它关联的对象'
                           '（选小队看它的特遣/脚本；选特遣看谁在用它）',
-                  foreground='#6b7280').pack(anchor='w', pady=(6, 2))
+                  foreground=ui_theme.T['muted']).pack(anchor='w', pady=(6, 2))
         self.ai_text = tk.Text(f, height=8, wrap='none',
-                               font=('Consolas', 9), background='#fbfbfd')
+                               font=('Consolas', 9), background=ui_theme.T['surface_2'])
         self.ai_text.pack(fill='both', expand=True)
         self._ai = None
         self._ai_teams, self._ai_tfs, self._ai_scripts = {}, {}, {}
@@ -7843,7 +7907,7 @@ class App(tk.Tk):
                 ttk.Entry(body, textvariable=v, width=48).grid(
                     row=i, column=1, sticky='we', padx=(8, 0), pady=3)
         if note:
-            ttk.Label(body, text=note, foreground='#6b7280', wraplength=540,
+            ttk.Label(body, text=note, foreground=ui_theme.T['muted'], wraplength=540,
                       justify='left').grid(row=len(rows), column=0, columnspan=2,
                                            sticky='w', pady=(6, 0))
         res = {}
@@ -7918,7 +7982,7 @@ class App(tk.Tk):
         v_name = tk.StringVar(value=name)
         ttk.Entry(top, textvariable=v_name, width=40).pack(side='left', padx=6)
         ttk.Label(top, text='分组 -1（与地编一致）',
-                  foreground='#6b7280').pack(side='left', padx=6)
+                  foreground=ui_theme.T['muted']).pack(side='left', padx=6)
         body = ttk.Frame(win, padding=(8, 0))
         body.pack(fill='both', expand=True)
         tv = ttk.Treeview(body, columns=('i', 'cnt', 'type'), show='headings', height=10)
@@ -8019,7 +8083,7 @@ class App(tk.Tk):
         v_name = tk.StringVar(value=name)
         ttk.Entry(top, textvariable=v_name, width=40).pack(side='left', padx=6)
         ttk.Label(top, text='（空脚本 = 小队原地待命）',
-                  foreground='#6b7280').pack(side='left', padx=6)
+                  foreground=ui_theme.T['muted']).pack(side='left', padx=6)
 
         body = ttk.Frame(win, padding=(8, 0))
         body.pack(fill='both', expand=True)
@@ -8191,7 +8255,7 @@ class App(tk.Tk):
         top.pack(fill='x')
         ttk.Label(top, text='作战小队连接到特遣部队和动作脚本，并可被触发调用。'
                             '（带 * 的标志是地编里真正生效的那些）',
-                  foreground='#374151').pack(side='left')
+                  foreground=ui_theme.T['ink_2']).pack(side='left')
         ttk.Button(top, text='查找引用', command=lambda: self._team_refs_dlg(state['key'])
                    ).pack(side='right')
 
@@ -8260,14 +8324,14 @@ class App(tk.Tk):
         # ★§259：运输机起始（TransportWaypoint，`+0xEC`）。勾了「运输机空投」才有意义。
         lab(8, 0, '运输机起始（路径点号）')
         ttk.Entry(g, textvariable=v_twp, width=10).grid(row=8, column=1, sticky='w', padx=6)
-        lbl_twp = ttk.Label(g, text='', foreground='#6b7280')
+        lbl_twp = ttk.Label(g, text='', foreground=ui_theme.T['muted'])
         lbl_twp.grid(row=8, column=2, columnspan=2, sticky='w', padx=6)
         ttk.Label(g, text='★' + ai_objects.TEAM_MC_NOTE,
-                  foreground='#1d4ed8', wraplength=640, justify='left').grid(
+                  foreground=ui_theme.T['info'], wraplength=640, justify='left').grid(
             row=9, column=0, columnspan=4, sticky='w', pady=(2, 0))
         ttk.Label(g, text='★「运输机起始」= 空投飞机**起飞**的路径点，只有勾了「运输机空投*」才有意义；'
                           '-1 = 未设置（地编显示 None），0 是合法路径点',
-                  foreground='#1d4ed8', wraplength=640, justify='left').grid(
+                  foreground=ui_theme.T['info'], wraplength=640, justify='left').grid(
             row=10, column=0, columnspan=4, sticky='w', pady=(2, 0))
 
         # ---- 复选框（只放带 * 的）----
@@ -8283,7 +8347,7 @@ class App(tk.Tk):
             if not ok:
                 cb.state(['disabled'])
         ttk.Label(box, text='（灰掉的两个/三个：偏移还没定案 —— 需要一份"这些勾选有开有关"的存档来对账）',
-                  foreground='#9ca3af').pack(anchor='w', pady=(4, 0))
+                  foreground=ui_theme.T['muted_soft']).pack(anchor='w', pady=(4, 0))
 
         bar = ttk.Frame(win, padding=8)
         bar.pack(fill='x')
@@ -9238,7 +9302,7 @@ class App(tk.Tk):
                                                         sticky='w', pady=(0, 6))
         ttk.Label(frm, text='挂上后，挂在该标签上的触发就会把这支小队当作事件对象'
                             '（如「小队被攻击 → 全部寻敌」）。',
-                  foreground='#6b7280').grid(row=1, column=0, columnspan=2,
+                  foreground=ui_theme.T['muted']).grid(row=1, column=0, columnspan=2,
                                              sticky='w', pady=(0, 8))
         opts = ['（无）'] + ['%s → 触发 %s' % (x['id'], x['trigger_id'] or '?') for x in tags]
         ids = [None] + [x['id'] for x in tags]
@@ -9296,7 +9360,7 @@ class App(tk.Tk):
         frm = ttk.Frame(win, padding=12)
         frm.pack(fill='both', expand=True)
         ttk.Label(frm, text='勾选即写入（每个标志只占 1 个字节，记录长度不变）',
-                  foreground='#6b7280').grid(row=0, column=0, columnspan=4,
+                  foreground=ui_theme.T['muted']).grid(row=0, column=0, columnspan=4,
                                              sticky='w', pady=(0, 8))
         vars_ = {}
         order = ['Full', 'Loadable', 'Reinforce', 'Prebuild', 'Autocreate', 'Recruiter',
@@ -9322,7 +9386,7 @@ class App(tk.Tk):
                      values=[x[1] for x in self.TEAM_MC_CHOICES]).grid(
             row=r0 + 1, column=2, columnspan=2, sticky='w')
         ttk.Label(frm, text='= 本小队心控单位控制住的敌方单位接下来做什么（+0xD4，4 字节）',
-                  foreground='#6b7280').grid(row=r0 + 2, column=0, columnspan=4,
+                  foreground=ui_theme.T['muted']).grid(row=r0 + 2, column=0, columnspan=4,
                                              sticky='w', pady=(2, 0))
 
         def apply():
@@ -9497,7 +9561,7 @@ class TriggerEditor(tk.Toplevel):
         self.var_name.trace_add('write', lambda *_a: self._on_name_change())
         ttk.Button(r1, text='改名', command=self.apply_name).pack(side='left')
         ttk.Label(r1, text='  ID：').pack(side='left')
-        self.lbl_sid = ttk.Label(r1, text='—', foreground='#6b7280')
+        self.lbl_sid = ttk.Label(r1, text='—', foreground=ui_theme.T['muted'])
         self.lbl_sid.pack(side='left')
 
         r2 = ttk.Frame(top)
@@ -9511,12 +9575,12 @@ class TriggerEditor(tk.Toplevel):
                                            '2 可重复'])
         self.cb_rep.pack(side='left', padx=6)
         # ★§157：含局部变量事件（36/37）的触发，持久性必须 0（1=永不触发 / 2=反复执行）
-        self.lbl_rep_hint = ttk.Label(r2, text='', foreground='#b91c1c')
+        self.lbl_rep_hint = ttk.Label(r2, text='', foreground=ui_theme.T['danger'])
         self.lbl_rep_hint.pack(side='left', padx=(2, 0))
         ttk.Button(r2, text='应用', width=5, command=self.apply_owner_rep).pack(side='left')
         ttk.Label(r2, text='  下级触发').pack(side='left', padx=(12, 0))
         ttk.Label(r2, text='（存档里未定位·待样本）',
-                  foreground='#9ca3af').pack(side='left')
+                  foreground=ui_theme.T['muted_soft']).pack(side='left')
 
         r3 = ttk.Frame(top)
         r3.pack(fill='x', pady=(4, 0))
@@ -9532,7 +9596,7 @@ class TriggerEditor(tk.Toplevel):
                         command=self.apply_flags).pack(side='left', padx=(8, 0))
         ttk.Checkbutton(r3, text='困难', variable=self.var_hard,
                         command=self.apply_flags).pack(side='left', padx=(8, 0))
-        self.lbl_state = ttk.Label(r3, text='', foreground='#6b7280')
+        self.lbl_state = ttk.Label(r3, text='', foreground=ui_theme.T['muted'])
         self.lbl_state.pack(side='left', padx=12)
         # ★2026-10-22 §168：引擎只认 CellTag 的剩余挂载数（0x6E53A0 / 0x485250 / 0x485130），
         #   所以"计数漏账"能救回来的唯一办法就是把它改回实际存活数 —— 这里给一个一键入口。
@@ -9563,7 +9627,7 @@ class TriggerEditor(tk.Toplevel):
                    command=self.add_event_gui).pack(side='left', padx=2)
         ttk.Button(r4, text='删除', width=5,
                    command=self.del_event_gui).pack(side='left', padx=2)
-        self.lbl_evcnt = ttk.Label(r4, text='', foreground='#6b7280')
+        self.lbl_evcnt = ttk.Label(r4, text='', foreground=ui_theme.T['muted'])
         self.lbl_evcnt.pack(side='left', padx=8)
 
         evbody = ttk.Frame(ev)
@@ -9577,7 +9641,7 @@ class TriggerEditor(tk.Toplevel):
             self.tv_ev.column(c, width=w, anchor=a)
         self.tv_ev.pack(fill='x')
         self.tv_ev.bind('<<TreeviewSelect>>', lambda e: self._ev_pick())
-        self.lbl_evhint = ttk.Label(ev, text='', foreground='#374151', wraplength=820,
+        self.lbl_evhint = ttk.Label(ev, text='', foreground=ui_theme.T['ink_2'], wraplength=820,
                                     justify='left')
         self.lbl_evhint.pack(anchor='w', pady=(4, 0))
 
@@ -9606,7 +9670,7 @@ class TriggerEditor(tk.Toplevel):
         ttk.Label(self.row_wp, text='路径点').pack(side='left')
         ttk.Entry(self.row_wp, textvariable=self.var_wp, width=8).pack(side='left', padx=6)
         ttk.Label(self.row_wp, text='（上面的「参数」= 小队，这里 = 刷出来的位置；留空 = 0）',
-                  foreground='#6b7280').pack(side='left')
+                  foreground=ui_theme.T['muted']).pack(side='left')
 
         body = ttk.Frame(ac)
         body.pack(fill='both', expand=True, pady=(6, 0))
@@ -9620,7 +9684,7 @@ class TriggerEditor(tk.Toplevel):
             self.tv_ac.column(c, width=w, anchor=a)
         self.tv_ac.pack(fill='both', expand=True)
         self.tv_ac.bind('<<TreeviewSelect>>', lambda e: self._ac_pick())
-        self.lbl_achint = ttk.Label(ac, text='', foreground='#374151', wraplength=820,
+        self.lbl_achint = ttk.Label(ac, text='', foreground=ui_theme.T['ink_2'], wraplength=820,
                                     justify='left')
         self.lbl_achint.pack(anchor='w', pady=(4, 0))
 
@@ -9639,7 +9703,7 @@ class TriggerEditor(tk.Toplevel):
                    command=self.save_doc).pack(side='right', padx=(0, 8))
         ttk.Label(bar, text='改动先落在存档内存里（新建模式=真正创建这条触发）；'
                             '要写到文件请回主窗口「保存」。删除无法撤销，建议先备份。',
-                  foreground='#b45309', wraplength=520, justify='left'
+                  foreground=ui_theme.T['warn'], wraplength=520, justify='left'
                   ).pack(side='left', fill='x', expand=True)
 
     # ---------------- 新建模式（惰性：不点「新建」就不写存档） ----------------
@@ -9669,7 +9733,7 @@ class TriggerEditor(tk.Toplevel):
     def _load_new_form(self):
         """把"待建清单"画到界面上（新建模式专用，不读任何真实触发）。"""
         self.cb_t.set('（新建·尚未保存）')
-        self.lbl_sid.config(text='（新建·尚未写入存档）', foreground='#b45309')
+        self.lbl_sid.config(text='（新建·尚未写入存档）', foreground=ui_theme.T['warn'])
         self.var_name.set(getattr(self, '_pending_name', '新触发'))
         # 国家默认游戏里当前玩家阵营
         try:
@@ -9704,7 +9768,7 @@ class TriggerEditor(tk.Toplevel):
         self._fill_actions()
         self._ev_hint()
         self._ac_hint()
-        self.lbl_state.config(foreground='#b45309',
+        self.lbl_state.config(foreground=ui_theme.T['warn'],
                               text='新建模式（未写入存档）：填名称 / 选事件 / 加行为 → 点「✔ 保存该触发」；'
                                    '直接关闭 = 什么都不发生')
         self.app.status.set('新建触发：现在还没写进存档，点「✔ 保存该触发」才创建')
@@ -9771,7 +9835,7 @@ class TriggerEditor(tk.Toplevel):
         self._cur = sid
         det = self.doc.trigger_detail(sid)
         self._det = det
-        self.lbl_sid.config(text=sid, foreground='#6b7280')
+        self.lbl_sid.config(text=sid, foreground=ui_theme.T['muted'])
         self.var_name.set(det['name'])
         # 国家
         hs = [h.get('cn') or h.get('short') for h in (self.doc.houses() or [])]
@@ -9784,7 +9848,7 @@ class TriggerEditor(tk.Toplevel):
         rp = det['repeat'] or '0'
         self.cb_rep.current(int(rp) if rp in ('0', '1', '2') else 0)
         # ★§158：持久性 1 是"计数型"，两种坑要实时提示
-        tip, col = '', '#b91c1c'
+        tip, col = '', ui_theme.T['danger']
         try:
             natt = det['attached'] or 0
             etypes = [e['type'] for e in self.doc.trigger_event_list(sid)]
@@ -9792,7 +9856,7 @@ class TriggerEditor(tk.Toplevel):
                 tip = '⚠ 进入事件挂 %d 个对象：持久1 是已知 BUG（永不执行）' % natt
             elif natt == 0:
                 tip = '⚠ 挂接 0 个对象：持久1 永不触发'
-                col = '#6b7280'
+                col = ui_theme.T['muted']
             elif len([t for t in etypes if t != 8]) > 1 and rp == '1':
                 # ★§163/§166：离场记账被"还没满足的其它事件"卡住（8 任何事件恒真，不算）
                 tip = ('⚠ 多条事件 + 挂 %d 个对象：摧毁/变卖必须发生在其它事件满足**之后**，'
@@ -9932,9 +9996,9 @@ class TriggerEditor(tk.Toplevel):
     def _ev_count_hint(self):
         n = len(getattr(self, '_ev_rows', []) or [])
         if n <= 1:
-            txt, col = ('共 %d 条' % n, '#6b7280')
+            txt, col = ('共 %d 条' % n, ui_theme.T['muted'])
         else:
-            txt, col = ('共 %d 条（AND：任一不满足即短路，上面先评估）' % n, '#b45309')
+            txt, col = ('共 %d 条（AND：任一不满足即短路，上面先评估）' % n, ui_theme.T['warn'])
         try:
             self.lbl_evcnt.config(text=txt, foreground=col)
         except Exception:
@@ -10819,7 +10883,7 @@ class TriggerEditor(tk.Toplevel):
         ttk.Label(frm, text='%s　%s' % (det['sid'], det['name']),
                   font=('', 10, 'bold')).pack(anchor='w')
         ttk.Label(
-            frm, justify='left', wraplength=560, foreground='#374151',
+            frm, justify='left', wraplength=560, foreground=ui_theme.T['ink_2'],
             text='\n软删除（推荐·可逆）：一个对象都不删，只把事件改成永不满足 ——\n'
                  '　 · 挂了建筑（本档 %d 栋）或是计时触发 → 「13 流逝时间」+ 参数拉到上限\n'
                  '　　 （16,777,215 秒 ≈ 194 天连续游戏，实际永远到不了）\n'
