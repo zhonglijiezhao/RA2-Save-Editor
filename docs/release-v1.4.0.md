@@ -155,5 +155,17 @@ py _selftest_all.py        # 142 个用例全跑 + 和基线比，只报"相对�
 |---|---|---|
 | `RA2SaveEditor-v1.4.0-win64.zip` | 13.6 MB（1003 个条目） | `67946eb84c40ac4f6514ccad6fa0826c4367b9ed0bcce8746a7e76623f319e4a` |
 
-解压后**直接双击 `RA2存档编辑器.exe`**（`_internal` 要跟它同级）。
-Windows 10 / 11 64 位，不需要装 Python。
+解压后**直接双击 `RA2存档编辑器.exe`**（`_internal` 要跟它同级）。不需要装 Python。
+
+### 系统要求
+
+| 系统 | 能不能跑 |
+|---|---|
+| Windows 10 / 11（64 位） | ✅ 正常 |
+| Windows 8.1（64 位） | ⚠️ 理论可以，未实测 |
+| **Windows 7** | ❌ **不支持** |
+
+Win7 跑不了不是本工具的问题，是**打包用的 Python 3.13 从 3.9 起就要求 Win8.1+**
+（Win7 上最高只能到 Python 3.8）。在 Win7 上双击会报
+`无法定位程序输入点 PathCchCombineEx` 或 `Failed to load Python DLL`。
+真需要 Win7 版的话可以单独做一个（用 Python 3.8 重新打包），但需要单独验证。
