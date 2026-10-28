@@ -192,7 +192,7 @@ def main():
         print('  ⚠ distpath 已存在（旧目录上千文件会触发批量删除拦截）⇒ 换版本号或先手动删')
         return 3
     try:
-        print('  版本资源: 产品 %s / 文件 1.4 系列 + p%d' % (semver, ver))
+        print('  版本资源: 产品 %s / 文件 %s.p%d' % (semver, semver, ver))
         write_version_info(ver, semver)
     except Exception as e:
         print('  ⚠ 版本资源生成失败（不影响打包）：%s' % e)
