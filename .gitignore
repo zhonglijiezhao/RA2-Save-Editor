@@ -75,6 +75,9 @@ _view_*.png
 _*.py
 !_selftest_*.py
 !_paths.py
+# ★例外：Primary 指针探测（§298）。它把"类型对象锚点 + 四个武器槽位"的结论
+#   固化成 23 条断言，是"换枪"这个高风险功能的回归基线，不能只留在本地。
+!_probe_primary.py
 _*.txt
 _*.json
 _*.cmd
