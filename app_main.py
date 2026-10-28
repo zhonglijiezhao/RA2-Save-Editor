@@ -1900,10 +1900,10 @@ def export_weapons_cmd(args):
             n_w = n
         detail = '（%d 段 = %d 把武器 + %d 个弹头/抛射体%s）' % (
             n, n_w, n - n_w,
-            '；只取与 rules 不同的武器' if only_diff else '')
+            '；只取与官方原版不同的武器（含新增）' if only_diff else '')
         label = '段数'
     else:
-        detail = ('（只含与 rules 不同的 %d 把 / 共 %d 把）' % (n, total)
+        detail = ('（只含与官方原版不同的 %d 把 / 共 %d 把）' % (n, total)
                   if only_diff else '（全部 %d 把）' % total)
         label = '行数'
     _write_report('EXPORT PASS\n'
