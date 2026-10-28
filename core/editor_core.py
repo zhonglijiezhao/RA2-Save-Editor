@@ -13051,7 +13051,13 @@ class SaveDoc(object):
             o = pjobj.get(pjn)
             L = ['[%s];抛射体' % pjn]
             if o:
-                L.append('; Image / Arcing / SubjectTo* = **存档实读**；其余照抄 rules')
+                # ★2026-10-28（玩家第二次实验后修正的措辞）：
+                #   存档里**确实有**这份记录（+0x1D4 起），但玩家实测：
+                #   把 rules 里 `[564187213A] Image=ZEP` 一改，进游戏就发射 ZEP
+                #   ⇒ **游戏以 rules 为准**，存档这份只是"存盘当时是什么"的记录。
+                #   别写成"存档实读"，那会让人以为改存档能生效。
+                L.append('; 以下是**存档里记录的**值（存盘当时是什么）；'
+                         '游戏读档时以 rulesmd.ini 为准，改 rules 会覆盖它')
             else:
                 L.append('; 存档里没找到这个抛射体对象，以下全部照抄 rules')
             # Image：存档优先（空则退回 rules —— 空表示"用 art 里同名条目"）
