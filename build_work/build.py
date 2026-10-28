@@ -88,6 +88,55 @@ def prune_dists(keep=KEEP_DISTS, dry=False):
     return 0
 
 
+VERINFO = os.path.join(HERE, '_version_info.txt')
+
+VERINFO_TMPL = """# -*- coding: utf-8 -*-
+# 自动生成（build.py），别手改 —— 版本号跟着 --p 走。
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=%(v4s)s, prodvers=%(v4s)s,
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([
+      StringTable('080404b0', [
+        StringStruct('FileDescription', 'RA2 / 尤里的复仇 存档编辑器'),
+        StringStruct('FileVersion', '%(fv)s'),
+        StringStruct('InternalName', 'RA2SaveEditor'),
+        StringStruct('OriginalFilename', 'RA2存档编辑器.exe'),
+        StringStruct('ProductName', 'RA2 存档编辑器'),
+        StringStruct('ProductVersion', '%(ver)s')])]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)
+"""
+
+
+def write_version_info(ver, semver='1.4.0'):
+    """写 `_version_info.txt`（PyInstaller 版本资源）→ 路径。
+
+    ★2026-10-28：以前 exe 的"属性→详细信息"全是空的 —— 玩家报 bug 时说不出
+      用的是哪一版，只能靠 zip 文件名猜。
+
+    两套号，都有用：
+      · 产品版本 `semver`（1.4.0）—— 玩家认这个
+      · 文件版本 1.4.0.<p>（1.4.0.257）—— 同一版本号下重打包也能区分
+    """
+    try:
+        v = int(ver)
+    except Exception:
+        v = 0
+    try:
+        a, b, c = (list(map(int, str(semver).split('.'))) + [0, 0, 0])[:3]
+    except Exception:
+        a, b, c = 1, 4, 0
+    v4 = (a, b, c, v % 65536)
+    txt = VERINFO_TMPL % {'v4s': repr(v4), 'ver': semver,
+                          'fv': '%d.%d.%d.%d' % v4}
+    with open(VERINFO, 'w', encoding='utf-8') as f:
+        f.write(txt)
+    return VERINFO
+
+
 def check(dist_inner=DIST_INNER):
     """校验一个 onedir 产物是否完整（有 exe + _internal/python31x.dll）。"""
     exe = os.path.join(dist_inner, 'RA2存档编辑器.exe')
@@ -107,6 +156,18 @@ def check(dist_inner=DIST_INNER):
 
 def main():
     args = sys.argv[1:]
+    semver = '1.4.0'
+    if '--ver' in args:
+        try:
+            semver = args[args.index('--ver') + 1]
+        except Exception:
+            print('--ver 后面要跟版本号（如 1.4.0）'); return 2
+    semver = '1.4.0'
+    if '--ver' in args:
+        try:
+            semver = args[args.index('--ver') + 1]
+        except Exception:
+            print('--ver 后面要跟版本号（如 1.4.0）'); return 2
     if '--clean' in args:
         print('清理旧构建目录（保留最近 %d 个 build_dist_p*）' % KEEP_DISTS)
         return prune_dists(dry=('--dry' in args))
@@ -130,6 +191,11 @@ def main():
     if os.path.isdir(dist):
         print('  ⚠ distpath 已存在（旧目录上千文件会触发批量删除拦截）⇒ 换版本号或先手动删')
         return 3
+    try:
+        print('  版本资源: 产品 %s / 文件 1.4 系列 + p%d' % (semver, ver))
+        write_version_info(ver, semver)
+    except Exception as e:
+        print('  ⚠ 版本资源生成失败（不影响打包）：%s' % e)
     cmd = [PY, '-m', 'PyInstaller', SPEC, '--noconfirm',
            '--workpath', WORK, '--distpath', dist]
     log = os.path.join(ROOT, '_build_p%d.log' % ver)

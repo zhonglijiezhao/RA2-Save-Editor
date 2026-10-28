@@ -69,6 +69,11 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    # ★2026-10-28：版本资源（属性→详细信息里能看到 v1.4.0）。
+    #   文件由 build.py 每次按版本号重写；没有它 exe 的"详细信息"全是空的，
+    #   玩家报 bug 时也没法确认用的是哪一版。
+    version=(os.path.join(SPECPATH, '_version_info.txt')
+             if os.path.exists(os.path.join(SPECPATH, '_version_info.txt')) else None),
 )
 coll = COLLECT(
     exe,
