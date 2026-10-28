@@ -361,7 +361,7 @@
  },
  "_selftest_ev300_export_weapons": {
   "failed": 0,
-  "passed": 32,
+  "passed": 37,
   "status": "ok"
  },
  "_selftest_ev301_ai_scroll": {

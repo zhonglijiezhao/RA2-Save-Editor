@@ -12625,7 +12625,14 @@ class SaveDoc(object):
     WEAPON_DMG_OFF = 0x80
     WEAPON_ROF_OFF = 0x8C
     WEAPON_RANGE_OFF = 0x90
+    # ★2026-10-28（玩家拿原版 rules 的写法来对格式时顺手探到的）：
+    #   `+0x78` = **Burst**，拿 52 把有 Burst 的武器对 rules 值，49/52 命中（94%），
+    #   全档分布 1×155 / 2×35 / 4×3 —— 就是红警的 Burst 语义。
+    WEAPON_BURST_OFF = 0x78
     WARHEAD_VERSES_OFF = 0x7C
+    # 弹头对象里两个 float：`+0x100` CellSpread、`+0x108` PercentAtMax（各 48/48 命中）
+    WARHEAD_SPREAD_OFF = 0x100
+    WARHEAD_PCTMAX_OFF = 0x108
     VERSES_COUNT = 11
 
     def _type_objects(self):
@@ -12804,68 +12811,177 @@ class SaveDoc(object):
         return len(rows), out_path
 
     def export_weapons_ini(self, out_path=None, only_diff=False):
-        """把武器表导出成**红警 INI 格式**（每把一段）→ `(段数, 路径)`。
+        """把武器表导出成**原版 rules 的写法**（武器 / 抛射体 / 弹头 三段）→ `(段数, 路径)`。
 
-        ★2026-10-28（玩家要求）：CSV 便于对照，但要拿回游戏 / 贴进 rulesmd.ini 时
-          INI 才是原生格式 —— 段名 `[Vulcan]`、键值 `Damage=`、百分比 `Verses=100%,…`，
-          跟 rules 里长得一模一样，复制粘贴就能用。
+        ★2026-10-28（玩家拿原版 rulesmd.ini 的段落来对格式）：
+          原版是这么写的 ——
 
-        输出是**覆盖片段**，不是完整 rulesmd.ini：
-          贴某个段进 rulesmd.ini 只会覆盖同名武器，不会动别的；也不会写
-          `[WeaponTypes]` 注册表（那一段一旦写错会让整个武器表错位）。
-          头注释里说明这一点，并给出本档的注册顺序供参考。
+              [120mmx] ;武器
+              Damage=100
+              ROF=80
+              Range=5.75
+              Projectile=Cannon
+              Speed=40
+              Warhead=ApocAP
+              Report=ApocalypseAttackGround
+              Anim=APMUZZLE
+              Burst=2
+              Bright=yes
+
+              [Cannon];抛射体
+              Image=120MM
+              Arcing=true
+
+              [ApocAP];弹头
+              CellSpread=.3
+              PercentAtMax=.5
+              Verses=25%,25%,25%,75%,100%,100%,100%,100%,70%,60%,100%
+
+          所以导出照这个来：每把武器一段，后面跟上它用到的抛射体段、弹头段。
+
+        字段来源分两类（头注释里也写清）：
+          · **实读存档**：Damage `+0x80` / ROF `+0x8C` / Range `+0x90` /
+            Burst `+0x78`；弹头的 Verses `+0x7C`、CellSpread `+0x100`、
+            PercentAtMax `+0x108`
+          · **照抄 rules**：Projectile / Speed / Report / Anim / Bright、
+            弹头的 Wall / Wood / Conventional / InfDeath / AnimList / ProneDamage、
+            以及整段抛射体 —— 存档里**没有**抛射体对象
+            （实测 rules 里那 55 个抛射体名，在档内 `Name:` 命中 0 个）。
         """
         rules = self._rules_all() or {}
+        pl = self.plain
         whmap = self.weapon_warhead_map()
-        verses = {x['name']: x['verses'] for x in self.warhead_objects()}
+        whobjs = {x['name']: x for x in self.warhead_objects()}
 
-        def num(kv, key):
-            try:
-                return float(str(kv.get(key, '')).split(';')[0].strip())
-            except Exception:
-                return None
+        def rs(kv, key):
+            v = kv.get(key)
+            return v.strip() if isinstance(v, str) and v.strip() else None
 
-        def fmt_num(v):
-            """rules 里就爱写 `5.75` / `4` 这种，别输出 `5.750000`。"""
-            s = ('%.3f' % v).rstrip('0').rstrip('.')
+        def fmtf(v):
+            """`5.750000` → `5.75`；`0.300000` → `0.3`（跟 rules 一个写法）。"""
+            s = ('%.4f' % v).rstrip('0').rstrip('.')
             return s or '0'
 
         ws = sorted(self.weapon_objects(), key=lambda x: x['off'])
-        blocks, order = [], []
-        for i, w in enumerate(ws):
+        wblocks, wh_used, pj_used = [], set(), set()
+        for w in ws:
             nm = w['name']
-            order.append((i, nm))
             kv = rules.get(nm) or {}
-            od, orf, org = num(kv, 'Damage'), num(kv, 'ROF'), num(kv, 'Range')
+            od = rs(kv, 'Damage')
+            orf = rs(kv, 'ROF')
+            org = rs(kv, 'Range')
             diff = []
-            if od is not None and int(od) != w['damage']:
-                diff.append('伤害 %g→%d' % (od, w['damage']))
-            if orf is not None and int(orf) != w['rof']:
-                diff.append('射速 %g→%d' % (orf, w['rof']))
-            if org is not None and abs(org - w['range_cells']) > 0.01:
-                diff.append('射程 %g→%s' % (org, fmt_num(w['range_cells'])))
+            if od is not None:
+                try:
+                    if int(float(od)) != w['damage']:
+                        diff.append('伤害 %g→%d' % (float(od), w['damage']))
+                except Exception:
+                    pass
+            if orf is not None:
+                try:
+                    if int(float(orf)) != w['rof']:
+                        diff.append('射速 %g→%d' % (float(orf), w['rof']))
+                except Exception:
+                    pass
+            if org is not None:
+                try:
+                    if abs(float(org) - w['range_cells']) > 0.01:
+                        diff.append('射程 %g→%s' % (float(org), fmtf(w['range_cells'])))
+                except Exception:
+                    pass
             if only_diff and not diff:
                 continue
 
-            L = ['[%s]' % nm]
+            L = ['[%s] ;武器' % nm]
             if diff:
                 L.append('; 与官方不同：%s' % '；'.join(diff))
-                if od is not None:
-                    L.append('; 官方：Damage=%g  ROF=%g  Range=%g'
-                             % (od, orf if orf is not None else 0,
-                                org if org is not None else 0))
-            else:
-                L.append('; 与官方一致')
             L.append('Damage=%d' % w['damage'])
             L.append('ROF=%d' % w['rof'])
-            L.append('Range=%s' % fmt_num(w['range_cells']))
-            whn = whmap.get(nm, '')
+            L.append('Range=%s' % fmtf(w['range_cells']))
+            pj = rs(kv, 'Projectile')
+            if pj:
+                L.append('Projectile=%s' % pj)
+                pj_used.add(pj)
+            sp = rs(kv, 'Speed')
+            if sp:
+                L.append('Speed=%s' % sp)
+            whn = whmap.get(nm) or rs(kv, 'Warhead')
             if whn:
                 L.append('Warhead=%s' % whn)
-            vs = verses.get(whn) or verses.get(nm) or []
-            if vs:
-                L.append('Verses=%s' % ','.join('%d%%' % round(v * 100) for v in vs))
-            blocks.append('\n'.join(L))
+                wh_used.add(whn)
+            rp = rs(kv, 'Report')
+            if rp:
+                L.append('Report=%s' % rp)
+            an = rs(kv, 'Anim')
+            if an:
+                L.append('Anim=%s' % an)
+            try:
+                burst = struct.unpack_from('<I', pl, w['off'] + self.WEAPON_BURST_OFF)[0]
+            except Exception:
+                burst = None
+            if burst and burst != 1:
+                L.append('Burst=%d' % burst)
+            elif rs(kv, 'Burst'):
+                L.append('Burst=%s' % rs(kv, 'Burst'))
+            br = rs(kv, 'Bright')
+            if br:
+                L.append('Bright=%s' % br)
+            wblocks.append('\n'.join(L))
+
+        # ---- 弹头段：三个值实读，其余照抄 rules ----
+        wh_blocks = []
+        for whn in sorted(wh_used):
+            kv = rules.get(whn) or {}
+            obj = whobjs.get(whn)
+            L = ['[%s] ;弹头' % whn]
+            if obj:
+                try:
+                    spread = struct.unpack_from('<f', pl, obj['off'] + self.WARHEAD_SPREAD_OFF)[0]
+                    pct = struct.unpack_from('<f', pl, obj['off'] + self.WARHEAD_PCTMAX_OFF)[0]
+                except Exception:
+                    spread = pct = None
+            else:
+                spread = pct = None
+            # 实读优先；实读是 0 而 rules 有非 0，说明这个字段在存档里没被写，
+            # 用 rules 的值更像"原版"（0 会让爆炸范围变成没有）
+            if spread is None or (spread == 0 and rs(kv, 'CellSpread')):
+                spread = rs(kv, 'CellSpread')
+                L.append('CellSpread=%s' % spread if spread else 'CellSpread=0')
+            else:
+                L.append('CellSpread=%s' % fmtf(spread))
+            if pct is None or (pct == 0 and rs(kv, 'PercentAtMax')):
+                pv = rs(kv, 'PercentAtMax')
+                L.append('PercentAtMax=%s' % pv if pv else 'PercentAtMax=1')
+            else:
+                L.append('PercentAtMax=%s' % fmtf(pct))
+            for key in ('Wall', 'Wood'):
+                v = rs(kv, key)
+                if v:
+                    L.append('%s=%s' % (key, v))
+            # Verses 紧跟在 Wood 后面 —— 原版就是 `Wall/Wood/Verses/Conventional` 这个顺序
+            if obj and obj.get('verses'):
+                L.append('Verses=%s' % ','.join(
+                    '%d%%' % round(x * 100) for x in obj['verses']))
+            elif rs(kv, 'Verses'):
+                L.append('Verses=%s' % rs(kv, 'Verses'))
+            for key in ('Conventional', 'InfDeath', 'AnimList', 'ProneDamage'):
+                v = rs(kv, key)
+                if v:
+                    L.append('%s=%s' % (key, v))
+            wh_blocks.append('\n'.join(L))
+
+        # ---- 抛射体段：存档里没有对象，整段照抄 rules ----
+        pj_blocks = []
+        for pjn in sorted(pj_used):
+            kv = rules.get(pjn) or {}
+            L = ['[%s];抛射体' % pjn]
+            if not kv:
+                L.append('; 当前 rules 里没有这一节（存档不存抛射体，无法还原）')
+            else:
+                for k, v in kv.items():
+                    if isinstance(v, str) and v.strip():
+                        L.append('%s=%s' % (k, v.strip()))
+            pj_blocks.append('\n'.join(L))
 
         if out_path is None:
             base = os.path.splitext(self.path)[0]
@@ -12874,28 +12990,30 @@ class SaveDoc(object):
         src = self.rules_source() or {}
         head = [
             '; ' + '=' * 66,
-            '; RA2 / 尤里的复仇 —— 存档武器表（%d 段%s）'
-            % (len(blocks), '，只含与官方不同的' if only_diff else ''),
+            '; RA2 / 尤里的复仇 —— 存档武器表（%d 把武器 · %d 种弹头 · %d 种抛射体）'
+            % (len(wblocks), len(wh_blocks), len(pj_blocks)),
             '; 存档     : %s' % os.path.basename(self.path),
             '; 对照规则 : %s' % (src.get('rules') or '（没找到 rulesmd.ini，无官方对照）'),
             '; 导出时间 : %s' % datetime.datetime.now().strftime('%Y-%m-%d %H:%M'),
             ';',
-            '; 这张表来自**存档内部**，是存盘那一刻真正生效的数值。',
-            '; 它和 rulesmd.ini 不一致是正常的：地图内联 INI、MIX 覆盖都算进去了。',
+            '; 格式照原版 rules 的写法：每把武器一段，后面跟它用到的抛射体段、弹头段。',
             ';',
-            '; ★这是一份**覆盖片段**，不是完整的 rulesmd.ini：',
-            ';   把某个 [武器名] 段落贴进你的 rulesmd.ini，就会覆盖同名武器，不动别的。',
-            ';   想改**这一份存档**，请用本工具 —— 改 rules 对已经存盘的档不生效。',
+            '; 哪些值是**这份存档里的真实值**（比 rulesmd.ini 更准）：',
+            ';   武器 Damage / ROF / Range / Burst',
+            ';   弹头 CellSpread / PercentAtMax / Verses（11 项）',
+            '; 哪些值是**照 rules 抄的**（存档里没有独立记录）：',
+            ';   武器 Projectile / Speed / Report / Anim / Bright',
+            ';   弹头 Wall / Wood / Conventional / InfDeath / AnimList / ProneDamage',
+            ';   整段抛射体 —— 存档不存抛射体对象，只能抄 rules',
             ';',
-            '; ★没有写 [WeaponTypes] 注册表：那一段一旦顺序错，整个武器表会错位。',
-            ';   下面是本档的注册顺序，需要做完整 rules 时照着核。',
+            '; ★这是**覆盖片段**，不是完整的 rulesmd.ini：',
+            ';   把某段贴进 rulesmd.ini 只会覆盖同名项；没写 [WeaponTypes] 注册表。',
+            ';   想改**这一份存档**请用本工具 —— 改 rules 对已存盘的档不生效。',
+            '; ' + '=' * 66,
         ]
-        # 注册顺序放注释里（一行 8 个，别把文件撑得太长）
-        for i in range(0, len(order), 8):
-            head.append(';   ' + ' '.join('%d=%s' % (k, n) for k, n in order[i:i + 8]))
-        head.append('; ' + '=' * 66)
 
-        text = '\n'.join(head) + '\n\n' + '\n\n'.join(blocks) + '\n'
+        parts = wblocks + pj_blocks + wh_blocks
+        text = '\n'.join(head) + '\n\n' + '\n\n'.join(parts) + '\n'
         # ★编码：红警是 ANSI 程序，rulesmd.ini 一直是 GBK。这里优先写 GBK
         #   （记事本、UE、游戏本体都认，贴进 rulesmd.ini 也不会因为 BOM 出错）；
         #   万一注释里有 GBK 编不了的字，再退回「UTF-8 带 BOM」——至少不乱码。
@@ -12906,7 +13024,7 @@ class SaveDoc(object):
             payload = b'\xef\xbb\xbf' + data.encode('utf-8')
         with open(out_path, 'wb') as f:
             f.write(payload)
-        return len(blocks), out_path
+        return len(parts), out_path
 
     def warhead_objects(self):
         """→ `[{'name','off','verses':[11 个系数]}]`（只读）。

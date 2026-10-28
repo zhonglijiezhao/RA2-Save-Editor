@@ -194,11 +194,13 @@ class WeaponsPage(object):
         else:
             messagebox.showinfo(
                 '导出完成',
-                '已导出 %d 个武器段%s。\n\n%s\n\n'
-                '格式跟 rulesmd.ini 一样（GBK + CRLF，红警原生编码）。\n'
-                '想改游戏规则就把对应段落贴进 rulesmd.ini；\n'
-                '只想改这一份存档，用左边的输入框改就行（改 rules 对已存盘的档不生效）。'
-                % (n, '（只含与 rules 不同的）' if only else '', path),
+                '已导出 %d 段%s。\n\n%s\n\n'
+                '格式跟原版 rules 一样：每把武器一段（Damage/ROF/Range/Projectile/'
+                'Speed/Warhead/Report/Anim/Burst），\n后面跟上它用到的 [抛射体] 段和 [弹头] 段。\n'
+                '编码 GBK + CRLF（红警原生），贴进 rulesmd.ini 就能用。\n\n'
+                '· Damage/ROF/Range/Burst、弹头的 CellSpread/Verses 是**这份存档的真实值**\n'
+                '· Projectile/Speed/Report/Anim 和整段抛射体是**照 rules 抄的**（存档不存这些）'
+                % (n, '（只含与 rules 不同的武器）' if only else '', path),
                 parent=self)
 
     def _wpn_users(self, weapon):
