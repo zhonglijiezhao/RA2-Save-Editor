@@ -796,6 +796,12 @@ class SaveDoc(object):
     def __init__(self, path):
         self.path = path
         self.error = None
+        # ★2026-10-28：记下"这份档在哪个目录"，让 core 能就近找到 rules/art
+        #   （玩家把游戏装在任意位置时，可建造判定 / Foundation / Power 才不会静默失效）
+        try:
+            self.note_save_dir(path)
+        except Exception:
+            pass
         self.load()
 
     # ---------- 读取 ----------
@@ -6057,7 +6063,9 @@ class SaveDoc(object):
     #   从业没见过更大的任务图 ⇒ 读出的尺寸只要超过 200×200，基本就是读错了（口径不对/字段偏移错）。
     MAP_TILE_MAX = 200
     _CELL_STRUCT_MIN = 64          # 少于这么多槽就不认（防止误认单条 GUID）
-    _ART_PATHS = [
+    # ★2026-10-28（审查 P0-4）：art 同样不再写死开发者路径 —— 主路径走
+    #   `_resolve_rule_files()` 里 game_ini 找到的那一份；这份只作兜底。
+    _LEGACY_ART_PATHS = [
         r'E:\YURI\artmd.ini',
         r'E:\YURI\artmd - 原版副本.ini',
         r'C:\Users\zhao5\Desktop\WorkBuddy\红警MOD制作素材工具与教程\artmd.ini',
@@ -8744,6 +8752,11 @@ class SaveDoc(object):
         （默认行为，等于旧版）。非 None 时把记录 `+0x150`(int) 与 `+0x164`(float 2−n)
         **成对改写** —— 这两个字段在全档 1394 个单位里严格孪生，必须一起改。
         """
+        # ★2026-10-28 修：原来 `warnings = []` 在函数中段（约 8966 行）才初始化，
+        #   而前面"缺移动方式模板"的 else 分支（约 8890 行）就已经 append ⇒ 那条分支
+        #   必抛 `UnboundLocalError`（玩家看到的是一句看不懂的
+        #   "cannot access local variable 'warnings'"）。警告列表必须一开始就存在。
+        warnings = []
         t = str(type_name).strip().upper()
         if not t:
             raise ValueError('单位类型不能为空')
@@ -8963,7 +8976,8 @@ class SaveDoc(object):
                 struct.pack_into('<I', blob, 0xB8, _alt)
 
         # ---- 所属方（★2026-10-17 新增：house 参数真正改主人，不再只挑模板）----
-        warnings = []
+        # ★注意：`warnings` 已在函数开头初始化（见顶部注释），这里**不能**再 `= []`，
+        #   否则会把前面"缺移动方式模板"等早先攒下的警告冲掉。
         # ★★2026-10-23 §209（玩家实测：SAVE0029 上四个变体全隐形）：
         #   跨型号克隆**载具**（本档没有该型号）目前拿不到能显示的单位 —— 记录内容已经不是变量：
         #   移动方式/类型键/HP/同档 A/B 找出的 9 个型号派生槽（记录 3 + 伴随 6）/类型对象/指针表/
@@ -9493,7 +9507,19 @@ class SaveDoc(object):
     QUEUE_CONST_PTR = 0x0f8e63e0      # 队列条目固定指针（三档恒在，照抄）
 
     # ---- rules 解析（可建造判据：TechLevel>=1，用户钦定 2026-10-15）----
-    _RULES_PATHS = [
+    # ★★2026-10-28（审查 P0-4 / P2-12）：原来这里写死三条**开发者本机**路径，
+    #   而 `SaveDoc.__init__` 根本不接受游戏目录 ⇒ 玩家把游戏装在 D:\Games\RA2 时
+    #   永远读不到 rules，可建造判定 / Foundation / Power 全部**静默失效**
+    #   （不报错，只是结果不对）。现在改成动态解析，优先级：
+    #     ① `set_game_dir()` 显式指定（GUI 灌进来）
+    #     ② 存档所在目录及其上溯（存档常在 <GameDir>\ 或 <GameDir>\save\ 下）
+    #     ③ `game_ini.find_sources()` —— 还能从 MIX 里抽、能回落到内置副本
+    #     ④ `_LEGACY_RULES_PATHS`（只为兼容老机器/老版本行为，不再作为主路径）
+    GAME_DIR = None                    # 游戏安装目录（None = 未指定，就近找）
+    _recent_save_dirs = []             # 最近打开过的存档目录（最多 4 个）
+    _rules_files = None                # 解析结果缓存：(rules_path, art_path)
+    _rules_all_cache = None            # rules 全量节表 {节名: {键: 值}}（武器/弹头名字表用）
+    _LEGACY_RULES_PATHS = [
         r'E:\YURI\rulesmd.ini',
         r'E:\YURI\rulesmd - 原版副本.ini',
         r'C:\Users\zhao5\Desktop\WorkBuddy\红警MOD制作素材工具与教程\rulesmd - 原版副本.ini',
@@ -9503,10 +9529,125 @@ class SaveDoc(object):
     _rules_prereq = {}            # {类型名: Prerequisite 原串}（用于就绪赠送的前置诊断）
     _rules_image = {}             # {类型名: Image=}（→ artmd 节名，用于查 Foundation）
     _rules_power = {}             # {类型名: Power=}（正=发电 / 负=耗电；2026-10-17）
+    _rules_order = []             # [BuildingTypes] 的 0 基顺序（侧栏槽位 A 值）
     # rules 前置里的别名 ⇒ 实际类型（判"前置是否满足"用）
     _PREREQ_ALIAS = {'POWER': ('GAPOWR', 'NAPOWR'), 'PROC': ('GAREFN', 'NAREFN'),
                      'BARRACKS': ('GAPILE', 'NAHAND'), 'RADAR': ('GAAIRC', 'NARADR'),
                      'FACTORY': ('GAWEAP', 'NAWEAP'), 'TECH': ('GATECH', 'NATECH')}
+
+    # ---- 规则文件定位（2026-10-28 新增，见上面 P0-4 注释）----------------
+    @classmethod
+    def set_game_dir(cls, d):
+        """告诉 core「游戏装在哪」—— GUI 在开档 / 改目录时调一次。
+
+        传 None / 空 / 不存在的目录 = 清掉显式设置，回到"就近找"。总是清缓存。
+        """
+        nd = (str(d).strip() or None) if d else None
+        if nd and not os.path.isdir(nd):
+            nd = None
+        cls.GAME_DIR = nd
+        cls._reset_rule_cache()
+
+    @classmethod
+    def note_save_dir(cls, path):
+        """记下"刚打开过哪个目录的存档"—— 没配游戏目录的玩家也能就近找到 rules。"""
+        try:
+            d = os.path.dirname(os.path.abspath(path))
+        except Exception:
+            return
+        if not d:
+            return
+        lst = cls._recent_save_dirs
+        _same = bool(lst) and lst[0] == d
+        if d in lst:
+            lst.remove(d)
+        lst.insert(0, d)
+        del lst[4:]                    # 只留最近 4 个，别越攒越多
+        if not _same:
+            # 目录没变就别清缓存 —— 否则批量开档（列表页预读 12 档）会反复重解析 rules
+            cls._reset_rule_cache()
+
+    @classmethod
+    def _reset_rule_cache(cls):
+        cls._rules_files = None
+        cls._rules_cache = None
+        cls._rules_all_cache = None
+        cls._foundation_cache = None
+        cls._rules_buildcat = {}
+        cls._rules_prereq = {}
+        cls._rules_image = {}
+        cls._rules_power = {}
+        cls._rules_order = []
+
+    @classmethod
+    def _resolve_rule_files(cls):
+        """→ `(rules_path, art_path)`，找不到是 `(None, None)`；结果缓存在 `_rules_files`。"""
+        if cls._rules_files is not None:
+            return cls._rules_files
+        save_dir = cls._recent_save_dirs[0] if cls._recent_save_dirs else None
+        rp = ap = None
+        # ① game_ini 那条成熟链路（显式目录 > 存档目录及上一级 > MIX 抽取 > 内置）
+        try:
+            import game_ini
+            _src, _d, rp, ap = game_ini.find_sources(save_dir, cls.GAME_DIR)
+        except Exception:
+            rp = ap = None
+        # ② 兜底：老清单（保住开发机 / 老版本行为）
+        if not rp:
+            for p in cls._LEGACY_RULES_PATHS:
+                if os.path.exists(p):
+                    rp = p
+                    if not ap:
+                        cand = os.path.join(os.path.dirname(p), 'artmd.ini')
+                        ap = cand if os.path.exists(cand) else None
+                    break
+        cls._rules_files = (rp, ap)
+        return cls._rules_files
+
+    @classmethod
+    def rules_source(cls):
+        """规则文件实际来自哪（给界面显示 / 诊断用）。"""
+        rp, ap = cls._resolve_rule_files()
+        return {'rules': rp, 'art': ap, 'game_dir': cls.GAME_DIR, 'ok': bool(rp)}
+
+    @classmethod
+    def _rules_all(cls):
+        """把 rules ini **全量**解析成 `{节名: {键: 值}}`（类级缓存，换游戏目录才失效）。
+
+        `_rules_info` 只抽了 TechLevel/BuildCat/… 那几项；武器/弹头/抛射体要的是
+        `Damage`/`ROF`/`Verses`/`Warhead=` 这些，所以单独来一份全量的。
+        """
+        if cls._rules_all_cache is not None:
+            return cls._rules_all_cache
+        out = {}
+        rp, _ap = cls._resolve_rule_files()
+        if rp and os.path.exists(rp):
+            try:
+                raw = open(rp, 'rb').read()
+                txt = None
+                for enc in ('utf-16', 'utf-8', 'gbk'):
+                    try:
+                        txt = raw.decode(enc)
+                        if '[' in txt:
+                            break
+                    except Exception:
+                        continue
+                cur = None
+                for line in (txt or '').splitlines():
+                    line = line.split(';')[0].strip()
+                    if not line:
+                        continue
+                    if line.startswith('[') and line.endswith(']'):
+                        cur = line[1:-1].strip()
+                        out.setdefault(cur, {})
+                        continue
+                    if cur and '=' in line:
+                        k, v = line.split('=', 1)
+                        out[cur].setdefault(k.strip(), v.strip())
+            except Exception:
+                out = {}
+        cls._rules_all_cache = out
+        return out
 
     @classmethod
     def _rules_info(cls):
@@ -9518,7 +9659,12 @@ class SaveDoc(object):
         cls._rules_prereq = {}
         cls._rules_image = {}
         cls._rules_power = {}
-        for p in cls._RULES_PATHS:
+        # ★2026-10-28：`_rules_order` 以前用 `if not hasattr(cls, '_rules_order')` 惰性建表，
+        #   缓存一失效就**接着往后 append** ⇒ 序号翻倍、侧栏槽位全错。现在每次解析先清空。
+        cls._rules_order = []
+        _rp, _ap = cls._resolve_rule_files()
+        paths = [_rp] if _rp else list(cls._LEGACY_RULES_PATHS)
+        for p in paths:
             if not os.path.exists(p):
                 continue
             try:
@@ -9545,8 +9691,6 @@ class SaveDoc(object):
                         nm = v.split(',')[0].split(':')[0].strip().upper()
                         if nm:
                             buildings.add(nm)
-                            if not hasattr(cls, '_rules_order'):
-                                cls._rules_order = []
                             cls._rules_order.append(nm)
                     elif sec in buildings or k in ('TECHLEVEL', 'BUILDCAT', 'PREREQUISITE',
                                                    'IMAGE', 'POWER'):
@@ -10133,7 +10277,8 @@ class SaveDoc(object):
         if cls._foundation_cache is not None:
             return cls._foundation_cache
         out = {}
-        for p in cls._ART_PATHS:
+        _rp, _ap = cls._resolve_rule_files()
+        for p in ([_ap] if _ap else list(cls._LEGACY_ART_PATHS)):
             if not os.path.exists(p):
                 continue
             try:
@@ -12345,6 +12490,331 @@ class SaveDoc(object):
                            len(cks) - len(removed_comp) - len(moved_comp), trimmed))
         return out
 
+    # ------------------------------------------------------------------ #
+    # 武器 / 弹头 类型对象（★2026-10-28 新发现，只读）
+    #
+    # 结论先写在这儿：**武器/抛射体/弹头不是"每个单位一份"，而是存档里一张
+    # 全局类型表**。单位实例只存"我是哪个型号"，型号决定用哪把武器。
+    # 但——这张表**确实在存档明文里**，而且是完整数值（不只是名字）。
+    #
+    # 实测布局（`X` = 对象第一份名字缓冲的起点，本档 SAVE0665 逐项验过）：
+    #   X + 0x00   ID    串（64 字节定长，null 补齐）
+    #   X + 0x40   Name  串（同一份，64 字节定长）—— **这个"双名 +0x40"是
+    #              存档里所有 Type 类（武器/弹头/抛射体/动画/建筑…）的通用特征**
+    #   X + 0x80   Damage   u32
+    #   X + 0x84   （未定，与 Damage 无关，本档 121/50/113… 随武器变）
+    #   X + 0x8C   ROF      u32（帧）
+    #   X + 0x90   Range    u32（**lepton**，1 格 = 256；Range=5.5 ⇒ 1408）
+    #
+    # 弹头（WarheadType）：
+    #   X + 0x7C   Verses   **11 个 double**（不是 float！），对应 11 种装甲，
+    #              顺序见 `ARMOR_ORDER`。实测 PrismWarhead / SA / AP 三个全中。
+    #
+    # 验证记录（2026-10-28，`E:/YURI/SAVE0665_修改.SAV`，199 把武器）：
+    #   与 rulesmd.ini 逐项比对 ⇒ 184 把完全一致（10 处 Range 小数舍入属正常），
+    #   **15 处真不一致**（如 SonicZap Damage rules 100 / 存档 4、
+    #   Maverick3 1100/750、ChaosAttack ROF 30/45、IvanBomber 600/400）
+    #   ⇒ 存档存的是**存盘当时的有效值**（地图 INI / MIX 里的规则覆盖也会体现在这儿），
+    #     不是"照抄散装 rulesmd.ini"。
+    #
+    # ⚠ 还没验的事：**读档时引擎到底用存档这份、还是重新读 rules**。
+    #   要坐实得进游戏实测（改 PrismShot Damage 120→999，读档打一枪看是否秒杀）。
+    # ------------------------------------------------------------------ #
+    ARMOR_ORDER = ('none', 'flak', 'plate', 'light', 'medium', 'heavy',
+                   'wood', 'steel', 'concrete', 'special1', 'special2')
+    WEAPON_DMG_OFF = 0x80
+    WEAPON_ROF_OFF = 0x8C
+    WEAPON_RANGE_OFF = 0x90
+    WARHEAD_VERSES_OFF = 0x7C
+    VERSES_COUNT = 11
+
+    def _type_objects(self):
+        """扫出所有"双名缓冲"的 Type 对象 → `[(偏移, 名字)]`（缓存到 `_typeobjs_memo`）。
+
+        特征：`X` 起是可打印 ASCII 名（2~31 字节、null 结尾），且 `X+0x40` 处是**同一份**。
+        这个特征覆盖存档里**全部** Type 类（武器/弹头/抛射体/动画/建筑/步兵/阵营…），
+        所以还要靠 rules 的名字表再分类（见 `weapon_objects` / `warhead_objects`）。
+
+        ★首字符必须允许**数字** —— `105mm` `120mm` `2Inch` 这类武器名就是以数字开头的，
+          第一版只认 `A-z` 漏了 36 把（自检 §295 逮到）。
+
+        ★性能：逐字节 Python 循环扫 26.7MB 要 **4.2 秒**；改成 `re.finditer` 走 C 引擎
+          只要 **203ms**（同一份档、结果逐项一致，实测 1196 个对象）。
+        """
+        memo = getattr(self, '_typeobjs_memo', None)
+        if memo is not None:
+            return memo
+        pl = bytes(self.plain)
+        rx = getattr(SaveDoc, '_RX_TYPE_NAME', None)
+        if rx is None:
+            rx = re.compile(rb'[0-9A-Za-z_.\-]{2,31}\x00')
+            SaveDoc._RX_TYPE_NAME = rx
+        out = []
+        for m in rx.finditer(pl):
+            i = m.start()
+            ln = m.end() - 1 - i
+            if ln < 2:
+                continue
+            if pl[i + 0x40:i + 0x40 + ln] == pl[i:i + ln] and pl[i + 0x40 + ln] == 0:
+                out.append((i, pl[i:i + ln].decode('ascii', 'replace')))
+        self._typeobjs_memo = out
+        return out
+
+    @classmethod
+    def _rules_list(cls, r, sec):
+        """`[Warheads] 1=SA 2=…` 这类"总表" → 名字集合。"""
+        out = set()
+        for k, v in (r.get(sec) or {}).items():
+            if k.isdigit() and v:
+                out.add(v.strip())
+        return out
+
+    @classmethod
+    def _names_by_key(cls, r, keys):
+        """所有节里 `keys` 这些键的**取值**集合（如 Primary/Secondary → 武器名）。"""
+        out = set()
+        for _sec, kv in r.items():
+            for k in keys:
+                v = kv.get(k)
+                if v:
+                    out.add(v.strip())
+        return out
+
+    def _weapon_name_set(self):
+        r = self._rules_all()
+        if not r:
+            return None                     # 没 rules ⇒ 交给结构特征兜底
+        names = {s for s, kv in r.items() if 'Damage' in kv and 'ROF' in kv}
+        names |= self._rules_list(r, 'WeaponTypes')
+        names |= self._names_by_key(r, ('Primary', 'Secondary',
+                                        'ElitePrimary', 'EliteSecondary'))
+        return names
+
+    def _warhead_name_set(self):
+        r = self._rules_all()
+        if not r:
+            return None
+        names = {s for s, kv in r.items() if 'Verses' in kv}
+        names |= self._rules_list(r, 'Warheads')
+        names |= self._names_by_key(r, ('Warhead',))
+        return names
+
+    def weapon_objects(self):
+        """→ `[{'name','off','damage','rof','range','range_cells'}]`（只读）。
+
+        名字以 rules 为准（`Damage`+`ROF` 的节 / `Primary` 等键的取值），
+        存档里按名字找对象读数值；没有 rules 时退回结构特征
+        （`+0x8C` ROF ∈ (0,2000]、`+0x90` Range ≤ RANGE_MAX_L、`+0x80` Damage ≤ 100000）。
+
+        ★2026-10-28（玩家把射程改成 90 格后这把武器**从列表里消失**了，才发现这里还写死
+          `0x4000`（64 格）—— 那是旧护栏。改值上限放宽到 255 格后，扫描过滤必须跟着放宽，
+          否则"改完就看不见"，而且 `_find_weapon` 会报"存档里没有这把武器"。
+        
+        """
+        pl = self.plain
+        want = self._weapon_name_set()
+        out = []
+        for off, nm in self._type_objects():
+            try:
+                dmg = struct.unpack_from('<I', pl, off + self.WEAPON_DMG_OFF)[0]
+                rof = struct.unpack_from('<I', pl, off + self.WEAPON_ROF_OFF)[0]
+                rng = struct.unpack_from('<I', pl, off + self.WEAPON_RANGE_OFF)[0]
+            except Exception:
+                continue
+            if not (0 < rof <= 2000 and dmg <= 100000
+                    and 0 < rng <= self.RANGE_MAX_L):
+                continue
+            if want is not None:
+                if nm not in want:
+                    continue
+            elif rng % 32:                  # 无 rules 时：至少要是 1/8 格
+                continue
+            out.append({'name': nm, 'off': off, 'damage': dmg, 'rof': rof,
+                        'range': rng, 'range_cells': rng / 256.0})
+        return out
+
+    def warhead_objects(self):
+        """→ `[{'name','off','verses':[11 个系数]}]`（只读）。
+
+        ★必须靠 rules 的名字表定位 —— 纯结构特征（11 个 double）会把**阵营对象**
+          （Americans/Alliance/…）误判成弹头，第一版就踩了这个坑（自检 §295）。
+          没有 rules 时返回空列表（宁可没有，也不给错的）。
+        """
+        pl = self.plain
+        want = self._warhead_name_set()
+        if not want:
+            return []
+        out = []
+        for off, nm in self._type_objects():
+            if nm not in want:
+                continue
+            try:
+                vs = struct.unpack_from('<%dd' % self.VERSES_COUNT,
+                                        pl, off + self.WARHEAD_VERSES_OFF)
+            except Exception:
+                continue
+            if all(-0.01 <= v <= 10.0 for v in vs) and sum(1 for v in vs if v >= 0.5) >= 6:
+                out.append({'name': nm, 'off': off, 'verses': list(vs)})
+        # 同名可能命中两个对象（实测 `Special` 就是 2 个）⇒ 只留第一份，避免界面重复
+        seen, uniq = set(), []
+        for x in out:
+            if x['name'] in seen:
+                continue
+            seen.add(x['name'])
+            uniq.append(x)
+        return uniq
+
+    def weapon_warhead_map(self):
+        """`{武器名: 弹头名}` —— 从 rules 反查（武器对象里弹头是**指针**，不是名字）。"""
+        memo = getattr(self, '_wpnwh_memo', None)
+        if memo is not None:
+            return memo
+        out = {}
+        for nm, kv in (self._rules_all() or {}).items():
+            wh = kv.get('Warhead')
+            if wh:
+                out[nm] = wh.strip()
+        self._wpnwh_memo = out
+        return out
+
+    # ------------------------------------------------------------------ #
+    # 写：改武器 / 弹头数值（★2026-10-28）
+    #
+    # ★★为什么这条路可行（玩家 2026-10-28 亲口确认）：
+    #    **改 rulesmd.ini 不会影响已存盘存档里的武器效果** ⇒ 读档时引擎用的是
+    #    存档里这份类型表，不是重新读 ini。所以改这里的定长字段是**真正生效**的，
+    #    而且只影响这一份存档（不动 rules、不影响别的档、不影响联机同步的其他人）。
+    #
+    # ★安全性：Damage/ROF/Range 都是**定长 u32**，Verses 是**定长 double**
+    #   ⇒ 只改值、不改长度 ⇒ 明文偏移一个都不动 ⇒ 不需要 `invalidate_caches`，
+    #   也不会碰"残留键/块布局"那些雷。这是本项目里最安全的一类写入。
+    # ------------------------------------------------------------------ #
+    # ★2026-10-28（玩家问「射程上限凭什么是 64 格」）：**这是我设的护栏，不是引擎限制**。
+    #   实测游戏自带数据的真实分布：
+    #     · 本档 213 把武器：最大 25 格（HornetLauncher / DredLauncher），中位数 6 格
+    #     · rulesmd.ini 全部 328 个 Range=：最大 40 格（EMPulseWeapon）
+    #     · rulesmd.ini 全部 576 个 Sight=：最大 20 格（DREDA）
+    #   字段本身是 u32（lepton），塞多大都不会溢出；真正的边界是"地图只有 200×200"，
+    #   所以上限放到 **255 格**（超过地图对角线，再多没意义），并保留 1/8 格精度。
+    #   超过 40 格会给一条**软警告**（不拦），因为能不能开火还要看单位 Sight。
+    RANGE_MIN_L = 32           # 1/8 格
+    RANGE_MAX_L = 255 * 256    # 255 格
+    RANGE_TYPICAL_L = 40 * 256 # 游戏自带数据的最大值（超过就提醒一句）
+    WEAPON_FIELDS = {
+        # 键名       偏移                    下限          上限            单位
+        'damage': (WEAPON_DMG_OFF, 0, 100000, '点'),
+        'rof':    (WEAPON_ROF_OFF, 1, 2000, '帧（**越小越快**）'),
+        'range':  (WEAPON_RANGE_OFF, RANGE_MIN_L, RANGE_MAX_L, '格'),
+    }
+
+    def _find_weapon(self, name):
+        """按名字找**唯一**一个武器对象；找不到/重名都报清楚。"""
+        n = str(name).strip()
+        hit = [x for x in self.weapon_objects() if x['name'] == n]
+        if not hit:
+            cands = [x['name'] for x in self.weapon_objects()
+                     if n.lower() in x['name'].lower()][:8]
+            raise KeyError('存档里没有武器「%s」%s'
+                           % (n, ('；相近的有：' + '、'.join(cands)) if cands else ''))
+        if len(hit) > 1:
+            raise KeyError('武器「%s」在存档里有 %d 个对象，不确定改哪个' % (n, len(hit)))
+        return hit[0]
+
+    def set_weapon_field(self, name, field, value):
+        """改某把武器的 `damage` / `rof` / `range`。**定长写，明文长度不变。**
+
+        `range` 传**格**（如 5.5），内部换成 lepton（×256，且必须是 1/8 格的整数倍）。
+        → `{'name','field','old','new','off'}`；越界抛 `ValueError`。
+        """
+        f = str(field).strip().lower()
+        if f not in self.WEAPON_FIELDS:
+            raise ValueError('字段只能是 %s（收到 %r）'
+                             % ('/'.join(self.WEAPON_FIELDS), field))
+        off_delta, lo, hi, unit = self.WEAPON_FIELDS[f]
+        w = self._find_weapon(name)
+
+        if f == 'range':
+            try:
+                cells = float(value)
+            except Exception:
+                raise ValueError('range 要传格数（如 5.5），收到 %r' % (value,))
+            raw = int(round(cells * 256))
+            if raw % 32:
+                raise ValueError('range 精度只到 1/8 格（0.125），收到 %r' % (value,))
+        else:
+            try:
+                raw = int(float(value))
+            except Exception:
+                raise ValueError('%s 要传整数，收到 %r' % (f, value))
+        if not (lo <= raw <= hi):
+            if f == 'range':
+                raise ValueError('射程超出范围 %g ~ %g 格（收到 %g 格）。'
+                                 '字段本身放得下，但地图只有 200×200，再远没有意义'
+                                 % (lo / 256.0, hi / 256.0, raw / 256.0))
+            raise ValueError('%s 超出范围 %s..%s（%s），收到 %s'
+                             % (f, lo, hi, unit, raw))
+
+        off = w['off'] + off_delta
+        old = struct.unpack_from('<I', self.plain, off)[0]
+        # 软警告（不拦）：射程超过游戏自带的最大值
+        warn = ''
+        if f == 'range' and raw > self.RANGE_TYPICAL_L:
+            warn = ('射程 %g 格超出游戏自带的最大值（%g 格）；实际能不能开火还要看'
+                    '单位的 Sight（全游戏最大 20 格），太远可能"看得见打不着"或干脆不索敌'
+                    % (raw / 256.0, self.RANGE_TYPICAL_L / 256.0))
+        if old == raw:
+            return {'name': w['name'], 'field': f, 'old': old, 'new': raw,
+                    'off': off, 'changed': False, 'warn': warn}
+        struct.pack_into('<I', self.plain, off, raw)
+        return {'name': w['name'], 'field': f, 'old': old, 'new': raw,
+                'off': off, 'changed': True, 'warn': warn}
+
+    def set_warhead_verse(self, name, armor, percent):
+        """改某个弹头对某类装甲的伤害系数。**定长写（double），明文长度不变。**
+
+        `armor` 传 1..11 的序号，或 `ARMOR_ORDER` 里的名字（none/flak/…/special2）。
+        `percent` 传百分比（100 = 100%，可以是 200、0、12.5…）。
+        → `{'name','armor','index','old','new','off'}`。
+        """
+        n = str(name).strip()
+        hit = [x for x in self.warhead_objects() if x['name'] == n]
+        if not hit:
+            cands = [x['name'] for x in self.warhead_objects()
+                     if n.lower() in x['name'].lower()][:8]
+            raise KeyError('存档里没有弹头「%s」%s'
+                           % (n, ('；相近的有：' + '、'.join(cands)) if cands else ''))
+        wh = hit[0]
+        # 装甲：序号（1 基）或名字
+        idx = None
+        s = str(armor).strip()
+        if s.isdigit():
+            i = int(s)
+            if not (1 <= i <= self.VERSES_COUNT):
+                raise ValueError('装甲序号只能是 1..%d（收到 %d）'
+                                 % (self.VERSES_COUNT, i))
+            idx = i - 1
+        else:
+            low = s.lower()
+            if low not in self.ARMOR_ORDER:
+                raise ValueError('装甲名只能是 %s（收到 %r）'
+                                 % ('/'.join(self.ARMOR_ORDER), armor))
+            idx = self.ARMOR_ORDER.index(low)
+        try:
+            pct = float(percent)
+        except Exception:
+            raise ValueError('百分比要传数字（100 = 100%%），收到 %r' % (percent,))
+        if not (0 <= pct <= 1000):
+            raise ValueError('百分比超出 0..1000（收到 %g）' % pct)
+        new = pct / 100.0
+        off = wh['off'] + self.WARHEAD_VERSES_OFF + 8 * idx
+        old = struct.unpack_from('<d', self.plain, off)[0]
+        if abs(old - new) < 1e-12:
+            return {'name': wh['name'], 'armor': self.ARMOR_ORDER[idx], 'index': idx + 1,
+                    'old': old, 'new': new, 'off': off, 'changed': False}
+        struct.pack_into('<d', self.plain, off, new)
+        return {'name': wh['name'], 'armor': self.ARMOR_ORDER[idx], 'index': idx + 1,
+                'old': old, 'new': new, 'off': off, 'changed': True}
+
     def map_tile_size(self):
         """★2026-10-18 新增：**真正的地图尺寸**（与 FA2「地图参数」的 宽度/高度 同口径）。
 
@@ -13665,9 +14135,43 @@ class SaveDoc(object):
                 or bool(getattr(self, 'pending_bld', False))
                 or getattr(self, 'pending_newtrig', False))
 
+    def modified(self):
+        """明文是否和**打开时**不一样 —— 判断"有没有未保存改动"的**权威判据**。
+
+        ★2026-10-28（审查 P1-5）：`dirty()` 只统计 `pending_*` 那几类"延迟写"操作，
+          而像 `set_waypoint` / `add_action` / `remove_building` 这类**直接改明文**的
+          操作它看不到（实测 `set_waypoint` 改了明文但 `dirty()` 仍返回 False）⇒
+          拿 `dirty()` 做"关窗提醒"会漏报。这里直接比明文，C 层比较，
+          26.7MB 实测 2.2ms（有差异时 0.02ms 就短路返回）。
+        """
+        try:
+            return self.plain != self.plain_orig
+        except Exception:
+            return self.dirty()
+
     def diff(self):
+        """→ `[(偏移, 旧字节, 新字节), ...]`。
+
+        ★2026-10-28（审查 P3-16）：原来是 `for i in range(len(a))` 逐字节扫 26MB 明文，
+          一次要 5~10 秒（还是纯 Python 循环）。改成**先按 64KB 块比**，只对不相同的块
+          逐字节扫 —— 常见改动只有几处，耗时降到毫秒级。返回格式不变（`_selftest.py` 在用）。
+        """
         a, b = self.plain_orig, bytes(self.plain)
-        return [(i, a[i], b[i]) for i in range(len(a)) if a[i] != b[i]]
+        if len(a) != len(b):
+            # 增删对象会改变明文长度 ⇒ 退化到逐字节（只在自检脚本里会走到）
+            n = min(len(a), len(b))
+            return [(i, a[i], b[i]) for i in range(n) if a[i] != b[i]]
+        out = []
+        CH = 65536
+        for base in range(0, len(a), CH):
+            sa = a[base:base + CH]
+            sb = b[base:base + CH]
+            if sa == sb:
+                continue
+            for i in range(len(sa)):
+                if sa[i] != sb[i]:
+                    out.append((base + i, sa[i], sb[i]))
+        return out
 
     def _rechunk(self, new_plain):
         """按 65536 重切 CONTENTS（**与游戏一致**），返回 (新 CONTENTS, 重编码块数)。
@@ -13742,6 +14246,23 @@ class SaveDoc(object):
             raise RuntimeError('重切结果为空')
         return out, recompressed
 
+    @staticmethod
+    def _block_layout(cc):
+        """数 CONTENTS 里的块 → `(块数, [(序号, 声明 unpacked), ...] 异常块)`。
+
+        2026-10-28 从 `save()` 里抽出来，好让"写盘前"和"回读后"共用同一份判据。
+        """
+        p, n, bad = 0, 0, []
+        while p + 8 <= len(cc):
+            pk, uk = struct.unpack_from('<II', cc, p)
+            if pk == 0:
+                break
+            n += 1
+            if uk != CONTENTS_UNPACKED:
+                bad.append((n, uk))
+            p += 8 + pk
+        return n, bad
+
     def save(self, out_path, backup=True):
         """重建 CONTENTS 并写盘（**块布局与游戏一致**：65536 × N，无短尾块）。
 
@@ -13764,12 +14285,26 @@ class SaveDoc(object):
                 '带着它们进游戏会弹 Internal error。请用「清理残留引用」重试，'
                 '或者撤销这次改动后换新版重新操作。'
                 % (len(_left), '、'.join('%08X' % k for k in list(_left)[:3])))
+        # ★2026-10-28（审查 P3-15）：原来这里 `bytes(self.plain)` 复制了两次
+        #   （一次给 new_plain，一次只为和 plain_orig 比大小）—— 26MB 明文白抄一遍。
+        #   bytearray 可以直接和 bytes 比较，省掉第二次复制。
         new_plain = bytes(self.plain)
-        if bytes(self.plain) == self.plain_orig:
+        if self.plain == self.plain_orig:
             raise RuntimeError('没有任何修改')
         new_cc, recompressed = self._rechunk(new_plain)
         if not new_cc:
             raise RuntimeError('重建 CONTENTS 为空')
+        # ★★2026-10-28（审查 P0-3）：块布局自检以前是"只算不判"——`bad_declared`/
+        #   `blocks_expect` 算出来后塞进返回值，全项目**没有任何调用方读它**，块数不符
+        #   照样返回成功。docstring 写着"块数必须与游戏一致"，那就得真的卡住。
+        #   放在**写盘前**判：不通过就一个字节都不落盘，不会给玩家留半份坏档。
+        _nb, _bad = self._block_layout(new_cc)
+        _expect = (len(new_plain) + CONTENTS_CHUNK - 1) // CONTENTS_CHUNK
+        if _bad or _nb != _expect:
+            raise RuntimeError(
+                '块布局自检不通过，已拒绝写盘：块数 %d（应为 %d，明文 %d B ÷ %d），'
+                '声明 unpacked 异常的块 %r'
+                % (_nb, _expect, len(new_plain), CONTENTS_CHUNK, _bad[:5]))
         if backup and os.path.abspath(out_path) == os.path.abspath(self.path):
             bdir = os.path.join(os.path.dirname(os.path.abspath(self.path)), '_备份存档')
             os.makedirs(bdir, exist_ok=True)
@@ -13812,21 +14347,63 @@ class SaveDoc(object):
                                    + ('；surgery 异常：%s' % surgery_err if surgery_err else ''))
         # 分块自检：块数必须与游戏一致（明文/65536 向上取整），块头 unpacked 恒 65536
         cc2 = CFB(chk_raw).open('CONTENTS')
-        p, nblocks, bad = 0, 0, []
-        while p + 8 <= len(cc2):
-            pk, uk = struct.unpack_from('<II', cc2, p)
-            if pk == 0:
-                break
-            nblocks += 1
-            if uk != CONTENTS_UNPACKED:
-                bad.append((nblocks, uk))
-            p += 8 + pk
+        nblocks, bad = self._block_layout(cc2)
         expect = (len(new_plain) + CONTENTS_CHUNK - 1) // CONTENTS_CHUNK
-        return {'out': out_path, 'recompressed': recompressed,
-                'contents': (len(self.contents), len(new_cc)),
-                'file': len(chk_raw), 'md5': hashlib.md5(chk_raw).hexdigest(),
-                'blocks': nblocks, 'blocks_expect': expect, 'writer': writer,
-                'bad_declared': bad}
+        # 写盘前已经判过一次；这里是**落盘后回读**的二次确认（容器层可能改过块表）
+        if bad or nblocks != expect:
+            try:
+                if os.path.abspath(out_path) != os.path.abspath(self.path):
+                    os.remove(out_path)      # 别把坏档留在玩家选的位置上
+            except Exception:
+                pass
+            raise RuntimeError(
+                '保存后回读的块布局不对，已删除该输出文件：块数 %d（应为 %d），异常块 %r'
+                % (nblocks, expect, bad[:5]))
+        res = {'out': out_path, 'recompressed': recompressed,
+               'contents': (len(self.contents), len(new_cc)),
+               'file': len(chk_raw), 'md5': hashlib.md5(chk_raw).hexdigest(),
+               'blocks': nblocks, 'blocks_expect': expect, 'writer': writer,
+               'bad_declared': bad}
+        # ★★2026-10-28（审查 P1-5 连带修）：保存成功后把"基准"推进到刚写出的状态。
+        #   以前这里什么都不更新，后果有三：
+        #     ① `plain_orig` 还是**打开时**的明文 ⇒ `modified()` 永远 True，
+        #        标题栏的 `*未保存` 标记再也消不掉、关窗一直追问；
+        #     ② 另存为到新文件后 `self.path` 仍指原档 ⇒ 再点「原地保存」会去覆盖**原档**；
+        #     ③ `self.contents` 还是旧容器流 ⇒ 第二次保存的 surgery 定位会落空（白走 rebuild）。
+        self.path = out_path
+        self.plain_orig = new_plain
+        self.plain = bytearray(new_plain)
+        self.contents = new_cc
+        self.raw = chk_raw                # 让 info['文件大小'] 等也跟着更新
+        # `ranges` = [(明文偏移, 明文长度, 容器内偏移, packed 长度)]，`_rechunk` 下次靠它
+        # 复用未改动块的原始压缩字节 ⇒ 必须重算成新容器的块表，否则第二次保存会定位错。
+        try:
+            rs, pos2, off2 = [], 0, 0
+            while pos2 + 8 <= len(new_cc):
+                pk2, uk2 = struct.unpack_from('<II', new_cc, pos2)
+                if pk2 == 0:
+                    break
+                rs.append((off2, uk2, pos2, pk2))
+                off2 += uk2
+                pos2 += 8 + pk2
+            if rs:
+                self.ranges = rs
+        except Exception:
+            pass
+        # 清掉"延迟写"账本，`dirty()` 也跟着归零
+        self.pending_money = None
+        self.pending_houses = {}
+        self.pending_triggers = {}
+        self.pending_events = {}
+        self.pending_actions = {}
+        self.pending_attach = {}
+        self.pending_bld = False
+        self.pending_newtrig = False
+        try:
+            self.invalidate_caches()
+        except Exception:
+            pass
+        return res
 
     # ---------- 工具 ----------
     def hexdump(self, off, length=256):
@@ -13864,7 +14441,9 @@ class SaveDoc(object):
                   '_terrobjs', '_terrnames', '_terrsav', '_occ_memo',     # §281 Terrain
                   '_ovlcells', '_ovl_info', '_ovl_map',                   # §283 覆盖物/地图包
                   '_teamtypes', '_teamlbl',                              # §283.9 小队表缓存
-                  '_ovl_memo', '_ovl_names'):
+                  '_ovl_memo', '_ovl_names',
+                  # ★2026-10-28：武器/弹头类型表扫描（偏移相关，增删字节后必须重扫）
+                  '_typeobjs_memo', '_wpnwh_memo'):
             if hasattr(self, a):
                 setattr(self, a, None)
         if rescan:

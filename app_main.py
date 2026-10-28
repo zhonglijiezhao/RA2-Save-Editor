@@ -1741,6 +1741,222 @@ def trigactions_cmd(args):
         _write_report("TRIGACTIONS FAIL\n\n" + traceback.format_exc())
         return 1
 
+def setweapon_cmd(args, kind='weapon'):
+    """--setweapon <in> <out> <武器> <damage|rof|range> <值> [再一组…]
+       --setwarhead <in> <out> <弹头> <装甲 1-11 或名字> <百分比> [再一组…]
+
+    改的是**存档里那份武器类型表**（玩家 2026-10-28 确认：改 rulesmd.ini 不影响已存盘
+    存档里的武器效果 ⇒ 读档时引擎用的是存档这份）。所以：
+      · 只影响这一份存档，不动 rules、不影响别的档
+      · Damage/ROF/Range 是**定长 u32**、Verses 是**定长 double** ⇒ 明文长度不变，
+        不触发"残留键 / 块布局"那些雷，是本项目里最安全的一类写入
+    写完**重新打开输出文件回读**，逐项核对再报 PASS。
+    """
+    if len(args) < 5:
+        _write_report('SETWEAPON FAIL\n用法:\n'
+                      '  --setweapon <in> <out> <武器> <damage|rof|range> <值> [更多组…]\n'
+                      '  --setwarhead <in> <out> <弹头> <装甲1-11|名字> <百分比> [更多组…]')
+        return 2
+    src, dst = args[0], args[1]
+    groups = args[2:]
+    if len(groups) % 3:
+        _write_report('SETWEAPON FAIL\n参数要成三组：<目标> <字段/装甲> <值>（收到 %d 个）'
+                      % len(groups))
+        return 2
+    try:
+        from editor_core import SaveDoc
+        d = SaveDoc(src)
+        n0 = len(d.plain)
+        done = []
+        for i in range(0, len(groups), 3):
+            a, b, c = groups[i], groups[i + 1], groups[i + 2]
+            if kind == 'weapon':
+                r = d.set_weapon_field(a, b, c)
+                if b.strip().lower() == 'range':
+                    shown = '%g 格' % (r['new'] / 256.0)
+                    old = '%g 格' % (r['old'] / 256.0)
+                else:
+                    shown, old = str(r['new']), str(r['old'])
+                done.append((r['name'], b.strip().lower(), old, shown, r['off'],
+                             r['changed'], r.get('warn') or ''))
+            else:
+                r = d.set_warhead_verse(a, b, c)
+                done.append((r['name'], '对 %s(%d)' % (r['armor'], r['index']),
+                             '%g%%' % (r['old'] * 100), '%g%%' % (r['new'] * 100),
+                             r['off'], r['changed'], ''))
+        if len(d.plain) != n0:
+            raise RuntimeError('内部错误：明文长度变了（%d → %d），本应定长'
+                               % (n0, len(d.plain)))
+        res = d.save(dst)
+    except Exception as e:
+        _write_report('SETWEAPON FAIL\n%s: %s' % (type(e).__name__, e))
+        return 1
+
+    # 回读核对（不信内存，重新打开写出来的文件）
+    lines = ['SETWEAPON PASS', 'in  : %s' % src, 'out : %s' % dst,
+             '明文长度 %d → %d（定长写入，未变）' % (n0, len(d.plain)),
+             '保存：块 %s/%s · %s · %d B · md5 %s'
+             % (res['blocks'], res['blocks_expect'], res['writer'],
+                res['file'], res['md5'][:12]), '',
+             '%-20s %-14s %-10s %-10s %s' % ('目标', '字段', '改前', '改后', '位置')]
+    try:
+        d2 = SaveDoc(dst)
+        ws = {x['name']: x for x in d2.weapon_objects()}
+        whs = {x['name']: x for x in d2.warhead_objects()}
+        ok = True
+        for name, field, old, new, off, changed, warn in done:
+            lines.append('%-20s %-14s %-10s %-10s 0x%06X%s'
+                         % (name, field, old, new, off, '' if changed else '（本来就是这值）'))
+            if warn:
+                lines.append('    ⚠ ' + warn)
+            if kind == 'weapon':
+                w = ws.get(name)
+                if not w:
+                    ok = False
+                    continue
+                got = {'damage': w['damage'], 'rof': w['rof'],
+                       'range': '%g 格' % w['range_cells']}.get(field)
+                if str(got) != str(new):
+                    ok = False
+                    lines.append('    ✗ 回读不一致：期望 %s，实得 %s' % (new, got))
+            else:
+                wh = whs.get(name)
+                if not wh:
+                    ok = False
+                    continue
+                idx = SaveDoc.ARMOR_ORDER.index(field.split('(')[0].replace('对 ', ''))
+                got = '%g%%' % (wh['verses'][idx] * 100)
+                if got != new:
+                    ok = False
+                    lines.append('    ✗ 回读不一致：期望 %s，实得 %s' % (new, got))
+        if not ok:
+            lines[0] = 'SETWEAPON FAIL（回读核对没过）'
+    except Exception as e:
+        lines.append('回读失败：%s' % e)
+        lines[0] = 'SETWEAPON FAIL'
+        ok = False
+    lines.append('')
+    if kind == 'weapon':
+        lines.append('注意：ROF 是**帧数，越小越快**；Range 精度 1/8 格。')
+    lines.append('只影响这一份存档，rulesmd.ini 一个字节没动。')
+    _write_report('\n'.join(lines))
+    return 0 if ok else 1
+
+
+def weapons_cmd(args):
+    """--weapons <存档> [--type 型号] [--n 60]：列出存档里的**武器 / 弹头**数值（只读）。
+
+    为什么要有（2026-10-28 玩家问"单位和防御建筑的武器/抛射体/弹头是什么、能不能改"）：
+      实测发现存档里有一张**全局武器类型表**，每个 WeaponType 对象带完整数值
+      （Damage `+0x80` / ROF `+0x8C` / Range `+0x90` 以 lepton 计），弹头带 11 项 Verses
+      （`+0x7C`，**double**）。而且这份数值和散装 rulesmd.ini **不一定一致**
+      —— 本档 213 把武器里有 15 处不同（SonicZap 100→4、Maverick3 1100→750…），
+      说明存的是**存盘当时的有效值**（地图 INI / MIX 里的覆盖也算在内）。
+
+    所以这个命令先解决"看得见"：把存档里到底存了什么值列出来，并标出与 rules 的差异。
+    ⚠ 还没验"改这些值读档后是否生效"（要进游戏实测），所以**这里只读、不写**。
+    """
+    typ, n = None, 60
+    rest, i = [], 0
+    while i < len(args):
+        if args[i] in ('--type', '-t') and i + 1 < len(args):
+            typ = args[i + 1].strip().upper(); i += 2; continue
+        if args[i] in ('--n', '--top') and i + 1 < len(args):
+            n = int(args[i + 1]); i += 2; continue
+        rest.append(args[i]); i += 1
+    if not rest:
+        _write_report('WEAPONS FAIL\n用法: --weapons <存档> [--type 型号] [--n 60]')
+        return 2
+    src = rest[0]
+    try:
+        from editor_core import SaveDoc
+        d = SaveDoc(src)
+        ws = d.weapon_objects()
+        whs = {x['name']: x for x in d.warhead_objects()}
+        whmap = d.weapon_warhead_map()
+        rules = SaveDoc._rules_all()
+        src_info = SaveDoc.rules_source()
+    except Exception as e:
+        _write_report('WEAPONS FAIL\n%s' % e)
+        return 1
+
+    lines = ['WEAPONS PASS', 'src : %s' % src,
+             '规则: %s' % (src_info.get('rules') or '（没找到 rulesmd.ini）'),
+             '存档里的类型对象：武器 %d 把 · 弹头 %d 个' % (len(ws), len(whs)), '']
+
+    def _num(v, default=None):
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    # ---- 单型号模式：看某兵/建筑的武器链 ----
+    if typ:
+        rs = rules.get(typ) or {}
+        if not rs:
+            lines.append('rules 里没有 [%s] 这一节' % typ)
+        else:
+            lines.append('=== [%s] %s ===' % (typ, rs.get('Name', '')))
+            for key in ('Primary', 'Secondary', 'ElitePrimary', 'EliteSecondary',
+                        'Weapon', 'Elbow', 'OccupantAnim'):
+                w = rs.get(key)
+                if not w:
+                    continue
+                hit = next((x for x in ws if x['name'] == w), None)
+                if not hit:
+                    lines.append('  %-16s = %-18s （存档里没有这个武器对象）' % (key, w))
+                    continue
+                whn = whmap.get(w, '?')
+                wh = whs.get(whn)
+                lines.append('  %-16s = %-18s Damage %-5d ROF %-4d Range %.2f 格  弹头 %s'
+                             % (key, w, hit['damage'], hit['rof'],
+                                hit['range_cells'], whn))
+                if wh:
+                    lines.append('  %-16s   Verses = %s' % ('', '/'.join(
+                        ('%g' % (v * 100)) + '%' for v in wh['verses'])))
+            if rs.get('Armor'):
+                lines.append('  装甲类型 = %s（对应 Verses 第 %d 项）'
+                             % (rs['Armor'],
+                                (SaveDoc.ARMOR_ORDER.index(rs['Armor'].lower()) + 1)
+                                if rs['Armor'].lower() in SaveDoc.ARMOR_ORDER else 0))
+        _write_report('\n'.join(lines))
+        return 0
+
+    # ---- 全量模式：列出所有武器，标出与 rules 的差异 ----
+    lines.append('%-22s %-7s %-5s %-8s %-16s %s'
+                 % ('武器', 'Damage', 'ROF', 'Range格', '弹头', '与 rulesmd.ini 的差异'))
+    lines.append('-' * 96)
+    diffs = 0
+    shown = 0
+    for x in ws:
+        r = rules.get(x['name']) or {}
+        marks = []
+        rd = _num(r.get('Damage'))
+        rr = _num(r.get('ROF'))
+        rg = _num(r.get('Range'))
+        if rd is not None and int(rd) != x['damage']:
+            marks.append('Damage %g→%d' % (rd, x['damage']))
+        if rr is not None and int(rr) != x['rof']:
+            marks.append('ROF %g→%d' % (rr, x['rof']))
+        if rg is not None and abs(rg * 256 - x['range']) > 2:
+            marks.append('Range %g→%.2f格' % (rg, x['range_cells']))
+        if marks:
+            diffs += 1
+        if marks or shown < n:
+            lines.append('%-22s %-7d %-5d %-8.2f %-16s %s'
+                         % (x['name'], x['damage'], x['rof'], x['range_cells'],
+                            whmap.get(x['name'], '?'),
+                            ('★ ' + '，'.join(marks)) if marks else '—'))
+            shown += 1
+    lines.append('')
+    lines.append('共 %d 把武器，其中 %d 把的数值与当前 rulesmd.ini **不一致**（★ 行）'
+                 % (len(ws), diffs))
+    lines.append('说明：存档存的是**存盘当时**的有效值，地图 INI / MIX 里的规则覆盖也会体现在这里。')
+    lines.append('提示：--type E1 看单个型号的武器链；--n 0 只看有差异的。')
+    _write_report('\n'.join(lines))
+    return 0
+
+
 def main():
     # ★2026-10-22（开源前补）：`--help/-h` 打印模块头部的用法清单。
     #   以前没有这个开关，`--help` 会落到"启动 GUI"分支 —— 在没装 tkinter 的环境里直接
@@ -1856,9 +2072,79 @@ def main():
     if '--gift' in sys.argv:
         i = sys.argv.index('--gift')
         return gift(sys.argv[i + 1:])
+    if '--weapons' in sys.argv:
+        i = sys.argv.index('--weapons')
+        return weapons_cmd(sys.argv[i + 1:])
+    if '--setweapon' in sys.argv:
+        i = sys.argv.index('--setweapon')
+        return setweapon_cmd(sys.argv[i + 1:], 'weapon')
+    if '--setwarhead' in sys.argv:
+        i = sys.argv.index('--setwarhead')
+        return setweapon_cmd(sys.argv[i + 1:], 'warhead')
     import RA2存档编辑器 as m
+    # ★★2026-10-28（审查 P4-19）：打包后的 exe 入口是**本文件**，而
+    #   `RA2存档编辑器._install_crash_hooks()` 写在它自己的 `if __name__ == '__main__'`
+    #   里 —— 被 import 时**永远不会执行**，所以线上 exe 的非 Tk 异常（启动期、后台线程）
+    #   一直进不了 crash.log。这里显式装上，顺便补 `threading.excepthook`。
+    _install_crash_hooks(m)
+    _enable_dpi_awareness()
     m.App().mainloop()
     return 0
+
+
+def _install_crash_hooks(m):
+    """装上全局崩溃钩子：主线程 + 后台线程都写 crash.log。"""
+    try:
+        m._install_crash_hooks()
+    except Exception:
+        pass
+
+    def _thread_hook(args):
+        try:
+            m.write_crash_log(args.exc_type, args.exc_value, args.exc_traceback,
+                              'thread:%s' % getattr(args.thread, 'name', '?'))
+        except Exception:
+            pass
+
+    try:
+        import threading
+        threading.excepthook = _thread_hook
+    except Exception:
+        pass
+
+
+def _enable_dpi_awareness():
+    """让窗口在高 DPI 屏上按原生分辨率渲染（否则 125%/150% 缩放会被位图拉伸 ⇒ 全糊）。
+
+    ★2026-10-28（审查 P4-20）。只在 Windows 上做，失败一律忽略。
+    用 **1 = system DPI aware**（不是 per-monitor）：Tk 对 per-monitor 的
+    缩放切换支持不好，拖动到另一块不同 DPI 的屏幕上反而会错位。
+
+    **逃生阀**：`%APPDATA%\\RA2SED\\editor_config.json` 里写 `"dpi_aware": false`
+    即可关掉（万一某台机器上开了之后布局反而不好看）。
+    """
+    # 先看配置里的逃生阀
+    try:
+        import json
+        base = os.environ.get('APPDATA') or os.path.expanduser('~')
+        cfg = os.path.join(base, 'RA2SED', 'editor_config.json')
+        if os.path.exists(cfg):
+            with open(cfg, encoding='utf-8') as f:
+                if json.load(f).get('dpi_aware') is False:
+                    return
+    except Exception:
+        pass
+    try:
+        import ctypes
+        try:
+            # Windows 8.1+：PROCESS_SYSTEM_DPI_AWARE = 1
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            # Windows 7 / 老系统
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 
 
 if __name__ == '__main__':

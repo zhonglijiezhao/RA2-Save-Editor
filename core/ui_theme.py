@@ -20,6 +20,29 @@ import tkinter as tk
 FONT_UI = 'Microsoft YaHei UI'
 FONT_MONO = 'Consolas'
 
+# ★2026-10-28（审查 P4-20）：DPI 缩放系数。
+#   开了 DPI 感知后（见 `app_main.py`），高 DPI 屏上字体按原生分辨率渲染，
+#   写死的像素宽度（列表卡 340、导航条 172）就会显得过窄。
+#   `App._apply_geometry()` 会按实际 DPI 调 `set_scale()`；不调用时保持 1.0
+#   ⇒ 从源码直接跑（未开 DPI 感知）时行为与以前完全一致。
+SCALE = 1.0
+
+
+def set_scale(s):
+    """设置全局像素缩放（1.0 = 96 DPI 原尺寸）。"""
+    global SCALE
+    try:
+        SCALE = max(0.75, min(float(s), 3.0))
+    except Exception:
+        SCALE = 1.0
+    return SCALE
+
+
+def px(n):
+    """把 96 DPI 下的像素值换算成当前缩放下的像素。"""
+    return max(1, int(round(n * SCALE)))
+
+
 T = {
     # 地面 / 表面
     'canvas':       '#e9edf3',
@@ -260,7 +283,7 @@ class NavRail(tk.Frame):
         self._cur = -1
         self._group = None
 
-        self.strip = tk.Frame(self, bg=T['rail'], width=self.WIDTH)
+        self.strip = tk.Frame(self, bg=T['rail'], width=px(self.WIDTH))
         self.strip.pack(side='left', fill='y')
         self.strip.pack_propagate(False)
 

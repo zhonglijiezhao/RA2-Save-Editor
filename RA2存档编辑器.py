@@ -44,12 +44,14 @@ class App(tk.Tk):
     def __init__(self):
         tk.Tk.__init__(self)
         self.title('RA2 / 尤里的复仇 — 存档编辑器')
-        self.geometry('1280x820')
-        self.minsize(1120, 700)
+        self._apply_geometry()           # ★P4-20：按屏幕 DPI 定窗口大小（封顶到屏幕）
         self.configure(bg=BG)
         self.doc = None
         self._warned_zero = False        # 「-无事件-」(0) 告警每次载入只弹一次
-        self.game_dir = tk.StringVar(value=GAME_DIR_DEFAULT)
+        # ★2026-10-28（审查 P4-21）：游戏目录以前写死 E:\YURI 且从不记住，
+        #   玩家每次启动都要重新输一遍。现在读配置、并在刷新/开档时回写。
+        self.game_dir = tk.StringVar(
+            value=(self._cfg_get('game_dir', '') or GAME_DIR_DEFAULT))
         self.status = tk.StringVar(value='就绪')
         self.q = queue.Queue()
         # 后台任务状态 —— 用于「看门狗」，避免进度条永远转（见 _poll）
@@ -58,10 +60,40 @@ class App(tk.Tk):
         self._saving = False
         self._t_save = 0.0
         self._scanning = False
+        self._sync_game_dir()            # 把游戏目录灌给 core（rules/art 靠它定位）
         self._build_style()
         self._build_ui()
+        # ★2026-10-28（审查 P1-5）：以前没有 WM_DELETE_WINDOW 处理 —— 改了一堆触发
+        #   直接点 × 就全没了，一句提示都没有。现在有未保存改动会先问。
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
+        self._bind_shortcuts()           # ★P1-7：Ctrl+S / Ctrl+Shift+S / Ctrl+O / F5
         self.after(120, self._poll)
         self.refresh_list()
+
+    def _apply_geometry(self):
+        """按屏幕 DPI 定窗口大小（★2026-10-28 审查 P4-20）。
+
+        以前固定 `1280x820` + `minsize(1120, 700)`。开了 DPI 感知后（见 `app_main.py`），
+        高 DPI 屏上字体按**原生分辨率**渲染：窗口像素尺寸不变、文字变大 ⇒ 必然横向溢出。
+        所以窗口/最小尺寸都跟着 DPI 缩放，并**按屏幕可用区域封顶**
+        （150% 时 1280×1.5 = 1920，正好铺满 1920 宽的笔记本，再大就超出屏幕了）。
+
+        从源码直接跑（未开 DPI 感知）时 `winfo_fpixels('1i')` 仍返回 96 ⇒ s=1.0，
+        行为与改动前完全一致，不会影响自检基线。
+        """
+        try:
+            s = self.winfo_fpixels('1i') / 96.0
+        except Exception:
+            s = 1.0
+        s = max(1.0, min(float(s), 2.5))
+        self._ui_scale = s
+        ui_theme.set_scale(s)             # 写死的像素宽度（列表卡/导航条）跟着缩放
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = min(int(1280 * s), max(960, sw - 40))
+        h = min(int(820 * s), max(640, sh - 80))
+        self.geometry('%dx%d' % (w, h))
+        self.minsize(min(int(1120 * s), max(960, sw - 40)),
+                     min(int(700 * s), max(640, sh - 80)))
 
     def report_callback_exception(self, exc, val, tb):
         """Tk 回调里的异常 —— **写日志 + 弹出来**（不让窗口"静默闪退"）。
@@ -140,7 +172,7 @@ class App(tk.Tk):
         body = ttk.PanedWindow(self, orient='horizontal')
         body.pack(fill='both', expand=True, padx=12, pady=(12, 8))
 
-        left = tk.Frame(body, bg=T['line'], width=340)
+        left = tk.Frame(body, bg=T['line'], width=ui_theme.px(340))
         left.pack_propagate(False)
         inner = tk.Frame(left, bg=T['surface'])
         inner.pack(fill='both', expand=True, padx=1, pady=1)
@@ -179,6 +211,9 @@ class App(tk.Tk):
         nb.add(self._tab_search(nb), text='明文搜索')
         # ★2026-10-18 新增：AI 三大件（作战小队 / 特遣部队 / 动作脚本）—— 只读
         nb.add(self._tab_ai(nb), text='作战小队')
+        # ★2026-10-28 新增：武器 / 弹头（★新页一律**追加在末尾** ——
+        #   现有自检按固定索引取页（6=地图 7=赠送…），插在中间会把它们全打歪）
+        nb.add(self._tab_weapons(nb), text='武器 · 弹头')
         self.nb = nb
         nb.bind('<<NotebookTabChanged>>', self._on_tab_changed)
         nb.select(0)
@@ -710,171 +745,10 @@ class App(tk.Tk):
                 text='显示 %d / %d 条%s%s' % (shown, len(rows),
                                             '' if show_tags else '（标签已隐藏）', extra))
 
-    def repair_runtime_dialog(self):
-        """诊断 / 修复「缺运行期组件（TagNode/CellTag）」的触发。
 
-        ★ 背景（2026-10-15 四档解剖定案）：缺 TagNode/CellTag 的触发引擎不会执行 ——
-          症状就是「改事件类型 / 改参数 / 启用了都没反应」。修复 = 补齐组件 + 计时表登记，
-          复用新写触发那套已游戏内验收的克隆机器。"""
-        if not self.doc:
-            messagebox.showwarning('提示', '请先打开一个存档')
-            return
-        try:
-            st = self.doc.runtime_status()
-        except Exception as e:
-            messagebox.showerror('出错', '诊断失败：%s' % e, parent=self)
-            return
-        bad = [s for s in st if not s['has_node'] or not s['has_cell']]
-        if not bad:
-            messagebox.showinfo('诊断结果', '所有触发都有运行期组件（TagNode/CellTag），无需修复。')
-            return
-        dlg = tk.Toplevel(self)
-        dlg.title('修复缺组件触发（补 TagNode/CellTag + 计时表登记）')
-        dlg.transient(self)
-        frm = ttk.Frame(dlg, padding=12)
-        frm.grid(sticky='nsew')
-        ttk.Label(frm, text='以下触发缺少运行期组件，引擎不会执行它们（改事件/启用都无效）：',
-                  foreground='#b91c1c').grid(row=0, column=0, columnspan=2, sticky='w')
-        cols = ('sel', 'name', 'id', 'st', 'rep', 'node', 'cell', 'ticks')
-        tv = ttk.Treeview(frm, columns=cols, show='headings', height=9)
-        for c, t, w in (('sel', '修复', 42), ('name', '触发名', 140), ('id', 'ID', 76),
-                        ('st', '诊断', 190), ('rep', '触发类型', 100),
-                        ('node', 'TagNode', 62), ('cell', 'CellTag', 62),
-                        ('ticks', '计时帧', 56)):
-            tv.heading(c, text=t)
-            tv.column(c, width=w, anchor='w' if c in ('name', 'st', 'rep') else 'center')
-        tv.grid(row=1, column=0, columnspan=2, sticky='nsew', pady=(6, 4))
-        try:
-            tv.tag_configure('risk', foreground='#b91c1c')     # 确定已执行 ⇒ 再触发风险
-            tv.tag_configure('mid', foreground='#b45309')      # 分不清/类型未读出 ⇒ 仍可能再触发
-        except Exception:
-            pass
-        self._repair_iids = []
-        n_risk = n_mid = 0
-        for s in bad:
-            txt, lvl, rep_txt = self._repair_verdict(s)
-            n_risk += (lvl == 'high')
-            n_mid += (lvl == 'mid')
-            iid = tv.insert('', 'end', values=(
-                '☐', s['name'], s['sid'], txt, rep_txt,
-                '✗ 缺失' if not s['has_node'] else '✓',
-                '✗ 缺失' if not s['has_cell'] else '✓',
-                s['ticks'] if s['ticks'] is not None else '—'),
-                tags=(('risk',) if lvl == 'high' else ('mid',) if lvl == 'mid' else ()))
-            self._repair_iids.append((iid, s, lvl))
-        tv.bind('<Double-1>', lambda e: self._toggle_repair_row(tv))
-
-        def toggle_sel():
-            for iid, _s, _l in self._repair_iids:
-                cur = tv.set(iid, 'sel')
-                tv.set(iid, 'sel', '☑' if cur == '☐' else '☐')
-        ttk.Button(frm, text='全选/反选', command=toggle_sel).grid(
-            row=2, column=0, sticky='w', padx=(0, 6))
-        ttk.Label(frm, text='计时帧数按该触发当前事件自动算（13 流逝时间 → 秒×15）。',
-                  foreground='#6b7280').grid(row=2, column=1, sticky='w')
-
-        # ★2026-10-20（交接 next-step 2）：**已执行警示** —— 对跑过的单次型触发点修复
-        #   = 重新武装，条件再满足会**再触发一次**。以前这里一声不响，容易把玩家坑了。
-        ttk.Label(
-            frm,
-            text='⚠ 红字行 = 确定已执行过（CellTag 还在，TagNode 被引擎回收）：修复 = 把这条\n'
-                 '　 单次型触发「重新武装」，条件一满足就会「再触发一次」\n'
-                 '　（刷建筑 / 给钱 / 放援军都会再来一遍）。\n'
-                 '　 橙字行 = 组件全无或重复类型读不出，分不清跑没跑过 —— 同样可能再触发。\n'
-                 '　 修复前会二次确认，并列出具体是哪几条。',
-            foreground='#b91c1c', justify='left').grid(
-                row=3, column=0, columnspan=2, sticky='w', pady=(6, 0))
-        if n_risk or n_mid:
-            ttk.Label(frm, text='本档：确定已执行 %d 条　分不清/类型未读出 %d 条（共 %d 条缺组件）'
-                                % (n_risk, n_mid, len(bad)),
-                      foreground='#374151').grid(
-                row=4, column=0, columnspan=2, sticky='w', pady=(4, 0))
-
-        def do_repair():
-            todo = [(iid, s, lvl) for iid, s, lvl in self._repair_iids
-                    if tv.set(iid, 'sel') == '☑']
-            if not todo:
-                messagebox.showinfo('提示', '没有勾选任何触发。', parent=dlg)
-                return
-            risky = [(s, lvl) for _i, s, lvl in todo if lvl in ('high', 'mid')]
-            if risky:
-                names = ['%s（%s）' % (s['name'], '确定已执行' if lvl == 'high'
-                                       else '分不清/类型未读出') for s, lvl in risky]
-                head = '\n'.join('　· ' + n for n in names[:8])
-                more = ('\n　…等共 %d 条' % len(names)) if len(names) > 8 else ''
-                if not messagebox.askyesno(
-                        '⚠ 修复 = 重新武装（可能再触发一次）',
-                        '勾选项里有 %d 条可能已经执行过（引擎把运行期组件回收了）：\n\n%s%s\n\n'
-                        '补回 TagNode/CellTag 等于把它们「重新武装」：条件一满足就会\n'
-                        '「再触发一次」（刷建筑 / 给钱 / 放援军都会再来一遍）。\n\n'
-                        '确定要重新武装这 %d 条吗？' % (len(risky), head, more, len(risky)),
-                        icon='warning', default='no', parent=dlg):
-                    return
-            done, fails = [], []
-            for _iid, s, _lvl in todo:
-                try:
-                    info = self.doc.repair_trigger_runtime(s['inst_key'])
-                    (done if not info.get('already') else fails).append(
-                        '%s：已补 TagNode+CellTag（帧 %d）' % (s['name'], info['ticks'])
-                        if not info.get('already') else '%s：已有组件，跳过' % s['name'])
-                    for w in info.get('warnings', []):
-                        fails.append('%s：%s' % (s['name'], w))
-                except Exception as e:
-                    fails.append('%s：%s' % (s['name'], e))
-            self.refresh_records()
-            self.refresh_events()
-            self.refresh_actions()
-            self.status.set('修复完成：%s%s（尚未保存，请另存/原地保存）'
-                            % ('；'.join(done) or '无', '　|　' + '；'.join(fails) if fails else ''))
-            msg = '已修复 %d 个触发。\n%s' % (len(done), ('\n'.join(fails)) if fails else '')
-            if done and risky:
-                msg += '\n\n⚠ 其中 %d 条是重新武装的：进游戏后条件满足会再触发一次。' % len(risky)
-            if done:
-                messagebox.showinfo('修复完成', msg.strip(), parent=self)
-            else:
-                messagebox.showwarning('未修复', msg.strip(), parent=self)
-            dlg.destroy()
-        ttk.Button(frm, text='修复勾选项', command=do_repair).grid(
-            row=5, column=0, sticky='w', pady=(8, 0))
-        ttk.Button(frm, text='关闭', command=dlg.destroy).grid(
-            row=5, column=1, sticky='w', pady=(8, 0))
-
-    def _repair_verdict(self, s):
-        """给「修复缺组件触发」里的一条触发定性 → (诊断文字, 等级, 触发类型文字)。
-
-        ★2026-10-20 二次修正（玩家实测：「被攻击」类触发本来就没有 TagNode，不是废触发）：
-          判"执行过没有"不能只看 TagNode 在不在，要看**事件对象的运行期指针**
-          （`+0x50..+0x68`）有没有被引擎写过 —— 见 `SaveDoc.trigger_event_live()`。
-
-        等级：'high' = 确定执行过（CellTag 还在 / 事件指针非零）⇒ 修复 = 重新武装
-              'mid'  = 分不清（组件全无且事件指针读不出来）
-              'low'  = 事件驱动型（本来就没有 TagNode）/ 重复型 / 定义禁用 / 只缺 CellTag
-        """
-        rep = None
-        try:
-            rep = self.doc.trigger_repeat_type(s['sid'])
-        except Exception:
-            rep = None
-        rep_txt = (getattr(self.doc, 'REPEAT_TEXT', {}).get(rep, '型' + rep)
-                   if rep else '未读出')
-        try:
-            live = self.doc.trigger_event_live(s['sid'])
-        except Exception:
-            live = True          # 读不出来就按"可能执行过"处理（宁可提示）
-        if s['record_enabled'] is False:
-            return ('定义即禁用（未武装）', 'low', rep_txt)
-        if s['has_node']:
-            return ('有 TagNode、缺 CellTag', 'low', rep_txt)
-        # 走到这里 = 有实例但没 TagNode ⇒ 要看事件的运行期指针
-        if rep == '2':
-            return ('重复型跑完（本来就会再跑）', 'low', rep_txt)
-        if not live:
-            # 事件驱动型：被攻击/被摧毁/进房子这类，引擎靠回调驱动，天然没有 TagNode
-            return ('事件驱动型（本来就没有 TagNode·未执行）', 'low', rep_txt)
-        if s['has_cell']:
-            return ('执行后被回收（CellTag 还在）', 'high', rep_txt)
-        return ('执行后被回收（事件已处理·组件全回收）', 'high', rep_txt)
-
+    # ★2026-10-28 删：这里原本有一份 128 行的 `repair_runtime_dialog` 和一份 `_repair_verdict`，
+    #   与下面（原 882 行起）的版本**逐字重复 / 逻辑被取代**，属于编辑时的复制粘贴残留。
+    #   同名后定义会覆盖前定义，前一份从来没被执行过 —— 直接删掉，只留下面这一份。
     def repair_runtime_dialog(self):
         """诊断 / 修复「缺运行期组件（TagNode/CellTag）」的触发。
 
@@ -1209,6 +1083,10 @@ class App(tk.Tk):
                         self.mv_load(_p)
                     except Exception:
                         pass
+            elif idx == 10:                             # ★2026-10-28 武器·弹头页（第 11 个）
+                # 懒加载：扫类型表要 ~230ms，开档时不做，第一次切进来才填
+                if not getattr(self, '_wpn_loaded', False):
+                    self.refresh_weapons()
         except Exception:
             pass
 
@@ -2352,12 +2230,30 @@ class App(tk.Tk):
         self.refresh_actions()
         self.status.set('已删除触发 %s 的 1 条行为（剩 %d 条，尚未保存）' % (sid, r['left']))
 
+    def _tree_scrolled(self, parent, columns, height=16):
+        """建一棵**带横竖滚动条**的 Treeview，返回 `(容器, tree)`（不 pack 容器，由调用方定位置）。
+
+        ★2026-10-28（玩家要求）：事件 / 行为页原来只有 `pack(fill=both, expand=True)`，
+          既没有竖滚动条也没有横滚动条 —— 大任务档上千条只能靠滚轮，列宽超出时还看不到右半边。
+          触发页早就有这两条（340 行起），这里抽出来复用，样式跟触发页保持一致。
+        """
+        wrap = ttk.Frame(parent)
+        tv = ttk.Treeview(wrap, columns=columns, show='headings', height=height)
+        vsb = ttk.Scrollbar(wrap, orient='vertical', command=tv.yview)
+        hsb = ttk.Scrollbar(wrap, orient='horizontal', command=tv.xview)
+        tv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side='right', fill='y')
+        hsb.pack(side='bottom', fill='x')
+        tv.pack(side='left', fill='both', expand=True)
+        return wrap, tv
+
     def _tab_events(self, nb):
         f = ttk.Frame(nb, padding=8)
         _ph = ui_theme.page_header(f, '事件', '选中触发对应的事件链')
         _ph.pack(fill='x', padx=2, pady=(2, 8))
         cols = ('idx', 'type', 'name', 'arg', 'argtext', 'owner', 'off')
-        self.te = ttk.Treeview(f, columns=cols, show='headings', height=16)
+        # ★2026-10-28：带横竖滚动条（原来只有滚轮，列超宽看不到右半边）
+        self._te_wrap, self.te = self._tree_scrolled(f, cols, 16)
         for c, t, w, a in (('idx', '#', 36, 'center'), ('type', '类型', 50, 'center'),
                            ('name', '事件类型', 220, 'w'), ('arg', '参数', 78, 'e'),
                            ('argtext', '参数含义', 108, 'w'), ('owner', '所属触发', 150, 'w'),
@@ -2378,7 +2274,7 @@ class App(tk.Tk):
                    ).pack(side='left', padx=(2, 8))
         self.lbl_ev_count = ttk.Label(qrow, text='', foreground='#6b7280')
         self.lbl_ev_count.pack(side='left')
-        self.te.pack(fill='both', expand=True)
+        self._te_wrap.pack(fill='both', expand=True)      # ★带滚动条的容器（位置同原来的表格）
         self.te.tag_configure('bad', foreground='#b91c1c')
         self.te.bind('<Double-1>', lambda e: self.edit_event())
         self.te.bind('<Return>', lambda e: self.edit_event())
@@ -2686,7 +2582,8 @@ class App(tk.Tk):
         _ph = ui_theme.page_header(f, '行为', '选中触发对应的行为链')
         _ph.pack(fill='x', padx=2, pady=(2, 8))
         cols = ('idx', 'type', 'name', 'arg', 'argtext', 'owner', 'off')
-        self.ta = ttk.Treeview(f, columns=cols, show='headings', height=16)
+        # ★2026-10-28：带横竖滚动条（同事件页）
+        self._ta_wrap, self.ta = self._tree_scrolled(f, cols, 16)
         for c, t, w, a in (('idx', '#', 36, 'center'), ('type', '类型', 50, 'center'),
                            ('name', '行为类型', 220, 'w'), ('arg', '参数', 78, 'e'),
                            ('argtext', '参数含义', 108, 'w'), ('owner', '所属触发', 150, 'w'),
@@ -2707,7 +2604,7 @@ class App(tk.Tk):
                    ).pack(side='left', padx=(2, 8))
         self.lbl_ac_count = ttk.Label(qrow, text='', foreground='#6b7280')
         self.lbl_ac_count.pack(side='left')
-        self.ta.pack(fill='both', expand=True)
+        self._ta_wrap.pack(fill='both', expand=True)      # ★带滚动条的容器
         self.ta.tag_configure('bad', foreground='#b91c1c')
         self.ta.bind('<Double-1>', lambda e: self.edit_action())
         self.ta.bind('<Return>', lambda e: self.edit_action())
@@ -4503,7 +4400,8 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror('备份失败', str(e))
             return
-        dirty = self.doc.dirty() if hasattr(self.doc, 'dirty') else False
+        # ★2026-10-28：改用 `modified()`（比 `dirty()` 可靠 —— 后者漏报直接改明文的操作）
+        dirty = self._is_modified()
         msg = '已备份到：\n%s\n\n大小 %.1f KB' % (dst, os.path.getsize(dst) / 1024.0)
         if dirty:
             msg += ('\n\n注意：备份的是**磁盘上的原文件**；当前编辑器里还有未保存的改动，'
@@ -4532,16 +4430,43 @@ class App(tk.Tk):
             return os.path.dirname(os.path.abspath(sys.executable))
         return _HERE
 
+    @staticmethod
+    def _cfg_path():
+        """配置文件放 `%APPDATA%\\RA2SED\\editor_config.json`。
+
+        ★2026-10-28（审查 P4-21）：原来写在**程序目录**，装在 `Program Files` 下会因
+          无写权限而静默失败（`except: pass`）—— 玩家的"记住游戏目录"就永远不生效。
+          老版本留在程序目录的同名文件会在第一次读不到时自动迁移过来。
+        """
+        base = os.environ.get('APPDATA') or os.path.expanduser('~')
+        d = os.path.join(base, 'RA2SED')
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            return os.path.join(App._app_dir(), 'editor_config.json')
+        p = os.path.join(d, 'editor_config.json')
+        if not os.path.exists(p):
+            # 迁移老位置（程序目录）里的配置，别让老用户丢设置
+            old = os.path.join(App._app_dir(), 'editor_config.json')
+            if os.path.exists(old):
+                try:
+                    with open(old, encoding='utf-8') as f:
+                        data = json.load(f)
+                    with open(p, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+        return p
+
     def _cfg_get(self, key, default=None):
         try:
-            with open(os.path.join(self._app_dir(), 'editor_config.json'),
-                      encoding='utf-8') as f:
+            with open(self._cfg_path(), encoding='utf-8') as f:
                 return json.load(f).get(key, default)
         except Exception:
             return default
 
     def _cfg_set(self, key, val):
-        p = os.path.join(self._app_dir(), 'editor_config.json')
+        p = self._cfg_path()
         try:
             d = {}
             if os.path.exists(p):
@@ -4552,6 +4477,21 @@ class App(tk.Tk):
                 json.dump(d, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    def _sync_game_dir(self, persist=False):
+        """把界面上的「游戏目录」交给 core —— rules/art 的定位全看这个。
+
+        ★2026-10-28（审查 P0-4）：core 以前只认写死的开发者路径，玩家装在别处时
+          可建造判定 / Foundation / Power 会**静默失效**。现在由界面统一告知。
+        `persist=True` 时顺便写进配置（下次启动自动带出来）。
+        """
+        d = (self.game_dir.get() or '').strip()
+        try:
+            SaveDoc.set_game_dir(d)
+        except Exception:
+            pass
+        if persist and d:
+            self._cfg_set('game_dir', d)
 
     def _fa2_launcher(self, ask=True):
         r"""返回 (kind, 工作目录)。优先级：**FA2SPLaunch.exe**（新版 Unicode 启动器）
@@ -6284,6 +6224,330 @@ class App(tk.Tk):
             self._gift_log('（未选保存路径——修改仍在本档内存里，可用「另存」继续保存）')
             self.status.set('赠送完成（未保存到磁盘）')
 
+    # ---------------- 武器 · 弹头（★2026-10-28 新增）----------------
+    # 背景：玩家确认「改 rulesmd.ini 不影响已存盘存档里的武器效果」⇒ 读档时引擎用的是
+    # 存档里那张武器类型表。所以这一页的编辑是**真正生效**的，且只影响这一份存档。
+    # 写入全是**定长**（Damage/ROF/Range = u32、Verses = double）⇒ 明文长度不变、偏移不动。
+    def _tab_weapons(self, nb):
+        T = ui_theme.T
+        f = ttk.Frame(nb, padding=8)
+        _ph = ui_theme.page_header(
+            f, '武器 · 弹头',
+            '存档里的武器类型表；改这里只影响这一份存档，rulesmd.ini 一个字节不动')
+        _ph.pack(fill='x', padx=2, pady=(2, 8))
+
+        body = tk.Frame(f, bg=T['canvas'])
+        body.pack(fill='both', expand=True)
+
+        # ── 左：武器列表（★宽度按"正文可用宽度"配比：主窗口 1280 时正文约 740，
+        #      左 330 + 右 ~370 刚好不溢出。改这里先量 row.winfo_reqwidth()）──
+        lf = tk.Frame(body, bg=T['canvas'], width=ui_theme.px(330))
+        lf.pack(side='left', fill='both')
+        lf.pack_propagate(False)
+
+        qrow = ttk.Frame(lf)
+        qrow.pack(fill='x', pady=(0, 6))
+        self._q_wpn = tk.StringVar()
+        ent = ttk.Entry(qrow, textvariable=self._q_wpn, width=11)
+        ent.pack(side='left')
+        ent.bind('<KeyRelease>', lambda e: self.refresh_weapons())
+        ent.bind('<Escape>', lambda e: (self._q_wpn.set(''), self.refresh_weapons()))
+        self._wpn_only_diff = tk.BooleanVar(value=False)
+        ttk.Checkbutton(qrow, text='只看 ≠rules', variable=self._wpn_only_diff,
+                        command=self.refresh_weapons).pack(side='left', padx=(6, 0))
+
+        cols = ('name', 'dmg', 'rof', 'rng', 'wh')
+        wrap, self.tw = self._tree_scrolled(lf, cols, 20)
+        wrap.pack(fill='both', expand=True)
+        for c, t, w, a in (('name', '武器', 118, 'w'), ('dmg', '伤害', 42, 'e'),
+                           ('rof', '射速', 38, 'e'), ('rng', '射程', 46, 'e'),
+                           ('wh', '弹头', 70, 'w')):
+            self.tw.heading(c, text=t)
+            self.tw.column(c, width=w, anchor=a)
+        self.tw.tag_configure('diff', foreground=T['danger'])
+        self.tw.bind('<<TreeviewSelect>>', self._wpn_pick)
+        self.lbl_wpn_count = ttk.Label(lf, text='', foreground=T['muted'],
+                                       font=(ui_theme.FONT_UI, 8))
+        self.lbl_wpn_count.pack(fill='x', pady=(4, 0))
+
+        # ── 右：详情 + 编辑 ──
+        rt = tk.Frame(body, bg=T['canvas'])
+        rt.pack(side='left', fill='both', expand=True, padx=(10, 0))
+
+        # ① 武器数值
+        o1, in1 = ui_theme.card(rt, '武器数值')
+        o1.pack(fill='x')
+        self.lbl_wpn_name = tk.Label(in1, text='（左侧选一把武器）', bg=T['surface'],
+                                     fg=T['ink'], font=(ui_theme.FONT_UI, 12, 'bold'),
+                                     anchor='w')
+        self.lbl_wpn_name.grid(row=0, column=0, columnspan=6, sticky='w')
+        self.lbl_wpn_diff = tk.Label(in1, text='', bg=T['surface'], fg=T['muted'],
+                                     font=(ui_theme.FONT_UI, 9), anchor='w',
+                                     justify='left', wraplength=ui_theme.px(330))
+        self.lbl_wpn_diff.grid(row=1, column=0, columnspan=6, sticky='w', pady=(2, 0))
+
+        self._wpn_var = {}
+        for i, (key, lab, unit) in enumerate((('damage', '伤害', '点'),
+                                              ('rof', '射速', '帧·越小越快'),
+                                              ('range', '射程', '格'))):
+            g = tk.Frame(in1, bg=T['surface'])
+            g.grid(row=2, column=i * 2, columnspan=2, sticky='w',
+                   padx=(0 if i == 0 else 8, 0), pady=(8, 0))
+            tk.Label(g, text=lab, bg=T['surface'], fg=T['muted'],
+                     font=(ui_theme.FONT_UI, 9)).pack(side='left')
+            v = tk.StringVar()
+            self._wpn_var[key] = v
+            ttk.Entry(g, textvariable=v, width=6).pack(side='left', padx=(3, 2))
+            tk.Label(g, text=unit, bg=T['surface'], fg=T['muted_soft'],
+                     font=(ui_theme.FONT_UI, 8)).pack(side='left')
+        bar = tk.Frame(in1, bg=T['surface'])
+        bar.grid(row=3, column=0, columnspan=6, sticky='w', pady=(10, 0))
+        ttk.Button(bar, text='应用数值', style='Primary.TButton',
+                   command=self._wpn_apply).pack(side='left')
+        ttk.Button(bar, text='按 rules 还原', style='Ghost.TButton',
+                   command=self._wpn_revert).pack(side='left', padx=6)
+        self.lbl_wpn_msg = tk.Label(bar, text='', bg=T['surface'], fg=T['muted'],
+                                    font=(ui_theme.FONT_UI, 9))
+        self.lbl_wpn_msg.pack(side='left', padx=6)
+        # 哪些型号用它（一行灰字，不单独占一张卡 —— 否则小窗口会被挤成一条缝）
+        self.lbl_wpn_users = tk.Label(in1, text='—', bg=T['surface'], fg=T['ink_2'],
+                                      font=(ui_theme.FONT_UI, 9), anchor='w',
+                                      justify='left', wraplength=ui_theme.px(330))
+        self.lbl_wpn_users.grid(row=4, column=0, columnspan=6, sticky='w', pady=(8, 0))
+
+        # ② 弹头克制表（11 项，两列）
+        o2, in2 = ui_theme.card(rt, '弹头克制表')
+        o2.pack(fill='both', expand=True, pady=(8, 0))
+        self.lbl_wh_name = tk.Label(in2, text='—', bg=T['surface'], fg=T['ink'],
+                                    font=(ui_theme.FONT_UI, 10, 'bold'), anchor='w')
+        self.lbl_wh_name.grid(row=0, column=0, columnspan=8, sticky='w')
+        tk.Label(in2, text='伤害 × 该系数（100 = 100%）', bg=T['surface'],
+                 fg=T['muted'], font=(ui_theme.FONT_UI, 8), anchor='w').grid(
+            row=1, column=0, columnspan=8, sticky='w')
+        self._verse_var = []
+        for i in range(SaveDoc.VERSES_COUNT):
+            col = (i // 6) * 3
+            row = 2 + (i % 6)
+            nm = SaveDoc.ARMOR_ORDER[i]
+            tk.Label(in2, text='%d %s' % (i + 1, nm), bg=T['surface'], fg=T['muted'],
+                     font=(ui_theme.FONT_MONO, 8), anchor='w', width=10).grid(
+                row=row, column=col, sticky='w', pady=1)
+            v = tk.StringVar()
+            self._verse_var.append(v)
+            ttk.Entry(in2, textvariable=v, width=5).grid(row=row, column=col + 1,
+                                                         sticky='w', pady=1, padx=(2, 1))
+            tk.Label(in2, text='%', bg=T['surface'], fg=T['muted_soft'],
+                     font=(ui_theme.FONT_UI, 8)).grid(row=row, column=col + 2, sticky='w',
+                                                      padx=(0, 10), pady=1)
+        bar2 = tk.Frame(in2, bg=T['surface'])
+        bar2.grid(row=8, column=0, columnspan=8, sticky='w', pady=(8, 0))
+        ttk.Button(bar2, text='应用克制表', command=self._wpn_verse_apply).pack(side='left')
+        self.lbl_verse_msg = tk.Label(bar2, text='', bg=T['surface'], fg=T['muted'],
+                                      font=(ui_theme.FONT_UI, 9))
+        self.lbl_verse_msg.pack(side='left', padx=6)
+        return f
+
+    def _wpn_users(self, weapon):
+        """rules 里哪些型号把 `weapon` 当主/副/精英武器 → ['E1 GI（Primary）', …]。"""
+        out = []
+        try:
+            for sec, kv in (SaveDoc._rules_all() or {}).items():
+                for k in ('Primary', 'Secondary', 'ElitePrimary', 'EliteSecondary'):
+                    if kv.get(k, '').strip() == weapon:
+                        out.append('%s %s（%s）' % (sec, kv.get('Name', ''), k))
+        except Exception:
+            pass
+        return out
+
+    def _wpn_diff_of(self, w):
+        """和 rulesmd.ini 比 → 差异描述（空串 = 一致）。"""
+        r = (SaveDoc._rules_all() or {}).get(w['name']) or {}
+        marks = []
+
+        def _f(v):
+            try:
+                return float(v)
+            except Exception:
+                return None
+        rd, rr, rg = _f(r.get('Damage')), _f(r.get('ROF')), _f(r.get('Range'))
+        if rd is not None and int(rd) != w['damage']:
+            marks.append('伤害 %g→%d' % (rd, w['damage']))
+        if rr is not None and int(rr) != w['rof']:
+            marks.append('射速 %g→%d' % (rr, w['rof']))
+        if rg is not None and abs(rg * 256 - w['range']) > 2:
+            marks.append('射程 %g→%.2f格' % (rg, w['range_cells']))
+        return '；'.join(marks)
+
+    def _wpn_refresh_if_visible(self):
+        """当前正停在武器页时立刻重填（换档后 `nb.select(同一页)` 不触发事件）。
+
+        不在武器页就什么都不做 —— 扫类型表要 230ms，别在开档路径上白花。
+        """
+        try:
+            if not hasattr(self, 'tw'):
+                return
+            if self.nb.index(self.nb.select()) != 10:
+                return
+            self.refresh_weapons()
+        except Exception:
+            pass
+
+    def refresh_weapons(self):
+        """填左侧武器列表（★2026-10-28）。"""
+        if not hasattr(self, 'tw'):
+            return
+        keep = getattr(self, '_wpn_cur', None)     # 刷新前记下选中的那把
+        self.tw.delete(*self.tw.get_children())    # ★delete 会清空 selection
+        self._wpn_rows = {}
+        self._wpn_loaded = True
+        if not self.doc:
+            self.lbl_wpn_count.config(text='')
+            return
+        try:
+            ws = self.doc.weapon_objects()
+        except Exception as e:
+            self.status.set('武器表扫描失败：%s' % e)
+            return
+        whmap = self.doc.weapon_warhead_map()
+        q = (self._q_wpn.get() or '').strip().upper()
+        only = self._wpn_only_diff.get()
+        n = 0
+        for w in ws:
+            if q and q not in w['name'].upper():
+                continue
+            diff = self._wpn_diff_of(w)
+            if only and not diff:
+                continue
+            self._wpn_rows[w['name']] = w
+            self.tw.insert('', 'end', iid=w['name'],
+                           values=(('★ ' if diff else '') + w['name'],
+                                   w['damage'], w['rof'],
+                                   '%.2f' % w['range_cells'],
+                                   whmap.get(w['name'], '?')),
+                           tags=('diff',) if diff else ())
+            n += 1
+        ndiff = sum(1 for w in ws if self._wpn_diff_of(w))
+        self.lbl_wpn_count.config(
+            text='%d / %d 把（%d 把 ≠rules）' % (n, len(ws), ndiff))
+        # 恢复选中：优先保持原来那把；它被搜索/过滤藏掉了才退回第一行
+        target = keep if (keep and self.tw.exists(keep)) else (
+            self.tw.get_children()[0] if self.tw.get_children() else None)
+        if target:
+            self.tw.selection_set(target)
+            self.tw.focus(target)
+
+    def _wpn_pick(self, _e=None):
+        """选中一把武器 → 右侧填数值 + 弹头克制表 + 使用它的型号。"""
+        sel = self.tw.selection()
+        if not sel:
+            return
+        name = sel[0]
+        w = (getattr(self, '_wpn_rows', None) or {}).get(name)
+        if not w:
+            return
+        same = (name == getattr(self, '_wpn_cur', None))
+        self._wpn_cur = name
+        whname = self.doc.weapon_warhead_map().get(name, '?')
+        self.lbl_wpn_name.config(text='%s   →   弹头 %s' % (name, whname))
+        d = self._wpn_diff_of(w)
+        self.lbl_wpn_diff.config(
+            text=('与 rulesmd.ini 不同：' + d) if d else '与 rulesmd.ini 一致',
+            fg=(ui_theme.T['danger'] if d else ui_theme.T['ok']))
+        self._wpn_var['damage'].set(str(w['damage']))
+        self._wpn_var['rof'].set(str(w['rof']))
+        self._wpn_var['range'].set('%g' % w['range_cells'])
+        if not same:
+            # ★只有"换了另一把武器"才清提示 —— 应用数值后刷新会重选同一把，
+            #   那时清掉就把刚写的"已改 N 项"抹了（自检 §297 逮到）
+            self.lbl_wpn_msg.config(text='', fg=ui_theme.T['muted'])
+        # 克制表
+        wh = None
+        try:
+            wh = next((x for x in self.doc.warhead_objects() if x['name'] == whname), None)
+        except Exception:
+            pass
+        self.lbl_wh_name.config(text=whname if wh else '%s（存档里没有这个弹头对象）' % whname)
+        for i, v in enumerate(self._verse_var):
+            if wh:
+                v.set('%g' % (wh['verses'][i] * 100))
+            else:
+                v.set('')
+        if not same:
+            self.lbl_verse_msg.config(text='')
+        # 使用它的型号
+        users = self._wpn_users(name)
+        self.lbl_wpn_users.config(
+            text=('\n'.join(users) if users else '（rules 里没有型号把它当主/副武器）'))
+
+    def _wpn_apply(self):
+        """把右侧三个数值写进存档（定长）。"""
+        if not self.doc or not getattr(self, '_wpn_cur', None):
+            return
+        name = self._wpn_cur
+        try:
+            r1 = self.doc.set_weapon_field(name, 'damage', self._wpn_var['damage'].get())
+            r2 = self.doc.set_weapon_field(name, 'rof', self._wpn_var['rof'].get())
+            r3 = self.doc.set_weapon_field(name, 'range', self._wpn_var['range'].get())
+        except Exception as e:
+            messagebox.showerror('改不了', '%s' % e, parent=self)
+            return
+        ch = [x for x in (r1, r2, r3) if x['changed']]
+        warns = [x.get('warn') for x in (r1, r2, r3) if x.get('warn')]
+        # 先刷新列表（选中项会保持），再写提示
+        self.refresh_weapons()
+        if warns:
+            self.lbl_wpn_msg.config(text=warns[0], fg=ui_theme.T['warn'])
+        else:
+            self.lbl_wpn_msg.config(
+                text=('已改 %d 项（尚未保存）' % len(ch)) if ch else '数值没变',
+                fg=ui_theme.T['muted'])
+        if ch:
+            self.status.set('%s：%s（尚未保存，记得另存/原地保存）'
+                            % (name, '、'.join('%s %s→%s' % (
+                                {'damage': '伤害', 'rof': '射速', 'range': '射程'}[x['field']],
+                                x['old'] if x['field'] != 'range' else '%g格' % (x['old'] / 256.0),
+                                x['new'] if x['field'] != 'range' else '%g格' % (x['new'] / 256.0))
+                                for x in ch)))
+        else:
+            self.status.set('%s 数值未变' % name)
+
+    def _wpn_verse_apply(self):
+        """把 11 项克制系数写进存档。"""
+        if not self.doc or not getattr(self, '_wpn_cur', None):
+            return
+        whname = self.doc.weapon_warhead_map().get(self._wpn_cur, None)
+        if not whname:
+            messagebox.showwarning('没有弹头', '这把武器在 rules 里没有 Warhead 定义', parent=self)
+            return
+        n = 0
+        try:
+            for i, v in enumerate(self._verse_var):
+                s = (v.get() or '').strip()
+                if not s:
+                    continue
+                r = self.doc.set_warhead_verse(whname, i + 1, s)
+                if r['changed']:
+                    n += 1
+        except Exception as e:
+            messagebox.showerror('改不了', '%s' % e, parent=self)
+            return
+        self.lbl_verse_msg.config(text=('已改 %d 项（尚未保存）' % n) if n else '数值没变')
+        self.status.set('%s 的克制表改了 %d 项（尚未保存）' % (whname, n))
+        self.refresh_weapons()          # 列表里的数值列不用变，但保持选中态一致
+
+    def _wpn_revert(self):
+        """把当前武器三个数值按 rulesmd.ini 还原（改错了的后悔药）。"""
+        if not self.doc or not getattr(self, '_wpn_cur', None):
+            return
+        r = (SaveDoc._rules_all() or {}).get(self._wpn_cur) or {}
+        if not r.get('Damage'):
+            messagebox.showinfo('还原', 'rules 里没有这把武器的定义，没法还原', parent=self)
+            return
+        for key, rk in (('damage', 'Damage'), ('rof', 'ROF'), ('range', 'Range')):
+            if r.get(rk):
+                self._wpn_var[key].set(r[rk])
+        self.lbl_wpn_msg.config(text='已填入 rules 的值 —— 点「应用数值」才写入')
+
     def _tab_search(self, nb):
         f = ttk.Frame(nb, padding=8)
         _ph = ui_theme.page_header(f, '明文搜索', '在明文里搜字符串 / 偏移')
@@ -6305,18 +6569,33 @@ class App(tk.Tk):
 
     # ---------------- 列表 ----------------
     def refresh_list(self):
-        d = self.game_dir.get()
+        d = self.game_dir.get().strip()
         self.tree.delete(*self.tree.get_children())
+        self._sync_game_dir(persist=True)      # 目录变了就告诉 core，并记住
         if not os.path.isdir(d):
             self.status.set('目录不存在: %s' % d)
             return
         files = []
-        for n in os.listdir(d):
-            if n.lower().endswith(('.sav', '.sav.bak')):
-                files.append(os.path.join(d, n))
-        files.sort(key=lambda p: -os.path.getmtime(p))
-        for i, p in enumerate(files[:200]):
-            self.tree.insert('', 'end', iid=p, values=(os.path.basename(p), '', ''),
+        # ★2026-10-28（审查 P4-21）：以前只看顶层目录，而玩家**常把存档挪进子文件夹**
+        #   （交接文档里开发脚本用 `_paths.find_sav()` 递归找，工具自己反而看不见）。
+        #   现在扫顶层 + 一级子目录；`_备份存档` 跳过（那是本工具自己的备份，别混进列表）。
+        def _collect(dirp, prefix=''):
+            try:
+                names = os.listdir(dirp)
+            except Exception as e:
+                self.status.set('读取目录失败（%s）：%s' % (dirp, e))
+                return
+            for n in names:
+                fp = os.path.join(dirp, n)
+                if n.lower().endswith(('.sav', '.sav.bak')):
+                    files.append((fp, prefix + n))
+                elif not prefix and os.path.isdir(fp) and n != '_备份存档':
+                    _collect(fp, n + '/')
+
+        _collect(d)
+        files.sort(key=lambda x: -os.path.getmtime(x[0]))
+        for i, (p, disp) in enumerate(files[:200]):
+            self.tree.insert('', 'end', iid=p, values=(disp, '', ''),
                              tags=('odd',) if i % 2 else ())
         self.status.set('共 %d 个存档（按时间倒序）' % len(files))
         try:
@@ -6415,7 +6694,102 @@ class App(tk.Tk):
             self._saving = False
             self.pbar.stop()
             self.status.set('保存超时（>180 秒）—— 请确认文件未被占用后重试')
+        # ---- 标题栏的「*未保存」标记（约每 0.6 秒核一次，26MB 明文比较约 2ms）----
+        self._title_tick = getattr(self, '_title_tick', 0) + 1
+        if self._title_tick % 5 == 0:
+            self._refresh_title()
         self.after(120, self._poll)
+
+    # ---------------- 未保存改动保护（★2026-10-28 审查 P1-5）----------------
+    # 以前：全项目没有 protocol('WM_DELETE_WINDOW')，改了一堆触发后直接点 × 或者
+    # 在列表里点另一个存档 ⇒ `self.doc` 被换掉，改动**无声消失**，一句提示都没有。
+    def _is_modified(self):
+        """当前存档有没有未保存的改动（用 `modified()`，不用 `dirty()` —— 后者漏报）。"""
+        try:
+            return bool(self.doc and self.doc.modified())
+        except Exception:
+            return False
+
+    def _refresh_title(self):
+        """标题栏显示当前文件 + `*`（有未保存改动时）。"""
+        base = 'RA2 / 尤里的复仇 — 存档编辑器'
+        try:
+            if self.doc and getattr(self.doc, 'path', None):
+                mark = ' *' if self._is_modified() else ''
+                self.title('%s — %s%s' % (base, os.path.basename(self.doc.path), mark))
+            else:
+                self.title(base)
+        except Exception:
+            pass
+
+    def _confirm_discard(self, what='继续'):
+        """有未保存改动时问一句。→ True 可以继续 / False 中止本次操作。
+
+        三个选项（`askyesnocancel`）：
+          **是**   = 先去保存 → 弹出「另存为」，本次操作**中止**（存完再自己点一次，最不容易搞错）
+          **否**   = 丢弃改动，继续
+          **取消** = 什么都不做
+        """
+        if not self._is_modified():
+            return True
+        r = messagebox.askyesnocancel(
+            '有未保存的改动',
+            '当前存档还有**未保存**的改动。\n\n'
+            '是（Y）  = 先去保存（弹出「另存为」），本次操作先取消\n'
+            '否（N）  = 丢弃这些改动，直接%s\n'
+            '取消     = 什么都不做' % what,
+            icon='warning', default='cancel')
+        if r is None:                     # 取消
+            return False
+        if r:                             # 是 ⇒ 去保存，本次操作中止
+            self.save_as()
+            self.status.set('已打开「另存为」，保存完成后请再%s一次' % what)
+            return False
+        return True                       # 否 ⇒ 丢弃改动，继续
+
+    def _on_close(self):
+        """点窗口 × —— 有未保存改动先问，别让玩家白改一小时。"""
+        try:
+            if self._is_modified():
+                if not messagebox.askyesno(
+                        '确认退出',
+                        '当前存档还有**未保存**的改动，退出后会全部丢失。\n\n确定退出吗？',
+                        icon='warning', default='no'):
+                    return
+            self.destroy()
+        except Exception:
+            try:
+                self.destroy()
+            except Exception:
+                pass
+
+    def _bind_shortcuts(self):
+        """★2026-10-28（审查 P1-7）：桌面软件的肌肉记忆。
+
+        `Ctrl+S` = 另存为新文件（本工具的**推荐**路径，绝不覆盖原档）
+        `Ctrl+O` = 打开存档　`F5` = 刷新列表
+
+        用 `self.bind` 而不是 `bind_all` —— 后者会把快捷键漏进「触发编辑器」那个
+        Toplevel，在那边按 Ctrl+S 会去保存主窗口的档，很容易误操作。
+        """
+        def _k(seq, fn):
+            try:
+                self.bind(seq, fn, add='+')
+            except Exception:
+                pass
+
+        def _wrap(fn):
+            def h(_e=None):
+                try:
+                    fn()
+                except Exception as e:
+                    self.status.set('快捷键执行失败：%s' % e)
+                return 'break'
+            return h
+
+        _k('<Control-s>', _wrap(self.save_as))
+        _k('<Control-o>', _wrap(self.open_dialog))
+        _k('<F5>', _wrap(self.refresh_list))
 
     # ---------------- 打开 ----------------
     def open_selected(self):
@@ -6433,6 +6807,13 @@ class App(tk.Tk):
         if getattr(self, '_pending_load', False):
             self.status.set('正在打开上一个存档，请稍候…')
             return
+        # ★2026-10-28（审查 P1-5）：换档前先问一句 —— 以前改完不保存就点另一个存档，
+        #   `self.doc` 直接被换掉，改动无声消失。
+        if not self._confirm_discard('打开另一个存档'):
+            return
+        # ★2026-10-28（审查 P0-4）：玩家可能在目录框里直接改了路径却没点刷新 ⇒
+        #   开档前再同步一次，保证 core 用的是最新的游戏目录。
+        self._sync_game_dir()
         self._pending_load = True
         self._t_load = time.time()
         self.pbar.start(12)
@@ -6530,6 +6911,7 @@ class App(tk.Tk):
             os.path.basename(self.doc.path), len(self.doc.records),
             '未挂地图' if getattr(self, '_map_mode', '') == 'no_map'
             else (ms or {}).get('text', '')))
+        self._refresh_title()                 # ★P1-5：标题栏显示文件名（刚载入时无 *）
         try:
             self.after(400, self._auto_scan_anim)
         except Exception:
@@ -6539,8 +6921,10 @@ class App(tk.Tk):
         """**同步**刷新（自检脚本 / 命令行用；界面上走 `_set_doc_async` 才有读条）。"""
         self.doc = doc
         self._warned_zero = False
+        self._wpn_loaded = False          # ★换档 ⇒ 武器页要重填
         for _n, fn in self._doc_steps():
             fn()
+        self._wpn_refresh_if_visible()
 
     def _set_doc_async(self, doc):
         """★★§272：分步刷新 + 读条。
@@ -6553,9 +6937,11 @@ class App(tk.Tk):
         """
         self.doc = doc
         self._warned_zero = False
+        self._wpn_loaded = False          # ★换档 ⇒ 武器页要重填
         self._st_steps = list(self._doc_steps())
         self._st_total = len(self._st_steps)
         self._st_t0 = time.time()
+        self._wpn_refresh_if_visible()
         try:
             self.pbar.stop()
             self.pbar.config(mode='determinate', maximum=100, value=0)
@@ -6886,26 +7272,68 @@ class App(tk.Tk):
         def work():
             try:
                 res = self.doc.save(path)
-                self.q.put(('done', '已保存：%s\n重编码 %d 块，文件 %d B，md5 %s' % (
-                    res['out'], res['recompressed'], res['file'], res['md5'][:12])))
+                # ★2026-10-28（审查 P0-3）：把块布局核对结果**显式报给玩家**。
+                #   以前这两项算了但没人看，块数不对也照样报"已保存"。
+                self.q.put(('done', '已保存：%s\n重编码 %d 块 · 块布局核对 %d/%d 通过'
+                            ' · 文件 %d B · md5 %s'
+                            % (res['out'], res['recompressed'],
+                               res.get('blocks', -1), res.get('blocks_expect', -1),
+                               res['file'], res['md5'][:12])))
             except Exception as e:
                 self.q.put(('err', '%s\n%s' % (e, traceback.format_exc())))
         threading.Thread(target=work, daemon=True).start()
 
+    def _suggest_save_name(self, src_path):
+        """给「另存为」拟一个**磁盘上还不存在**的默认文件名。
+
+        ★2026-10-28（玩家反馈，截图 QQ20261028-123404）：
+          以前一律 `base + '_修改'`。打开 `65_修改.SAV` 时建议名是 `65_修改_修改.SAV`，
+          而那个文件是上一次另存为留下的 ⇒ Windows 立刻弹「要替换它吗」，
+          玩家以为要**覆盖原档**（其实原档 `65_修改.SAV` 一点没动）。
+        现在三条规矩：
+          ① 名字已经以 `_修改` 结尾就**不再叠加**（避免 `_修改_修改_修改` 越滚越长）；
+          ② 磁盘上已有同名文件就往后找 `_2` `_3` …，保证默认名一定是"新文件"；
+          ③ 主干仍然截短到 40 GBK 字节以内（引擎读档 64 字节缓冲的老坑，见 _finish_save）。
+        """
+        base = os.path.splitext(os.path.basename(src_path))[0]
+        d = os.path.dirname(os.path.abspath(src_path))
+
+        def _free(stem):
+            cand = stem + '.SAV'
+            n = 2
+            while os.path.exists(os.path.join(d, cand)):
+                cand = '%s_%d.SAV' % (stem, n)
+                n += 1
+                if n > 999:            # 兜底，别死循环
+                    cand = '%s_%s.SAV' % (stem, time.strftime('%H%M%S'))
+                    break
+            return cand
+
+        # ★先把名字尾部的「_修改 / _2 / _3 …」这一串剥掉，否则会滚成
+        #   `65_修改_2_修改_2_修改`（自检 §294 场景 E 逮到的）。
+        #   只在名字里**本来就含 `_修改`** 时才剥 —— 免得把正常的 `SAVE_2.SAV` 剥成 `SAVE`。
+        if '_修改' in base:
+            while True:
+                nb = re.sub(r'(_修改|_\d+)$', '', base)
+                if nb == base or not nb:
+                    break
+                base = nb
+        stem = base + '_修改'
+        try:
+            if len(stem.encode('gbk', 'ignore')) > 40:
+                stem = base[:8] + '_修改'
+        except Exception:
+            pass
+        return _free(stem)
+
     def save_as(self):
         if not self.doc:
             return
-        base = os.path.splitext(os.path.basename(self.doc.path))[0]
-        sug = base + '_修改'
-        # ★长文件名读档会崩（见 _finish_save 注释）⇒ 默认名过长时自动截短
-        try:
-            if len(sug.encode('gbk', 'ignore')) > 40:
-                sug = base[:8] + '_修改'
-        except Exception:
-            pass
-        p = filedialog.asksaveasfilename(title='另存为', defaultextension='.SAV',
-                                         initialfile=sug + '.SAV',
-                                         initialdir=os.path.dirname(self.doc.path))
+        p = filedialog.asksaveasfilename(
+            title='另存为新文件（不会覆盖当前打开的存档）',
+            defaultextension='.SAV',
+            initialfile=self._suggest_save_name(self.doc.path),
+            initialdir=os.path.dirname(self.doc.path))
         if p:
             self._finish_save(p)
 
@@ -7470,11 +7898,11 @@ class App(tk.Tk):
         win.grab_set()
         return win
 
-    def _unit_type_names(self):
-        try:
-            return sorted((self.doc.unit_type_index() or {}).keys())
-        except Exception:
-            return []
+    # ★2026-10-28 删：这里原有一个 5 行的 `_unit_type_names`（返回裸 ID），
+    #   它在同一个类里**覆盖**了前面 4874 行那个 33 行的正式版本 ⇒ 地图页全部单位下拉
+    #   都退化成 `ADOG` 这种裸 ID，丢了「ADOG（警犬）」的中文名与 rules 建造栏排序。
+    #   它当初是提交 62a4d23a 为了迁就 `_dlg_tf.add()` 没做 split('（') 而加的补丁；
+    #   现在 add() 已改成先 split，故删除本定义，统一走 4874 行那一版。
 
     def _dlg_tf(self, name='新特遣部队', units=None, ident=None):
         """特遣部队对话框（仿地编：名称 / 分组 / 单位列表 / 添加 / 删除 / 数目 / 类型）。
@@ -7523,7 +7951,9 @@ class App(tk.Tk):
                 n = int(v_cnt.get() or 0)
             except ValueError:
                 return
-            ty = (v_ty.get() or '').strip().upper()
+            ty = (v_ty.get() or '').split('（')[0].strip().upper()
+            # ★2026-10-28：下拉项是 `ID（显示名）`（见 _unit_type_names），必须先去括号再当型号，
+            #   否则会把 "ADOG（警犬）" 整个写进特遣部队的类型键。
             if not ty or n <= 0:
                 return
             if len(units) >= 6:

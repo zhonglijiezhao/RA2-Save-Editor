@@ -91,7 +91,9 @@ ck(_btn_req is not None and str(_btn_req) in ('0', 0),
 
 # ② 左侧导航（不再是 10 个横向页签）
 ck(isinstance(app.nb, ui_theme.NavRail), '主容器是 NavRail（不是 Notebook）')
-ck(len(app.nb.tabs()) == 10, '10 个页签：%d' % len(app.nb.tabs()))
+# ★2026-10-28：新增「武器 · 弹头」页 ⇒ 10 → 11（新页一律追加在末尾，
+#   不能插在中间，否则按固定索引取页的老自检全打歪）
+ck(len(app.nb.tabs()) == 11, '11 个页签：%d' % len(app.nb.tabs()))
 for i in range(10):
     app.nb.select(i)
     app.update()
