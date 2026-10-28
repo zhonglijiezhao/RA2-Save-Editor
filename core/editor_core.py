@@ -13030,13 +13030,19 @@ class SaveDoc(object):
                     L.append('%s=%s' % (key, v))
             wh_blocks.append('\n'.join(L))
 
-        # ---- 抛射体段：存档里没有对象，整段照抄 rules ----
+        # ---- 抛射体段：存档里只有名字、没有参数，整段照抄 rules ----
         pj_blocks = []
         for pjn in sorted(pj_used):
             kv = rules.get(pjn) or {}
             L = ['[%s];抛射体' % pjn]
+            # ★2026-10-28 探测结论（别删，这是"为什么抄 rules"的依据）：
+            #   抛射体对象在档内**只是个名字壳** —— 拿 `Arcing=yes` 的 MARIOSTAR 和
+            #   `Arcing=no` 的 InvisibleHighA 对比，+0x80..+0x1A0 **0 处字节不同**，
+            #   两者全 0；59 个抛射体对象里 57 个在 +0x80 之后没有任何非零槽。
+            #   引擎读档时按名字从 rules 重建这些参数，所以这里只能抄。
+            L.append('; 注意：抛射体参数不落盘（读档时按名字从 rules 重建），以下取自 rules')
             if not kv:
-                L.append('; 当前 rules 里没有这一节（存档不存抛射体，无法还原）')
+                L.append('; 当前 rules 里也没有这一节 —— 只能给个空段，需要你自己补参数')
             else:
                 for k, v in kv.items():
                     if isinstance(v, str) and v.strip():
