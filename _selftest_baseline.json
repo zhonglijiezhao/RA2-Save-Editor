@@ -354,6 +354,11 @@
   "passed": 15,
   "status": "ok"
  },
+ "_selftest_ev299_heavy_save": {
+  "failed": 0,
+  "passed": 12,
+  "status": "ok"
+ },
  "_selftest_game_ini": {
   "failed": 3,
   "passed": 24,

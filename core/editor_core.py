@@ -892,6 +892,11 @@ class SaveDoc(object):
         self.time_sync_note = ''         # 最近一次时间同步的结果说明（供界面提示）
         self._tables_lowconf = False     # 类型空间校验未通过 ⇒ 低置信（只读提示用）
         self._tagrecs = None              # 标签记录缓存（tag_records，按类 GUID 尾识别）
+        # ★2026-10-28（玩家报「这个存档打开就卡死」）：标签↔触发配对、标签持久性
+        #   以前每次调用都重算，而 `trigger_repeat_type` 是**每条触发一次**的调用
+        #   ⇒ 5250 条触发的档 = 5250 ×（全量名字匹配）⇒ 直接卡死。
+        self._tagpairs_memo = None        # [(tag_sid, trig_sid)]
+        self._tagpersist_memo = None      # {tag_sid: '0'/'1'/'2'/None}
         self.info = self._read_info()
         self.records = self._scan_records()
         self.pending_money = None
@@ -1779,6 +1784,7 @@ class SaveDoc(object):
         self._tagobjs = None
         self._wpbase_memo = None     # §273 路径点表基址（全档 find 定位）
         self._tagrecs = None
+        self._tagpairs_memo = self._tagpersist_memo = None     # ★2026-10-28：跟着标签记录一起废
         self._ctimerlist = None
         self._navmemo = None
         # ★§256：挂接总览 / House 块也按偏移缓存，插入后必须作废
@@ -2234,7 +2240,7 @@ class SaveDoc(object):
     def action_owner_sids(self):
         """{行为自键: 触发 sid} —— 沿行为链把**每一条**行为都归属到触发（无需地图）。"""
         pl = self.plain
-        by_key = {a.get('key'): a for a in self.actions() if a.get('key')}
+        by_key = self._actions_by_key()
         out = {}
         for sid, d in self.runtime_links().items():
             k, seen = d['ac'], set()
@@ -2276,10 +2282,38 @@ class SaveDoc(object):
                 out.append((sid, names.get(sid) or sid))
         return out
 
+    def _actions_by_key(self):
+        """`{行为自键: 行}` —— **缓存**，别每条链都重建一次。
+
+        ★2026-10-28（玩家报「这个存档打开就卡死」的第二个坑）：
+          `action_chain()` 原来每次调用都 `{a['key']: a for a in self.actions()}`。
+          本档 400+ 条行为 × 2000+ 次调用 = 几十万次字典构建 + 4800 万次 get ⇒
+          刷新一次触发列表要十几秒。
+          缓存判据用「同一个列表对象 + 长度没变」：`actions()` 重建时会换新对象，
+          万一有人原地 append，长度也变了 ⇒ 两种情况都自动失效。
+        """
+        lst = self.actions()
+        cache = getattr(self, '_actbykey', None)
+        if cache is not None and cache[0] is lst and cache[1] == len(lst):
+            return cache[2]
+        m = {a.get('key'): a for a in lst if a.get('key')}
+        self._actbykey = (lst, len(lst), m)
+        return m
+
+    def _events_by_key(self):
+        """`{事件自键: 行}` —— 同上，缓存。"""
+        lst = self.events()
+        cache = getattr(self, '_evbykey', None)
+        if cache is not None and cache[0] is lst and cache[1] == len(lst):
+            return cache[2]
+        m = {e.get('key'): e for e in lst if e.get('key')}
+        self._evbykey = (lst, len(lst), m)
+        return m
+
     def action_chain(self, head_key, limit=512):
         """从一条行为自键出发，沿 `obj+0x3C` 走完整条链 → [行为自键, ...]。"""
         pl = self.plain
-        by_key = {a.get('key'): a for a in self.actions() if a.get('key')}
+        by_key = self._actions_by_key()
         out, seen, k = [], set(), head_key
         while k and k in by_key and k not in seen and len(out) < limit:
             out.append(k)
@@ -2296,7 +2330,7 @@ class SaveDoc(object):
     def event_chain(self, head_key, limit=512):
         """从一条事件自键出发，沿 `obj+0x3C` 走完整条链 → [事件自键, ...]。"""
         pl = self.plain
-        by_key = {e.get('key'): e for e in self.events() if e.get('key')}
+        by_key = self._events_by_key()
         out, seen, k = [], set(), head_key
         while k and k in by_key and k not in seen and len(out) < limit:
             out.append(k)
@@ -2311,7 +2345,7 @@ class SaveDoc(object):
         d = self.runtime_links().get(sid)
         if not d:
             return []
-        by_key = {e.get('key'): e for e in self.events() if e.get('key')}
+        by_key = self._events_by_key()
         out = []
         for k in self.event_chain(d.get('ev')):
             e = by_key.get(k)
@@ -2363,6 +2397,8 @@ class SaveDoc(object):
         self._mapm = None
         self._events = None
         self._actions = None
+        # ★2026-10-28：配对优先取地图 [Tags]，换地图就得重算
+        self._tagpairs_memo = None
         self._apply_map()
         if path:
             try:
@@ -3095,14 +3131,22 @@ class SaveDoc(object):
         return self._tagrecs
 
     def tag_persist(self, tag_sid):
-        """标签的持久性（= 重复类型）'0'/'1'/'2'；读不到返回 None。"""
-        for sid, _nm, off in self.tag_records():
-            if sid == tag_sid:
+        """标签的持久性（= 重复类型）'0'/'1'/'2'；读不到返回 None。
+
+        ★2026-10-28：加了 memo。原来每次调用都要遍历**全部标签记录**（O(标签数)），
+          而 `trigger_repeat_type` 会为每条触发、每个配对标签各调一次 ⇒ 乘起来是
+          O(触发 × 标签²)，5250 条触发的档上就是这一层把界面拖死的。
+        """
+        memo = getattr(self, '_tagpersist_memo', None)
+        if memo is None:
+            memo = {}
+            for sid, _nm, off in self.tag_records():
                 v = int.from_bytes(
                     self.plain[off + TAG_PERSIST_OFF:off + TAG_PERSIST_OFF + 4],
                     'little')
-                return str(v) if 0 <= v <= 3 else None
-        return None
+                memo[sid] = str(v) if 0 <= v <= 3 else None
+            self._tagpersist_memo = memo
+        return memo.get(tag_sid)
 
     # ---------- 改已有触发的"触发类型"（★2026-10-20 玩家要求） ----------
     def tag_obj_off(self, rec_off):
@@ -3293,6 +3337,9 @@ class SaveDoc(object):
         if not done:
             raise RuntimeError('标签 %s 的对象帧校验失败，已拒绝写入（避免写错位置）'
                                % ','.join(sorted(tset)))
+        # ★2026-10-28：持久性字节刚被改写 ⇒ 那个 memo 必须作废，
+        #   否则界面重画时读到的还是旧值（写成功但显示没变）。
+        self._tagpersist_memo = None
         # ★§157：含局部变量事件（36/37）的触发，写 1 等于让它永不触发、写 2 会反复执行。
         #   这里**不拦**（有的地图作者故意要 2 的重复效果），但把警告串带回去，GUI 弹确认。
         return {'changed': n, 'old': old, 'new': persistence,
@@ -3304,7 +3351,13 @@ class SaveDoc(object):
 
         优先用**已挂地图**的 `[Tags]` 末字段（权威）；没挂地图则用命名规律：
         FinalSun 把标签命名为「触发名 + " N"」（如 `A2号信标铁幕a` → `A2号信标铁幕a 1`）。
+
+        ★2026-10-28：**有 memo**（本档 5250 条记录，重算一次 ~2.5 秒，而被调用 2000+ 次）。
+          失效点见 `invalidate_caches()` / `attach_map()` / 新建触发后。
         """
+        memo = getattr(self, '_tagpairs_memo', None)
+        if memo is not None:
+            return memo
         m = getattr(self, '_map', None)
         if m:
             pairs = [(tid, trig) for tid, trig in m.tag_trigger_map().items() if trig]
@@ -3312,30 +3365,43 @@ class SaveDoc(object):
             #   必须用命名规律兜底，否则新触发的"触发类型"永远读不出来。
             known = {t for t, _g in pairs}
             pairs += [(t, g) for t, g in self._tag_pairs_by_name() if t not in known]
+            self._tagpairs_memo = pairs
             return pairs
-        return self._tag_pairs_by_name()
+        pairs = self._tag_pairs_by_name()
+        self._tagpairs_memo = pairs
+        return pairs
 
     def _tag_pairs_by_name(self):
         """按命名规律把标签对到触发：FinalSun 把标签命名为「触发名 + " N"」。
+
         ⚠ 不能从右往左把所有数字段都剥掉（会剥出 `A3号信标铁幕a` 这种不存在的名字），
-          改用**最长触发名前缀 + 剩余部分是纯数字**来匹配。"""
+          改用**最长触发名前缀 + 剩余部分是纯数字**来匹配。
+
+        ★2026-10-28（玩家报「这个存档打开就卡死」，档里 5250 条触发）：
+          原来是「对每个标签，遍历**按长度倒序的全部触发名**做 startswith」⇒
+          O(标签 × 触发名)。名字有几千个时这一层就是几十万次前缀比较，
+          而它又被 `trigger_repeat_type` 每条触发调一次 ⇒ 直接跑到天荒地老。
+          改成**从尾部往前找切点**：第一个「head 在表里 且 尾巴是纯数字」的切点
+          就是最长的匹配（与原逻辑等价），代价只跟**名字长度**有关，与触发数量无关。
+        """
         trig_by_name = {}
         for r in self.records:
             if r.kind == '触发' and r.name:
                 trig_by_name.setdefault(r.name, []).append(r.sid)
-        names = sorted(trig_by_name, key=len, reverse=True)   # 长的优先 ⇒ 最具体的触发名
         out = []
         for sid, nm, _off in self.tag_records():
             if not nm:
                 continue
-            for tn in names:
-                if nm.startswith(tn):
-                    rest = nm[len(tn):].strip()
-                    if rest.isdigit():
-                        # 同名触发无法用名字区分 ⇒ 都挂上（持久性取任一，实测同名同值）
-                        for tsid in trig_by_name[tn]:
-                            out.append((sid, tsid))
-                        break
+            hit = None
+            for i in range(len(nm) - 1, 0, -1):
+                head, rest = nm[:i].rstrip(), nm[i:].strip()
+                if rest.isdigit() and head in trig_by_name:
+                    hit = trig_by_name[head]
+                    break
+            if hit:
+                # 同名触发无法用名字区分 ⇒ 都挂上（持久性取任一，实测同名同值）
+                for tsid in hit:
+                    out.append((sid, tsid))
         return out
 
     def trigger_repeat_type(self, sid):
@@ -4322,6 +4388,7 @@ class SaveDoc(object):
         self._house_keys_memo = None
         self._houses_memo = None        # ★P3-14：阵营结构 memo（偏移会变）
         self._tagrecs = None            # ★2026-10-20：标签记录缓存也要失效（否则新建触发的类型读不出）
+        self._tagpairs_memo = self._tagpersist_memo = None     # ★2026-10-28：同上
         self.records = self._scan_records()
         if self._map:
             self._events = None
@@ -13859,6 +13926,7 @@ class SaveDoc(object):
         self._house_keys_memo = None
         self._houses_memo = None        # ★P3-14
         self._tagrecs = None            # ★2026-10-20：同上，新建触发的标签也要能被认出
+        self._tagpairs_memo = self._tagpersist_memo = None     # ★2026-10-28：同上
         self._instmaps = None           # ★2026-10-20：不失效它 ⇒ 新触发"没有运行期实例"，
         #                                  接着 add_action/copy 全部失败（自检抓到）
         self.records = self._scan_records()
@@ -14469,6 +14537,7 @@ class SaveDoc(object):
                   '_instmaps', '_house_econ', '_custom_houses', '_house_keys_memo',
                   '_houses_memo',          # ★P3-14：houses() 的结构 memo
                   '_tagrecs', '_mapm', '_aiids',
+                  '_tagpairs_memo', '_tagpersist_memo',   # ★2026-10-28 标签配对/持久性 memo
                   # ★2026-10-27：`_horder` 只是 [{'short','cn','is_player'}]，**与偏移无关**，
                   #   以前每次增删对象都清它 ⇒ 下次 `_arg_text` 要重算 1.3 秒（本档）。
                   #   实测这是「添加行为」里最大的一笔浪费，故从清理表里移除。
@@ -14570,7 +14639,7 @@ class SaveDoc(object):
             if len(evs) >= 2:
                 out['ev_size'] = evs[1]['obj'] - evs[0]['obj']
         ack = int.from_bytes(pl[inst + 196:inst + 200], 'little')
-        byk = {a.get('key'): a for a in self.actions()}
+        byk = self._actions_by_key()
         for k in self.action_chain(ack):
             if k in byk:
                 out['acs'].append((byk[k]['obj'], k))
@@ -14634,7 +14703,7 @@ class SaveDoc(object):
             except Exception:
                 pass
         evs = self.events()
-        byk = {a.get('key'): a for a in self.actions()}
+        byk = self._actions_by_key()
         # ★2026-10-20：事件对象 `+0x50..+0x68` 是**运行期指针区**：
         #   全 0 = 这个事件还没被引擎"接管"（事件驱动型触发本来就不需要 TagNode）；
         #   非 0 = 引擎已经处理过它（= 执行过）。
@@ -14758,7 +14827,7 @@ class SaveDoc(object):
         d = self.runtime_links().get(sid)
         if not d:
             return []
-        by_key = {a.get('key'): a for a in self.actions() if a.get('key')}
+        by_key = self._actions_by_key()
         out = []
         for k in self.action_chain(d.get('ac')):
             a = by_key.get(k)
@@ -14833,7 +14902,7 @@ class SaveDoc(object):
         if not old_head:
             pl[inst + 192:inst + 196] = struct.pack('<I', k)
         else:
-            byk = {e.get('key'): e for e in evs if e.get('key')}
+            byk = self._events_by_key()
             tail = byk.get(self.event_chain(old_head)[-1]) if self.event_chain(old_head) else None
             if tail is None:
                 raise RuntimeError('事件链异常（链尾对象找不到）—— 请勿保存')
@@ -14956,7 +15025,7 @@ class SaveDoc(object):
         if not chain:
             pl[inst + 196:inst + 200] = struct.pack('<I', k)
         else:
-            byk = {x.get('key'): x for x in self.actions()}
+            byk = self._actions_by_key()
             last = byk.get(chain[-1])
             if last is None:
                 raise RuntimeError('行为链异常（链尾对象找不到）—— 请勿保存')
@@ -15328,7 +15397,7 @@ class SaveDoc(object):
         m = self._instance_maps()
         insts = sorted(m['inst'].items(), key=lambda kv: kv[1])
         tobj = self._tag_objs_by_key()
-        byk = {a.get('key'): a for a in self.actions()}
+        byk = self._actions_by_key()
         evs = {e.get('key'): e for e in self.events()}
         for i, (k, off) in enumerate(insts):
             pl[off + self.TRIG_SEQ_OFF:off + self.TRIG_SEQ_OFF + 4] = struct.pack('<I', i)
