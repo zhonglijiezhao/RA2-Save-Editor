@@ -111,6 +111,57 @@ VSVersionInfo(
 """
 
 
+APPVER = os.path.join(ROOT, 'core', 'app_version.py')
+
+APPVER_TMPL = '''# -*- coding: utf-8 -*-
+"""版本信息 —— 界面头部显示的版本号来自这里（★自动生成，别手改）。"""
+SEMVER = '@@SEMVER@@'
+BUILD = @@BUILD@@
+
+REPO = 'https://github.com/zhonglijiezhao/RA2-Save-Editor'
+REPO_SHORT = 'zhonglijiezhao/RA2-Save-Editor'
+ISSUES = REPO + '/issues'
+
+
+def version_text():
+    try:
+        b = int(BUILD)
+    except Exception:
+        b = 0
+    if b > 0:
+        return 'v%s · p%d' % (SEMVER, b)
+    return 'v%s' % SEMVER
+'''
+
+
+def write_app_version(ver, semver='1.4.2'):
+    """把 `core/app_version.py` 的 SEMVER / BUILD 刷成本次打包的值 → 路径。
+
+    ★2026-10-29（玩家要求「主页面加版本号」）：界面要显示版本，就得有个**程序自己能读**
+      的来源。exe 属性里那份只有玩家手动翻才看得到，还常常被 SmartScreen 挡住。
+      这里只改前两行赋值，`REPO` 等手维护的内容原样保留（用正则换行，不整文件覆盖）。
+    """
+    try:
+        v = int(ver)
+    except Exception:
+        v = 0
+    try:
+        s = open(APPVER, encoding='utf-8').read()
+    except Exception:
+        s = None
+    if s:
+        new = re.sub(r'(?m)^SEMVER\s*=\s*.*$', "SEMVER = '%s'" % semver, s, count=1)
+        new = re.sub(r'(?m)^BUILD\s*=\s*.*$', 'BUILD = %d' % v, new, count=1)
+        if new != s:
+            with open(APPVER, 'w', encoding='utf-8', newline='') as f:
+                f.write(new)
+        return APPVER
+    txt = APPVER_TMPL.replace('@@SEMVER@@', semver).replace('@@BUILD@@', str(v))
+    with open(APPVER, 'w', encoding='utf-8', newline='') as f:
+        f.write(txt)
+    return APPVER
+
+
 def write_version_info(ver, semver='1.4.0'):
     """写 `_version_info.txt`（PyInstaller 版本资源）→ 路径。
 
@@ -194,6 +245,7 @@ def main():
     try:
         print('  版本资源: 产品 %s / 文件 %s.p%d' % (semver, semver, ver))
         write_version_info(ver, semver)
+        write_app_version(ver, semver)      # → 界面头部显示的版本号
     except Exception as e:
         print('  ⚠ 版本资源生成失败（不影响打包）：%s' % e)
     cmd = [PY, '-m', 'PyInstaller', SPEC, '--noconfirm',

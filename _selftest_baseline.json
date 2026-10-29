@@ -374,6 +374,11 @@
   "passed": 9,
   "status": "ok"
  },
+ "_selftest_ev303_version_link": {
+  "failed": 0,
+  "passed": 31,
+  "status": "ok"
+ },
  "_selftest_game_ini": {
   "failed": 3,
   "passed": 24,

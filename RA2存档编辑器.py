@@ -13,7 +13,8 @@
   7. 保存：默认另存为新文件（绝不覆盖原档）；可选原地保存（自动备份）
 """
 import os, sys, re, struct, threading, queue, time, traceback
-import json, subprocess
+import json, subprocess, webbrowser
+import platform
 import tkinter as tk
 from tkinter import ttk
 # ★P2-8：对话框走共享代理，测试打补丁才能对全部页面生效（见 ui/msg.py）
@@ -27,6 +28,7 @@ from editor_core import (SaveDoc, MONEY_SIG, MIRROR_DELTA,   # noqa: E402
                          action_name, action_ptype, event_note, action_note,
                          ENGINE_PTYPE_TEXT)
 import game_ini                                            # noqa: E402  规则文件（rules/art）
+import app_version                                         # noqa: E402  ★版本号/仓库地址
 import ai_objects                                          # noqa: E402  AI 三大件（小队/特遣/脚本）
 import ui_theme                                            # noqa: E402  ★v1.3 视觉主题层
 # ★2026-10-28（P2-8）：11 个页签各一个 Page 类（mixin），App 只留外壳；
@@ -162,6 +164,25 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
                  font=(ui_theme.FONT_UI, 12, 'bold')).pack(side='left', padx=(9, 6))
         tk.Label(hi, text='尤里的复仇', bg=T['surface'], fg=T['muted'],
                  font=(ui_theme.FONT_UI, 9)).pack(side='left', pady=(4, 0))
+
+        # ★2026-10-29（玩家要求「主页面加版本号和 GITHUB 链接」）：
+        #   放头部左侧、标题之后 —— 状态栏右边被进度条占着，而玩家截图报 bug 时
+        #   头部一定在画面里，"我用的是哪一版"就再也不用问了。
+        #   点版本号 = 复制「版本 + Python + 系统」到剪贴板；点 GitHub = 开浏览器。
+        self.lbl_ver = tk.Label(hi, text=app_version.version_text(),
+                                bg=T['surface'], fg=T['muted_soft'],
+                                font=(ui_theme.FONT_UI, 8), cursor='hand2')
+        self.lbl_ver.pack(side='left', padx=(12, 0), pady=(7, 0))
+        self.lbl_ver.bind('<Button-1>', lambda e: self.copy_version())
+        self.lbl_repo = tk.Label(hi, text='GitHub \u2197', bg=T['surface'], fg=T['info'],
+                                 font=(ui_theme.FONT_UI, 8, 'underline'),
+                                 cursor='hand2')
+        self.lbl_repo.pack(side='left', padx=(9, 0), pady=(7, 0))
+        self.lbl_repo.bind('<Button-1>', lambda e: self.open_repo())
+        self.lbl_ver.bind('<Enter>', lambda e: self.lbl_ver.configure(fg=T['ink_2']))
+        self.lbl_ver.bind('<Leave>', lambda e: self.lbl_ver.configure(fg=T['muted_soft']))
+        self.lbl_repo.bind('<Enter>', lambda e: self.lbl_repo.configure(fg=T['accent_deep']))
+        self.lbl_repo.bind('<Leave>', lambda e: self.lbl_repo.configure(fg=T['info']))
 
         # 右侧：目录 + 刷新 + 打开（从右往左 pack）
         ttk.Button(hi, text='打开存档…', style='Secondary.TButton',
@@ -335,6 +356,63 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
         except Exception:
             pass
         return bool(rp)
+
+
+    # ---------- 版本号 / 仓库链接（★2026-10-29 玩家要求） ----------
+    def version_info_text(self):
+        """一行能直接贴进 issue 的版本信息（版本 / Python / 系统）。"""
+        try:
+            osname = platform.platform(terse=True)
+        except Exception:
+            osname = 'Windows'
+        return ('RA2 存档编辑器 %s  |  Python %s  |  %s'
+                % (app_version.version_text(), platform.python_version(), osname))
+
+    def copy_version(self):
+        """点版本号 → 复制「版本 + Python + 系统」到剪贴板。
+
+        报 bug 时最缺的就是这三样，让人手打不如一点。
+        """
+        t = self.version_info_text()
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(t)
+            self.update_idletasks()
+        except Exception:
+            pass
+        self.status.set('已复制版本信息：%s' % t)
+        return t
+
+    def open_repo(self):
+        """点「GitHub ↗」→ 用默认浏览器打开仓库。
+
+        打不开（没默认浏览器 / 被安全策略拦）时不静默失败：
+        把地址复制到剪贴板并弹出来，玩家照样能自己粘。
+        """
+        url = app_version.REPO
+        ok = False
+        try:
+            ok = bool(webbrowser.open(url))
+        except Exception:
+            ok = False
+        if ok:
+            self.status.set('已在浏览器打开：%s' % url)
+            return True
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(url)
+            self.update_idletasks()
+            tail = '\n\n（地址已复制到剪贴板，粘到浏览器地址栏就能打开）'
+        except Exception:
+            tail = ''
+        try:
+            messagebox.showinfo('项目主页',
+                                'RA2 存档编辑器 %s\n\n%s%s'
+                                % (app_version.version_text(), url, tail))
+        except Exception:
+            pass
+        self.status.set('无法自动打开浏览器：%s' % url)
+        return False
 
 
 def crash_log_path():
