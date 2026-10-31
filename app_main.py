@@ -48,12 +48,24 @@ r"""RA2 存档编辑器 —— 命令行入口 / PyInstaller 入口
         --house 也可用于 --gift 的 placed 分支。
     RA2存档编辑器.exe --owner <in> <out> <阵营> [--type 类型] [--cell cx cy] [--key hex] [--idx n]
         headless **改已有建筑的所属方**（写记录载荷 +336/+544）。给 --type = 该类型**全部**都改。
+    RA2存档编辑器.exe --captured <in> [--cell cx cy | --type 类型 | --all] [--set 0|1] [--out 输出.SAV | --inplace]
+        看/改「这栋楼是不是工程师占领来的」（b 帧 +0x6AF）。**--set 0 = 恢复成自建 ⇒ 建造场拆了会出工程师**；
+        --set 1 = 标成占领来的 ⇒ 拆了永不出工程师。不带 --set 只列出。
+    RA2存档编辑器.exe --export-weapons <in> [输出.ini|.csv] [--diff] [--format ini|csv]
+        导出存档里的武器表（默认 INI，每把一段，可直接贴 rulesmd.ini）；--diff 只要非原版的。
+    RA2存档编辑器.exe --shrapnel <in> [--set 抛射体=数量 ...] [--out 输出.SAV] [--inplace]
+        inventory/改**抛射体的分裂配置**（ShrapnelWeapon + ShrapnelCount，在存档里，
+        改 rules 对已存盘的档无效）。例：--set Electricbounce=8 ⇒ 1 发主弹 + 8 发分裂。
+    RA2存档编辑器.exe --refract <in> [--n1 3] [--n2 1] [--term ElectricBolt] --out 新.SAV
+        把档内电弧链改成**两级自我折射**：主弹 → n1 个子武器 → 每个再炸出 n2 个 ⇒ 1+n1+n1*n2 发。
+        依靠"Type 对象自地址表"改写指针（只能指向档里已有的对象，且不能成环）。
 """
 import os
 import sys
 import traceback
 import datetime
 import tempfile
+import shutil
 
 
 def _base_dir():
@@ -1366,6 +1378,81 @@ def owner(args):
         return 1
 
 
+def captured(args):
+    """headless 看/改「这栋楼是不是工程师占领来的」（b 帧 +0x6AF）：
+    --captured <in> [--cell cx cy | --type 类型 | --all] [--set 0|1] [--out 输出.SAV | --inplace]
+
+    `--set 0` = 恢复成"自建" ⇒ 建造场（Factory=BuildingType）拆掉时**会出工程师**；
+    `--set 1` = 标成"占领来的" ⇒ 拆了**永不出工程师**（原版对占领楼的行为）。
+    不带 `--set` = 只列出，不改盘。★2026-10-31 四轮游戏内实测定案，只此一格开关。
+    """
+    cvals, args = _opt(args, '--cell', 2)
+    tvals, args = _opt(args, '--type', 1)
+    svals, args = _opt(args, '--set', 1)
+    ov, args = _opt(args, '--out', 1)
+    if not args:
+        _write_report('CAPTURED FAIL\n用法: --captured <in> [--cell cx cy | --type 类型 | --all] '
+                      '[--set 0|1] [--out 输出.SAV | --inplace]')
+        return 2
+    src = args[0]
+    inplace = '--inplace' in args
+    do_all = '--all' in args
+    try:
+        from editor_core import SaveDoc
+        d = SaveDoc(src)
+        rows = d.buildings()
+        if not rows:
+            _write_report('CAPTURED FAIL\n这份存档里没有建筑'); return 1
+        hit = []
+        for r in rows:
+            if cvals and (r['x'], r['y']) != (int(cvals[0]), int(cvals[1])):
+                continue
+            if tvals and r['type'].upper() != tvals[0].upper():
+                continue
+            hit.append(r)
+        lines = ['CAPTURED %s' % ('PASS' if svals else 'LIST'), 'src: %s' % src,
+                 '共 %d 栋建筑，命中 %d 栋' % (len(rows), len(hit))]
+        for r in hit:
+            lines.append('  %-10s @(%3d,%3d)  %s  归属=%s  原属=%s' % (
+                r['type'], r['x'], r['y'],
+                '占领来的（拆了不出工程师）' if r['captured'] else '自建（拆了会出工程师）',
+                d.house_label(r['house']), d.house_label(r['origin'])))
+        if not svals:
+            lines.append('改：加 --set 0（恢复出工程师）/ --set 1（禁掉）+ --out 输出.SAV 或 --inplace')
+            _write_report('\n'.join(lines)); return 0
+        if not hit:
+            _write_report('CAPTURED FAIL\n没有匹配的建筑（--cell/--type）'); return 1
+        if not do_all and not (cvals or tvals):
+            _write_report('CAPTURED FAIL\n为防误伤，--set 必须配 --cell / --type / --all 之一'); return 1
+        want = str(svals[0]).strip().lower() not in ('0', 'false', 'no', 'off')
+        infos = [d.set_building_captured(want, base=r['base']) for r in hit]
+        if ov:
+            out = ov[0]
+        elif inplace:
+            stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            bak = src + '.bak_captured_' + stamp
+            shutil.copy2(src, bak)
+            lines.append('已备份：%s' % bak)
+            out = src
+        else:
+            _write_report('CAPTURED FAIL\n要么给 --out 输出.SAV，要么给 --inplace'); return 1
+        d.save(out)
+        e = SaveDoc(out)
+        chk = {(x['x'], x['y']): x for x in e.buildings()}
+        lines.append('out: %s' % out)
+        lines += ['  ' + i['note'] for i in infos]
+        lines.append('复检：')
+        for r in hit:
+            x = chk.get((r['x'], r['y']))
+            lines.append('  %s @(%d,%d) captured=%s' % (
+                r['type'], r['x'], r['y'], bool(x and x['captured'])))
+        _write_report('\n'.join(lines))
+        return 0
+    except BaseException:
+        _write_report('CAPTURED FAIL\n\n' + traceback.format_exc())
+        return 1
+
+
 def gift(args):
     """headless 赠送建筑：
     --gift <in> <out> <类型ID> [ready | placed <cx> <cy>] [槽2偏移hex]
@@ -2033,6 +2120,214 @@ def weapons_cmd(args):
     return 0
 
 
+def shrapnel_cmd(args):
+    """`--shrapnel <存档> [--set 抛射体=数量 ...] [--out 输出.SAV] [--inplace]`
+
+    **抛射体的分裂配置**（2026-10-29 新功能）。
+
+    不带 `--set`：只读列出档内**真的会分裂**的抛射体（子武器指针 + 数量）。
+    带 `--set`：改数量并落盘。不给 `--out` 就必须给 `--inplace`（原地覆盖，
+               会先备份成 `<原名>.bak_shrapnel_<时间戳>`）。
+
+    ★为什么需要这个命令（而不是改 rules）：
+      分裂配置（`ShrapnelWeapon` / `ShrapnelCount`）**也存进存档了**
+      —— 抛射体对象 `+0x290` / `+0x294`，读档以档里这份为准。
+      玩家把 rules 的 `Electricbounce.ShrapnelCount` 改成 6，读档后依然只分裂 2 个。
+
+    用法示例：
+        --shrapnel SAVE0665.SAV
+        --shrapnel SAVE0665.SAV --set Electricbounce=8 --out 新.SAV
+    """
+    src, out, inplace, sets = None, None, False, []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ('--set', '-s') and i + 1 < len(args):
+            for part in args[i + 1].split(','):
+                part = part.strip()
+                if not part:
+                    continue
+                if '=' not in part:
+                    _write_report('SHRAPNEL FAIL\n--set 要写成 抛射体名=数量，收到 %r' % part)
+                    return 2
+                k, v = part.split('=', 1)
+                sets.append((k.strip(), v.strip()))
+            i += 2
+            continue
+        if a in ('--out', '-o') and i + 1 < len(args):
+            out = args[i + 1]
+            i += 2
+            continue
+        if a == '--inplace':
+            inplace = True
+            i += 1
+            continue
+        if src is None:
+            src = a
+        i += 1
+    if not src or not os.path.exists(src):
+        _write_report('SHRAPNEL FAIL\n用法: --shrapnel <存档> [--set 抛射体=数量 ...] '
+                      '[--out 输出.SAV] [--inplace]')
+        return 2
+    try:
+        from editor_core import SaveDoc
+        d = SaveDoc(src)
+    except Exception as e:
+        _write_report('SHRAPNEL FAIL\n打开存档失败：%s' % e)
+        return 1
+
+    lines = ['存档：%s' % src]
+    cur = d.projectile_shrapnel()
+    lines.append('当前会分裂的抛射体 %d 个：' % len(cur))
+    for x in cur:
+        lines.append('  %-20s ShrapnelCount=%-3d ptr=0x%08X' % (x['name'], x['count'], x['ptr']))
+    if not cur:
+        lines.append('  （一个都没有 —— 这份档里没有抛射体带分裂配置）')
+
+    if not sets:
+        lines.append('')
+        lines.append('想改数量：--shrapnel <存档> --set 抛射体名=数量 --out 新档.SAV')
+        lines.append('提示：打**空地**永远不分裂（原版判定），要打单位/建筑/树石才看得到效果。')
+        _write_report('\n'.join(lines))
+        return 0
+
+    if not out and not inplace:
+        _write_report('\n'.join(lines) +
+                      '\n\nSHRAPNEL FAIL\n--set 要落盘：给 --out <新档> 或 --inplace（会先备份）')
+        return 2
+    if inplace:
+        stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        bak = src + '.bak_shrapnel_' + stamp
+        try:
+            shutil.copy2(src, bak)
+        except Exception as e:
+            _write_report('SHRAPNEL FAIL\n备份失败，已中止：%s' % e)
+            return 1
+        out = out or src
+        lines.append('')
+        lines.append('已备份：%s' % bak)
+
+    lines.append('')
+    ok = True
+    for nm, val in sets:
+        try:
+            r = d.set_projectile_shrapnel(nm, val)
+        except Exception as e:
+            lines.append('  [失败] %s：%s' % (nm, e))
+            ok = False
+            continue
+        lines.append('  [%s] %s：%d → %d（偏移 0x%08X）'
+                     % ('改了' if r['changed'] else '没变', r['name'],
+                        r['old'], r['new'], r['off']))
+    if not ok:
+        _write_report('\n'.join(lines) + '\n\nSHRAPNEL FAIL\n有项目没改成，未写盘')
+        return 1
+    try:
+        d.save(out)
+    except Exception as e:
+        _write_report('\n'.join(lines) + '\n\nSHRAPNEL FAIL\n存盘失败：%s' % e)
+        return 1
+    lines.append('已写盘：%s' % out)
+    lines.append('进游戏读这一档，打**单位/建筑/树石**看效果（打空地不分裂）。'
+                 '原版实证上限 8（BlimpBombPE），更大没验证过。')
+    _write_report('\n'.join(lines))
+    return 0
+
+
+def refract_cmd(args):
+    """`--refract <存档> [--n1 3] [--n2 1] [--term ElectricBolt] --out 新.SAV`
+
+    **两级"自我折射"电弧链**（2026-10-29 新功能）。
+
+    做的事（三处定长写，明文长度不变）：
+        ① `Electricbounce.ShrapnelCount = n1`      （主弹命中后炸出 n1 个子武器）
+        ② `SmallTeslaP.ShrapnelWeapon = term`      （子武器 TeslaFragment 的弹**也会分裂了**）
+        ③ `SmallTeslaP.ShrapnelCount  = n2`
+    链路：NZ2BOLT/三星磁暴 → Electricbounce -(n1)-> TeslaFragment → SmallTeslaP
+          -(n2)-> term（默认 ElectricBolt，它自己的抛射体 InvisibleLow 不分裂 ⇒ 走到终点，不成环）
+
+    电弧数：1 + n1 + n1*n2 发 EBolt，每发 3 条电流（原版 EBolt 一发生成 3 条）。
+    n1=3 / n2=1 ⇒ 7 发 = 21 条。默认值就是这个。
+
+    ★为什么能成（以前我判"不可能"）：每个 Type 对象在**名字偏移 −0x28** 处存着自身
+      运行时地址（`SaveDoc.type_addr_map`），所以指针既能读成名字、也能改写成"另一个
+      既有对象"。以前说"指针不可算"是拿指针值反推文件偏移，方向错了。
+    ★铁律：链上每一环都必须是**档里已有**的对象，且**不能成环**（成环 = 无限递归崩溃）。
+    """
+    src, out, n1, n2, term = None, None, 3, 1, 'ElectricBolt'
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == '--n1' and i + 1 < len(args):
+            n1 = int(args[i + 1]); i += 2; continue
+        if a == '--n2' and i + 1 < len(args):
+            n2 = int(args[i + 1]); i += 2; continue
+        if a == '--term' and i + 1 < len(args):
+            term = args[i + 1]; i += 2; continue
+        if a in ('--out', '-o') and i + 1 < len(args):
+            out = args[i + 1]; i += 2; continue
+        if src is None:
+            src = a
+        i += 1
+    if not src or not os.path.exists(src):
+        _write_report('REFRACT FAIL\n用法: --refract <存档> [--n1 3] [--n2 1] '
+                      '[--term ElectricBolt] --out 新.SAV')
+        return 2
+    if not out:
+        _write_report('REFRACT FAIL\n必须给 --out <新档>（本命令不改原档）')
+        return 2
+    try:
+        from editor_core import SaveDoc
+        d = SaveDoc(src)
+    except Exception as e:
+        _write_report('REFRACT FAIL\n打开存档失败：%s' % e)
+        return 1
+    lines = ['存档：%s' % src]
+    steps = []
+    try:
+        steps.append(d.set_projectile_shrapnel('Electricbounce', n1))
+        steps.append(d.set_projectile_shrapnel_weapon('SmallTeslaP', term))
+        steps.append(d.set_projectile_shrapnel('SmallTeslaP', n2))
+    except Exception as e:
+        _write_report('\n'.join(lines) + '\n\nREFRACT FAIL\n接线失败：%s' % e)
+        return 1
+    for s in steps:
+        if 'new_name' in s:
+            lines.append('  %-14s 子武器 %s → %s'
+                         % (s['name'], s['old_name'], s['new_name']))
+        else:
+            lines.append('  %-14s 数量 %d → %d' % (s['name'], s['old'], s['new']))
+    # 落盘 + 重读复核
+    try:
+        d.save(out)
+    except Exception as e:
+        _write_report('\n'.join(lines) + '\n\nREFRACT FAIL\n存盘失败：%s' % e)
+        return 1
+    e = SaveDoc(out)
+    sh = {x['name']: x for x in e.projectile_shrapnel()}
+    chain, node = [], 'Electricbounce'
+    while True:
+        p = sh.get(node)
+        if not p:
+            chain.append('%s(止)' % node)
+            break
+        w = e.resolve_ptr(p['ptr'])
+        chain.append('%s -%d-> %s' % (node, p['count'], w))
+        nxt = {x['name']: x for x in e.weapon_projectiles()}.get(w, {}).get('projectile')
+        if not nxt or len(chain) > 6:
+            chain.append('(%s 抛射体 %s 不分裂)' % (w, nxt))
+            break
+        node = nxt
+    lines.append('')
+    lines.append('链路：' + ' | '.join(chain))
+    lines.append('预计 EBolt：1 + %d + %d = %d 发 ⇒ %d 条电流'
+                 % (n1, n1 * n2, 1 + n1 + n1 * n2, (1 + n1 + n1 * n2) * 3))
+    lines.append('已写盘：%s' % out)
+    lines.append('进游戏读这一档，打**单位/建筑/树石**（打空地不分裂）。')
+    _write_report('\n'.join(lines))
+    return 0
+
+
 def main():
     # ★2026-10-22（开源前补）：`--help/-h` 打印模块头部的用法清单。
     #   以前没有这个开关，`--help` 会落到"启动 GUI"分支 —— 在没装 tkinter 的环境里直接
@@ -2051,6 +2346,9 @@ def main():
     if '--owner' in sys.argv:
         i = sys.argv.index('--owner')
         return owner(sys.argv[i + 1:])
+    if '--captured' in sys.argv:
+        i = sys.argv.index('--captured')
+        return captured(sys.argv[i + 1:])
     if '--types' in sys.argv:
         i = sys.argv.index('--types')
         return typelist(sys.argv[i + 1:])
@@ -2148,6 +2446,12 @@ def main():
     if '--gift' in sys.argv:
         i = sys.argv.index('--gift')
         return gift(sys.argv[i + 1:])
+    if '--shrapnel' in sys.argv:
+        i = sys.argv.index('--shrapnel')
+        return shrapnel_cmd(sys.argv[i + 1:])
+    if '--refract' in sys.argv:
+        i = sys.argv.index('--refract')
+        return refract_cmd(sys.argv[i + 1:])
     if '--export-weapons' in sys.argv:
         i = sys.argv.index('--export-weapons')
         return export_weapons_cmd(sys.argv[i + 1:])
