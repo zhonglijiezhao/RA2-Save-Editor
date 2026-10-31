@@ -12,7 +12,7 @@
 """
 
 SEMVER = '1.4.2'
-BUILD = 284
+BUILD = 305
 
 # 仓库地址（界面上「GitHub ↗」点开的就是它）
 REPO = 'https://github.com/zhonglijiezhao/RA2-Save-Editor'

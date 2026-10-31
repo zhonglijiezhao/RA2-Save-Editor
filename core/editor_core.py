@@ -6180,9 +6180,25 @@ class SaveDoc(object):
     #   ⚠ 旧常量 40 是错的（它落在载荷 +96 = 类常量 0x0087E294 上，从不携带信息）。
     #   ⚠ 本类里有两套帧：`g+16` 帧（= 载荷帧，remove_building/bld_rows 用）
     #     与 `buildings()` 的 b 帧（b = 载荷 + 56，由 COORD_RE 命中位置 − back 反推）。
-    BLD_OWNER_OFF = 336           # 载荷帧：所属方 House 键
-    BLD_OWNER2_OFF = 544          # 载荷帧：同一键的第二副本
-    BLD_HOUSE_OFF = 280           # b 帧里的同一字段（= 336 − 56），供 `buildings()['house']` 用
+    BLD_OWNER_OFF = 336           # 载荷帧：★**原属方（建造者）**，占领/改所属方都不该动它
+    BLD_OWNER2_OFF = 544          # 载荷帧：★**当前归属**（引擎占领时改的是这一份）
+    BLD_HOUSE_OFF = 280           # b 帧里的「原属方」（= 336 − 56）
+    # ★★★★★ 2026-10-31 双档对拍（`E:\YURI\两基地…` vs `…占领敌方一个`）**推翻"两份副本"的说法**：
+    #   · 玩家用工程师占领敌方 GACNST 后，**只有 +544（b 帧 +488）被改成本家键**，
+    #     +336（b 帧 +280）**留着原主不动** ⇒ 两个字段语义不同，不是同一键的两份副本：
+    #       +336 = 原属方/建造者（占领不改），+544 = 当前归属（占领改这一份）
+    #   · 判"是不是占领来的"最稳的是 `BLD_CAPTURED_OFF`（见下），**不是**比对这两个键
+    #     （实测：把 +280 强行写成 = +488 的值，进游戏照样不出工程师）
+    BLD_HOUSE_LIVE_OFF = 488      # b 帧里的「当前归属」（= 544 − 56）
+    # ★★★★★ 2026-10-31 **「占领过的建筑永不出工程师」就是这一格**（四轮游戏内实测定案）：
+    #   1 号 = 这栋楼是被工程师占领来的 ⇒ 引擎把 `[General] Engineer=` 那一支残兵写死禁用
+    #       （普通残兵 E1/E2/CTECH 照出；`Crewed`/`CrewEscape`/SurvivorRate 全都照旧走）
+    #   0 号 = 自己盖的 ⇒ 建造场（`Factory=BuildingType`）拆掉时按 25%/名额 出工程师
+    #   · 反向也成立：把已占领的楼**清成 0**，进游戏拆掉就立刻恢复出工程师（已实测）
+    #   · 归属两格（+280/+488）**改不改都不影响出不出工程师**，只管这楼归谁
+    #   · Ares 文档那句 "if the building has been captured, engineers are not allowed"
+    #     说的就是这一格；原版无 INI 开关，Ares 的 Crew.EngineerChance 也压不过它
+    BLD_CAPTURED_OFF = 0x6AF      # b 帧：1 = 占领来的（禁工程师残兵）
     # ★★★★★ 2026-10-17 补：**载荷 +1344 = 该栋主人的「运行期阵营序号」（小整数）**。
     #   发现法 = 在 1143 栋 / 9 阵营的大任务档里对**每个偏移**做「取值 ↔ 阵营」双射穷举：
     #   只有两个偏移全档双射 —— **+336（House 键）与 +1344（序号）**。
@@ -9304,7 +9320,10 @@ class SaveDoc(object):
           1. 正则匹配「两个 u32 坐标（低字节 0x80、高字节 0）」= 锚点像素坐标对 cell×256+128；
           2. 命中位置 h − 104 = 对象起点；对象 `+0x4EC` 必须是已知类型对象的自键；
           3. 耐久 `+56` ∈ (0, 0x100000]。
-        返回 [{base,type,type_key,x,y,px,py,hp,house,tag,coord2_ok}]，按 base 排序。
+        返回 [{base,type,type_key,x,y,px,py,hp,house,origin,captured,tag,coord2_ok}]，按 base 排序。
+        ★2026-10-31：`house` 改读 **b 帧 +488（当前归属）** —— 原来读的 +280 是**原属方**，
+          导致「工程师占领来的建筑」在界面里显示成原主（实测游戏目录里那两份对拍档）。
+          同时给出 `origin`（原属方）与 `captured`（=1 表示占领来的，引擎据此禁工程师残兵）。
         """
         if getattr(self, '_blds', None) is not None:
             return self._blds
@@ -9339,7 +9358,9 @@ class SaveDoc(object):
                 out[b] = {'base': b, 'type': nm, 'type_key': key,
                           'px': px, 'py': py, 'x': (px - 128) // 256,
                           'y': (py - 128) // 256, 'hp': hp,
-                          'house': struct.unpack_from('<I', pl, b + self.BLD_HOUSE_OFF)[0],
+                          'house': struct.unpack_from('<I', pl, b + self.BLD_HOUSE_LIVE_OFF)[0],
+                          'origin': struct.unpack_from('<I', pl, b + self.BLD_HOUSE_OFF)[0],
+                          'captured': bool(pl[b + self.BLD_CAPTURED_OFF]),
                           'tag': struct.unpack_from('<I', pl, b)[0],
                           'coord2_ok': (px2 == px and py2 == py)}
                 break
@@ -10500,6 +10521,63 @@ class SaveDoc(object):
                 struct.pack_into('<I', pl, s + off, 0)
         return len(slots)
 
+    # ---------- 空气墙：无主的占用标记（2026-11-01 新增） ----------
+    CELL_STRUCT_ACC = 0x138        # ★占用标记，**只有最低 1 个字节**
+    #   0x01..0x0F 步兵 / 0x10 树石 / 0x20 载具 / 0x80 建筑
+    CELL_STRUCT_ACC_BITS = 0xBF
+
+    def air_wall_cells(self):
+        """扫描全部格槽，找出"空气墙"格 → `(槽数, [{'x','y','mask','off'}…])`。
+
+        判据：**`+0x138` 占用标记非零，但 `+0xF8` 占用对象键为 0**。
+        也就是格子上空无一人、却仍然登记着"被占用"。
+
+        ★为什么这会变成空气墙（2026-11-01 玩家多轮实测定案）：
+          载具寻路读这个占用标记 ⇒ 认为过不去；步兵不读 ⇒ 照常通过。
+          所以症状是"只挡载具、步兵没事"。
+          典型来源：超时空传送、铁幕、时空兵下车、单位被吸收 —— 走的时候
+          漏了清这个标记，格子就永远立着一块看不见的墙。
+
+        ★★`+0x138` 只清最低那 1 个字节：引擎的格子拷贝函数
+          （gamemd 0x566066 / 0x566878）是 `mov dl,[esi+0x138]` →
+          `mov [edi+0x138],dl`，只搬 1 字节 ⇒ 上面 3 字节属于别的属性。
+          整 4 字节清零会误伤它们（实测那几个"+0x138 = 2 亿量级"的格子，
+          低字节其实是 0x00，根本不是空气墙）。
+        """
+        first, n = self.cell_struct_array()
+        if first is None:
+            return 0, []
+        pl = self.plain
+        out = []
+        for i in range(n):
+            s = first + i * self.CELL_STRUCT_STRIDE
+            mask = pl[s + self.CELL_STRUCT_ACC]
+            if not (mask & self.CELL_STRUCT_ACC_BITS):
+                continue
+            if struct.unpack_from('<I', pl, s + self.CELL_STRUCT_OCC)[0]:
+                continue                    # 有主，这是正常的占用
+            x, y = struct.unpack_from('<HH', pl, s + self.CELL_STRUCT_XY)
+            out.append({'x': x, 'y': y, 'mask': mask,
+                        'off': s + self.CELL_STRUCT_ACC})
+        return n, out
+
+    def clear_air_walls(self, dry_run=False):
+        """清掉全部空气墙格 → `(槽数, [格子…])`；`dry_run=True` 只扫描不写。
+
+        ★改完**必须存档、再读档**才会生效：通行状态是引擎在**读档那一刻**
+          按 `+0x138` 重建出来的，游戏运行中直接改内存里的这个字段没有用
+          （2026-11-01 反复实测：改存档有效、运行期改无效；整个 gamemd.exe
+          里也搜不到一条 `test [reg+0x138]`，只有格子拷贝会碰它）。
+        """
+        n, cells = self.air_wall_cells()
+        if n == 0 or not cells:
+            return n, cells
+        if not dry_run:
+            pl = self.plain
+            for c in cells:
+                pl[c['off']] = 0
+        return n, cells
+
     def occupy_cells_exact(self, type_name, cx, cy, key, ref_key):
         """按**真实字段**把 (cx,cy) 起的地基写成 key 占用（零增长）。
 
@@ -10869,15 +10947,20 @@ class SaveDoc(object):
         return None
 
     def buildings_of_house(self, house=None):
-        """本档某阵营的**全部建筑** → [{idx, base, key, type, x, y}]（house=None ⇒ 全部）。"""
+        """本档某阵营的**全部建筑** → [{idx, base, key, type, x, y}]（house=None ⇒ 全部）。
+
+        ★2026-10-31：按**当前归属**（载荷 +544）过滤 —— 原来按 +336（原属方）挑，
+          会把「工程师占领来的建筑」算到原主名下。`owner` = 当前归属，`origin` = 原属方。
+        """
         want = self.resolve_house(house) if house is not None else None
         hs, _c = self._bld_group()
         out = []
         for i, g in enumerate(hs):
             o = g + 16
             k = struct.unpack_from('<I', self.plain, o)[0]
-            ok = struct.unpack_from('<I', self.plain, o + self.BLD_OWNER_OFF)[0]
-            if want is not None and ok != want:
+            own = struct.unpack_from('<I', self.plain, o + self.BLD_OWNER2_OFF)[0]
+            org = struct.unpack_from('<I', self.plain, o + self.BLD_OWNER_OFF)[0]
+            if want is not None and own != want:
                 continue
             tkey = struct.unpack_from('<I', self.plain, o + 1316)[0]
             nm = '?%08x' % tkey
@@ -10887,18 +10970,27 @@ class SaveDoc(object):
                     break
             px, py = struct.unpack_from('<II', self.plain, o + 600)
             out.append({'idx': i, 'base': g, 'key': k, 'type': nm,
-                        'owner': ok, 'x': (px - 128) // 256, 'y': (py - 128) // 256,
+                        'owner': own, 'origin': org,
+                        'captured': bool(self.plain[o + self.BLD_CAPTURED_OFF]),
+                        'x': (px - 128) // 256, 'y': (py - 128) // 256,
                         'owner_idx': struct.unpack_from('<I', self.plain,
                                                         o + self.BLD_OWNER_IDX_OFF)[0]})
         return out
 
-    def set_building_owner(self, house, idx=None, cx=None, cy=None, key=None):
+    def set_building_owner(self, house, idx=None, cx=None, cy=None, key=None, captured=None):
         """★2026-10-17 新增：改一栋**已有建筑**的所属方（写记录载荷 `+336` 与 `+544`）。
 
         定位优先级：`key` > `(cx,cy)` > `idx`（0 基，顺序同 `_bld_group()`）。
         只动这两处（**伴随对象不含 House 键**，不用动）；
         **不动该阵营自己的建筑清单/占地统计**（这类结构尚未定位，若游戏内出现
         "改完颜色对但不认领"，就得补写 —— 见 `docs/加建筑_所属方_20261017.md`）。
+
+        ★2026-10-31 更正：`+336` 与 `+544` **不是同一键的两份副本** ——
+          `+336` = 原属方（建造者），`+544` = 当前归属（引擎占领时只改 +544）。
+          本函数为了兼容既有自检**仍然两处一起写**（等于"改成自己盖的"）。
+        ★`captured`：`None`=不碰；`True`=标成"占领来的"（拆了**不出**工程师）；
+          `False`=清成"自建"（`Factory=BuildingType` 的楼拆了**会出**工程师）。
+          这一格（b 帧 `+0x6AF`）才是引擎禁工程师残兵的唯一开关，归属两格不影响它。
         """
         want = self.resolve_house(house)
         if want is None:
@@ -10928,7 +11020,9 @@ class SaveDoc(object):
         if g is None:
             raise RuntimeError('定位不到目标建筑（key/cx,cy/idx 都没命中）')
         o = g + 16
-        old = struct.unpack_from('<I', pl, o + self.BLD_OWNER_OFF)[0]
+        # ★2026-10-31：取「当前归属」（+544）算电力搬家 —— 原来取 +336（原属方），
+        #   对「工程师占领来的建筑」会从**原主**身上扣电，扣错人。
+        old = struct.unpack_from('<I', pl, o + self.BLD_OWNER2_OFF)[0]
         old_idx = struct.unpack_from('<I', pl, o + self.BLD_OWNER_IDX_OFF)[0]
         rix = self.house_run_index(want)
         if rix is None:
@@ -10937,6 +11031,8 @@ class SaveDoc(object):
         for off in (self.BLD_OWNER_OFF, self.BLD_OWNER2_OFF):
             struct.pack_into('<I', pl, o + off, want)
         struct.pack_into('<I', pl, o + self.BLD_OWNER_IDX_OFF, rix)
+        if captured is not None:
+            pl[o + self.BLD_CAPTURED_OFF] = 1 if captured else 0
         px, py = struct.unpack_from('<II', pl, o + 600)
         tkey = struct.unpack_from('<I', pl, o + 1316)[0]
         nm = '?%08x' % tkey
@@ -10968,6 +11064,69 @@ class SaveDoc(object):
                         % (nm, (px - 128) // 256, (py - 128) // 256,
                            self.house_label(old), self.house_label(want), old_idx, rix,
                            pwr_note)}
+
+    # ★★★★★ 2026-10-31：**「占领过的建筑永不出工程师」的唯一开关**
+    #   四轮游戏内实测（`E:\YURI` 两份原档 + 六份单变量档，玩家亲手拆楼验证）：
+    #     · 只清 `b 帧 +0x6AF`（1→0）        ⇒ **恢复出工程师**
+    #     · 只把原属方 +0x118 改成 = 当前归属 ⇒ 仍然**不出**（否掉"比两个 House 键"的假设）
+    #     · 只动 +0x304 / +0x39F / +0x698     ⇒ 仍然**不出**
+    #   ⇒ 引擎读的就是这一格；普通残兵（E1/E2/CTECH）不受影响，`Crewed`/`CrewEscape`/
+    #     SurvivorRate 全照旧；Ares 的 `Crew.EngineerChance` 也压不过它（原版写死）。
+    def is_captured(self, rec=None, base=None):
+        """这栋楼是不是「被工程师占领来的」→ bool。`rec` 可传 `buildings()` 的一条。"""
+        if rec is not None:
+            base = rec['base']
+        if base is None:
+            raise RuntimeError('is_captured() 需要 rec 或 base')
+        return bool(self.plain[base + self.BLD_CAPTURED_OFF])
+
+    def set_building_captured(self, captured, idx=None, cx=None, cy=None, key=None,
+                              base=None, also_origin=False):
+        """把一栋楼标成「占领来的」(captured=True) 或「自建」(False)。
+
+        `captured=False` = **恢复出工程师**（`Factory=BuildingType` 的楼拆掉时会出）；
+        `captured=True`  = 拆了永不出工程师（原版对占领楼的行为）。
+        · `also_origin=True` 时顺带把原属方 `+336` 写成当前归属（让两个 House 键一致，
+          **纯外观/一致性**，实测对出不出工程师没有任何影响）
+        · 定位优先级同 `set_building_owner`：`base` > `key` > `(cx,cy)` > `idx`
+        """
+        pl = self.plain
+        if base is None:
+            hs, _c = self._bld_group()
+            if key is not None:
+                for g in hs:
+                    if struct.unpack_from('<I', pl, g + 16)[0] == key:
+                        base = g + 56
+                        break
+            if base is None and cx is not None and cy is not None:
+                for r in self.buildings():
+                    if (r['x'], r['y']) == (int(cx), int(cy)):
+                        base = r['base']
+                        break
+            if base is None and idx is not None and 0 <= int(idx) < len(hs):
+                base = hs[int(idx)] + 56
+            if base is None:
+                raise RuntimeError('定位不到目标建筑（base/key/cx,cy/idx 都没命中）')
+        old = pl[base + self.BLD_CAPTURED_OFF]
+        pl[base + self.BLD_CAPTURED_OFF] = 1 if captured else 0
+        note = []
+        if also_origin:
+            live = struct.unpack_from('<I', pl, base + self.BLD_HOUSE_LIVE_OFF)[0]
+            struct.pack_into('<I', pl, base + self.BLD_HOUSE_OFF, live)
+            note.append('原属方 +0x118 同步成 0x%X' % live)
+        self.pending_bld = True
+        self._blds = None
+        nm = '?'
+        for n, kk in sorted(self.building_types().items()):
+            if kk == struct.unpack_from('<I', pl, base + self.BLD_TYPEKEY_OFF)[0]:
+                nm = n
+                break
+        return {'mode': '改占领标记', 'type': nm, 'base': base,
+                'old_captured': bool(old), 'captured': bool(captured),
+                'note': '%s @0x%X：占领标记 %d → %d（%s）%s'
+                        % (nm, base, old, 1 if captured else 0,
+                           '拆了会出工程师' if not captured else '拆了不出工程师',
+                           '；' + '；'.join(note) if note else '')}
 
     # ★★★★★ 2026-10-17 定案：**House 对象 + 0x53B8 = (发电, 耗电) 两个 u32**
     #   证据（三档逐阵营对账）：把本档该阵营的建筑按 rules `Power=` 求和，
@@ -12655,7 +12814,61 @@ class SaveDoc(object):
                         ('SubjectToCliffs', 0x272),
                         ('SubjectToElevation', 0x273),
                         ('SubjectToWalls', 0x274))
+    # ★★2026-10-29（坐实）：**抛射体对象里也存着分裂配置，改 rules 对它无效**：
+    #     +0x290  ShrapnelWeapon 指针（运行时地址）
+    #     +0x294  ShrapnelCount   u32
+    #   证据（SAVE0665 原版档，档内带分裂的 4 个抛射体逐个对上 rules，值一模一样）：
+    #     Electricbounce=2 / LargeCometP=5 / SuperCometP=5 / SuperSmallCometP=3
+    #     其余 36 个抛射体这两处都是 0。
+    #   ⇒ 玩家把 rules 的 `Electricbounce.ShrapnelCount` 改成 6，读档后依然只分裂 2 个，
+    #     因为引擎用的是档里这份。要调数量只能改存档。
+    #
+    #   ★★2026-10-29（**上一轮我判错了，被玩家一句"存档是自足的"推翻**）：
+    #     当时我看到"指针与文件偏移之差不是常数"就断言"指针不可算、只能改数量"。
+    #     错在拿**指针的数值**去反推**对象在 dump 里的位置** —— 那当然不成常数。
+    #     正确的做法是反方向：**每个 Type 对象自己就把运行时地址存在档里**：
+    #
+    #        +0（相对名字偏移 -0x28）= u32 自身运行时地址
+    #
+    #     验证（SAVE4823，1322 个 Type 对象）：name-0x28 是合法地址的 1299 个，
+    #     **地址零重复**；再用这张表解析档内全部 4 个分裂指针，4/4 唯一命中且语义正确：
+    #        Electricbounce  → TeslaFragment
+    #        LargeCometP     → CometFragment
+    #        SuperCometP     → SuperCometFragment
+    #        SuperSmallCometP→ CometFragment
+    #     ⇒ 地址表可建 ⇒ **任何指针都能读成名字、也能改写成"另一个既有对象"**。
+    #     （引擎读档时必然要做一次旧地址→新对象的重定位，这张自地址表就是它的依据
+    #       —— 所以手写一个档内既有对象的地址，和引擎自己写的没有区别。）
+    #     这一条把"自我折射"从"不可能"变成"可以试"：见 `set_projectile_shrapnel_weapon`。
+    PROJECTILE_SHRAPNEL_PTR_OFF = 0x290
+    PROJECTILE_SHRAPNEL_CNT_OFF = 0x294
+    # ★Type 对象在"名字偏移"之前 -0x28 处存着自己的运行时地址（见上）
+    TYPE_SELF_ADDR_OFF = -0x28
+    # ★武器对象 → 抛射体：指针在名字偏移 +0x7C
+    #   判据：按 rules 的 `Projectile=` 把 202 把武器分 39 组，要求"同组同值 / 异组异值"，
+    #   全档只有 +0x7C 一个偏移满足（23 个含 ≥2 把武器的组全过），且取值正好是
+    #   抛射体对象的地址（InvisibleLow=0x1B43CCA0 …）。见 `weapon_projectiles`。
+    WEAPON_PROJECTILE_PTR_OFF = 0x7C
     VERSES_COUNT = 11
+
+    # ★★2026-10-29（玩家："武器表漏了 209 把" —— 拿直播玩家的存档对出来的）：
+    #   **武器 Type 对象有一处全档统一的"类标记"，比靠 rules 名字表过滤可靠得多**：
+    #       +0xC8  u32 == 10                     ← 该类对象的固定值
+    #       +0xD0  u32 == 同一常量（本机实测 0x007EB6D4，动态取众数，不写死）
+    #   4 份存档交叉验证（SAVE5DC8 / SAVE0665 / SAVE0029 / 铁峰243）：
+    #     · 标记命中 413 / 224 / 207 / 224，**旧的名字过滤结果 100% 被它包含**（漏收 0）
+    #     · 命中集合的 +0xD0 全部是同一个值（413/413、224/224、207/207、224/224）
+    #   比旧的"三值判据"（Damage/ROF/Range）多抓 11~12 把，多抓的全是真武器：
+    #     ASWLauncher / BarrelExplosion / DefaultDeathWeapon / MakeupKit /
+    #     NukeCarrier / NukePayload / OilExplosion / RepairAura / RepairBullet /
+    #     SpyCameraWeapon / VirtualScanner
+    #   —— 这些要么 ROF=0、要么 Range=0，三值判据天生看不见。
+    #
+    #   ⇒ 从这里起判据改成 **结构优先**：`+0xC8==10` 就算武器；
+    #     rules 名字只用来标"这把在 rules 里叫什么"和补漏，**不再用来过滤**。
+    WEAPON_CLS_MARK_OFF = 0xC8
+    WEAPON_CLS_MARK_VAL = 10
+    WEAPON_CLS_TAG_OFF = 0xD0
 
     def _type_objects(self):
         """扫出所有"双名缓冲"的 Type 对象 → `[(偏移, 名字)]`（缓存到 `_typeobjs_memo`）。
@@ -12714,6 +12927,13 @@ class SaveDoc(object):
         if not r:
             return None                     # 没 rules ⇒ 交给结构特征兜底
         names = {s for s, kv in r.items() if 'Damage' in kv and 'ROF' in kv}
+        # ★2026-10-29：有些武器**不写 ROF**（`[NukePayload]` 只有 Damage/Range/
+        #   Projectile/Warhead），按"必须同时有 Damage+ROF"会判漏 ⇒ 名字被标成
+        #   `struct`（明明 rules 里有）。补一条：有 Projectile 且 (Damage 或 Range)
+        #   的段就是武器段 —— 抛射体段写的是 Image/Arcing、弹头段写的是 Verses，
+        #   都不会带 Projectile，所以这条不会误收。
+        names |= {s for s, kv in r.items()
+                  if 'Projectile' in kv and ('Damage' in kv or 'Range' in kv)}
         names |= self._rules_list(r, 'WeaponTypes')
         names |= self._names_by_key(r, ('Primary', 'Secondary',
                                         'ElitePrimary', 'EliteSecondary'))
@@ -12728,38 +12948,130 @@ class SaveDoc(object):
         names |= self._names_by_key(r, ('Warhead',))
         return names
 
-    def weapon_objects(self):
-        """→ `[{'name','off','damage','rof','range','range_cells'}]`（只读）。
+    def _weapon_marks(self):
+        """按**结构标记**扫出武器 Type 对象 → `([(偏移, 名字)], tag)`（缓存 `_wpnmarks_memo`）。
 
-        名字以 rules 为准（`Damage`+`ROF` 的节 / `Primary` 等键的取值），
-        存档里按名字找对象读数值；没有 rules 时退回结构特征
-        （`+0x8C` ROF ∈ (0,2000]、`+0x90` Range ≤ RANGE_MAX_L、`+0x80` Damage ≤ 100000）。
+        判据（见 `WEAPON_CLS_MARK_OFF` 的注释）：`+0xC8 == 10`，且 `+0xD0` 等于该类
+        的**众数值**（同类对象共用同一个常量；取众数而不是写死 0x007EB6D4，
+        换个引擎版本写的存档也不会整批失效）。
+
+        `+0xD0` 众数不过半 ⇒ 视为"这份存档不合这套标记"，返回空表，
+        交给 `weapon_objects` 退回旧的名字过滤 —— 宁可少收，也不乱收。
+
+        ★性能：`_type_objects()`（203ms，走 re 引擎）已经缓存，这里只多读两个 u32，
+          实测整表 < 5ms。
+        """
+        memo = getattr(self, '_wpnmarks_memo', None)
+        if memo is not None:
+            return memo
+        pl = self.plain
+        cand = []
+        for off, nm in self._type_objects():
+            if off + self.WEAPON_CLS_TAG_OFF + 4 > len(pl):
+                continue
+            try:
+                if struct.unpack_from('<I', pl, off + self.WEAPON_CLS_MARK_OFF)[0] \
+                        != self.WEAPON_CLS_MARK_VAL:
+                    continue
+                tag = struct.unpack_from('<I', pl, off + self.WEAPON_CLS_TAG_OFF)[0]
+            except Exception:
+                continue
+            cand.append((off, nm, tag))
+        tag = None
+        if cand:
+            cnt = {}
+            for _o, _n, t in cand:
+                cnt[t] = cnt.get(t, 0) + 1
+            top = max(cnt.items(), key=lambda kv: (kv[1], kv[0]))
+            if top[1] * 2 > len(cand):
+                tag = top[0]
+        out = [(o, n) for o, n, t in cand if tag is None or t == tag]
+        if tag is None:
+            out = []                          # 标记不成立 ⇒ 空表（让上层退回旧逻辑）
+        self._wpnmarks_memo = (out, tag)
+        return self._wpnmarks_memo
+
+    def weapon_objects(self):
+        """→ `[{'name','off','damage','rof','range','range_cells','name_src'}]`（只读）。
+
+        ★★2026-10-29 改造（**判据反过来**：结构优先，rules 只做命名参考）：
+
+          旧实现是"先拿 rules 的名字表过滤，名字不在表里就整条丢掉"。直播玩家的存档
+          是别的 mod，武器名 `TESLAGUNPW / JAPTESLAP / CNOPCoilBolt` 这类本机 rules
+          压根没有 ⇒ 被整条滤掉，193 把的表漏了 **220 把**（占一半）。
+
+          现在：
+            1. 主判据 = `_weapon_marks()`（`+0xC8==10` 结构标记）⇒ 结构上是武器就收；
+            2. `name_src` 标明名字从哪来：
+               · `'rules'`      rules 里有这把（能查到伤害/射程的对照值）
+               · `'struct'`     存档独有（别的 mod / 自造）—— 旧逻辑就是在这里丢的
+               · `'rules-only'` 结构标记没命中、但 rules 有名字且三值成立（兜底补漏）
+            3. 只有结构标记整体失效（空表）才退回旧的名字过滤。
+
+        数值护栏只做**上限**（`dmg<=100000`、`rof<=2000`、`rng<=RANGE_MAX_L`）：
+        旧代码还要求 `0 < rof`、`0 < rng`，那会漏掉 `DefaultDeathWeapon`（ROF=0）、
+        `RepairBullet` 这类**真实存在的**零射速武器。
 
         ★2026-10-28（玩家把射程改成 90 格后这把武器**从列表里消失**了，才发现这里还写死
           `0x4000`（64 格）—— 那是旧护栏。改值上限放宽到 255 格后，扫描过滤必须跟着放宽，
           否则"改完就看不见"，而且 `_find_weapon` 会报"存档里没有这把武器"。
-        
         """
         pl = self.plain
         want = self._weapon_name_set()
-        out = []
-        for off, nm in self._type_objects():
+        marks, _tag = self._weapon_marks()
+
+        def read3(off):
+            # ★★2026-10-29（结构判据放开后多抓了 4 把，逼出这个坑）：
+            #   **这三个字段是有符号 i32，不是 u32**。官方 rules 就能证：
+            #     `[RepairBullet] Damage=-50`         ← 负伤害 = 治疗
+            #     `[ASWLauncher] Range=-2 ; infinite` ← 负射程 = 无限射程
+            #     `[MakeupKit]   Range=-2 ; infinite`
+            #   按 u32 读出来是 4294967246 / 4294966784，一眼像垃圾数据 ——
+            #   旧的"`0 < rof` 且 `0 < rng`"护栏正好把这 4 把真武器全挡在门外。
+            return tuple(struct.unpack_from('<i', pl, off + x)[0]
+                         for x in (self.WEAPON_DMG_OFF, self.WEAPON_ROF_OFF,
+                                   self.WEAPON_RANGE_OFF))
+
+        def sane(dmg, rof, rng):
+            """只挡"明显不是武器"的量级，**不做业务区间检查**。
+
+            ★`RANGE_MAX_L`(255 格) 是编辑器**写入**上限，不是读取上限：
+              直播档里 `YXFSPrimary` 的射程就是 300 格，读的时候不能因为它大就丢掉。
+            """
+            return (-100000 <= dmg <= 100000 and 0 <= rof <= 2000
+                    and -65280 <= rng <= (1 << 24))
+
+        out, seen_off = [], set()
+        for off, nm in marks:
             try:
-                dmg = struct.unpack_from('<I', pl, off + self.WEAPON_DMG_OFF)[0]
-                rof = struct.unpack_from('<I', pl, off + self.WEAPON_ROF_OFF)[0]
-                rng = struct.unpack_from('<I', pl, off + self.WEAPON_RANGE_OFF)[0]
+                dmg, rof, rng = read3(off)
             except Exception:
                 continue
-            if not (0 < rof <= 2000 and dmg <= 100000
-                    and 0 < rng <= self.RANGE_MAX_L):
-                continue
-            if want is not None:
-                if nm not in want:
-                    continue
-            elif rng % 32:                  # 无 rules 时：至少要是 1/8 格
+            if not sane(dmg, rof, rng):
                 continue
             out.append({'name': nm, 'off': off, 'damage': dmg, 'rof': rof,
-                        'range': rng, 'range_cells': rng / 256.0})
+                        'range': rng, 'range_cells': rng / 256.0,
+                        'name_src': 'rules' if (want and nm in want) else 'struct'})
+            seen_off.add(off)
+
+        # ---- 兜底：结构标记没命中的老档，或"rules 有名字但结构漏掉"的个别对象 ----
+        if want is not None:
+            for off, nm in self._type_objects():
+                if off in seen_off or nm not in want:
+                    continue
+                try:
+                    dmg, rof, rng = read3(off)
+                except Exception:
+                    continue
+                if not sane(dmg, rof, rng):
+                    continue
+                # 结构模式下的补漏要更严：三值必须真的成立（防把类型对象误认成武器）
+                if marks and not (0 < rof and 0 < rng and rng % 32 == 0):
+                    continue
+                out.append({'name': nm, 'off': off, 'damage': dmg, 'rof': rof,
+                            'range': rng, 'range_cells': rng / 256.0,
+                            'name_src': 'rules-only'})
+        out.sort(key=lambda x: x['off'])
         return out
 
     _official_cache = None
@@ -12939,14 +13251,17 @@ class SaveDoc(object):
 
           所以导出照这个来：每把武器一段，后面跟上它用到的抛射体段、弹头段。
 
-        字段来源分两类（头注释里也写清）：
-          · **实读存档**：Damage `+0x80` / ROF `+0x8C` / Range `+0x90` /
-            Burst `+0x78`；弹头的 Verses `+0x7C`、CellSpread `+0x100`、
-            PercentAtMax `+0x108`
-          · **照抄 rules**：Projectile / Speed / Report / Anim / Bright、
+        字段来源分三类（头注释里也写清）：
+          · **实读存档**：武器 Damage `+0x80` / ROF `+0x8C` / Range `+0x90`
+            （三者都是**有符号 i32**：`RepairBullet Damage=-50`、`MakeupKit Range=-2`）、
+            Burst `+0x78`；弹头的 Verses `+0x7C`、CellSpread `+0x100`、PercentAtMax `+0x108`；
+            抛射体的 Image `+0x1D4` + Arcing/SubjectTo* 四个开关
+          · **照抄 rules**：Projectile 名 / Speed / Report / Anim / Bright、
             弹头的 Wall / Wood / Conventional / InfDeath / AnimList / ProneDamage、
-            以及整段抛射体 —— 存档里**没有**抛射体对象
-            （实测 rules 里那 55 个抛射体名，在档内 `Name:` 命中 0 个）。
+            以及抛射体段里除上面五项之外的键
+          · **只有存档、rules 里查不到**（别的 mod / 自造武器，`name_src='struct'`）：
+            段里只会有 Damage/ROF/Range 三行 —— 这不是导出漏了，是这份存档
+            比本机 rules 多出 200 多把武器，名字和引用键只能到存档里找。
         """
         rules = self._rules_all() or {}
         pl = self.plain
@@ -13197,9 +13512,191 @@ class SaveDoc(object):
                     rec[key] = bool(pl[off + dd])
                 except Exception:
                     rec[key] = None
+            # ★2026-10-29：分裂配置也在这个对象里（见 PROJECTILE_SHRAPNEL_* 注释）
+            try:
+                rec['shrapnel_count'] = struct.unpack_from(
+                    '<i', pl, off + self.PROJECTILE_SHRAPNEL_CNT_OFF)[0]
+                rec['shrapnel_ptr'] = struct.unpack_from(
+                    '<I', pl, off + self.PROJECTILE_SHRAPNEL_PTR_OFF)[0]
+            except Exception:
+                rec['shrapnel_count'] = rec['shrapnel_ptr'] = None
             out.append(rec)
             seen.add(nm)
         return out
+
+    def projectile_shrapnel(self):
+        """→ `[{'name','off','count','ptr'}]`：**档内真的会分裂**的抛射体（只读）。
+
+        ★2026-10-29：这是"改 rules 不生效"的答案 —— 分裂配置（子武器指针 + 数量）
+          存在抛射体对象里，读档以这份为准。想看/改数量用 `set_projectile_shrapnel`。
+
+        `count=0` 或 `ptr=0` 都表示不分裂，所以这里只列两者都非 0 的。
+        """
+        out = []
+        for x in self.projectile_objects():
+            ptr = x.get('shrapnel_ptr') or 0
+            cnt = x.get('shrapnel_count') or 0
+            if ptr and cnt:
+                out.append({'name': x['name'], 'off': x['off'],
+                            'count': cnt, 'ptr': ptr})
+        return out
+
+    def set_projectile_shrapnel(self, name, count):
+        """改某个抛射体在**存档里**的分裂数量。**定长 u32 写，明文长度不变。**
+
+        `count`：0 = 关闭分裂；1..32 = 命中后生成几个子武器。
+        → `{'name','off','old','new','changed'}`；越界抛 `ValueError`。
+
+        ★为什么必须改存档（2026-10-29 玩家实测 + 探测）：
+          改 `rulesmd.ini` 的 `ShrapnelCount` 对**已经存盘的老档**无效 —— 引擎用的是
+          档里那份（实测老档 `+0x294` 还是 2）。
+          ★但**新存的档会带上改后的 rules 值**：玩家 00:46 存的 SAVE4823（v4 规则，
+          rules 里写的 6）档内 `Electricbounce+0x294` 就是 **6**，自造武器 `NZ2BOLT`
+          也整条在档里（264 个武器对象之一，Damage=100/ROF=45/Range=15 全对）。
+          ⇒ 正确表述：**老档沿用存盘时的值，新档跟随当时的 rules**。玩家那句
+          "存档是自足的"就是这个意思，我之前说成"改 rules 白改"是错的。
+
+        ★改子武器指针请用 `set_projectile_shrapnel_weapon`（2026-10-29 起可用）：
+          本方法只动数量，是为了"最小改动"；指针现在能算了（`type_addr_map`）。
+          但要注意**成环 = 无限递归**（见 `set_projectile_shrapnel_weapon` 的说明）。
+
+        ★实测上限参考：原版最大的 `ShrapnelCount` 是 8（`BlimpBombPE`，轰炸机炸弹）。
+          这里硬拦 32（防手抖），但 8 以上没有实证，改完先存档 → 进游戏 → 打**单位/建筑/树**验证
+          （打空地永远不分裂，那是原版判定）。
+        """
+        n = str(name).strip()
+        hit = [x for x in self.projectile_objects() if x['name'] == n]
+        if not hit:
+            cands = [x['name'] for x in self.projectile_objects()
+                     if n.lower() in x['name'].lower()][:8]
+            raise KeyError('存档里没有抛射体「%s」%s'
+                           % (n, ('；相近的有：' + '、'.join(cands)) if cands else ''))
+        if len(hit) > 1:
+            raise KeyError('抛射体「%s」在存档里有 %d 个对象，不确定改哪个'
+                           % (n, len(hit)))
+        try:
+            raw = int(float(count))
+        except Exception:
+            raise ValueError('count 要传整数（0=关闭分裂），收到 %r' % (count,))
+        if not (0 <= raw <= 32):
+            raise ValueError('count 只能 0..32（0=关闭，原版最大实证值是 8），收到 %s' % raw)
+        off = hit[0]['off'] + self.PROJECTILE_SHRAPNEL_CNT_OFF
+        old = struct.unpack_from('<i', self.plain, off)[0]
+        if old == raw:
+            return {'name': hit[0]['name'], 'off': off, 'old': old, 'new': raw,
+                    'changed': False}
+        struct.pack_into('<i', self.plain, off, raw)
+        return {'name': hit[0]['name'], 'off': off, 'old': old, 'new': raw,
+                'changed': True}
+
+    # ---------- 类型对象地址表（2026-10-29）----------
+    def type_addr_map(self):
+        """→ `{运行时地址: [名字, ...]}`（缓存到 `_addr_memo`）。
+
+        地址取自每个 Type 对象**名字偏移 -0x28** 的那个 u32（见 `TYPE_SELF_ADDR_OFF`
+        的注释）。SAVE4823 实测：1322 个对象里 1299 个有合法地址、**零重复**。
+
+        ★这张表是"指针能不能改"的**唯一依据**：拿到名字就知道该往指针里写什么数。
+          之前我判"指针不可算"是拿数值反推文件偏移，方向错了；正解在这里。
+        """
+        memo = getattr(self, '_addr_memo', None)
+        if memo is not None:
+            return memo
+        pl = bytes(self.plain)
+        out = {}
+        for off, nm in self._type_objects():
+            try:
+                v = struct.unpack_from('<I', pl, off + self.TYPE_SELF_ADDR_OFF)[0]
+            except Exception:
+                continue
+            if 0x04000000 <= v <= 0x3FFFFFFF:
+                out.setdefault(v, []).append(nm)
+        self._addr_memo = out
+        return out
+
+    def obj_addr(self, name):
+        """按名字查运行时地址（唯一命中才算）→ `(addr, [同名对象...])`。"""
+        hits = [(v, o) for v, o in self.type_addr_map().items() if name in o]
+        if len(hits) == 1:
+            return hits[0][0], hits[0][1]
+        return None, [o for _, o in hits]
+
+    def resolve_ptr(self, value):
+        """把一个指针值解析成对象名字（解析不出返回 None）。"""
+        o = self.type_addr_map().get(value & 0xFFFFFFFF)
+        return o[0] if o and len(o) == 1 else None
+
+    def weapon_projectiles(self):
+        """→ `[{'name','off','ptr','projectile'}]`：每把武器**档内**记的抛射体。
+
+        `projectile` = 由 `+0x7C` 指针查地址表得到的名字（查不到为 None）。
+        这条把 `weapon_objects()` 和 `projectile_objects()` 连起来 —— 以前只能
+        靠 rules 的 `Projectile=` 猜，现在能直接读档里那份关系。
+        """
+        out = []
+        for w in self.weapon_objects():
+            ptr = struct.unpack_from('<I', self.plain,
+                                     w['off'] + self.WEAPON_PROJECTILE_PTR_OFF)[0]
+            out.append({'name': w['name'], 'off': w['off'], 'ptr': ptr,
+                        'projectile': self.resolve_ptr(ptr)})
+        return out
+
+    def set_weapon_projectile(self, weapon, projectile):
+        """把某把武器的抛射体指针改成另一个**档内既有**抛射体。定长 u32 写。
+
+        ★只能指向"存档里已经存在的对象"（地址从 `obj_addr` 取）。指到不存在的
+          名字会抛 KeyError —— 那正是 v1~v3 崩在 `0x4664C0`（`mov bl,[eax+0x2F6]`，
+          `EAX=0`）的原因：自造抛射体在存盘那个进程里没有对象，类型指针是 NULL。
+        """
+        addr, who = self.obj_addr(projectile)
+        if not addr:
+            raise KeyError('存档里没有唯一的抛射体对象「%s」%s'
+                           % (projectile, ('同名 %d 个' % len(who)) if who else ''))
+        hit = [w for w in self.weapon_objects()
+               if w['name'].upper() == str(weapon).strip().upper()]
+        if len(hit) != 1:
+            raise KeyError('存档里武器「%s」命中 %d 个' % (weapon, len(hit)))
+        off = hit[0]['off'] + self.WEAPON_PROJECTILE_PTR_OFF
+        old = struct.unpack_from('<I', self.plain, off)[0]
+        if old == addr:
+            return {'name': hit[0]['name'], 'off': off, 'old': old, 'new': addr,
+                    'old_name': self.resolve_ptr(old), 'new_name': projectile,
+                    'changed': False}
+        struct.pack_into('<I', self.plain, off, addr)
+        return {'name': hit[0]['name'], 'off': off, 'old': old, 'new': addr,
+                'old_name': self.resolve_ptr(old), 'new_name': projectile,
+                'changed': True}
+
+    def set_projectile_shrapnel_weapon(self, projectile, weapon):
+        """改抛射体的**子武器指针**（`+0x290`），指向档内既有武器。定长 u32 写。
+
+        ★这是"自我折射"的钥匙：原来 `+0x290` 只能读、不能改（我一度以为指针
+          不可算）。现在有地址表，可以把子武器换成任意既有武器 —— 于是能做
+          **两级链**：主弹 → 子武器 A（带电、抛射体是 P2）→ P2 的子武器 B（带电）
+          ⇒ 电弧打到人身上再从落点折射出去。
+
+        ★安全前提：链上**每一环都必须是档里已有的对象**，且**不能形成环**。
+          形成环 = 无限递归（词典里 `ShrapnelCount` 那条"指数增长乃至崩溃"说的就是它）。
+          本方法不替你环检测，调用方自己要保证有终点。
+        """
+        addr, who = self.obj_addr(weapon)
+        if not addr:
+            raise KeyError('存档里没有唯一的武器对象「%s」%s'
+                           % (weapon, ('同名 %d 个' % len(who)) if who else ''))
+        hit = [p for p in self.projectile_objects()
+               if p['name'].upper() == str(projectile).strip().upper()]
+        if len(hit) != 1:
+            raise KeyError('存档里抛射体「%s」命中 %d 个' % (projectile, len(hit)))
+        off = hit[0]['off'] + self.PROJECTILE_SHRAPNEL_PTR_OFF
+        old = struct.unpack_from('<I', self.plain, off)[0]
+        if old == addr:
+            return {'name': hit[0]['name'], 'off': off, 'old': old, 'new': addr,
+                    'old_name': self.resolve_ptr(old), 'new_name': weapon,
+                    'changed': False}
+        struct.pack_into('<I', self.plain, off, addr)
+        return {'name': hit[0]['name'], 'off': off, 'old': old, 'new': addr,
+                'old_name': self.resolve_ptr(old), 'new_name': weapon,
+                'changed': True}
 
     def warhead_objects(self):
         """→ `[{'name','off','verses':[11 个系数]}]`（只读）。
@@ -15015,7 +15512,11 @@ class SaveDoc(object):
                   '_teamtypes', '_teamlbl',                              # §283.9 小队表缓存
                   '_ovl_memo', '_ovl_names',
                   # ★2026-10-28：武器/弹头类型表扫描（偏移相关，增删字节后必须重扫）
-                  '_typeobjs_memo', '_wpnwh_memo'):
+                  '_typeobjs_memo', '_wpnwh_memo',
+                  # ★2026-10-29：武器类标记扫描（off 相关，同上）
+                  '_wpnmarks_memo',
+                  # ★2026-10-29：类型对象 地址→名字 表（指针相关，改动后要重扫）
+                  '_addr_memo'):
             if hasattr(self, a):
                 setattr(self, a, None)
         if rescan:
