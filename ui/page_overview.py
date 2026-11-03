@@ -76,14 +76,20 @@ class OverviewPage(object):
             gbody.columnconfigure(c, weight=1, uniform='v')
         self.lbl_map = ttk.Label(gbody, text='-', style='Value.TLabel', anchor='w')
         self.lbl_map_mode = ttk.Label(gbody, text='-', style='Value.TLabel', anchor='w')
+        # ★§SOV05：地图 [Basic] IgnoreGlobalAITriggers（FA2「忽略全局AI」）的存档镜像
+        self.lbl_ignore_ai = ttk.Label(gbody, text='-', style='Value.TLabel', anchor='w')
         for r, (lab, wid) in enumerate((('地图文件', self.lbl_map),
-                                        ('挂接方式', self.lbl_map_mode))):
+                                        ('挂接方式', self.lbl_map_mode),
+                                        ('忽略全局AI', self.lbl_ignore_ai))):
             col = 0
             ttk.Label(gbody, text=lab, style='Field.TLabel', width=9).grid(
                 row=r, column=col, sticky='w', pady=6)
             wid.grid(row=r, column=col + 1, sticky='w', padx=(14, 0), pady=6)
-        ttk.Label(gbody, text='本工具只读地图：不写 .map，一个字节都不改',
-                  style='Field.TLabel').grid(row=2, column=0, columnspan=4,
+        ttk.Button(gbody, text='切换', command=self.toggle_ignore_ai).grid(
+            row=2, column=2, sticky='w', padx=(8, 0))
+        ttk.Label(gbody, text='本工具只读地图：不写 .map，一个字节都不改 '
+                             '（「忽略全局AI」改的是存档里的镜像）',
+                  style='Field.TLabel').grid(row=3, column=0, columnspan=4,
                                              sticky='w', pady=(6, 0))
 
         # ── ④ 存档修复：清除空气墙（★2026-11-01 新增）──
@@ -113,6 +119,54 @@ class OverviewPage(object):
     #  真实战绩：SAVE2CD6（超时空+铁幕留下的 9 格 0x20）、SAVE72AE（5 格）
     #  存档改完读档即消失 —— 玩家在游戏里实测确认过。
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    #  忽略全局AI触发（★★§SOV05，2026-11-03）
+    #  地图 `[Basic] IgnoreGlobalAITriggers`（FA2 面板「忽略全局AI」）在**存档里有一份镜像**：
+    #  明文 0x34B4 的 u32 —— 0 = AI 触发生效，1 = 忽略（AI 触发不跑）。
+    #  证据（两档对照，前后 64 字节完全一致、只差这一格）：
+    #    · AI触发打开.SAV（改图前存）= 0；AI触发关闭.SAV（改图后存，地图 =yes）= 1；
+    #    · 另一张图 sov01umd.map =no 的档同样是 0。
+    #  ⚠ 显示的是**存档里的值**；和地图不一致说明图改过而档还是旧的。
+    # ------------------------------------------------------------------
+    def toggle_ignore_ai(self):
+        doc = getattr(self, 'doc', None)
+        if not doc:
+            messagebox.showinfo('忽略全局AI', '请先打开一个存档。', parent=self)
+            return
+        cur = doc.ignore_global_ai()
+        if cur is None:
+            messagebox.showwarning(
+                '读不到', '这条存档里没能在 0x%X 定位到「忽略全局AI触发」字段'
+                          '（该处不是 0/1）。' % doc.IGNORE_AI_OFF, parent=self)
+            return
+        new = 0 if cur else 1
+        if not messagebox.askyesno(
+                '切换「忽略全局AI触发」',
+                '当前：%s\n改成：%s\n\n'
+                '写的是**存档里**那一格（明文 0x%X，4 字节，原地改）。\n'
+                '效果等价于地图 [Basic] IgnoreGlobalAITriggers：\n'
+                '  · 忽略 ⇒ 全局 AI 触发（AITriggerTypes）不再被评估；\n'
+                '  · 不忽略 ⇒ 恢复评估。\n\n'
+                '改完要回主窗口点「保存」才写进文件。确定切换吗？'
+                % (doc.ignore_ai_text(cur), doc.ignore_ai_text(new), doc.IGNORE_AI_OFF),
+                parent=self):
+            return
+        try:
+            r = doc.set_ignore_global_ai(new)
+        except Exception as e:
+            messagebox.showerror('写入失败', str(e), parent=self)
+            return
+        try:
+            self.lbl_ignore_ai.config(text=doc.ignore_ai_text(r['new']))
+        except Exception:
+            pass
+        try:
+            self.app._lists_dirty = True
+        except Exception:
+            pass
+        self.status.set('忽略全局AI触发：%s → %s（内存已改，点「保存」才落盘）'
+                        % (doc.ignore_ai_text(r['old']), doc.ignore_ai_text(r['new'])))
+
     def _airwall_doc(self):
         doc = getattr(self, 'doc', None)
         if not doc:

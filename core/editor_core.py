@@ -42,6 +42,19 @@ OBJ_TYPE_OFF = 64
 OBJ_ARG_OFF = 72
 ACTION_SIZE = 168
 
+# ★★★ 2026-11-03 §SOV01：**对象类别看 obj+0 的"类字"**，不再靠步长切分。
+#   类字 = 对象 16 字节类哈希的第 1 个 u32：
+#       0x4F0EC392 = ActionClass（行为，固定 168 B）
+#       0x4F0EC393 = EventClass （事件，108 / 124 B）
+#   24 档批量验证：595/595、以及另外 23 档全部对象**非 392 即 393**，
+#   且与旧的"168 步长切分"结果 100% 重合 ⇒ 类是**逐对象**可读的硬事实。
+#   为什么必须改：旧实现靠"第一个 Δ≠168 处当分界 + 段内类型必须全在表里"，
+#   SOV01UMD.sav 里有一条地图真值就是 **行为 609**（未知类型，sov01umd.map:
+#   `01000105=2,14,0,8,…A, 609,0,0,1,…A`）⇒ 类型校验失败 ⇒ 整张表退化成
+#   "全是事件" ⇒ 该档**所有触发读出来都是 0 条行为**（玩家报「读出的不对」）。
+OBJ_CLASS_ACTION = 0x4F0EC392
+OBJ_CLASS_EVENT = 0x4F0EC393
+
 # ---- §175 行为 56/57（设置 / 清除局部变量）的**变量号不在 +72，而在 +164** ----
 # 证据（gamemd.exe 静态反汇编，2026-10-22）：
 #   ActionClass::Execute 分派 = `edx = [esi+0x2C] - 1; cmp edx,0x90; jmp [edx*4+0x6DFDEC]`
@@ -457,6 +470,14 @@ NODEGRP_BASE_KEY = 0x133FD000   # TagNode/CellTag 键所在区（同区未用键
 # 触发记录的字段偏移（★相对**记录起点** = 触发实例对象 + 56 处的 ID 字符串）：
 #   +64 名字 / +120..123 难度位+启用副本 / +172 序号 / +192 事件键 / +196 行为键
 TRIG_REC_INST_BACK = 56      # 记录起点 − 56 = 触发实例对象起点（本格式判据）
+# ★★§SOV03（2026-11-03）**关联触发**（FA2「关联触发」/ ra2map「如何关联触发」）：
+#   一个标签可以共享给多条触发 —— 主触发挂着标签，其余从触发**把自己的标签删掉**，
+#   靠链子串起来；引擎执行时整条链共用那一个标签（持久性/挂载数/执行状态都属于标签）。
+#   存档里的字段：记录帧 `+132` = **下级（关联）触发的实例键**，0 = 链尾。
+#   实测（31 档样本）：SAVE5739.SAV 202/202 命中、SOV01UMD 1/1（01000588→01000517，
+#   与地图 `[Triggers]` 第 2 字段一致）、0 处"指不到任何触发"的野值。
+#   ⚠ 记录帧 `+128` 是**全档同一个常量**（0x10363520 / 0x10265280 …），不是标签键，别拿它当锚。
+TRIG_REC_LINK_OFF = 132
 TRIG_REC_IDX_OFF = 172       # 触发/标签对象：集群内**序号**（0 基，必须与位置一致）
 TRIG_REC_FLAG_COPY = 123     # 记录 +123 = 启用状态的**副本**（与 TagNode+88 同步写）
 TRIG_REC_QUAD_OFF = 120      # 记录 +120..123 = 难度位 01 01 01 + 启用副本
@@ -891,6 +912,7 @@ class SaveDoc(object):
         self._bnames = None              # 建筑类型名集合（rulesmd [BuildingTypes] ∪ artmd Foundation）
         self.time_sync_note = ''         # 最近一次时间同步的结果说明（供界面提示）
         self._tables_lowconf = False     # 类型空间校验未通过 ⇒ 低置信（只读提示用）
+        self._unknown_types = []         # ★§SOV01：不在已知表里的类型 [(类别, 类型号)]，仅供提示
         self._tagrecs = None              # 标签记录缓存（tag_records，按类 GUID 尾识别）
         # ★2026-10-28（玩家报「这个存档打开就卡死」）：标签↔触发配对、标签持久性
         #   以前每次调用都重算，而 `trigger_repeat_type` 是**每条触发一次**的调用
@@ -921,6 +943,49 @@ class SaveDoc(object):
             out += o
             pos += 8 + pk
         return bytes(out), ranges
+
+    # ★★§SOV05（2026-11-03）地图 `[Basic] IgnoreGlobalAITriggers`（FA2 面板上叫「忽略全局AI」）
+    #   在**存档里的镜像** = 明文 **0x34B4** 的 u32：0 = AI 触发生效，1 = 忽略（AI 触发不跑）。
+    #   证据（三档对照；A/B 两档前后各 64 字节完全一致、只差这一格）：
+    #     · `sov01umd.map`  `IgnoreGlobalAITriggers=no`            → SOV01UMD.sav 该值 **0**
+    #     · `all01umd.map`  `=yes`（改图之后存的档）               → AI触发关闭.SAV 该值 **1**
+    #     · 同一张图，改图**之前**存的档                           → AI触发打开.SAV 该值 **0**
+    #   ⚠ 语义仍需游戏内验收（改这一格是否等效于改地图 [Basic]）；工具只做"读写 4 字节"，
+    #     并在概览页显示，方便玩家自己切换后进游戏对照。
+    IGNORE_AI_OFF = 0x34B4
+
+    @staticmethod
+    def ignore_ai_text(v):
+        if v is None:
+            return '未读出'
+        return '是（AI 触发不跑）' if v else '否（AI 触发生效）'
+
+    def ignore_global_ai(self):
+        """「忽略全局AI触发」的存档镜像 → 0/1；该处不是 0/1 ⇒ None（定位失败）。"""
+        p = self.IGNORE_AI_OFF
+        if p + 4 > len(self.plain):
+            return None
+        v = int.from_bytes(self.plain[p:p + 4], 'little')
+        return v if v in (0, 1) else None
+
+    def set_ignore_global_ai(self, on):
+        """改「忽略全局AI触发」（原地 4 字节，不动明文长度）。
+
+        `on=True` = 忽略 AI 触发（等价地图 `IgnoreGlobalAITriggers=yes`）。
+        返回 {'old','new','off'}；定位存疑时**拒绝写入**。
+        """
+        old = self.ignore_global_ai()
+        if old is None:
+            raise RuntimeError(
+                '存档 0x%X 处的值不是 0/1 ⇒ 定位可能不对，已拒绝写入' % self.IGNORE_AI_OFF)
+        new = 1 if on else 0
+        if new != old:
+            self.plain[self.IGNORE_AI_OFF:self.IGNORE_AI_OFF + 4] = struct.pack('<I', new)
+            try:
+                self.info['忽略全局AI触发'] = self.ignore_ai_text(new)
+            except Exception:
+                pass
+        return {'old': old, 'new': new, 'off': self.IGNORE_AI_OFF}
 
     def _read_info(self):
         pl = self.plain
@@ -1007,6 +1072,8 @@ class SaveDoc(object):
         if ne < 6:
             # 自定义所属方任务：提前定位（会回填 玩家阵营/金钱/经济块 描述）
             self.find_custom_houses()
+        # ★§SOV05：地图 [Basic] IgnoreGlobalAITriggers（FA2「忽略全局AI」）的存档镜像
+        info['忽略全局AI触发'] = self.ignore_ai_text(self.ignore_global_ai())
         return info
 
     def _money_field_desc(self):
@@ -1830,8 +1897,18 @@ class SaveDoc(object):
             # ★ 必须**允许 type == 0**：类型 0（-无事件-/-无行为-）虽然危险，但一旦被写进去，
             #   对象依然存在。若在此过滤掉，数组就会出现"空洞" ⇒ 工具自己读错
             #   （实测：把 2 个事件改成 0 后，界面只剩 2 条事件，地图对拍也报"数量不符"）。
-            if t > 0xFFFF or a > 0xFFFFFF:
+            # ★★§SOV01（2026-11-03）：**类字命中就收**，不再用 类型/参数 的范围当滤网。
+            #   SOV01UMD.sav 里有 2 条事件（对应 01000211 / 01000213）的参数是
+            #   引擎写的 `-1`（= 0xFFFFFFFF，"未设置"；地图 INI 里也是 `-1`），
+            #   旧滤网 `a > 0xFFFFFF` 把它们整条丢掉 ⇒ 那两条触发读出来"没有事件"。
+            #   现在的判据：obj+0 是本类字（392/393）⇒ 一定是真对象，收；
+            #   类字不认识（老档/巧合命中签名）⇒ 才退回用 类型/参数 做合理性筛。
+            if o < 0:
                 continue
+            w = int.from_bytes(pl[o:o + 4], 'little')
+            if w not in (OBJ_CLASS_ACTION, OBJ_CLASS_EVENT):
+                if t > 0xFFFF or a > 0xFFFFFF:
+                    continue
             pos.append({'obj': o, 'off': o + OBJ_TYPE_OFF, 'type': t, 'arg': a,
                         'key': int.from_bytes(pl[o + 16:o + 20], 'little')})
         pos.sort(key=lambda d: d['obj'])
@@ -1841,14 +1918,49 @@ class SaveDoc(object):
     def _split_tables(self):
         """把对象序列切成 (行为列表, 事件列表)。
 
-        规则：从左侧起，**行为对象之间恒为 168 字节**；第一个 Δ≠168 处即
-        「行为段 → 事件段」的分界（实测分界 Δ=172 = 168 + 4 字节间隙）。
-        切完做一次**类型空间校验**（行为段类型须全在 ACTION_TYPES，事件段须全在
-        EVENT_TYPES），不通过则退回「全是事件」并标记低置信（宁可不给，也不乱给）。
+        ★★§SOV01（2026-11-03）**判定方式已换**：按每个对象 `obj+0` 的**类字**分流
+        （`OBJ_CLASS_ACTION` / `OBJ_CLASS_EVENT`），不再用"第一个 Δ≠168 处切分"。
+
+        为什么换（玩家报「这个存档读出的不对」→ 触发编辑器里行为列表全空）：
+          旧实现 = 步长切分 + **段内类型必须全在 ACTION_TYPES/EVENT_TYPES 表里**。
+          `SOV01UMD.sav` 里存在一条**地图真值就是 609 的行为**（未知类型）：
+          `sov01umd.map` 的 `[Actions] 01000105=2,14,0,8,…,A,609,0,0,1,…,A`
+          ⇒ 校验不过 ⇒ 返回 `([], objs)`（全当事件）⇒ **整档 166 条触发读出来
+          行为数都是 0**，而列表页的「条件 1 · 行为 3」走的是地图对拍所以看着正常，
+          触发编辑器里却是空的 —— 玩家看到的就是"读出不对"。
+
+        现在：
+          · 未知类型**保留**（只置 `_tables_lowconf` 让界面提示，不拉倒整张表）；
+          · 类字不认识时（老档/异常档）退回旧的步长切分 `_split_by_stride()`。
         """
         objs = self._objects()
         if not objs:
             return [], []
+        pl = self.plain
+        acts, evs, unknown = [], [], []
+        for o in objs:
+            obj = o['obj']
+            w = struct.unpack_from('<I', pl, obj)[0] if obj + 4 <= len(pl) else 0
+            if w == OBJ_CLASS_ACTION:
+                acts.append(o)
+            elif w == OBJ_CLASS_EVENT:
+                evs.append(o)
+            else:
+                unknown.append(o)
+        if unknown:                          # 类字不认识 ⇒ 不猜，退回旧启发式
+            return self._split_by_stride(objs)
+        # 分类结果来自"类字"这个硬事实 ⇒ **不算低置信**；未知类型（如 609）只记一笔，
+        # 供界面给一句"这条类型不在已知表里"的软提示，绝不拉倒整张表。
+        self._tables_lowconf = False
+        self._unknown_types = ([('行为', o['type']) for o in acts
+                                if o['type'] not in ACTION_TYPES] +
+                               [('事件', o['type']) for o in evs
+                                if o['type'] not in EVENT_TYPES])
+        return acts, evs
+
+    def _split_by_stride(self, objs):
+        """旧判定（类字缺失时的兜底）：从左侧起行为对象之间恒为 168 B，
+        第一个 Δ≠168 处即分界；切完做类型空间校验，不过则全当事件并标记低置信。"""
         if len(objs) == 1:                   # 只有一个对象：按类型空间判归属
             t = objs[0]['type']
             if t in ACTION_TYPES and t not in EVENT_TYPES:
@@ -2356,9 +2468,15 @@ class SaveDoc(object):
 
     def _mk(self, kind, o):        # ★改成实例方法：参数文案要用到阵营顺序（house_order）
         t, v = o['type'], o['arg']
+        raw = v
+        # ★★§SOV01（2026-11-03）：引擎用 `-1`（= 0xFFFFFFFF）表示"这个参数没有设置"。
+        #   SOV01UMD.sav 的 01000211 / 01000213 两条事件就是这种（地图 INI 里也写 -1）。
+        #   对外统一成 -1，别在界面上显示成 4294967295（看着像读错了）。
+        if v == 0xFFFFFFFF:
+            v = -1
         nm, pt = (event_name(t), event_ptype(t)) if kind == 'event' else \
                  (action_name(t), action_ptype(t))
-        return {'off': o['off'], 'obj': o['obj'], 'type': t, 'arg': v,
+        return {'off': o['off'], 'obj': o['obj'], 'type': t, 'arg': v, 'arg_raw': raw,
                 'name': nm, 'ptype': pt, 'arg_text': self._arg_text(pt, v),
                 'key': o.get('key'),
                 'owner': None, 'map_type': None, 'map_arg': None}
@@ -2858,10 +2976,26 @@ class SaveDoc(object):
             st['text'] = '读不到这条触发的对象'
             return st
         pl = self.plain
-        st['has_tag'] = o['tag_obj'] is not None
-        st['has_node'] = o['cell'] is not None
+        # ★★§SOV03（2026-11-03）：**关联触发**的从触发自己没有标签（标签被删了，
+        #   整条链共用链头那一个）⇒ 「是否已执行 / 还挂几个对象 / 是否被抑制」这些
+        #   属于**标签**的字段，一律去链头那条读，否则永远显示"没有标签"。
+        st['tag_owner'] = None
         try:
-            st['attached'] = self.trigger_attach_count(sid)
+            st['tag_owner'] = self.trigger_tag_owner(sid)
+        except Exception:
+            pass
+        tsid = st['tag_owner'] or sid
+        if tsid != sid:
+            try:
+                o_tag = self.trigger_objects(tsid)
+            except Exception:
+                o_tag = o
+        else:
+            o_tag = o
+        st['has_tag'] = o_tag['tag_obj'] is not None
+        st['has_node'] = o_tag['cell'] is not None
+        try:
+            st['attached'] = self.trigger_attach_count(tsid)
         except Exception:
             pass
         # ★★2026-10-27（玩家："添加行为会卡，然后闪退"）：
@@ -2875,11 +3009,11 @@ class SaveDoc(object):
             st['repeat'] = '1'          # 读不到就按"需要算"处理（保守，不丢信息）
         if st['repeat'] == '1':
             try:
-                st['remain'] = self.semi_persist_remaining(sid)
+                st['remain'] = self.semi_persist_remaining(tsid)
             except Exception:
                 pass
             try:
-                st['live'] = self.attach_live_count(sid)
+                st['live'] = self.attach_live_count(tsid)
             except Exception:
                 pass
         if st['remain'] is not None and st['live'] is not None:
@@ -2888,10 +3022,30 @@ class SaveDoc(object):
             st['ev_fired'] = bool(int.from_bytes(
                 pl[o['ev'] + self.EVENT_FIRED_PTR_OFF:o['ev'] + self.EVENT_FIRED_PTR_OFF + 4],
                 'little'))
-        if o['cell'] is not None and o['cell'] + self.TAG_RAW_BYTE_OFF + 1 <= len(pl):
-            st['tag_byte'] = int(pl[o['cell'] + self.TAG_RAW_BYTE_OFF])
+        # ★★§SOV01（2026-11-03）：一次性触发跑完后引擎**不回收** CellTag/TagNode
+        #   ⇒ 旧的「节点没了才算已执行」在"挂 0 个对象 + 事件恒真"的触发上永远为假，
+        #   界面就一直显示"等待中"。真实指纹：**CellTag 仍在定时表 + TagNode 帧数归零**
+        #   （被轮询过一次、条件恒真 ⇒ 当场执行 ⇒ 帧数减到 0，条目留下）。
+        st['ticks'] = None
+        st['in_timer'] = False
+        st['fired'] = False
+        st['always_true'] = False
         try:
-            fl = self.celltag_flags(sid)
+            st['always_true'] = 8 in [e['type'] for e in self.trigger_event_list(sid)]
+        except Exception:
+            pass
+        if o['node'] is not None:
+            _nd = o['node']
+            st['ticks'] = int.from_bytes(
+                pl[_nd + NODE_TICKS_OFF:_nd + NODE_TICKS_OFF + 4], 'little')
+            if st['ticks'] == 0 and o_tag['cell'] is not None:
+                _ck = int.from_bytes(pl[o_tag['cell'] + 16:o_tag['cell'] + 20], 'little')
+                st['in_timer'] = _ck in self._timer_key_set()
+                st['fired'] = bool(st['in_timer'] and str(st.get('repeat')) == '0')
+        if o_tag['cell'] is not None and o_tag['cell'] + self.TAG_RAW_BYTE_OFF + 1 <= len(pl):
+            st['tag_byte'] = int(pl[o_tag['cell'] + self.TAG_RAW_BYTE_OFF])
+        try:
+            fl = self.celltag_flags(tsid)
         except Exception:
             fl = None
         if fl:
@@ -2902,6 +3056,8 @@ class SaveDoc(object):
             st['verdict'] = 'no_tag'
         elif st['executed']:
             st['verdict'] = 'executed'
+        elif st.get('fired'):
+            st['verdict'] = 'fired'
         elif st['suppress']:
             st['verdict'] = 'suppressed'
         elif st['leak'] and st['leak'] > 0:
@@ -2914,6 +3070,13 @@ class SaveDoc(object):
             st['text'] = '本档找不到这条触发的标签（只有定义，或标签已被销毁且无残留）'
         elif st['executed']:
             st['text'] = ('已执行：CellTag 节点已消失（挂载数归零后执行、标签被销毁）')
+        elif st.get('fired'):
+            st['text'] = ('已执行（**推断**）：一次性触发跑完后引擎不回收它的 CellTag/运行期节点，'
+                          '所以"节点还在"并不代表没跑。存档里的指纹是'
+                          '「CellTag 仍登记在定时表里、TagNode 帧数已被减到 0」%s。'
+                          '⇒ 改它不会再触发；要重跑请重新武装（把帧数改回 >0）或换一条新触发。'
+                          % ('；且它的事件是 8「任何事件」（恒真），轮询到第一帧就会执行'
+                             if st.get('always_true') else ''))
         elif st['suppress']:
             st['text'] = ('⚠ 标签被**抑制**：CellTag 标志字节 +0x34 = %d（正常应为 0）⇒ '
                           '引擎在 0x6E53A0 一进门就 return，连计数都不动 ⇒ 这条触发在本档里'
@@ -2930,6 +3093,17 @@ class SaveDoc(object):
         else:
             st['text'] = ('未执行：CellTag 节点还在，还挂 %d 个对象'
                           '（持久 1 要等它减到 0 才执行）' % st['attached'])
+        # ★§SOV03：关联触发的从触发要把"状态借自链头"说清楚，否则玩家会以为
+        #   "我没给这条挂标签，怎么算出来的挂载数/执行状态"。
+        if st.get('tag_owner'):
+            try:
+                _ow = self.trigger_rec(st['tag_owner'])
+                _nm = (_ow.name if _ow else '') or st['tag_owner']
+            except Exception:
+                _nm = st['tag_owner']
+            st['text'] = ('**关联触发**：本条与「%s（%s）」等共用同一个标签（自己那份已删）'
+                          '⇒ 下面的挂载数/执行状态是**链头那个标签**的。\n'
+                          % (_nm, st['tag_owner'])) + st['text']
         return st
 
     # ★★★ 2026-10-22 §168：引擎侧反汇编（REA/Ghidra + capstone，细节见主文档 §168）把上面
@@ -3309,6 +3483,14 @@ class SaveDoc(object):
             raise ValueError('触发类型只能是 0/1/2（0 一次性·任一挂载 / '
                              '1 一次性·挂载清空 / 2 可重复）')
         tags = [t for t, g in self.trigger_tag_pairs() if g == sid]
+        shared_owner = None
+        if not tags:
+            # ★§SOV03：关联触发的从触发自己没有标签（FA2 里"关联触发"就是这意思：
+            #   主触发把标签共享给从触发，从触发的标签被删掉）⇒ 改的是**链头那个标签**，
+            #   也就是改整条链的触发类型。返回值里带 shared_owner，GUI 用它提示影响范围。
+            shared_owner = self.trigger_tag_owner(sid)
+            if shared_owner:
+                tags = [t for t, g in self.trigger_tag_pairs() if g == shared_owner]
         if not tags:
             raise RuntimeError('没找到触发 %s 对应的标签' % sid)
         tset = set(tags)
@@ -3344,6 +3526,7 @@ class SaveDoc(object):
         #   这里**不拦**（有的地图作者故意要 2 的重复效果），但把警告串带回去，GUI 弹确认。
         return {'changed': n, 'old': old, 'new': persistence,
                 'tags': done, 'total': len(done),
+                'shared_owner': shared_owner,
                 'warn': self.repeat_pitfall(sid, persistence)}
 
     def trigger_tag_pairs(self):
@@ -3404,14 +3587,54 @@ class SaveDoc(object):
                     out.append((sid, tsid))
         return out
 
+    # ★§SOV03：标签**对象帧** `+0xB0` 就是持久性（= 记录帧 `+120`，两者差 56）。
+    #   以前只能靠「地图 [Tags]」或「标签名 = 触发名 + ' N'」把标签对到触发，
+    #   名字不合规律的档（SAVE5739：8 条共用一个标签、名字也不带序号）就整列读不出来，
+    #   界面显示"未读出（无标签）"。而触发实例 `+?`→标签键是**直接可读**的
+    #   （`_instance_maps()['tag_of_inst']`），所以先走这条路。
+    TAG_PERSIST_OBJ_OFF = 0xB0
+
+    def _sid2inst_key(self, sid):
+        """sid → 触发实例自键（带缓存；`_instance_maps` 里只有反过来的映射）。"""
+        n = len(self.plain)
+        memo = getattr(self, '_sid2inst', None)
+        if memo is None or memo[0] != n:
+            memo = (n, {s: k for k, s in self._instance_maps()['sid'].items()})
+            self._sid2inst = memo
+        return memo[1].get(sid)
+
+    def own_tag_persist(self, sid):
+        """本条触发**自己那个**标签对象的持久性（不经任何名字/地图配对）；没有 ⇒ None。"""
+        try:
+            k = self._sid2inst_key(sid)
+            if k is None:
+                return None
+            tk = self._instance_maps()['tag_of_inst'].get(k)
+            if not tk:
+                return None
+            obj = self._tag_objs_by_key().get(tk)
+            if obj is None:
+                return None
+            p = obj + self.TAG_PERSIST_OBJ_OFF
+            if p + 4 > len(self.plain):
+                return None
+            v = int.from_bytes(self.plain[p:p + 4], 'little')
+            return str(v) if 0 <= v <= 3 else None
+        except Exception:
+            return None
+
     def trigger_repeat_type(self, sid):
         """触发重复类型 '0'/'1'/'2'；都读不到 ⇒ None。
 
-        ★优先级：**存档里的标签持久性**（存档自足） → 地图 `[Tags]` 第 0 字段兜底。
+        ★优先级：**本条自己的标签对象 +0xB0**（最直接，不需要任何配对）
+          → 存档里的标签配对（地图 `[Tags]` / 名字规律）→ **关联触发的链头**。
           注意：一个触发可挂多个标签；只有任一标签是持久(2) 才算"会重复"。
         """
         if not sid:
             return None
+        own = self.own_tag_persist(sid)
+        if own is not None:
+            return own
         vals = []
         for tag_sid, trig_sid in self.trigger_tag_pairs():
             if trig_sid == sid:
@@ -3428,9 +3651,16 @@ class SaveDoc(object):
                         pass
                 if p is not None:
                     vals.append(p)
-        if not vals:
-            return None
-        return '2' if '2' in vals else vals[0]
+        if vals:
+            return '2' if '2' in vals else vals[0]
+        # ★§SOV03：关联触发的从触发**自己没有标签**（标签被删了）⇒ 看链头那条。
+        ow = self.trigger_tag_owner(sid)
+        if ow:
+            try:
+                return self.trigger_repeat_type(ow)
+            except Exception:
+                pass
+        return None
 
     def detach_map(self):
         self._map = None
@@ -3560,6 +3790,8 @@ class SaveDoc(object):
 
     def _arg_text(self, ptype, v):
         """把参数按类型翻译成人话（能翻就翻，翻不了给原值）"""
+        if v == -1:                        # ★§SOV01：引擎的"未设置"哨兵（存档里 0xFFFFFFFF）
+            return '（-1 = 未设置）'
         if ptype == 0:
             return ''
         if ptype == 2:
@@ -3608,9 +3840,10 @@ class SaveDoc(object):
             ev['ptype'] = event_ptype(etype)
         if arg is not None:
             arg = int(arg)
-            if not (0 <= arg <= 0xFFFFFF):
-                raise ValueError('参数需在 0 ~ 16777215 之间')
-            self.plain[ev['off'] + 8:ev['off'] + 12] = arg.to_bytes(4, 'little')
+            # ★§SOV01：-1 = 引擎的"未设置"哨兵（存档里存成 0xFFFFFFFF），允许原样写回。
+            if not (-1 <= arg <= 0xFFFFFF):
+                raise ValueError('参数需在 0 ~ 16777215 之间（或 -1 = 未设置）')
+            self.plain[ev['off'] + 8:ev['off'] + 12] = (arg & 0xFFFFFFFF).to_bytes(4, 'little')
             ev['arg'] = arg
             # ★「13 流逝时间」：事件里的秒数只是"地图 INI 的副本"，引擎计时用的是
             #   该触发 **TagNode +80 的帧数**（= 秒×15，15 fps）⇒ 必须一起改
@@ -3720,9 +3953,10 @@ class SaveDoc(object):
             ac['ptype'] = action_ptype(atype)
         if arg is not None:
             arg = int(arg)
-            if not (0 <= arg <= 0xFFFFFF):
-                raise ValueError('参数需在 0 ~ 16777215 之间')
-            self.plain[off + 8:off + 12] = arg.to_bytes(4, 'little')
+            # ★§SOV01：-1 = 引擎的"未设置"哨兵（存档里存成 0xFFFFFFFF），允许原样写回。
+            if not (-1 <= arg <= 0xFFFFFF):
+                raise ValueError('参数需在 0 ~ 16777215 之间（或 -1 = 未设置）')
+            self.plain[off + 8:off + 12] = (arg & 0xFFFFFFFF).to_bytes(4, 'little')
             ac['arg'] = arg
         # ★§255：行为 80/107 的「小队键」（对象 +0x44 = off+4）与「路径点」（对象 +0x58 = off+0x18）
         if team is not None:
@@ -4178,9 +4412,20 @@ class SaveDoc(object):
     def runtime_status(self):
         """每个触发实例的运行期组件状态（GUI「触发」页诊断用）：
         [{'inst_off', 'inst_key', 'sid', 'name', 'tag_key', 'has_node', 'node_off',
-          'ticks', 'has_cell', 'record_enabled'}]，按实例偏移升序。"""
+          'ticks', 'has_cell', 'record_enabled', 'in_timer', 'fired'}]，按实例偏移升序。
+
+        ★★§SOV01（2026-11-03）新增 `in_timer` / `fired` —— 一次性触发**跑完之后引擎
+          不回收**它的 CellTag/TagNode（只有"持久 1 计数减到 0"那条路径才消费节点），
+          所以旧的「节点还在 ⇒ 没执行」在"挂 0 个对象、事件恒真"的触发上永远判错。
+          存档里留下的真实指纹是：**CellTag 仍登记在定时表里，但 TagNode 帧数已归零**
+          （轮询过一次、条件恒真 ⇒ 当场执行 ⇒ 帧数被减到 0，条目留着）。
+          实证：SOV01UMD.sav 165 条触发里只有 01000588「爱因斯坦」是这个形态
+          （玩家确认已执行；其它在定时表里的帧数都 > 0：750 / 840 / 2100…）。
+        """
         m = self._instance_maps()
         recs = {r.sid: r for r in self.records if r.kind == '触发'}
+        cell_by_key = {nd['x']: nd['node'] for nd in self.celltag_nodes()}
+        tkeys = None
         out = []
         for k, off in sorted(m['inst'].items(), key=lambda x: x[1]):
             nm = self.plain[off + 120:off + 172].split(b'\x00')[0]
@@ -4190,16 +4435,31 @@ class SaveDoc(object):
                 nm = nm.decode('gbk', 'replace')
             node_off = m['node_of_inst'].get(k)
             rec = recs.get(m['sid'].get(k, ''))
+            ticks = int.from_bytes(self.plain[node_off + NODE_TICKS_OFF:
+                                              node_off + NODE_TICKS_OFF + 4], 'little') \
+                if node_off is not None else None
+            cell_key = m['cell_of_tag'].get(m['tag_of_inst'].get(k))
+            in_timer = False
+            fired = False
+            if node_off is not None and ticks == 0 and cell_key:
+                if tkeys is None:
+                    tkeys = self._timer_key_set()
+                in_timer = cell_key in tkeys
+                if in_timer:
+                    try:
+                        fired = str(self.trigger_repeat_type(m['sid'].get(k, ''))) == '0'
+                    except Exception:
+                        fired = False
             out.append({
                 'inst_off': off, 'inst_key': k, 'sid': m['sid'].get(k, ''),
                 'name': nm, 'tag_key': m['tag_of_inst'].get(k),
                 'has_node': node_off is not None, 'node_off': node_off,
-                'ticks': int.from_bytes(self.plain[node_off + NODE_TICKS_OFF:
-                                                   node_off + NODE_TICKS_OFF + 4], 'little')
-                if node_off is not None else None,
-                'has_cell': m['tag_of_inst'].get(k) in m['cell_of_tag'],
+                'ticks': ticks,
+                'has_cell': cell_key is not None,
                 'record_enabled': (rec.enabled if rec is not None
                                    and rec.enabled is not None else True),
+                'in_timer': in_timer,
+                'fired': fired,
                 # ★运行期启用位 = TagNode+88 最低位（大任务档：定义字节≠运行期状态，
                 #   被触发链启用的触发定义里仍是"禁用"——2026-10-15 SAVE194E 实战定案）
                 'rt_enabled': bool(int.from_bytes(self.plain[node_off + NODE_FLAG_OFF:
@@ -4207,6 +4467,14 @@ class SaveDoc(object):
                                                   'little') & 1)
                 if node_off is not None else None})
         return out
+
+    def _timer_key_set(self):
+        """「定时触发器挂接表」里的 CellTag 自键集合（没有表 ⇒ 空集合）。"""
+        try:
+            tl = self.celltag_timer_list() or {}
+        except Exception:
+            return set()
+        return set(tl.get('keys') or ())
 
     def node_of_event(self, ev):
         """事件 → 所属触发实例 → TagNode。
@@ -15500,6 +15768,8 @@ class SaveDoc(object):
         """把"跟着明文偏移走"的缓存全部作废（增删字节后必须调）。"""
         for a in ('_objs', '_events', '_actions', '_ticks', '_celltags', '_ctimerlist',
                   '_instmaps', '_house_econ', '_custom_houses', '_house_keys_memo',
+                  '_linkmaps',              # ★§SOV03：关联触发链（跟着记录帧 +132 走）
+                  '_sid2inst',              # ★§SOV03：sid → 实例自键（同上，偏移相关）
                   '_houses_memo',          # ★P3-14：houses() 的结构 memo
                   '_tagrecs', '_mapm', '_aiids',
                   '_tagpairs_memo', '_tagpersist_memo',   # ★2026-10-28 标签配对/持久性 memo
@@ -15555,6 +15825,93 @@ class SaveDoc(object):
             if s == sid:
                 return m['inst'].get(k)
         return None
+
+    # ---------------- 关联触发（一个标签共享给多条触发） ----------------
+    def trigger_link_maps(self):
+        """关联触发链 → `{'link':{sid:下级sid}, 'owner':{sid:链头sid}, 'chain':{链头:[sid…]}}`。
+
+        语义（FA2「关联触发」/ ra2map 教程）：**主触发**把它的标签共享给**从触发**；
+        从触发把自己的标签删掉，只留链接。所以：
+          · 「链头」= 真正挂着标签对象的那条（= 主触发）；
+          · 从触发的**重复类型 / 挂载数 / 执行状态**全都要看链头的标签。
+        链的方向：记录帧 `+132` = **下级**触发的实例键，0 = 链尾
+        （SAVE5739：Plant8→Plant7→…→Plant1，只有 Plant8 有标签）。
+        """
+        n = len(self.plain)
+        memo = getattr(self, '_linkmaps', None)
+        if memo is not None and memo[0] == n:
+            return memo[1]
+        m = self._instance_maps()
+        k2sid = dict(m['sid'])
+        recs = {r.sid: r for r in self.records if r.kind == '触发'}
+        pl = self.plain
+        link = {}
+        for sid, rec in recs.items():
+            p = rec.off + TRIG_REC_LINK_OFF
+            v = int.from_bytes(pl[p:p + 4], 'little') if p + 4 <= n else 0
+            nxt = k2sid.get(v)
+            if nxt and nxt != sid:
+                link[sid] = nxt
+        # 链头 = 有标签对象的那条（tag_of_inst 只收"Tag 对象 +0xB4 指向它"的实例）
+        heads = [m['sid'][k] for k in m['inst'] if m['tag_of_inst'].get(k)]
+        owner, chain = {}, {}
+        for h in heads:
+            seq, cur, seen = [h], h, {h}
+            while True:
+                nxt = link.get(cur)
+                if not nxt or nxt in seen or len(seq) > 64:
+                    break
+                seq.append(nxt)
+                seen.add(nxt)
+                cur = nxt
+            if len(seq) > 1:                 # 只有真链（≥2 条）才算"共用"
+                chain[h] = seq
+                for s in seq:
+                    owner.setdefault(s, h)
+        res = {'link': link, 'owner': owner, 'chain': chain}
+        self._linkmaps = (n, res)
+        return res
+
+    def trigger_link_sid(self, sid):
+        """这条触发的**下级（关联）触发** sid；没有/链尾返回 None。"""
+        return self.trigger_link_maps()['link'].get(sid)
+
+    def trigger_link_chain(self, sid):
+        """从这条触发往下走到的整条链（含自己）；不在链上返回 [sid]。"""
+        maps = self.trigger_link_maps()
+        for head, seq in maps['chain'].items():
+            if sid in seq:
+                return list(seq[seq.index(sid):])
+        return [sid]
+
+    def trigger_tag_owner(self, sid):
+        """这条触发**共用**的是哪条触发（链头）的标签；自己就是链头/不在链上 ⇒ None。"""
+        maps = self.trigger_link_maps()
+        ow = maps['owner'].get(sid)
+        return ow if ow and ow != sid else None
+
+    def trigger_tag_sid(self, sid):
+        """读「标签相关字段」（持久性 / CellTag 挂载数 / 执行状态）时该看哪条触发。
+        关联触发的从触发自己没有标签 ⇒ 一律看链头。"""
+        return self.trigger_tag_owner(sid) or sid
+
+    def trigger_shared_info(self, sid):
+        """关联触发摘要（GUI 用）→ {'owner','owner_name','up','down','chain'}；无关则 None。"""
+        maps = self.trigger_link_maps()
+        ow = maps['owner'].get(sid)
+        if not ow:
+            return None
+        names = {r.sid: r.name for r in self.records if r.kind == '触发'}
+
+        def nm(s):
+            return names.get(s) or s
+        chain = maps['chain'].get(ow, [ow])
+        i = chain.index(sid) if sid in chain else -1
+        return {'owner': ow, 'owner_name': nm(ow),
+                'up': (chain[i - 1] if i > 0 else None),
+                'down': maps['link'].get(sid),
+                'chain': chain,
+                'head_name': nm(chain[0]) if chain else nm(ow)}
 
     def _tag_objs_by_key(self):
         """标签自键 → 标签对象帧偏移。
@@ -15632,9 +15989,29 @@ class SaveDoc(object):
         """
         pl = self.plain
         o = self.trigger_objects(sid)
+        # ★★§SOV03（2026-11-03）：**关联触发**的从触发没有自己的标签对象（标签被删了，
+        #   整条链共用链头那一个）⇒ 这里把「标签 / CellTag」两类字段整体借链头的，
+        #   事件、行为、TagNode 仍然是本条自己的。只读，不影响改名（改名走 trigger_objects）。
+        tag_owner = None
+        try:
+            tag_owner = self.trigger_tag_owner(sid)
+        except Exception:
+            tag_owner = None
+        if tag_owner:
+            try:
+                _o2 = self.trigger_objects(tag_owner)
+                o = dict(o)
+                o['tag_key'] = _o2['tag_key']
+                o['tag_obj'] = _o2['tag_obj']
+                o['cell_key'] = _o2['cell_key']
+                o['cell'] = _o2['cell']
+                o['shared_from'] = tag_owner
+            except Exception:
+                pass
         rec = o['rec']
         d = {'sid': sid, 'name': rec.name, 'index': None, 'rec_off': rec.off,
              'owner': self.trigger_owner_name(rec), 'disabled': None,
+             'tag_owner': tag_owner, 'shared_tag': bool(tag_owner),
              'easy': None, 'normal': None, 'hard': None,
              'repeat': None, 'repeat_text': '', 'event': None, 'actions': [],
              'has_node': o['node'] is not None, 'has_cell': o['cell'] is not None,
@@ -15757,7 +16134,12 @@ class SaveDoc(object):
             suffix = tag_old[len(old):].strip() if tag_old.startswith(old) else ''
             if not suffix.isdigit():
                 suffix = '1'
-            self._write_name_at(tag + 120, '%s %s' % (name, suffix))
+            tag_name = '%s %s' % (name, suffix)
+            # ★§SOV02：名字本身已接近 51 B 上限时，再加「 N」会被 `_gbk_name` **静默截断**
+            #   ⇒ 宁可只写名字（标签名只是给人看的），也不要写进半截字节。
+            if len(tag_name.encode('gbk', 'ignore')) > 51:
+                tag_name = name
+            self._write_name_at(tag + 120, tag_name)
         self.invalidate_caches(rescan=True)
         return {'old': old, 'new': name}
 

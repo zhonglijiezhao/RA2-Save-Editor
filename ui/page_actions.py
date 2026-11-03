@@ -18,6 +18,7 @@ from editor_core import ACTION_TYPES
 from editor_core import action_name
 from editor_core import action_note
 from ui.msg import filedialog
+from ui import tree_fit
 from ui.msg import messagebox
 from tkinter import ttk
 import os
@@ -38,7 +39,7 @@ class ActionsPage(object):
                            ('argtext', '参数含义', 108, 'w'), ('owner', '所属触发', 150, 'w'),
                            ('off', '明文位置', 92, 'w')):
             self.ta.heading(c, text=t)
-            self.ta.column(c, width=w, anchor=a)
+            self.ta.column(c, width=w, anchor=a, stretch=False)   # ★§SOV04
         # ★2026-10-18：同款搜索框（按 类型/名称/参数/所属触发/位置 搜）
         qrow = ttk.Frame(f)
         qrow.pack(fill='x', pady=(0, 6))
@@ -54,6 +55,9 @@ class ActionsPage(object):
         self.lbl_ac_count = ttk.Label(qrow, text='', foreground=ui_theme.T['muted'])
         self.lbl_ac_count.pack(side='left')
         self._ta_wrap.pack(fill='both', expand=True)      # ★带滚动条的容器
+        # ★§SOV04：列宽按内容自适应 + 悬浮看全文 + 尺寸变化后重算
+        tree_fit.attach_tooltip(self.ta)
+        tree_fit.fit_on_resize(self.ta, caps={'name': 280, 'argtext': 320, 'owner': 160})
         self.ta.tag_configure('bad', foreground=ui_theme.T['danger'])
         self.ta.bind('<Double-1>', lambda e: self.edit_action())
         self.ta.bind('<Return>', lambda e: self.edit_action())
@@ -118,6 +122,14 @@ class ActionsPage(object):
         self._fill_ac_tree()
         if getattr(self.doc, '_tables_lowconf', False):
             self.status.set('事件/行为定位未通过校验 —— 请勿按此修改（可能不是行为表）')
+        else:
+            # ★§SOV01：未知行为类型（如 SOV01UMD 的 609）只是**表里没收录**，
+            #   不是"读错了"——照原样列出，这里给一句软提示即可。
+            unk = [t for k, t in (getattr(self.doc, '_unknown_types', None) or [])
+                   if k == '行为']
+            if unk:
+                self.status.set('扫到 %d 条行为；其中类型 %s 不在已知表里（按存档原样列出，'
+                                '可读不可改）' % (len(self._aclist), sorted(set(unk))))
         self._refresh_map_labels()
 
     def _fill_ac_tree(self):
@@ -138,6 +150,11 @@ class ActionsPage(object):
                                      foreground=ui_theme.T['muted'])
         # ★2026-10-20：重填（搜索/刷新）后把触发页选中项的高亮补回来
         self._mark_hits(self.ta, rows, getattr(self, '_ac_hits', set()))
+        # ★§SOV04：行集变了就重算列宽（否则搜索过滤后列宽还停在旧内容上）
+        try:
+            tree_fit.autosize(self.ta, caps={'name': 280, 'argtext': 320, 'owner': 160})
+        except Exception:
+            pass
 
     def _refresh_map_labels(self):
         """把地图对照结论写到两个页面的提示行"""

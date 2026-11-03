@@ -407,6 +407,13 @@ class SearchPage(object):
             self.lbl_map_mode.config(text={'auto': '自动匹配', 'manual': '手动指定',
                                            'no_map': '未找到地图'}.get(
                 getattr(self, '_map_mode', ''), getattr(self, '_map_mode', '-') or '-'))
+            # ★§SOV05：地图 [Basic] IgnoreGlobalAITriggers（FA2「忽略全局AI」）的存档镜像
+            _iai = None
+            try:
+                _iai = self.doc.ignore_global_ai()
+            except Exception:
+                _iai = None
+            self.lbl_ignore_ai.config(text=self.doc.ignore_ai_text(_iai))
         except Exception:
             pass
         # ★v1.3：操作条右侧显示当前打开的存档（原来只能看状态栏）

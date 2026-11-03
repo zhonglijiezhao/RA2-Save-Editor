@@ -347,7 +347,12 @@ class TriggerEditor(tk.Toplevel):
         if txt.startswith('（新建'):
             self._load_new_form()
             return
-        self.reload()
+        # ★★§SOV02：这里原来只调 `self.reload()`，而 `reload()` 在 `sid=None` 时用的是
+        #   `keep or self._cur`（= 上一条触发）⇒ **下拉里选什么都不换人**，界面会瞬间
+        #   弹回原来那条。必须把下拉当前项对应的 sid 显式传进去。
+        i = self.cb_t.current()
+        sid = self._sids[i] if 0 <= i < len(self._sids) else None
+        self.reload(sid=sid)
 
     # ---------------- 载入 ----------------
     def reload(self, sid=None, keep=None):
@@ -444,6 +449,10 @@ class TriggerEditor(tk.Toplevel):
                               % (_rs['leak'], _rs['remain'], _rs['live']))
                 elif _rs['executed']:
                     state += ' · ✔ 已执行（挂载数归零、标签已销毁）'
+                elif _rs.get('fired'):
+                    # ★§SOV01：一次性触发跑完引擎不回收 CellTag/TagNode ⇒ 指纹是
+                    #   "仍在定时表 + 帧数归零"（详见 runtime_status 文档）
+                    state += ' · ✔ 已执行（计时已归零，引擎仍留着条目）'
                 else:
                     state += (' · 未执行（节点还在，剩余挂载 %s）'
                               % (_rs['remain'] if _rs['remain'] is not None else '—'))
@@ -457,6 +466,15 @@ class TriggerEditor(tk.Toplevel):
                     state += '·持久1 还差 %d 个对象离场' % _rs['remain']
         except Exception:
             pass
+        # ★§SOV03：关联触发（FA2「关联触发」= 主触发把标签共享给从触发，从触发标签已删）
+        try:
+            _sh = self.doc.trigger_shared_info(sid)
+        except Exception:
+            _sh = None
+        if _sh:
+            state += ' · 关联触发：共用「%s」的标签' % _sh['owner_name']
+            if _sh.get('down'):
+                state += '·下级 %s' % _sh['down']
         self.lbl_state.config(text=state)
         # 事件下拉（选项 = 编号 + 名称）
         # ★2026-10-20：0 = 地编占位项「-无事件-」，写进存档会崩 ⇒ 下拉里**直接不列**
@@ -693,7 +711,14 @@ class TriggerEditor(tk.Toplevel):
             if not nm:
                 messagebox.showwarning('提示', '名字不能为空', parent=self)
                 return
-            self._pending_name = nm[:16]
+            if not self._name_bytes_ok(nm):
+                messagebox.showwarning(
+                    '名字太长',
+                    '存档里触发名是 52 字节的 GBK 字段：最多 %d 字节'
+                    '（约 25 个汉字）。当前 %d 字节。'
+                    % (self.NAME_MAX_BYTES, len(nm.encode('gbk', 'ignore'))), parent=self)
+                return
+            self._pending_name = nm
             self.app.status.set('新建名已记为 %r（还没写入存档，点「新建」才生效）'
                                 % self._pending_name)
             return
@@ -724,8 +749,26 @@ class TriggerEditor(tk.Toplevel):
                 if tip and not messagebox.askyesno(
                         '⚠ 持久性有坑', tip + '\n\n仍要写 %s 吗？' % rep, parent=self):
                     return
+                # ★§SOV03：关联触发的从触发没有自己的标签 ⇒ 写的是**整条链共用**的那个标签，
+                #   也就是把整组一起改了。必须先说清楚（这档 8 条共用 1 个标签）。
+                sh = None
+                try:
+                    sh = self.doc.trigger_shared_info(self._cur)
+                except Exception:
+                    sh = None
+                if sh:
+                    n = len(sh.get('chain') or [])
+                    if not messagebox.askyesno(
+                            '这是关联触发',
+                            '本条与「%s」等 %d 条触发**共用同一个标签**'
+                            '（FA2「关联触发」，自己那份标签已删）。\n\n'
+                            '改触发类型 = 改这个共用标签的持久性 ⇒ **整组 %d 条一起变**。\n\n'
+                            '仍要写吗？' % (sh['owner_name'], n, n), parent=self):
+                        return
                 self.doc.set_trigger_repeat_type(self._cur, int(rep))
-                msgs.append('触发类型 → %s' % REPEAT_LABEL[int(rep)])
+                msgs.append('触发类型 → %s%s'
+                            % (REPEAT_LABEL[int(rep)],
+                               ('（共用「%s」的标签）' % sh['owner_name']) if sh else ''))
         except Exception as e:
             messagebox.showerror('写入失败', str(e), parent=self)
             return
@@ -810,6 +853,7 @@ class TriggerEditor(tk.Toplevel):
         if det['has_cell']:
             state += ' · CellTag ✓（挂接 %d 栋）' % det['attached']
         vmap = {'executed': ' · ✔ 已执行（挂载数归零、标签已销毁）',
+                'fired': ' · ✔ 已执行（计时已归零，引擎仍留着条目）',
                 'no_tag': ' · 本档无标签对象',
                 'suppressed': ' · ⚠ 标签被抑制（+0x34 非 0 ⇒ 引擎静默跳过）'}
         if rs['verdict'] in vmap:
@@ -1489,6 +1533,22 @@ class TriggerEditor(tk.Toplevel):
                           '要写文件请回主窗口点「保存」' % self._cur)
 
     # ---------------- 统一善后 ----------------
+    # ★★§SOV02（2026-11-03 玩家实测）：触发名在存档里是 **52 字节的 GBK 字段**
+    #   （`_write_name_at(..., span=52)`，`set_trigger_name` 允许到 51 B）。
+    #   这里以前写死 `nm[:16]` —— 按**字符**砍 16 个，于是 'Player_Has_Plant1'
+    #   （17 字符）被砍成 'Player_Has_Plant'；而 `_on_name_change` 是**实时写盘**的，
+    #   所以玩家只是**用触发编辑器打开一次**，8 条 'Player_Has_Plant1..8' 的尾号
+    #   就全被写没了。改成按 GBK 字节数判（超了就不写并提示），绝不静默截断。
+    NAME_MAX_BYTES = 51
+
+    def _name_bytes_ok(self, nm):
+        """名字能否塞进 52 B 的 GBK 字段（0 < GBK 字节数 ≤ 51）。"""
+        try:
+            n = len((nm or '').encode('gbk', 'ignore'))
+        except Exception:
+            return False
+        return 0 < n <= self.NAME_MAX_BYTES
+
     def _on_name_change(self):
         """名字**随输入实时生效**（地编同款，不用再点「改名」）。
 
@@ -1497,11 +1557,21 @@ class TriggerEditor(tk.Toplevel):
           · 新建模式（旧入口）：实时写 `_pending_name`，点「新建」时就用它；
           · **普通模式（编辑已有触发）：直接改名**（与当前名相同就跳过，
             避免 `reload()` 回填时自己触发一遍写盘）。
+
+        ★★§SOV02：回填时**必须原样保留**（一个字节都别动）—— 以前这里 `nm[:16]`
+          会在回填瞬间把长名字截短并立刻写进存档（"打开一次就掉尾号"）。
         """
         nm = (self.var_name.get() or '').strip()
         if not nm:
             return                       # 清空不写（存档里名字不能为空）
-        nm = nm[:16]
+        if not self._name_bytes_ok(nm):
+            try:
+                self.app.status.set(
+                    '名字太长：存档里触发名是 52 字节的 GBK 字段（上限 %d 字节，'
+                    '约 25 个汉字 / 50 个英文字符）—— 这次**没有写入**' % self.NAME_MAX_BYTES)
+            except Exception:
+                pass
+            return
         if getattr(self, '_new_mode', False):
             self._pending_name = nm
             try:

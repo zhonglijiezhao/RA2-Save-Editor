@@ -411,6 +411,26 @@ class GiftPage(object):
         dlg.wait_window()
         return ret or None
 
+    # ★§SOV02：触发名在存档里是 **52 字节的 GBK 字段**（`set_trigger_name` 允许 ≤51 B）。
+    #   以前这里用 `(...)[:16]` 按**字符**砍，类型名一长就把结尾序号砍掉 ⇒ 同批刷出的
+    #   几条触发重名（工具靠名字区分它们）。
+    NAME_MAX_BYTES = 51
+
+    def _fit_trigger_name(self, name):
+        """压到 51 GBK 字节以内，但**保住末尾序号**（只砍中间的类型名）。"""
+        if isinstance(name, bytes):
+            name = name.decode('gbk', 'ignore')
+        name = str(name or '刷兵')
+        if len(name.encode('gbk', 'ignore')) <= self.NAME_MAX_BYTES:
+            return name
+        i = len(name)
+        while i > 0 and name[i - 1].isdigit():      # 找末尾序号
+            i -= 1
+        head, tail = name[:i], name[i:]
+        while head and len((head + tail).encode('gbk', 'ignore')) > self.NAME_MAX_BYTES:
+            head = head[:-1]
+        return (head + tail) or name[:20]
+
     def mv_spawn_team(self):
         """🔫 刷单位（小队法）：特遣部队 + 作战小队 + 触发「13 流逝时间1秒 + 援军行为@路径点」。
 
@@ -448,7 +468,9 @@ class GiftPage(object):
         try:
             r = self.doc.spawn_units_by_trigger(
                 tname, int(n), cell=(sel[0], sel[1]),
-                trigger_name=('刷%s%d' % (tname, n))[:16],
+                # ★§SOV02：这里以前 `(...)[:16]` 按字符砍 —— 类型名一长就把结尾的序号砍掉，
+                #   同批刷出的几条会重名（工具靠名字区分）。改成按 **GBK 字节** 留出序号位。
+                trigger_name=self._fit_trigger_name('刷%s%d' % (tname, n)),
                 max_teams=1,
                 script_key=script_key,
                 script_entries=script_entries,

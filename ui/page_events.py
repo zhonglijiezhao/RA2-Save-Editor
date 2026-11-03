@@ -18,6 +18,7 @@ from editor_core import EVENT_TYPES
 from editor_core import event_name
 from editor_core import event_note
 from ui.msg import messagebox
+from ui import tree_fit
 from tkinter import ttk
 import tkinter as tk
 import ui_theme
@@ -36,7 +37,7 @@ class EventsPage(object):
                            ('argtext', '参数含义', 108, 'w'), ('owner', '所属触发', 150, 'w'),
                            ('off', '明文位置', 92, 'w')):
             self.te.heading(c, text=t)
-            self.te.column(c, width=w, anchor=a)
+            self.te.column(c, width=w, anchor=a, stretch=False)   # ★§SOV04
         # ★2026-10-18：大任务档事件上千条 ⇒ 同款搜索框（按 类型/名称/参数/所属触发/位置 搜）
         qrow = ttk.Frame(f)
         qrow.pack(fill='x', pady=(0, 6))
@@ -53,6 +54,9 @@ class EventsPage(object):
         self.lbl_ev_count.pack(side='left')
         self._te_wrap.pack(fill='both', expand=True)      # ★带滚动条的容器（位置同原来的表格）
         self.te.tag_configure('bad', foreground=ui_theme.T['danger'])
+        # ★§SOV04：列宽按内容自适应 + 悬浮看全文 + 尺寸变化后重算
+        tree_fit.attach_tooltip(self.te)
+        tree_fit.fit_on_resize(self.te, caps={'name': 280, 'argtext': 320, 'owner': 160})
         self.te.bind('<Double-1>', lambda e: self.edit_event())
         self.te.bind('<Return>', lambda e: self.edit_event())
 
@@ -155,6 +159,11 @@ class EventsPage(object):
                                      foreground=ui_theme.T['muted'])
         # ★2026-10-20：重填（搜索/刷新）后把触发页选中项的高亮补回来
         self._mark_hits(self.te, rows, getattr(self, '_ev_hits', set()))
+        # ★§SOV04：行集变了就重算列宽（否则搜索过滤后列宽还停在旧内容上）
+        try:
+            tree_fit.autosize(self.te, caps={'name': 280, 'argtext': 320, 'owner': 160})
+        except Exception:
+            pass
 
     def make_never_satisfied(self):
         """把选中的事件改成「永不满足」的条件 —— **等效禁用**该触发。

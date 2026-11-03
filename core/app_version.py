@@ -11,8 +11,8 @@
 源码直接跑时，用的就是上次打包写下的值 —— 这也是"代码现在对应哪个构建"的最实际记录。
 """
 
-SEMVER = '1.4.2'
-BUILD = 305
+SEMVER = '1.4.3'
+BUILD = 312
 
 # 仓库地址（界面上「GitHub ↗」点开的就是它）
 REPO = 'https://github.com/zhonglijiezhao/RA2-Save-Editor'

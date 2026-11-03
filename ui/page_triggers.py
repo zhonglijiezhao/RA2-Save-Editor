@@ -21,6 +21,7 @@ from ui.msg import filedialog
 from ui.msg import messagebox
 from tkinter import ttk
 from ui.trigger_editor import TriggerEditor
+from ui import tree_fit
 import os
 import re
 import tkinter as tk
@@ -43,13 +44,21 @@ class TriggersPage(object):
                         ('tags', '标签', 44), ('mapinfo', '地图（条件/行为）', 104),
                         ('note', '说明', 118)):
             self.tt.heading(c, text=t)
-            self.tt.column(c, width=w, anchor='w')
+            # ★§SOV04：`stretch=False` —— ttk 默认会把列按比例压到"正好填满控件"，
+            #   于是横向滚动条永远没内容可滚（滑块占满整条、拖不动），列还会被压窄裁字。
+            self.tt.column(c, width=w, anchor='w', stretch=False)
         self._tt_vsb = ttk.Scrollbar(tvw, orient='vertical', command=self.tt.yview)
         self._tt_hsb = ttk.Scrollbar(tvw, orient='horizontal', command=self.tt.xview)
         self.tt.configure(yscrollcommand=self._tt_vsb.set, xscrollcommand=self._tt_hsb.set)
         self._tt_vsb.pack(side='right', fill='y')
         self._tt_hsb.pack(side='bottom', fill='x')
         self.tt.pack(side='left', fill='both', expand=True)
+        # ★§SOV04：鼠标停在被裁切的单元格上弹全文（列宽自适应后仍有超长说明时）
+        tree_fit.attach_tooltip(self.tt)
+        # ★§SOV04：窗口/控件尺寸一变就重算列宽。**必须**有这个 —— 首次填表时控件
+        #   还没映射（winfo_width=1），量出来的字号/可用宽度都不对，等真正显示出来
+        #   再算一次才能贴合窗口。
+        self.tt.bind('<Configure>', self._on_trig_tree_resize, add='+')
         # ★2026-10-18 22:0x（玩家要求）：大任务档触发成百上千 ⇒ 加搜索框；
         #   「标签」记录和触发混在一张表里，既不能改也没用 ⇒ 默认隐藏（勾选可看）。
         qrow = ttk.Frame(f)
@@ -136,11 +145,21 @@ class TriggersPage(object):
                           '启用位未定位到的记录（显示"-"）为只读。\n'
                           '★ 状态列会写运行期情况：\n'
                           '    · 等待中（黑字）= 有 TagNode，正在计时（后面是剩余秒数）；\n'
+                          '    · 已执行（计时已归零，橙字）= 一次性触发跑完后引擎**不回收**它的 '
+                          'CellTag/TagNode ⇒ 旧判据（节点消失）永远判不出来。真正的指纹是'
+                          '「CellTag 仍登记在定时表、TagNode 帧数已归零」'
+                          '（2026-11-03 SOV01UMD 实证：玩家确认已执行的「爱因斯坦」正是这个形态，'
+                          '它的事件是 8「任何事件」恒真 ⇒ 轮询到第一帧就执行）；\n'
                           '    · 事件驱动型·未挂钩（黑字）= 没有 TagNode，且事件对象还没被引擎碰过'
                           '（+0x50..+0x68 全 0）⇒ 还没轮到它，改它有效；\n'
                           '    · 事件驱动型·已挂钩（橙字）= 没有 TagNode，但事件对象已被引擎写过'
                           '⇒ 只能确定「挂钩了」，分不清「已触发」还是「等回调」；改之前会弹确认；\n'
                           '    · 未启用 / 已禁用、未实例化（只有定义）（灰字）。\n'
+                          '★ 关联触发（FA2「关联触发」/ ra2map 教程）：主触发把**一个标签共享给**\n'
+                          '    一串从触发，从触发自己那份标签被删掉、只留链接（存档记录帧 +132 =\n'
+                          '    下级触发的实例键）。所以从触发的「触发类型」会带**（共用）**、\n'
+                          '    「标签」列写"共用"，状态/挂载数一律取**链头那条的标签**\n'
+                          '    （2026-11-03 SAVE5739 实证：Player_Has_Plant8 挂标签，1~7 共用）。\n'
                           '   ★ 关键教训（2026-10-20 玩家用「飞碟被攻击」触发指出）：'
                           '「没有 TagNode」≠「已执行」—— 「被攻击 / 被摧毁 / 进房子」这类触发靠对象'
                           '回调驱动，本来就不建 TagNode。\n'
@@ -217,6 +236,18 @@ class TriggersPage(object):
         tags_of = {}
         for _tsid, _trig in _pairs:
             tags_of.setdefault(_trig, set()).add(_tsid)
+        # ★★§SOV03（2026-11-03）：**关联触发**——主触发把标签共享给一串从触发，
+        #   从触发自己那份标签被删了（FA2「关联触发」/ ra2map 教程）。所以从触发的
+        #   「触发类型 / 状态」都要借链头的，列表里标出来，别再显示"未读出（无标签）"。
+        shared = {}
+        try:
+            _lm = self.doc.trigger_link_maps()
+            _nmap = {r.sid: (r.name or r.sid) for r in self.doc.records if r.kind == '触发'}
+            for _s, _ow in (_lm.get('owner') or {}).items():
+                if _ow and _ow != _s:
+                    shared[_s] = (_ow, _nmap.get(_ow) or _ow)
+        except Exception:
+            shared = {}
         rows = []
         stcnt = {}
         # ★2026-10-20：哪些触发**没有运行期组件**（存档里找不到它的事件/行为）
@@ -280,6 +311,11 @@ class TriggersPage(object):
                         #   在这一段字节上是同形）⇒ 只说"已挂钩"，不再断言"已执行"。
                         rts = '事件驱动型·已挂钩（可能已触发）'
                         st_key = '已执行'
+                elif rt.get('fired'):
+                    # ★§SOV01：一次性触发跑完引擎不回收 CellTag/TagNode ⇒ 指纹是
+                    #   "CellTag 还在定时表、TagNode 帧数已归零"。
+                    rts = '已执行（计时已归零）'
+                    st_key = '已执行'
                 elif rt['rt_enabled']:
                     rts = '等待中'
                     if rt['ticks']:
@@ -295,6 +331,9 @@ class TriggersPage(object):
                 state = (state + '｜' + rts) if state != '-' else rts
                 rep_cell = (_rep_text.get(_rep, '型' + _rep) if _rep
                             else '未读出（无标签）')
+                # ★§SOV03：从触发没有自己的标签，类型/状态都借链头的 ⇒ 标「共用」
+                if shared.get(r.sid) and _rep:
+                    rep_cell = '（共用）' + rep_cell
                 # ★§158：持久性 1 的两种坑（挂 0 个对象 / 进入事件挂多个对象）
                 #   直接在"触发类型"列打 ⚠，不用点开也能看见。只对 1 判，避免拖慢列表。
                 if _rep == '1':
@@ -305,12 +344,19 @@ class TriggersPage(object):
                         pass
                 ntags = len(tags_of.get(r.sid, ()))
                 tags_cell = ('%d' % ntags) if ntags else '—'
+                if shared.get(r.sid) and not ntags:
+                    tags_cell = '共用'          # 标签在链头那条上，本条只是共用
             else:
                 mi = ('→ %s' % t2t[r.sid]) if r.sid in t2t else '—'
                 rep_cell = getattr(self.doc, 'REPEAT_TEXT', {}).get(
                     self.doc.tag_persist(r.sid) or '', '') or '—'
                 tags_cell = '—'
             note = r.note
+            if r.kind == '触发' and shared.get(r.sid):
+                _ow, _own = shared[r.sid]
+                # ★§SOV04：说明列也要保持可读 —— 这里只写**短标记**，全文交给悬浮提示
+                #   （以前写「关联触发：共用「X」的标签（自己那份已删）」，把说明列撑爆了）
+                note = ((note + ' · ') if note else '') + '共用「%s」的标签' % _own
             if r.kind == '触发' and r.sid not in _links:
                 nort.add(i)
                 note = (note + ' · ' if note else '') + '⚠本档只有「触发定义」、未实例化（引擎不执行·只读）'
@@ -349,6 +395,17 @@ class TriggersPage(object):
         except Exception:
             pass
         return True
+
+    def _is_fired(self, rec):
+        """这条触发**很可能已经执行过**（§SOV01 的推断判据，只用于标橙/措辞，不拦人）。
+
+        一次性触发跑完后引擎**不回收** CellTag / TagNode ⇒「节点还在」不能当"没跑"的证据。
+        真实指纹（见 `runtime_status()` 文档）：CellTag 仍登记在定时表、TagNode 帧数已归零。
+        """
+        if rec is None:
+            return False
+        x = (getattr(self, '_rtmap', {}) or {}).get(rec.sid)
+        return bool(x and x.get('fired'))
 
     def _sid_of_row(self, item):
         """事件/行为行 → 所属触发 sid（优先地图归属，其次运行期键链）。"""
@@ -399,6 +456,25 @@ class TriggersPage(object):
             '如果它已经触发过，改它不会生效；如果只是挂钩等待，改了会生效。\n\n'
             '仍要修改吗？' % (rec.name, rep[0], rep[1]), parent=self)
 
+    # 列宽自适应的上限（像素）——说明列别把整行撑到屏幕外
+    TRIG_COL_CAPS = {'name': 240, 'note': 460, 'state': 200, 'rep': 185, 'mapinfo': 165}
+
+    def _on_trig_tree_resize(self, _e=None):
+        """控件尺寸变化 ⇒ 防抖后重算列宽（§SOV04）。"""
+        if not hasattr(self, 'tt'):
+            return
+        job = getattr(self, '_fit_job', None)
+        if job is not None:
+            try:
+                self.tt.after_cancel(job)
+            except Exception:
+                pass
+        try:
+            self._fit_job = self.tt.after(
+                120, lambda: tree_fit.autosize(self.tt, caps=self.TRIG_COL_CAPS))
+        except Exception:
+            self._fit_job = None
+
     def _fill_trig_tree(self):
         """把 `_trig_rows` 按「搜索词 + 是否显示标签」填进触发树。
 
@@ -427,7 +503,7 @@ class TriggersPage(object):
             _tags = ()
             if i in nort:
                 _tags = ('nort',)
-            elif _rec is not None and self._is_executed(_rec):
+            elif _rec is not None and (self._is_executed(_rec) or self._is_fired(_rec)):
                 _tags = ('warn',)      # 事件驱动型·已挂钩 ⇒ 橙字（不再判定为"已执行"红字）
             self.tt.insert('', 'end', iid=str(i), values=vals, tags=_tags)
             shown += 1
@@ -439,6 +515,12 @@ class TriggersPage(object):
             self.lbl_trig_count.config(
                 text='显示 %d / %d 条%s%s' % (shown, len(rows),
                                             '' if show_tags else '（标签已隐藏）', extra))
+        # ★§SOV04：列宽按内容自适应（以前写死 732 px ⇒ 长说明被列宽裁掉，
+        #   而横向滚动条因为"没超宽"拖不动）。内容仍超宽时滚动条就能拖了。
+        try:
+            tree_fit.autosize(self.tt, caps=self.TRIG_COL_CAPS)
+        except Exception:
+            pass
 
 
     # ★2026-10-28 删：这里原本有一份 128 行的 `repair_runtime_dialog` 和一份 `_repair_verdict`，
