@@ -30,6 +30,22 @@ class WeaponsPage(object):
             '存档里的武器类型表；改这里只影响这一份存档，rulesmd.ini 一个字节不动')
         _ph.pack(fill='x', padx=2, pady=(2, 8))
 
+        # ★★§SOV15（2026-11-04 玩家："这个武器列表能不能以单位显示，改这个单位的主武器
+        #   副武器，比如把大兵的武器换成谭雅的"）⇒ 顶部加「武器 / 单位」视图切换。
+        mrow = ttk.Frame(f)
+        mrow.pack(fill='x', padx=2, pady=(0, 6))
+        ttk.Label(mrow, text='视图').pack(side='left')
+        self._wpn_mode = tk.StringVar(value='weapon')
+        ttk.Radiobutton(mrow, text='武器（按把）', value='weapon',
+                        variable=self._wpn_mode,
+                        command=self._wpn_switch).pack(side='left', padx=(6, 0))
+        ttk.Radiobutton(mrow, text='单位（按型号改主/副武器）', value='unit',
+                        variable=self._wpn_mode,
+                        command=self._wpn_switch).pack(side='left', padx=(10, 0))
+        self.lbl_wpn_mode = ttk.Label(mrow, text='', foreground=T['muted'],
+                                      font=(ui_theme.FONT_UI, 8))
+        self.lbl_wpn_mode.pack(side='left', padx=(10, 0))
+
         body = tk.Frame(f, bg=T['canvas'])
         body.pack(fill='both', expand=True)
 
@@ -41,6 +57,7 @@ class WeaponsPage(object):
 
         qrow = ttk.Frame(lf)
         qrow.pack(fill='x', pady=(0, 6))
+        self._wpn_qrow = qrow
         self._q_wpn = tk.StringVar()
         ent = ttk.Entry(qrow, textvariable=self._q_wpn, width=11)
         ent.pack(side='left')
@@ -60,15 +77,29 @@ class WeaponsPage(object):
             self.tw.column(c, width=w, anchor=a)
         self.tw.tag_configure('diff', foreground=T['danger'])
         self.tw.bind('<<TreeviewSelect>>', self._wpn_pick)
+        # ★§SOV15：单位视图的列表（同一个位置，切换时显隐）
+        self._wpn_wrap = wrap
+        u_wrap, self.utw = self._tree_scrolled(
+            lf, ('type', 'cn', 'p', 's'), 20)
+        self._unit_wrap = u_wrap
+        # 4 列刚好塞进 330px 左栏（带竖滚动条），精英武器在右侧卡片里看
+        for c, t, w, a in (('type', '型号', 60, 'w'), ('cn', '名称', 86, 'w'),
+                           ('p', '主武器', 82, 'w'), ('s', '副武器', 74, 'w')):
+            self.utw.heading(c, text=t)
+            self.utw.column(c, width=w, anchor=a)
+        self.utw.tag_configure('ingame', foreground=T['ink'])
+        self.utw.bind('<<TreeviewSelect>>', self._unit_pick)
         bot = ttk.Frame(lf)
         bot.pack(fill='x', pady=(4, 0))
+        self._wpn_bot = bot
         self.lbl_wpn_count = ttk.Label(bot, text='', foreground=T['muted'],
                                        font=(ui_theme.FONT_UI, 8))
         self.lbl_wpn_count.pack(side='left')
         # ★2026-10-28：导出（玩家问「能不能把存档里的武器提取出来」；
         #   随后又要求「导出成 INI，更符合红警的格式」⇒ 一个按钮 + 文件类型选格式）
-        ttk.Button(bot, text='导出…', width=9,
-                   command=self._wpn_export).pack(side='right')
+        self._btn_wpn_export = ttk.Button(bot, text='导出…', width=9,
+                                          command=self._wpn_export)
+        self._btn_wpn_export.pack(side='right')
 
         # ── 右：详情 + 编辑 ──
         rt = tk.Frame(body, bg=T['canvas'])
@@ -77,6 +108,7 @@ class WeaponsPage(object):
         # ① 武器数值
         o1, in1 = ui_theme.card(rt, '武器数值')
         o1.pack(fill='x')
+        self._o_wpn_stats = o1
         self.lbl_wpn_name = tk.Label(in1, text='（左侧选一把武器）', bg=T['surface'],
                                      fg=T['ink'], font=(ui_theme.FONT_UI, 12, 'bold'),
                                      anchor='w')
@@ -118,6 +150,50 @@ class WeaponsPage(object):
         # ② 弹头克制表（11 项，两列）
         o2, in2 = ui_theme.card(rt, '弹头克制表')
         o2.pack(fill='both', expand=True, pady=(8, 0))
+        self._o_wpn_verse = o2
+
+        # ②b 单位武器（★§SOV15，默认不显示）
+        o3, in3 = ui_theme.card(rt, '单位武器（改的是型号）')
+        self._o_unit = o3
+        self.lbl_unit_name = tk.Label(in3, text='（左侧选一个单位）', bg=T['surface'],
+                                      fg=T['ink'], font=(ui_theme.FONT_UI, 12, 'bold'),
+                                      anchor='w')
+        self.lbl_unit_name.grid(row=0, column=0, columnspan=4, sticky='w')
+        tk.Label(in3, text='改的是「型号」：该型号所有单位（含敌方、以后新造的）都会换。'
+                           '按「还原选中型号」可回退到 rules 的配置。',
+                 bg=T['surface'], fg=T['muted'], font=(ui_theme.FONT_UI, 8),
+                 anchor='w', justify='left', wraplength=ui_theme.px(330)).grid(
+            row=1, column=0, columnspan=4, sticky='w', pady=(2, 6))
+        self._unit_slot_var = {}
+        self._unit_slot_cb = {}
+        self._unit_slot_old = {}
+        for i, (key, _rel, lab) in enumerate(SaveDoc.UNIT_WEAPON_SLOTS):
+            r = 2 + i
+            tk.Label(in3, text=lab, bg=T['surface'], fg=T['muted'],
+                     font=(ui_theme.FONT_UI, 9)).grid(row=r, column=0, sticky='w',
+                                                      pady=3)
+            v = tk.StringVar()
+            self._unit_slot_var[key] = v
+            cb = ttk.Combobox(in3, textvariable=v, width=24)
+            cb.grid(row=r, column=1, sticky='w', padx=(6, 4), pady=3)
+            self._unit_slot_cb[key] = cb
+            tk.Label(in3, text='', bg=T['surface'], fg=T['muted_soft'],
+                     font=(ui_theme.FONT_UI, 8)).grid(row=r, column=2, sticky='w')
+        self._unit_also_elite = tk.BooleanVar(value=True)
+        ttk.Checkbutton(in3, text='同时改精英武器（用 …E 版）',
+                        variable=self._unit_also_elite).grid(
+            row=6, column=0, columnspan=3, sticky='w', pady=(6, 0))
+        bar3 = tk.Frame(in3, bg=T['surface'])
+        bar3.grid(row=7, column=0, columnspan=4, sticky='w', pady=(8, 0))
+        ttk.Button(bar3, text='应用改动', style='Primary.TButton',
+                   command=self._unit_apply).pack(side='left')
+        ttk.Button(bar3, text='还原选中型号', style='Ghost.TButton',
+                   command=self._unit_revert).pack(side='left', padx=6)
+        self.lbl_unit_msg = tk.Label(in3, text='', bg=T['surface'], fg=T['ink_2'],
+                                     font=(ui_theme.FONT_UI, 9), anchor='w',
+                                     justify='left', wraplength=ui_theme.px(330))
+        self.lbl_unit_msg.grid(row=8, column=0, columnspan=4, sticky='w',
+                               pady=(6, 0))
         self.lbl_wh_name = tk.Label(in2, text='—', bg=T['surface'], fg=T['ink'],
                                     font=(ui_theme.FONT_UI, 10, 'bold'), anchor='w')
         self.lbl_wh_name.grid(row=0, column=0, columnspan=8, sticky='w')
@@ -146,6 +222,242 @@ class WeaponsPage(object):
                                       font=(ui_theme.FONT_UI, 9))
         self.lbl_verse_msg.pack(side='left', padx=6)
         return f
+
+    # ---------------- ★§SOV15 单位视图：按型号改主/副武器 ----------------
+    _UNIT_RULE_KEYS = {'primary': 'Primary', 'secondary': 'Secondary',
+                      'elite_primary': 'ElitePrimary', 'elite_secondary': 'EliteSecondary'}
+
+    def _wpn_switch(self):
+        """武器视图 ⇄ 单位视图（只切显隐，控件都是一次性建好的）。"""
+        unit = (self._wpn_mode.get() == 'unit')
+        try:
+            if unit:
+                self._wpn_qrow.pack_forget()       # 「只看 ≠原版」对单位视图没意义
+                try:
+                    self._btn_wpn_export.pack_forget()   # 导出的武器表，单位视图下不适用
+                    self.lbl_wpn_count.config(text='')
+                except Exception:
+                    pass
+                self._wpn_wrap.pack_forget()
+                self._unit_wrap.pack(fill='both', expand=True, before=self._wpn_bot)
+                self._o_wpn_stats.pack_forget()
+                self._o_wpn_verse.pack_forget()
+                self._o_unit.pack(fill='both', expand=True)
+                self.refresh_units()
+            else:
+                self._unit_wrap.pack_forget()
+                self._wpn_qrow.pack(fill='x', pady=(0, 6), before=self._wpn_wrap)
+                try:
+                    self._btn_wpn_export.pack(side='right')
+                except Exception:
+                    pass
+                self._wpn_wrap.pack(fill='both', expand=True, before=self._wpn_bot)
+                self._o_unit.pack_forget()
+                self._o_wpn_stats.pack(fill='x')
+                self._o_wpn_verse.pack(fill='both', expand=True, pady=(8, 0))
+                self.refresh_weapons()
+        except Exception as e:
+            try:
+                self.lbl_wpn_mode.config(text='切换视图失败：%s' % e)
+            except Exception:
+                pass
+
+    def refresh_units(self):
+        """填「单位」列表：型号 / 名称 / 主武器 / 副武器 / 精英主武器。"""
+        if not hasattr(self, 'utw'):
+            return
+        try:
+            self.utw.delete(*self.utw.get_children())
+        except Exception:
+            pass
+        try:
+            self.lbl_unit_msg.config(text='')
+        except Exception:
+            pass
+        self._unit_rows = {}
+        rows = []
+        try:
+            rows = self.doc.unit_weapon_list() if self.doc else []
+        except Exception as e:
+            try:
+                self.lbl_wpn_mode.config(text='读不到单位表：%s' % e)
+            except Exception:
+                pass
+        for i, r in enumerate(rows):
+            sl = r['slots']
+            self.utw.insert('', 'end', iid=str(i),
+                            values=(r['type'], r['cn'] or '—',
+                                    sl['primary']['name'] or '—',
+                                    sl['secondary']['name'] or '—'),
+                            tags=('ingame',) if r['in_game'] else ())
+            self._unit_rows[str(i)] = r
+        try:
+            self.lbl_wpn_mode.config(
+                text='可改型号 %d 个（深色 = 本局场上出现过）' % len(rows))
+        except Exception:
+            pass
+        try:
+            names = sorted({w['name'] for w in self.doc.weapon_objects()}) if self.doc else []
+        except Exception:
+            names = []
+        for cb in getattr(self, '_unit_slot_cb', {}).values():
+            try:
+                cb['values'] = names
+            except Exception:
+                pass
+
+    def _unit_pick(self, _e=None):
+        """选中一个型号 ⇒ 把它的 4 个槽填进下拉。"""
+        sel = ()
+        try:
+            sel = self.utw.selection()
+        except Exception:
+            pass
+        if not sel:
+            return
+        r = (getattr(self, '_unit_rows', None) or {}).get(sel[0])
+        if not r:
+            return
+        self._unit_cur = r
+        try:
+            self.lbl_unit_name.config(
+                text='%s ｜ %s%s' % (r['type'], r['cn'] or '—',
+                                     '' if r['in_game'] else '（本局没造）'))
+        except Exception:
+            pass
+        for key, _rel, _lab in SaveDoc.UNIT_WEAPON_SLOTS:
+            nm = r['slots'][key]['name'] or ''
+            try:
+                self._unit_slot_var[key].set(nm)
+            except Exception:
+                pass
+            self._unit_slot_old[key] = nm
+        # ★这里**不要**清消息：`selection_set()` 排队的 <<TreeviewSelect>> 会在
+        #   update 时才派发，如果这里清空，就会把「应用」刚写好的提示擦掉
+        #   （2026-11-04 自检抓到的）。消息由 refresh_units() 统一清。
+
+    def _unit_apply(self):
+        """把下拉里改过的槽写进存档（定长 u32）。"""
+        r = getattr(self, '_unit_cur', None)
+        if not r:
+            try:
+                self.lbl_unit_msg.config(text='先在左边选一个单位')
+            except Exception:
+                pass
+            return
+        todo = []
+        for key, _rel, _lab in SaveDoc.UNIT_WEAPON_SLOTS:
+            try:
+                new = (self._unit_slot_var[key].get() or '').strip()
+            except Exception:
+                new = ''
+            old = self._unit_slot_old.get(key, '')
+            if new and new != old:
+                todo.append((key, new))
+        if not todo:
+            try:
+                self.lbl_unit_msg.config(text='没有改动')
+            except Exception:
+                pass
+            return
+        lab = {k: l for k, _o, l in SaveDoc.UNIT_WEAPON_SLOTS}
+        lines = ['%s（%s）' % (r['type'], r['cn'] or '—'), '',
+                 '改的是型号 ⇒ 该型号的所有单位都会换（含敌方、以后新造的）。', '']
+        for key, new in todo:
+            lines.append('　· %s：%s → %s'
+                         % (lab[key], self._unit_slot_old.get(key) or '(空)', new))
+        lines += ['', '只写存档（原地 u32），rulesmd.ini 一个字节不动。',
+                  '不可撤销 —— 建议先在主窗口「备份存档」。', '', '确定应用吗？']
+        if not messagebox.askyesno('改单位武器', '\n'.join(lines), parent=self):
+            return
+        done, errs = [], []
+        for key, new in todo:
+            try:
+                done.append(self.doc.set_unit_weapon(
+                    r['type'], key, new,
+                    also_elite=bool(self._unit_also_elite.get())))
+            except Exception as e:
+                errs.append('%s → %s：%s' % (lab[key], new, e))
+        self.refresh_units()
+        for iid, row in (getattr(self, '_unit_rows', None) or {}).items():
+            if row['type'] == r['type']:
+                try:
+                    self.utw.selection_set(iid)
+                    self.utw.see(iid)
+                except Exception:
+                    pass
+                self._unit_pick()
+                break
+        if errs:
+            messagebox.showwarning('部分没改成', '\n'.join(errs), parent=self)
+        bits = []
+        for info in done:
+            for c in info['changes']:
+                if c['changed']:
+                    bits.append('%s %s→%s' % (lab[c['slot']], c['old_name'] or '(空)',
+                                              c['new_name']))
+        if bits:
+            try:
+                self.lbl_unit_msg.config(text='已改：' + '；'.join(bits)[:140])
+            except Exception:
+                pass
+            try:
+                self.status.set('已改 %s 的武器：%s' % (r['type'], '；'.join(bits)[:90]))
+            except Exception:
+                pass
+
+    def _unit_revert(self):
+        """把选中型号的武器按 rules 还原（只在 rules 里有值时才动）。"""
+        r = getattr(self, '_unit_cur', None)
+        if not r:
+            try:
+                self.lbl_unit_msg.config(text='先在左边选一个单位')
+            except Exception:
+                pass
+            return
+        kv = (SaveDoc._rules_all() or {}).get(r['type']) or {}
+        todo = []
+        for key, _rel, _lab in SaveDoc.UNIT_WEAPON_SLOTS:
+            want = (kv.get(self._UNIT_RULE_KEYS[key]) or '').strip()
+            if want and want != (r['slots'][key]['name'] or ''):
+                todo.append((key, want))
+        if not todo:
+            try:
+                self.lbl_unit_msg.config(text='已经和 rules 一致')
+            except Exception:
+                pass
+            return
+        lab = {k: l for k, _o, l in SaveDoc.UNIT_WEAPON_SLOTS}
+        lines = ['%s（%s）按 rules 还原：' % (r['type'], r['cn'] or '—'), '']
+        for key, want in todo:
+            lines.append('　· %s：%s → %s'
+                         % (lab[key], r['slots'][key]['name'] or '(空)', want))
+        lines += ['', '只写存档。确定吗？']
+        if not messagebox.askyesno('按 rules 还原', '\n'.join(lines), parent=self):
+            return
+        errs = []
+        for key, want in todo:
+            try:
+                self.doc.set_unit_weapon(r['type'], key, want, also_elite=False)
+            except Exception as e:
+                errs.append('%s → %s：%s' % (lab[key], want, e))
+        self.refresh_units()
+        for iid, row in (getattr(self, '_unit_rows', None) or {}).items():
+            if row['type'] == r['type']:
+                try:
+                    self.utw.selection_set(iid)
+                    self.utw.see(iid)
+                except Exception:
+                    pass
+                self._unit_pick()
+                break
+        if errs:
+            messagebox.showwarning('部分没还原', '\n'.join(errs), parent=self)
+        else:
+            try:
+                self.lbl_unit_msg.config(text='已按 rules 还原 %d 个槽' % len(todo))
+            except Exception:
+                pass
 
     def _wpn_export(self):
         """导出武器表（★2026-10-28：玩家要求 INI 格式，更符合红警）。
@@ -239,7 +551,12 @@ class WeaponsPage(object):
                 return
             if self.nb.index(self.nb.select()) != 10:
                 return
-            self.refresh_weapons()
+            # ★§SOV15：停在「单位」视图时刷单位表，别只刷武器
+            if getattr(self, '_wpn_mode', None) is not None \
+                    and self._wpn_mode.get() == 'unit':
+                self.refresh_units()
+            else:
+                self.refresh_weapons()
         except Exception:
             pass
 

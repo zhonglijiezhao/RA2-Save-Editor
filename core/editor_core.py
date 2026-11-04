@@ -13960,6 +13960,129 @@ class SaveDoc(object):
         o = self.type_addr_map().get(value & 0xFFFFFFFF)
         return o[0] if o and len(o) == 1 else None
 
+    # ---- ★★§SOV15（2026-11-04 玩家："能不能以单位显示，改这个单位的主武器副武器，
+    #      比如把大兵的武器换成谭雅的"）----
+    # 实测（SOV01UMD_修改_2.SAV，与 rules 逐条对拍全中）：
+    #   单位/步兵 Type 对象上 `+0x8AC` = Primary、`+0x8C8` = Secondary、
+    #   `+0xAA8` = ElitePrimary、`+0xAC4` = EliteSecondary（各 u32 = 武器对象的运行时地址）。
+    #   例：E1 → M60 / Para / M60E / ParaE；APOC → 120mmx / MammothTusk / 120mmxE / 0；
+    #       HTK → FlakTrackGun / FlakTrackAAGun / …E；DRON → DroneJump / VirtualScanner。
+    # ⚠ **建筑不要走这套偏移**：ATESLA 在 +0x8AC 读到的是 `PrismShot`（光棱塔的武器），
+    #   说明 BldgType 的布局不同 ⇒ 用 rules 段的 `Foundation=` 把它们排除掉。
+    UNIT_WEAPON_SLOTS = (('primary', 0x8AC, '主武器'),
+                         ('secondary', 0x8C8, '副武器'),
+                         ('elite_primary', 0xAA8, '精英主武器'),
+                         ('elite_secondary', 0xAC4, '精英副武器'))
+    # rules 段里出现这些键才算"战斗单位"（House / 中立 / 装饰段一个都没有）
+    UNIT_WEAPON_RULEKEYS = ('Primary', 'Secondary', 'ElitePrimary', 'EliteSecondary')
+
+    def unit_weapon_list(self, include_empty=False):
+        """可改武器的**单位型号**（步兵/载具）→ list of dict：
+
+        `{'type','cn','off','key','slots':{slot:{'addr','name'}},'in_game'}`
+
+        `include_empty=True` 连"一个武器都没有"的型号也列出来（默认只列有武器的）。
+        建筑被排除（布局不同，见 `UNIT_WEAPON_SLOTS` 的注释）。
+        """
+        self._invalidate_if_shifted()
+        c = getattr(self, '_unitwpns', None)
+        if c is not None and c[0] == len(self.plain):
+            data = c[1]
+        else:
+            ut = self.unit_types()
+            offs = getattr(self, '_utypes_off', None) or {}
+            rules = self._rules_all() or {}
+            amap = self.type_addr_map()
+
+            def nm_of(v):
+                o = amap.get(v & 0xFFFFFFFF)
+                return o[0] if o and len(o) == 1 else None
+
+            try:
+                in_game = {r['type'].upper() for r in self.unit_records()}
+            except Exception:
+                in_game = set()
+            out = []
+            for k, name in ut.items():
+                kv = rules.get(name) or rules.get(name.upper()) or {}
+                # ★排除建筑：**不能用 `Foundation`** —— 这份 rules 的建筑段里根本没有这个键。
+                #   实测 `BuildCat=` 才是可靠判据：8 个防御建筑（NALASR/NASAM/TESLA/ATESLA/
+                #   GTGCAN/GAPILL/NAFLAK/YAPSYT）全有，70 个单位/载具全没有。
+                if 'BuildCat' in kv:
+                    continue
+                # 再排除 House / 中立 / 装饰：rules 段里连一个武器键都没有
+                #   （`Neutral` 的 +0x8AC 会读到 `CRIVEXP`，就是靠这条挡掉的）
+                if not any(x in kv for x in self.UNIT_WEAPON_RULEKEYS):
+                    continue
+                off = offs.get(k)
+                if off is None or off + 0xAC8 > len(self.plain):
+                    continue
+                slots = {}
+                for key, rel, _lab in self.UNIT_WEAPON_SLOTS:
+                    v = struct.unpack_from('<I', self.plain, off + rel)[0]
+                    slots[key] = {'addr': v, 'name': nm_of(v)}
+                if not include_empty and not any(x['addr'] for x in slots.values()):
+                    continue
+                out.append({'type': name, 'cn': kv.get('Name', ''), 'off': off,
+                            'key': k, 'slots': slots,
+                            'in_game': name.upper() in in_game})
+            out.sort(key=lambda r: (not r['in_game'], r['type'].upper()))
+            self._unitwpns = (len(self.plain), out)
+            data = out
+        return data
+
+    def set_unit_weapon(self, type_name, slot, weapon, also_elite=True, dry_run=False):
+        """把**某型号**的某个武器槽换成存档内既有武器（定长 u32 原地写）。
+
+        参数：
+          · `type_name`：型号名（如 `E1`）
+          · `slot`：`primary` / `secondary` / `elite_primary` / `elite_secondary`
+          · `weapon`：目标武器名（必须是**本档**里唯一的武器对象，`obj_addr` 查得到）
+          · `also_elite`：改 primary/secondary 时，若该型号的精英槽**原本非 0**，
+            一并换成对应的 `…E` 版本（玩家想"整个型号换武器"时不用点两次）
+
+        返回 `{'type','slot','weapon','addr','changes':[{slot,off,old,old_name,new,new_name}]}`。
+        **改的是 Type 对象 ⇒ 影响该型号的所有单位**（包括敌方、以后新造的），不是单个实例。
+        """
+        rows = [r for r in self.unit_weapon_list()
+                if r['type'].upper() == str(type_name).strip().upper()]
+        if len(rows) != 1:
+            raise KeyError('本档型号「%s」命中 %d 个（可能是建筑或名字不唯一）'
+                           % (type_name, len(rows)))
+        row = rows[0]
+        rels = {k: o for k, o, _l in self.UNIT_WEAPON_SLOTS}
+        if slot not in rels:
+            raise KeyError('槽位要是 %s 之一' % '、'.join(rels))
+        addr, who = self.obj_addr(weapon)
+        if not addr:
+            raise KeyError('存档里没有唯一的武器对象「%s」%s'
+                           % (weapon, ('（同名 %d 个）' % len(who)) if who else ''))
+        targets = [(slot, rels[slot], addr)]
+        if also_elite and slot in ('primary', 'secondary'):
+            es = 'elite_' + slot
+            cur_e = struct.unpack_from('<I', self.plain, row['off'] + rels[es])[0]
+            if cur_e:                     # 原本没有精英武器就不凭空造
+                # 精英槽优先用目标武器的 `…E` 版（E1 的 M60/M60E 就是这个关系），
+                # 没有 E 版才退回同一个 —— 这样"换成谭雅武器"后老兵/精英也一致。
+                e_addr, _e_who = self.obj_addr(str(weapon) + 'E')
+                targets.append((es, rels[es], e_addr or addr))
+        changes = []
+        for s, rel, put in targets:
+            o = row['off'] + rel
+            old = struct.unpack_from('<I', self.plain, o)[0]
+            changes.append({'slot': s, 'off': o, 'old': old,
+                            'old_name': row['slots'][s]['name'],
+                            'new': put, 'new_name': self.resolve_ptr(put) or weapon,
+                            'changed': old != put})
+            if not dry_run and old != put:
+                struct.pack_into('<I', self.plain, o, put)
+        info = {'type': row['type'], 'cn': row['cn'], 'slot': slot, 'weapon': weapon,
+                'addr': addr, 'changes': changes, 'dry_run': bool(dry_run)}
+        if not dry_run:
+            self._unitwpns = None
+            self._addr_memo = None        # 地址表不受影响，但长度/内容变了保险起见清掉
+        return info
+
     def weapon_projectiles(self):
         """→ `[{'name','off','ptr','projectile'}]`：每把武器**档内**记的抛射体。
 
