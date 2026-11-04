@@ -1254,16 +1254,42 @@ class TriggerEditor(tk.Toplevel):
     # ---------------- 事件 ----------------
     @staticmethod
     def _parse_arg(txt):
-        """把参数框里的文本转成整数：允许 "8" 或下拉里的 "8 古巴"（取前导数字）。"""
+        """把参数框里的文本转成整数：取**前导数字**。
+
+        允许 "8"、"8 古巴"、"256（表里没有这个号）"（§SOV20 的动画/粒子会在
+        编号后面跟中文说明，且没有空格分隔，用 `split()[0]` 会解析失败）。
+        """
+        import re as _re
         t = (txt or '').strip()
         if not t:
             return 0
-        head = t.split()[0]
-        return int(head)
+        m = _re.match(r'(-?\d+)', t)
+        if not m:
+            raise ValueError('参数要以数字开头：%r' % t)
+        return int(m.group(1))
 
     def _fill_arg_values(self, combo, ptype, cur):
         """按参数类型给参数下拉填候选值（所属方型 = 阵营顺序，0 恒为玩家自己）。"""
         try:
+            if ptype in (25, 26):
+                # ★★§SOV20：ptype 25 = 动画（rulesmd [Animations]）、26 = 粒子系统
+                #   （[ParticleSystems]）。地编就是按这两张表下拉、把**编号**存进存档
+                #   （玩家确认：「41 播放动画在 的列表就在 rulesmd 里」）。
+                #   ★规则按**当前存档所在游戏目录**取（不同任务/不同 MOD 的 rules 不同）。
+                try:
+                    from game_tables import choices_of, label_of
+                    tb = self.doc.game_lists() if self.doc else None
+                    tbl = tb['animations' if ptype == 25 else 'particle_systems'] if tb else {}
+                    vals = choices_of(tbl)
+                    combo['values'] = vals
+                    if vals:
+                        if isinstance(cur, int):
+                            combo.set(label_of(tbl, cur))
+                        return
+                except Exception:
+                    pass
+                combo['values'] = []
+                return
             if ptype == 31:
                 # ★§SOV16：地编 ptype=31 = 「奖励箱类型」（108 创建工具箱 的参数）。
                 #   值实测存在行为对象 +164，不是 +72。
@@ -1531,6 +1557,13 @@ class TriggerEditor(tk.Toplevel):
                     elif pt == 14:
                         nt = ('触发型：参数 = 目标触发（存档里存在行为对象 +100 的实例键，'
                               '不是 +72）—— 选「自己」就是"这条触发跑完把自己禁掉"') + \
+                             ('　' + nt if nt else '')
+                    elif pt in (25, 26):
+                        _tb = self.doc.game_lists() if self.doc else None
+                        _n = len((_tb or {}).get('animations' if pt == 25 else 'particle_systems') or {})
+                        nt = ('%s：参数 = rulesmd `[%s]` 里的编号（本目录共 %d 项，可下拉选）'
+                              % ('动画' if pt == 25 else '粒子系统',
+                                 'Animations' if pt == 25 else 'ParticleSystems', _n)) + \
                              ('　' + nt if nt else '')
                     elif pt == 6:
                         # ★★§SOV19：数值型（25/26 计时器增减、27 计时设置、110 暂停N秒、

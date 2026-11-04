@@ -3913,6 +3913,46 @@ class SaveDoc(object):
                 return i
         return None
 
+    def game_lists(self):
+        """当前存档所在游戏目录里的 rulesmd.ini 列表（动画/粒子等）。
+
+        ★★§SOV20（玩家 2026-11-04：「存档是不同任务的存档，用的规则是不同的，
+          以游戏下的规则为准」）⇒ **绝不能写死某个目录**：
+          按 `self.path`（存档路径）的目录向上逐级找 `rulesmd.ini` / `rules.ini`，
+          找不到就返回 None（界面上只显示数字，不乱翻）。
+          结果按 (rules 路径, mtime) 缓存，换任务/换 MOD 会自动重新解析。
+        """
+        import os.path as _osp
+        try:
+            from game_tables import lists_for_dir
+        except Exception:
+            return None
+        # ★「以游戏下的规则为准」：优先用 GUI 显式指定的**游戏目录**（线程里那个
+        #   「游戏目录」框 → `set_game_dir`），其次存档所在目录，最后最近打开过的目录。
+        cands = []
+        gd = getattr(type(self), 'GAME_DIR', None)
+        if gd:
+            cands.append(gd)
+        if self.path:
+            cands.append(_osp.dirname(_osp.abspath(self.path)))
+        for d in (getattr(type(self), '_recent_save_dirs', None) or []):
+            if d not in cands:
+                cands.append(d)
+        key = tuple(cands)
+        hit = getattr(self, '_gamelists', None)
+        if hit and hit[0] == key:
+            return hit[1]
+        data = None
+        for d in cands:
+            try:
+                data = lists_for_dir(d)
+            except Exception:
+                data = None
+            if data:
+                break
+        self._gamelists = (key, data)
+        return data
+
     def _arg_text(self, ptype, v):
         """把参数按类型翻译成人话（能翻就翻，翻不了给原值）"""
         if v == -1:                        # ★§SOV01：引擎的"未设置"哨兵（存档里 0xFFFFFFFF）
@@ -3931,6 +3971,17 @@ class SaveDoc(object):
         if ptype == 31:
             # ★§SOV16：地编 ptype=31 = 「奖励箱类型」（108 创建工具箱 用的那个下拉）
             return crate_name(v)
+        if ptype in (25, 26):
+            # ★★§SOV20：ptype 25 = 动画（rulesmd `[Animations]`）、26 = 粒子系统
+            #   （`[ParticleSystems]`）。参数存的是**表里的编号**，地编就是按这两张表
+            #   下拉的（FAData.ini 的 [Filenames] 也印证：动画/规则都取自 rulesmd.ini）。
+            tb = self.game_lists()
+            if tb:
+                from game_tables import label_of
+                tbl = tb['animations' if ptype == 25 else 'particle_systems']
+                if tbl:
+                    return label_of(tbl, v)
+            return str(v)
         if ptype == 7:                     # ★§283.9 小队型：翻成「ID 名称」（走缓存表）
             lab = self._team_label_map().get(v)
             if lab:
