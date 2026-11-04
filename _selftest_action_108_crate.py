@@ -5,7 +5,7 @@
 
 覆盖：
   1. 17 条 108 行为，参数读成 0,1,2,3,4,6..17（+72 恒 0、+164 才是值）
-  2. `arg_text` 翻成中文名（本钱全移回己方 / 随机单位 / … / 一片矿）
+  2. `arg_text` 翻成中文名（大量金钱 / 随机单位 / 重置黑幕 / … / 一片矿）
   3. `set_action(arg=…)` 写的是 +164：+72 不动、长度不变、改回逐字节复原
   4. `add_action(108, 9)` 新建的行为同样把参数放在 +164
   5. 56/57（局部变量）不受影响（仍走 +164）
@@ -53,11 +53,11 @@ chk(p164 == args, '+164 与读出的参数完全一致', p164)
 print('== B. 参数含义翻成中文 ==')
 det = d.trigger_detail('01000005')
 texts = [a.get('arg_text') for a in (det.get('actions') or [])]
-chk(texts[0] == '本钱全移回己方', '0 → 本钱全移回己方', texts[0])
+chk(texts[0] == '大量金钱（固定值）', '0 → 大量金钱（固定值）', texts[0])
 chk(texts[1] == '随机单位', '1 → 随机单位', texts[1])
 _by_arg = {a['arg']: a.get('arg_text') for a in (det.get('actions') or [])}
 chk(_by_arg.get(12) == '一次核弹', '12 → 一次核弹', _by_arg.get(12))
-chk(_by_arg.get(13) == '（空）', '13 → （空）', _by_arg.get(13))
+chk(_by_arg.get(13) == '空', '13 → 空', _by_arg.get(13))
 chk(texts[-1] == '一片矿', '17 → 一片矿', texts[-1])
 chk(crate_name(99) == '类型#99', '未知值兜底：%s' % crate_name(99))
 
