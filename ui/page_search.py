@@ -720,6 +720,34 @@ class SearchPage(object):
         if not sel:
             messagebox.showwarning('提示', '请先选中一条触发')
             return
+        # ★★§SOV07（2026-11-04 玩家实测纠正）：**禁用上级触发 ⇒ 下级触发必失效**，
+        #   跟下级自己有没有标签无关。这里先把"连带名单"算出来，弹一次确认，
+        #   别让玩家点完"禁用"以后进游戏发现后面一串都不动了。
+        try:
+            down_all, dnames = [], {}
+            for iid in sel:
+                r0 = self.doc.records[int(iid)]
+                if on is not False and not (on is None and r0.enabled):
+                    continue                     # 本次不是"禁用"它，跳过
+                # ★§SOV07（玩家第二次修正）：**有自己标签的下级不受影响** ⇒ 只算无标签的
+                for s0 in self.doc.trigger_dependents(r0.sid):
+                    if s0 not in down_all:
+                        down_all.append(s0)
+                        dnames[s0] = next((x.name for x in self.doc.records
+                                           if x.kind == '触发' and x.sid == s0), s0)
+        except Exception:
+            down_all = []
+        if down_all:
+            if not messagebox.askyesno(
+                    '⚠ 这些是「关联触发」的上级',
+                    '禁用后会连带下面 %d 条**没有自己标签**的下级一起失效\n'
+                    '（它们共用链头的标签；有自己标签的下级不受影响）：\n\n%s\n\n'
+                    '仍然要禁用吗？'
+                    % (len(down_all),
+                       '、'.join('%s %s' % (s1, dnames.get(s1, '')) for s1 in down_all[:8])
+                       + ('…' if len(down_all) > 8 else '')),
+                    parent=self):
+                return
         done = skipped = never = blocked = 0
         for iid in sel:
             r = self.doc.records[int(iid)]

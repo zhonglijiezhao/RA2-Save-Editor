@@ -13,6 +13,7 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
         sys.path.insert(0, _p)
 
 from editor_core import ACTION_TYPES
+from editor_core import ACTION_TRIG_TYPES
 from editor_core import ENGINE_PTYPE_TEXT
 from editor_core import EVENT_TYPES
 from editor_core import action_name
@@ -132,9 +133,26 @@ class TriggerEditor(tk.Toplevel):
         self.lbl_rep_hint = ttk.Label(r2, text='', foreground=ui_theme.T['danger'])
         self.lbl_rep_hint.pack(side='left', padx=(2, 0))
         ttk.Button(r2, text='应用', width=5, command=self.apply_owner_rep).pack(side='left')
-        ttk.Label(r2, text='  下级触发').pack(side='left', padx=(12, 0))
-        ttk.Label(r2, text='（存档里未定位·待样本）',
-                  foreground=ui_theme.T['muted_soft']).pack(side='left')
+
+        # ★§SOV06（2026-11-04 玩家：「下级触发的显示和写入」）：
+        #   存档记录帧 `+132` = **下级（关联）触发**的实例键（0 = 链尾），所以在存档里
+        #   就能读、也能写 —— 以前这里只挂着"（存档里未定位·待样本）"一行灰字。
+        #   语义（334 条实档逐条核对）：一个标签 = 一条链；链头挂标签、其余从触发
+        #   没有自己的标签，靠这条链串起来。
+        r2b = ttk.Frame(top)
+        r2b.pack(fill='x', pady=(4, 0))
+        ttk.Label(r2b, text='下级触发').pack(side='left')
+        self.cb_link = ttk.Combobox(r2b, width=38, state='readonly')
+        self.cb_link.pack(side='left', padx=6)
+        self.btn_link = ttk.Button(r2b, text='应用', width=5, command=self.apply_link)
+        self.btn_link.pack(side='left')
+        self.btn_link_jump = ttk.Button(r2b, text='跳到下级 →', width=11,
+                                        command=self.jump_link)
+        self.btn_link_jump.pack(side='left', padx=(2, 0))
+        # 链关系单独一行（链可能几十条，塞在同一行会把窗口撑到两千像素）
+        self.lbl_link = ttk.Label(top, text='', foreground=ui_theme.T['muted'],
+                                  wraplength=640, justify='left')
+        self.lbl_link.pack(anchor='w', pady=(2, 0))
 
         r3 = ttk.Frame(top)
         r3.pack(fill='x', pady=(4, 0))
@@ -325,6 +343,14 @@ class TriggerEditor(tk.Toplevel):
         self.lbl_state.config(foreground=ui_theme.T['warn'],
                               text='新建模式（未写入存档）：填名称 / 选事件 / 加行为 → 点「✔ 保存该触发」；'
                                    '直接关闭 = 什么都不发生')
+        # ★§SOV06：新触发建出来会带一个自己的新标签 ⇒ 它是新链的链头，下级 = 0
+        try:
+            self._link_choices_cache = [('（无 · 链尾）', None)]
+            self.cb_link['values'] = ['（新建 · 建完再设）']
+            self.cb_link.set('（新建 · 建完再设）')
+            self.lbl_link.config(text='新触发 = 新链的链头（自带标签），建完再选下级')
+        except Exception:
+            pass
         self.app.status.set('新建触发：现在还没写进存档，点「✔ 保存该触发」才创建')
 
     def _blocked_in_new(self):
@@ -475,7 +501,15 @@ class TriggerEditor(tk.Toplevel):
             state += ' · 关联触发：共用「%s」的标签' % _sh['owner_name']
             if _sh.get('down'):
                 state += '·下级 %s' % _sh['down']
+        # ★★§SOV07（玩家 SAVE4823 实验）：上级被禁用 ⇒ 本条永不触发，摆到状态行最前面
+        try:
+            if (_rs or {}).get('blocked_by'):
+                state = ('⚠ 上级 %s 已禁用 ⇒ 本条永远不会触发　｜　'
+                         % _rs['blocked_by']) + state
+        except Exception:
+            pass
         self.lbl_state.config(text=state)
+        self._fill_link(sid)
         # 事件下拉（选项 = 编号 + 名称）
         # ★2026-10-20：0 = 地编占位项「-无事件-」，写进存档会崩 ⇒ 下拉里**直接不列**
         keys = [k for k in sorted(EVENT_TYPES) if k != 0]
@@ -662,8 +696,10 @@ class TriggerEditor(tk.Toplevel):
             return
         self.after_change('已删事件 %s' % event_name(r['type']))
 
-    def _ac_text(self, atype, arg, team=0, waypoint=0):
-        """「参数含义」列的文字：80/107 显示「小队名 · 路径点」。"""
+    def _ac_text(self, atype, arg, team=0, waypoint=0, trigger=None):
+        """「参数含义」列的文字：80/107 显示「小队名 · 路径点」，触发型显示「→ 哪条触发」。"""
+        if atype in ACTION_TRIG_TYPES:
+            return self._trig_ref_text(trigger)
         if self.doc.is_team_action(atype):
             nm = next((lab for lab, k in self._team_choices() if k == team), '')
             nm = nm or ('小队 %08X' % team if team else '（没选小队）')
@@ -672,6 +708,33 @@ class TriggerEditor(tk.Toplevel):
             return nm
         return self.doc._arg_text(action_ptype(atype), arg)
 
+    def _trig_ref_text(self, sid):
+        """触发型行为的参数显示：`01000000 AAAAAA（自己）` / `（没指定）`。
+
+        ★§SOV07（2026-11-04）：玩家给的写法里，「54 禁止触发」的参数就是**自己**，
+        用来给"可重复"的关联触发收尾。以前这里读的是 +72（恒 0）⇒ 界面上完全看不出
+        它禁的是谁。
+        """
+        if not sid:
+            return '（没指定触发）'
+        nm = next((r.name for r in self.doc.records
+                   if r.kind == '触发' and r.sid == sid), '') or ''
+        me = '（自己）' if sid == getattr(self, '_cur', None) else ''
+        return ('%s %s%s' % (sid, nm, me)).strip()
+
+    def _trig_choices(self):
+        """触发型参数的下拉候选 → `[(显示文字, sid), …]`（含「（没指定）」）。"""
+        out = [('（没指定触发）', None)]
+        try:
+            for r in self.doc.records:
+                if r.kind != '触发':
+                    continue
+                me = '（自己）' if r.sid == getattr(self, '_cur', None) else ''
+                out.append(('%s %s%s' % (r.sid, r.name, me), r.sid))
+        except Exception:
+            pass
+        return out
+
     def _fill_actions(self):
         self.tv_ac.delete(*self.tv_ac.get_children())
         if getattr(self, '_new_mode', False):
@@ -679,12 +742,14 @@ class TriggerEditor(tk.Toplevel):
                 if isinstance(it, dict):
                     t, a = int(it['type']), int(it.get('arg') or 0)
                     tm, wp = it.get('team') or 0, it.get('waypoint') or 0
+                    tg = it.get('trigger')
                 else:
                     t, a = int(it[0]), int(it[1])
                     tm, wp = 0, 0
+                    tg = None
                 self.tv_ac.insert('', 'end', iid=str(i), values=(
                     i, t, action_name(t), wp if t in self.doc.SPAWN_ACTIONS else a,
-                    self._ac_text(t, a, tm, wp)))
+                    self._ac_text(t, a, tm, wp, tg)))
             return
         for i, a in enumerate(self._det.get('actions') or [], 1):
             # ★§219.8：援军行为 80/107 的参数在 +0x44（小队键）/+0x58（路径点），
@@ -692,6 +757,9 @@ class TriggerEditor(tk.Toplevel):
             argcol = a['arg']
             if a.get('type') in self.doc.SPAWN_ACTIONS:
                 argcol = a.get('waypoint', 0)
+            elif a.get('type') in ACTION_TRIG_TYPES:
+                # ★§SOV07：触发型行为的参数列显示**目标触发 ID**（在 +100，不是 +72）
+                argcol = a.get('trigger') or 0
             elif self.doc.is_team_action(a.get('type')):
                 # ★§283.9：小队型（4/5/7）参数列显示**小队 ID**（不是 0，避免看着像空的）
                 _tk = a.get('team_key') or a.get('team') or 0
@@ -701,7 +769,8 @@ class TriggerEditor(tk.Toplevel):
                 i, a['type'], a['name'], argcol,
                 self._ac_text(a['type'], a['arg'],
                               a.get('team') or a.get('team_key') or 0,
-                              a.get('waypoint') or 0)))
+                              a.get('waypoint') or 0,
+                              a.get('trigger'))))
 
     # ---------------- 触发设置 ----------------
     def apply_name(self):
@@ -773,6 +842,174 @@ class TriggerEditor(tk.Toplevel):
             messagebox.showerror('写入失败', str(e), parent=self)
             return
         self.after_change('；'.join(msgs) or '无改动')
+
+    # ---------------- 下级触发（关联触发链，§SOV06） ----------------
+    def _link_choices(self):
+        """下拉候选 `[(显示文字, sid 或 None), …]`。
+
+        ★§SOV06：`〔自己有标签〕` 是实测出来的关键标记 —— 334 条实档里
+          **从触发一律没有自己的标签**（链头挂标签、其余靠 +132 串起来），
+          所以"有标签的当别人的下级"属于实档 0 例的形态，选的时候要能看见。
+        """
+        out = [('（无 · 链尾）', None)]
+        try:
+            im = self.doc._instance_maps()
+            k2sid = im.get('sid') or {}
+            has_tag = {k2sid.get(k) for k in (im.get('tag_of_inst') or {})}
+        except Exception:
+            has_tag = set()
+        try:
+            for r in self.doc.records:
+                if r.kind != '触发':
+                    continue
+                out.append(('%s  %s%s' % (r.sid, r.name,
+                                          '  〔自己有标签〕' if r.sid in has_tag else ''),
+                            r.sid))
+        except Exception:
+            pass
+        return out
+
+    def _fill_link(self, sid=None):
+        """把「上级 → 本条 → 下级 / 整条链」摆到界面（§SOV06）。"""
+        sid = sid or getattr(self, '_cur', None)
+        self._link_choices_cache = self._link_choices()
+        try:
+            self.cb_link['values'] = [c[0] for c in self._link_choices_cache]
+        except Exception:
+            pass
+        if not sid:
+            try:
+                self.cb_link.set('（无 · 链尾）')
+                self.lbl_link.config(text='')
+            except Exception:
+                pass
+            return
+        names = {}
+        try:
+            for r in self.doc.records:
+                if r.kind == '触发':
+                    names.setdefault(r.sid, r.name)
+        except Exception:
+            pass
+        info, down = None, None
+        try:
+            info = self.doc.trigger_seq_info(sid)
+            down = info.get('down')
+        except Exception:
+            info = None
+        cur = '（无 · 链尾）'
+        if down:
+            for lab, s in self._link_choices_cache:
+                if s == down:
+                    cur = lab
+                    break
+            else:
+                cur = '%s  %s' % (down, names.get(down, '?'))
+        try:
+            self.cb_link.set(cur)
+        except Exception:
+            pass
+        parts = []
+        if info:
+            up = info.get('up')
+            parts.append(('上级：%s %s' % (up, names.get(up, ''))) if up
+                         else '链头（没有上级）')
+            parts.append(('下级：%s %s' % (down, names.get(down, ''))) if down
+                         else '链尾（没有下级）')
+            chain = info.get('chain') or [sid]
+            if len(chain) > 1:
+                pos = chain.index(sid) + 1 if sid in chain else 1
+                # 整条链可能有几十条（本档最长 28）⇒ 只报"第几/共几 + 两头"，别把窗口撑爆
+                parts.append('这条链共 %d 条，本条第 %d 条（链头 %s … 链尾 %s）'
+                             % (len(chain), pos,
+                                names.get(chain[0], chain[0]),
+                                names.get(chain[-1], chain[-1])))
+            # ★★§SOV07（玩家 2026-11-04 两次修正后定案）：
+            #   · 本条**没有**自己的标签（共用链头那个）⇒ 命全靠链，上级一停就永不触发；
+            #   · 本条**有**自己的标签 ⇒ 按自己的标签执行，上级禁用/删除**不影响**它。
+            try:
+                mine = self.doc.trigger_has_own_tag(sid)
+                selfc = self.doc.trigger_events_self_contained(sid)
+                if up:
+                    if mine and selfc:
+                        # ★§SOV08（权威确认）：流逝时间这类不需要挂接对象 ⇒ 链对它没意义
+                        parts.append('本条是计时/自足型事件（流逝时间等）+ 有自己的标签 ⇒ '
+                                     '不受上级限制')
+                    elif not mine:
+                        parts.append('⚠ 本条没有自己的标签（共用链头那个）⇒ '
+                                     '上级被禁用/删除就永不触发')
+                    else:
+                        parts.append('⚠ 本条的事件要挂接对象（进入/摧毁…）⇒ 挂接对象来自'
+                                     '上级的标签，上级被禁用/删除就不触发')
+                deps = self.doc.trigger_dependents(sid)
+                if deps:
+                    parts.append('⚠ 禁用/删除本条 ⇒ 下面 %d 条（无标签的）一起失效' % len(deps))
+                elif up:
+                    parts.append('本条是链尾')
+            except Exception:
+                pass
+        try:
+            self.lbl_link.config(text='　·　'.join(parts))
+        except Exception:
+            pass
+
+    def apply_link(self):
+        """把下拉里选的那条写成**本条的下级** —— 只写记录帧 +132 的 4 个字节。
+
+        读写在 core（`set_trigger_link`）：成环/自指/目标没实例在那边就拒绝；
+        "实档里没见过的形态"（目标自己有标签、目标已有上级、原下级失去上级）
+        走二次确认，因为它是 4 字节、随时能改回来的操作。
+        """
+        if self._blocked_in_new() or not self._cur:
+            return
+        lab = self.cb_link.get()
+        tgt, found = None, False
+        for l, s in (getattr(self, '_link_choices_cache', None) or []):
+            if l == lab:
+                tgt, found = s, True
+                break
+        if not found and lab and not lab.startswith('（无'):
+            messagebox.showinfo('提示', '先在下拉里选一条触发（或选「无 · 链尾」）', parent=self)
+            return
+        try:
+            pre = self.doc.set_trigger_link(self._cur, tgt, dry=True)
+        except Exception as e:
+            messagebox.showerror('不能这样连（存档未改动）', str(e), parent=self)
+            return
+        if not pre['changed']:
+            self.app.status.set('下级触发没变（现在就是这个值）')
+            return
+        if pre['warnings']:
+            if not messagebox.askyesno(
+                    '⚠ 这条链的形态实档里没见过',
+                    '\n\n'.join('· ' + w for w in pre['warnings'])
+                    + '\n\n这次只改 4 个字节（记录帧 +132），随时能改回来。\n\n仍然要写吗？',
+                    parent=self):
+                return
+        try:
+            r = self.doc.set_trigger_link(self._cur, tgt)
+        except Exception as e:
+            messagebox.showerror('写入失败（存档未改动）', str(e), parent=self)
+            return
+        self.after_change('下级触发 → %s' % (r['new_sid'] or '（无 · 链尾）'))
+
+    def jump_link(self):
+        """切到「下级」那条触发（顺着链往下走，不用在下拉里翻）。"""
+        if not self._cur:
+            return
+        try:
+            down = self.doc.trigger_link_sid(self._cur)
+        except Exception:
+            down = None
+        if not down:
+            self.app.status.set('本条没有下级（链尾）')
+            return
+        if down not in self._sids:
+            self.app.status.set('下级 %s 不在触发列表里（可能只有定义、没有实例）' % down)
+            return
+        self.cb_t.current(self._sids.index(down))
+        self._load_one()
+        self.app.status.set('已跳到下级 %s' % down)
 
     # ---------------- 运行期组件修复（§168） ----------------
     def fix_attach_count(self):
@@ -897,6 +1134,14 @@ class TriggerEditor(tk.Toplevel):
     def _fill_arg_values(self, combo, ptype, cur):
         """按参数类型给参数下拉填候选值（所属方型 = 阵营顺序，0 恒为玩家自己）。"""
         try:
+            if ptype == 14:
+                # ★§SOV07：触发型（53 允许触发 / 54 禁止触发 / 12 摧毁触发 / 22 强制触发）
+                ch = self._trig_choices()
+                combo['values'] = [c[0] for c in ch]
+                if isinstance(cur, str) and cur:
+                    lab = next((l for l, s in ch if s == cur), None)
+                    combo.set(lab or ('%s' % cur))
+                return
             if ptype == 2:
                 hs = self.doc.house_order() or []
                 vals = ['%d %s%s' % (i, (h['cn'] or h['short']),
@@ -1059,8 +1304,25 @@ class TriggerEditor(tk.Toplevel):
         except Exception:
             pass
 
+    def _trig_from_text(self):
+        """从参数框文字里取触发 sid（`01000000 AAAAAA（自己）` → `01000000`）。"""
+        t = (self.var_acarg.get() or '').strip()
+        if not t:
+            return None
+        for tok in t.split():
+            if len(tok) == 8 and all(c in '0123456789ABCDEFabcdef' for c in tok):
+                return tok.upper()
+        return None
+
     def _ac_payload(self, atype):
-        """按行为类型算提交用的 `(arg, kwargs)` —— 80/107 走「小队 + 路径点」。"""
+        """按行为类型算提交用的 `(arg, kwargs)` —— 小队型走小队+路径点，触发型走 trigger。"""
+        if atype in ACTION_TRIG_TYPES:
+            # ★§SOV07：触发型参数写**对象 +100**（实例键），不是通用 +72
+            sid = self._trig_from_text()
+            if not sid:
+                raise ValueError('这条行为的参数是「触发」—— 先在「参数」里选一条'
+                                 '（要"禁止自己"就选（自己）那条）')
+            return 0, {'trigger': sid}
         if self.doc.is_team_action(atype):
             # ★§283.9：小队型（4 建立 / 5 解散 / 7 援军 / 80 / 107）—— 参数 = 小队键（+0x44）
             tkey = self._team_key_from_text(self.var_acarg.get())
@@ -1118,12 +1380,18 @@ class TriggerEditor(tk.Toplevel):
                         cur = self._parse_arg(self.var_acarg.get())
                     except Exception:
                         cur = None
+                    if pt == 14:                       # ★§SOV07：触发型参数 = 目标 sid
+                        cur = self._trig_from_text()
                     self._fill_arg_values(self.cb_acarg, pt, cur)
                     self._show_wp(False)
                     if pt == 2:
                         hs = self.doc.house_order() or []
                         nt = ('所属方型：0 = 玩家自己（本档 %s）；其余按存档阵营顺序'
                               % next((h['cn'] for h in hs if h['is_player']), '?')) + \
+                             ('　' + nt if nt else '')
+                    elif pt == 14:
+                        nt = ('触发型：参数 = 目标触发（存档里存在行为对象 +100 的实例键，'
+                              '不是 +72）—— 选「自己」就是"这条触发跑完把自己禁掉"') + \
                              ('　' + nt if nt else '')
         except Exception:
             pass
@@ -1162,6 +1430,10 @@ class TriggerEditor(tk.Toplevel):
                                    a.get('team') or a.get('team_key') or 0)
             self.var_wp.set(str(a.get('waypoint') or 0)
                             if a['type'] in self.doc.SPAWN_ACTIONS else '')
+        elif a['type'] in ACTION_TRIG_TYPES:
+            # ★§SOV07：触发型 —— 参数框显示「SID 名字（自己）」，写的是 +100 的实例键
+            self.var_acarg.set(self._trig_ref_text(a.get('trigger')))
+            self.var_wp.set('')
         else:
             self.var_acarg.set(str(a['arg']))
             self.var_wp.set('')
@@ -1454,8 +1726,10 @@ class TriggerEditor(tk.Toplevel):
                 '⚠ 确认真删除这条触发？',
                 '将整条删除：实例 + 标签 + 事件 + %d 条行为 + TagNode/CellTag'
                 '（若挂了建筑，会先把建筑的挂接字段清掉），并重排后面所有触发的序号。\n\n'
-                '%s　%s\n\n真删除无法撤销 —— 建议先在主窗口「备份存档」。\n\n确定删除吗？'
-                % (len(det.get('actions') or []), det['sid'], det['name']),
+                '%s　%s\n\n%s'
+                '真删除无法撤销 —— 建议先在主窗口「备份存档」。\n\n确定删除吗？'
+                % (len(det.get('actions') or []), det['sid'], det['name'],
+                   self._link_delete_warning()),
                 icon='warning', default='no', parent=self):
             return
         try:
@@ -1463,11 +1737,69 @@ class TriggerEditor(tk.Toplevel):
         except Exception as e:
             messagebox.showerror('删除失败', str(e), parent=self)
             return
-        self.after_change('已真删除触发 %s（%s）：移除 %d 字节（%s）%s'
-                          % (info['sid'], info['name'], info['bytes_removed'],
-                             '、'.join(info['objects']),
-                             '，清掉 %d 处建筑挂接' % len(info['detached'])
-                             if info['detached'] else ''))
+        msg = ('已真删除触发 %s（%s）：移除 %d 字节（%s）%s'
+               % (info['sid'], info['name'], info['bytes_removed'],
+                  '、'.join(info['objects']),
+                  '，清掉 %d 处建筑挂接' % len(info['detached'])
+                  if info['detached'] else ''))
+        # ★§SOV06：链上还有人 ⇒ 说清楚"它没有上级了 / 链头没了只剩孤儿"
+        if info.get('spliced'):
+            msg += '；链已接上（%d 条上级改指本条的下级）' % len(info['spliced'])
+        if info.get('orphans'):
+            msg += ('；⚠ 链上 %d 条下级（%s）现在**必失效**（上级没了，自己有没有标签都一样）'
+                    % (len(info['orphans']), '、'.join(info['orphans'][:4])
+                       + ('…' if len(info['orphans']) > 4 else '')))
+        self.after_change(msg)
+
+    def _downstream_note(self, sid=None):
+        """「本条失效会连带哪些」的一句话（软/真删除、禁用共用）。"""
+        sid = sid or self._cur
+        if not sid:
+            return ''
+        try:
+            down = self.doc.trigger_downstream(sid)
+            deps = self.doc.trigger_dependents(sid)
+        except Exception:
+            return ''
+        if not down:
+            return ''
+        txt = ''
+        if deps:
+            txt += ('\n⚠ 后面还挂 %d 条「没有自己标签」的下级：%s\n'
+                    '　 不管软删还是真删，它们都会一起失效。\n'
+                    % (len(deps), '、'.join(deps[:5]) + ('…' if len(deps) > 5 else '')))
+        if len(down) > len(deps):
+            txt += ('　 （另有 %d 条下级有自己的标签，删本条不影响它们）\n'
+                    % (len(down) - len(deps)))
+        return txt
+
+    def _link_delete_warning(self):
+        """真删除前的「链」提醒（§SOV07）：**删/禁上级 ⇒ 下级必失效**（玩家实测）。"""
+        try:
+            si = self.doc.trigger_seq_info(self._cur)
+        except Exception:
+            return ''
+        chain = si.get('chain') or []
+        ups = [x for x in (self.doc.trigger_link_parents().get(self._cur) or [])]
+        lines = []
+        down = chain[chain.index(self._cur) + 1:] if self._cur in chain else []
+        try:
+            deps = self.doc.trigger_dependents(self._cur)
+        except Exception:
+            deps = []
+        if deps:
+            lines.append('⚠ 后面还挂 %d 条「没有自己标签」的下级：\n'
+                         '   %s\n'
+                         '   删掉本条，它们就没人驱动了（必失效）。'
+                         % (len(deps), '、'.join(deps[:6]) + ('…' if len(deps) > 6 else '')))
+        if len(down) > len(deps):
+            lines.append('（另有 %d 条下级有自己的标签，删除本条不影响它们）'
+                         % (len(down) - len(deps)))
+        if down and ups:
+            lines.append('本条在链上（上级 %s），删除后上级会自动改指它的下级 %s —— 链不断。'
+                         % ('、'.join(ups) or '?',
+                            '、'.join(down[:3]) + ('…' if len(down) > 3 else '')))
+        return ('\n'.join(lines) + '\n\n') if lines else ''
 
     def _ask_delete_mode(self, det):
         """让玩家选「软删除 / 真删除 / 取消」，返回 'soft' / 'hard' / None。"""
@@ -1489,7 +1821,9 @@ class TriggerEditor(tk.Toplevel):
                  '　 只改 8 个字节；以后想恢复，把事件类型/参数改回去即可。\n\n'
                  '真删除（干净但不可逆）：实例 + 标签 + 事件 + %d 条行为 + TagNode/CellTag\n'
                  '　 全部移除，还要重排后面所有触发的序号 —— 动字节最多，建议先在主窗口备份。\n'
-                 % (att, len(det.get('actions') or []))).pack(anchor='w', pady=(8, 12))
+                 '%s'
+                 % (att, len(det.get('actions') or []),
+                    self._downstream_note(det.get('sid')))).pack(anchor='w', pady=(8, 12))
         out = {'v': None}
 
         def pick(v):

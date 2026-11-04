@@ -82,7 +82,10 @@ class TriggersPage(object):
         ttk.Label(qrow, text='（Esc 清空；可按 触发ID / 名称 / 说明 / 状态 / 触发类型 搜）',
                   foreground=ui_theme.T['muted_soft']).pack(side='left')
         tvw.pack(fill='both', expand=True)
-        self.tt.bind('<Double-1>', lambda e: self.toggle_selected())
+        # ★§SOV06（2026-11-04 玩家要求）：**双击一行 = 打开触发编辑器**编辑那条触发。
+        #   以前双击是"启用/禁用"开关，容易误触；现在开关只留给空格键和下面的按钮。
+        #   标签/AI 记录（不是触发）双击仍按老规矩切换启用。
+        self.tt.bind('<Double-1>', self._on_trig_dblclick)
         self.tt.bind('<space>', lambda e: self.toggle_selected())
         self.tt.bind('<<TreeviewSelect>>', self._remember_trigger_sel)
         self._sel_trigger_names = set()
@@ -155,11 +158,36 @@ class TriggersPage(object):
                           '    · 事件驱动型·已挂钩（橙字）= 没有 TagNode，但事件对象已被引擎写过'
                           '⇒ 只能确定「挂钩了」，分不清「已触发」还是「等回调」；改之前会弹确认；\n'
                           '    · 未启用 / 已禁用、未实例化（只有定义）（灰字）。\n'
-                          '★ 关联触发（FA2「关联触发」/ ra2map 教程）：主触发把**一个标签共享给**\n'
-                          '    一串从触发，从触发自己那份标签被删掉、只留链接（存档记录帧 +132 =\n'
-                          '    下级触发的实例键）。所以从触发的「触发类型」会带**（共用）**、\n'
-                          '    「标签」列写"共用"，状态/挂载数一律取**链头那条的标签**\n'
-                          '    （2026-11-03 SAVE5739 实证：Player_Has_Plant8 挂标签，1~7 共用）。\n'
+                          '★ 关联触发（FA2「关联触发」/ ra2map 教程）：`[Triggers]` 每行的第 2 字段\n'
+                          '    （= 存档记录帧 +132）就是「下级触发」，0 / `<none>` = 链尾。\n'
+                          '    **两种合法写法**（2026-11-04 玩家给 SAVE6443 + all01umd.map 补全）：\n'
+                          '    ① 共用标签：链头挂标签、从触发**删掉自己那份标签**，整条链共用它\n'
+                          '       （SAVE5739：Player_Has_Plant8 挂标签，1~7 共用，334 条实测\n'
+                          '        "有标签 ∧ 有上级 = 0")；\n'
+                          '    ② **各留标签**：每条触发都保留自己的标签、各自设重复类型，行为里加\n'
+                          '       「54 禁止触发·参数=自己」收尾 ⇒ 不用删下级标签也能连链\n'
+                          '       （SAVE6443：AAAAAA/BBBBB/CCCCC，持久性 2/2/0，行为 19/16 + 54，\n'
+                          '       54 的参数指向自己）。\n'
+                          '    ⇒ 所以「自己有标签 + 有上级」是正常形态，不是错误。\n'
+                          '   ★ 这套写法存在的真正理由（2026-11-04 红警作者权威答复）：\n'
+                          '      **一个建筑只能挂一个标签**。想让同一栋楼"进楼时做一件事、被摧毁时做另一件"，\n'
+                          '      就做成 A(进入) → B(摧毁) 的下级链 —— B 自己那份标签不挂任何对象，\n'
+                          '      它"摧毁谁"是靠**链共享 A 的挂接对象**。\n'
+                          '   ★★ 上级被禁用/删除，到底谁失效？（三轮修正后的最终口径）\n'
+                          '      · 下级事件是**流逝时间 / 局部变量**这类、且**有自己的标签** ⇒\n'
+                          '        **不受上级限制**（这套写法对它没有意义：它不靠挂接对象）；\n'
+                          '      · 下级事件要**挂接对象**（进入 / 被摧毁 / 被攻击…）⇒ 挂接对象来自上级\n'
+                          '        的标签 ⇒ 上级被禁用/删除就不触发；\n'
+                          '      · 下级**没有自己的标签**（写 A 那种）⇒ 无论什么事件，命都在链上。\n'
+                          '      反过来，从链尾往前删不影响前面。\n'
+                          '      ⇒ 「禁用选中」只在有"真会被拖死的下级"时弹连带名单确认。\n'
+                          '   ✏ 「下级」**可读可改**：双击一行打开触发编辑器 →「下级触发」下拉\n'
+                          '     （写的就是这 4 个字节，随时能改回；成环/自指会被拒绝，\n'
+                          '      "目标已被另一条链指着"这类分叉形态会先弹确认）。\n'
+                          '   🖱 双击触发行 = 打开触发编辑器（以前是启用/禁用开关，现改为空格键）。\n'
+                          '   ⚙ 行为 53/54/12/22（允许/禁止/摧毁/强制触发）的参数 = **目标触发**，\n'
+                          '     存档里存在行为对象 **+100** 的实例键（不是 +72）—— 参数列现在显示\n'
+                          '     "SID 名字（自己）"，改的时候也是写这一格（§SOV07，4 档 700 条实测）。\n'
                           '   ★ 关键教训（2026-10-20 玩家用「飞碟被攻击」触发指出）：'
                           '「没有 TagNode」≠「已执行」—— 「被攻击 / 被摧毁 / 进房子」这类触发靠对象'
                           '回调驱动，本来就不建 TagNode。\n'
@@ -184,6 +212,44 @@ class TriggersPage(object):
                   foreground=ui_theme.T['muted'], font=(ui_theme.FONT_UI, 8),
                   wraplength=880, justify='left').pack(anchor='w')
         return f
+
+    def _on_trig_dblclick(self, event=None):
+        """双击列表 = 打开触发编辑器（编辑双击到的那一行）。
+
+        ★§SOV06（2026-11-04 玩家要求）：以前双击 = 启用/禁用开关，鼠标容易误触；
+          现在双击只负责"打开编辑器"，开关留给空格键 / 下面两个按钮。
+          非「触发」行（标签、AI 三大件记录）没有编辑器 ⇒ 退回原来的开关行为。
+        """
+        if not self.doc:
+            return
+        iid = None
+        if event is not None:
+            try:
+                if self.tt.identify_region(event.x, event.y) == 'heading':
+                    return                      # 双击表头（排序/拉列宽）不算
+                iid = self.tt.identify_row(event.y)
+            except Exception:
+                iid = None
+            if not iid:
+                return
+            try:
+                self.tt.selection_set(iid)      # 让选中跟着双击的那一行走
+                self.tt.focus(iid)
+            except Exception:
+                pass
+        if iid is None:
+            sel = self.tt.selection()
+            iid = sel[0] if sel else None
+        if not iid:
+            return
+        try:
+            r = self.doc.records[int(iid)]
+        except Exception:
+            return
+        if r.kind != '触发':
+            self.toggle_selected()
+            return
+        self.open_trigger_editor(r.sid)
 
     def open_trigger_editor(self, sid=None):
         """打开仿地编的「触发编辑器」窗口（默认编辑当前选中的触发）。"""
@@ -265,6 +331,22 @@ class TriggersPage(object):
                     _evlive[_r.sid] = self.doc.trigger_event_live(_r.sid)
                 except Exception:
                     _evlive[_r.sid] = False
+        # ★★§SOV07（2026-11-04 玩家实验 SAVE4823）：**禁用上级 ⇒ 下级永不触发**。
+        #   实测形态：A 禁用后，链上两条「流逝时间 10 秒」计时走满（帧 150）却毫无反应。
+        #   列表必须直接说这句，别再显示"等待中 剩X秒"。整表算一次，别每行都走链。
+        blkmap = {}
+        try:
+            for _r in self.doc.records:
+                if _r.kind != '触发':
+                    continue
+                try:
+                    _b = self.doc.trigger_blocked_by(_r.sid)
+                except Exception:
+                    _b = None
+                if _b:
+                    blkmap[_r.sid] = _b
+        except Exception:
+            blkmap = {}
         for i, r in enumerate(self.doc.records):
             state = '-' if r.enabled is None else ('启用' if r.enabled else '禁用')
             if r.kind == '触发':
@@ -282,7 +364,11 @@ class TriggersPage(object):
                     _rep = None
                 _rep_text = getattr(self.doc, 'REPEAT_TEXT', {})
                 rt = rtmap.get(r.sid)
-                if rt is None:
+                if blkmap.get(r.sid):
+                    _bn = blkmap[r.sid]
+                    rts = '上级已禁用·永不触发（%s）' % _bn
+                    st_key = '已禁用'
+                elif rt is None:
                     # ★2026-10-20（玩家问"灰色的是什么状态"）：这些记录在本档里
                     #   只有「触发定义」、引擎还没实例化它 ⇒ 没有事件/行为/TagNode，
                     #   既不执行也改不了。写清楚，别让人以为是"坏了"。

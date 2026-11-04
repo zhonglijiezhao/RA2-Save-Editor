@@ -66,6 +66,19 @@ OBJ_CLASS_EVENT = 0x4F0EC393
 ACT_VAR_OFF = 164
 ACTION_VAR_TYPES = (56, 57)
 
+# ---- ★★§SOV07（2026-11-04 玩家样本 SAVE6443 + all01umd.map）：**「触发型」行为的参数不在 +72** ----
+# 地编 ptype=14 的那几个行为（12 摧毁触发 / 22 强制触发 / 53 允许触发 / 54 禁止触发 /
+# 499 兰博玩·允许付费触发）参数是**另一条触发**，存档里存在对象 **+100** 的 u32
+# **实例键**（不是 ID 字符串、不是序号、也不是 +72）。
+# 证据链：
+#   · 地图 `[Actions] 01000000=2,19,7,CrazyIvanFear,0,…,A,54,2,01000000,…`
+#     ⇒ 引擎口径第 2 字段 = 2（触发），值 = 01000000；
+#   · 存档里 01000000 的「54 禁止触发」+72 = 0、**+100 = 0D6F4020 = 它自己的实例键**；
+#   · 跨 4 档 700 条触发型行为：+100 全部命中本档实例键，**0 个 0、0 个野值**。
+# ⚠ 写错到 +72 的表现：界面上参数恒 0（"禁止触发"看不出禁的是谁），改参数也不生效。
+ACTION_TRIG_TYPES = frozenset(k for k, v in ACTION_TYPES.items() if v[1] == 14)
+ACT_TRIG_OFF = 36          # 相对"类型字段"（= 对象 +0x40 + 36 = 对象 +100）
+
 # ---- §175 局部变量表（ScenarioClass 里的定长槽数组）----
 # 引擎侧（gamemd.exe）：
 #   GetLocalVariable 0x689A00: `if (i >= 0x64) return false;`
@@ -115,6 +128,15 @@ SCENARIO_EXTS = ('.map', '.mmx', '.yrm', '.mpr')
 #   T10 档的「定时触发器挂接表」实测只有 2 个键 = Q2+Q3 的 CellTag，**Q1 不在表里**。
 POLL_EVENT_TYPES = frozenset((36, 37))
 HEARTBEAT_EVENT = 13          # 「流逝时间」—— 最省心的心跳（arg = 秒）
+# ★★§SOV08（2026-11-04 玩家请教红警权威后的机制说明）：
+#   **「下级触发」这套写法是为了绕开"一个建筑只能挂一个标签"** ——
+#   A=进入事件、B=摧毁事件，B 做成 A 的下级，于是同一栋楼"进楼时做一件事、被摧毁时做另一件事"。
+#   B 自己那份标签**不挂任何对象**（楼只能挂一个标签，挂着的是 A 的），B 的"摧毁谁"是靠
+#   **链共享 A 的挂接对象**得到的。
+#   ⇒ 推论：**下级事件是"流逝时间"这类不需要挂接对象的，这套写法对它没有意义**，
+#     它也不受上级限制（自己的标签 + 自己的计时器就能跑）。
+#   ⇒ 所以判"会不会被上级拖死"要先看**事件需不需要挂接对象**，而不是只看有没有标签。
+SELF_CONTAINED_EVENTS = frozenset((13, 36, 37))   # 流逝时间 / 局部变量查询：不依赖挂接对象
 HEARTBEAT_SEC = 1             # 心跳秒数：1 秒起，对"全部满足才执行"的逻辑无副作用
 
 
@@ -478,6 +500,10 @@ TRIG_REC_INST_BACK = 56      # 记录起点 − 56 = 触发实例对象起点（
 #   与地图 `[Triggers]` 第 2 字段一致）、0 处"指不到任何触发"的野值。
 #   ⚠ 记录帧 `+128` 是**全档同一个常量**（0x10363520 / 0x10265280 …），不是标签键，别拿它当锚。
 TRIG_REC_LINK_OFF = 132
+# ★§SOV06（2026-11-04）：同一个字段在**实例对象帧**上的偏移 = 记录帧 +132 + 56 = +188。
+#   新建触发是"克隆模板实例再 patch"，模板可能自带链接 ⇒ 必须显式清零，否则新触发
+#   会莫名其妙变成别人链上的从触发。
+TRIG_OBJ_LINK_OFF = TRIG_REC_INST_BACK + TRIG_REC_LINK_OFF
 TRIG_REC_IDX_OFF = 172       # 触发/标签对象：集群内**序号**（0 基，必须与位置一致）
 TRIG_REC_FLAG_COPY = 123     # 记录 +123 = 启用状态的**副本**（与 TagNode+88 同步写）
 TRIG_REC_QUAD_OFF = 120      # 记录 +120..123 = 难度位 01 01 01 + 启用副本
@@ -2969,6 +2995,7 @@ class SaveDoc(object):
         st = {'has_tag': False, 'has_node': False, 'attached': 0, 'remain': None,
               'executed': False, 'ev_fired': False, 'tag_byte': 0,
               'live': None, 'leak': None, 'suppress': None, 'busy': None,
+              'blocked_by': None,       # ★§SOV07：上级被禁用 ⇒ 本条永不触发
               'verdict': '', 'text': ''}
         try:
             o = self.trigger_objects(sid)
@@ -3093,6 +3120,25 @@ class SaveDoc(object):
         else:
             st['text'] = ('未执行：CellTag 节点还在，还挂 %d 个对象'
                           '（持久 1 要等它减到 0 才执行）' % st['attached'])
+        # ★★§SOV07（两次修正后定案）：**只有"没有自己标签"的下级**会被上级拖死；
+        #   有自己标签的下级不受影响 —— 由 `trigger_blocked_by()` 里"有标签返回 None"把关。
+        #   （SAVE4823 那次 B/C 各自都有标签，玩家已确认实验不严谨，不能当反例用。）
+        try:
+            _up = self.trigger_blocked_by(sid)
+        except Exception:
+            _up = None
+        if _up:
+            st['blocked_by'] = _up
+            st['verdict'] = 'blocked'
+            try:
+                _ur = self.trigger_rec(_up)
+                _un = ((_ur.name if _ur else '') or _up)
+            except Exception:
+                _un = _up
+            st['text'] = ('**永远不会触发**：本条**没有自己的标签**（共用链头那个），'
+                          '全靠链驱动；而上级「%s（%s）」是禁用状态 ⇒ 链根本不走。\n'
+                          '要让它跑：把上级启用；或给它自己建/挂一个标签。'
+                          % (_un, _up))
         # ★§SOV03：关联触发的从触发要把"状态借自链头"说清楚，否则玩家会以为
         #   "我没给这条挂标签，怎么算出来的挂载数/执行状态"。
         if st.get('tag_owner'):
@@ -3912,7 +3958,7 @@ class SaveDoc(object):
         self.pending_events[ev['off']] = (ev['type'], ev['arg'])
         return ev
 
-    def set_action(self, ac, atype=None, arg=None, team=None, waypoint=None):
+    def set_action(self, ac, atype=None, arg=None, team=None, waypoint=None, trigger=None):
         """改一条行为的类型 / 参数（**行为 80/107 还能改小队与路径点**）
 
         `ac` 需要带偏移，两种写法都认（§255 修正）：
@@ -3965,6 +4011,17 @@ class SaveDoc(object):
         if waypoint is not None:
             self.plain[off + 0x18:off + 0x1C] = (int(waypoint) & 0xFFFFFFFF).to_bytes(4, 'little')
             ac['waypoint'] = int(waypoint) & 0xFFFFFFFF
+        # ★§SOV07：触发型行为（53/54/12/22/499）的目标在 **+100**（实例键），不是 +72。
+        #   `trigger` 收 sid（字符串）或实例键（整数）；给 None 表示"不动"。
+        if trigger is not None:
+            tk = (self._sid2inst_key(str(trigger).upper())
+                  if isinstance(trigger, str) else int(trigger))
+            if not tk:
+                raise ValueError('认不出触发 %r 的实例键（可能只有定义、没有实例）' % (trigger,))
+            self.plain[off + ACT_TRIG_OFF:off + ACT_TRIG_OFF + 4] = \
+                (tk & 0xFFFFFFFF).to_bytes(4, 'little')
+            ac['trigger_key'] = tk
+            ac['trigger'] = self._instance_maps()['sid'].get(tk)
         ac['arg_text'] = self._arg_text(ac['ptype'], ac['arg'])
         self.pending_actions[off] = (ac['type'], ac['arg'])
         return ac
@@ -14578,12 +14635,19 @@ class SaveDoc(object):
             #   （`+0x48` 不是！§218 实证）。这里统一回填，触发编辑器才能反查出小队名。
             # ★§283.9：4/5/7 也是小队型（小队键同样在 +0x44），别只认 80/107
             team = struct.unpack_from('<I', pl, a + 0x44)[0] if self.is_team_action(atp) else 0
+            # ★§SOV07：触发型行为（53/54/12/22/499）的目标在 +100（实例键）
+            trg_key, trg_sid = 0, None
+            if atp in ACTION_TRIG_TYPES:
+                trg_key = struct.unpack_from('<I', pl, a + OBJ_TYPE_OFF + ACT_TRIG_OFF)[0]
+                trg_sid = self._instance_maps()['sid'].get(trg_key) if trg_key else None
             out.append({'ordinal': i + 1,
                         'index': r['start'] + i,
                         'action_off': a,
                         'type': atp,
                         'arg': argv,
                         'team': team,
+                        'trigger_key': trg_key,
+                        'trigger': trg_sid,
                         'name': bytes(pl[a + 104:a + 112]).split(b'\x00')[0]
                                   .decode('ascii', 'ignore').strip(),
                         'waypoint': wp, 'cell': self.waypoint_cell(wp),
@@ -14918,6 +14982,11 @@ class SaveDoc(object):
         t = bytearray(t_tpl)
         patch(t, 16, u32v(K_TRIG))
         patch(t, 56, sid_t.encode())
+        # ★§SOV06（2026-11-04）：`+188`（= 记录帧 +132）= **下级（关联）触发**的实例键。
+        #   这里是"克隆模板整段再 patch 少数字段"，模板若恰好挂在某条链上，新触发会
+        #   白捡一个别人的下级（读档后这条链就多出一个不请自来的成员）。
+        #   新建的触发自带新标签 ⇒ 它是新链的链头 ⇒ 下级必须清零（= 链尾）。
+        patch(t, TRIG_OBJ_LINK_OFF, u32v(0))
         # ★★2026-10-18 15:0x 重大修正：实例 **+0xB0 是"启用/难度"标志字**（4 个字节）。
         #   旧版这里**沿用模板**（模板 = 档里第一个触发实例）。若那一代档的模板是"被禁用"的，
         #   我们克隆出来的触发就**生下来就是禁用的** —— 引擎永远不会评估它。
@@ -15255,7 +15324,9 @@ class SaveDoc(object):
                              'name': a.get('name'), 'waypoint': a.get('waypoint'),
                              'cell': a.get('cell'),
                              # ★§255：80/107 的小队键（走 `+0x44`，不能塞进 arg）
-                             'team': a.get('team')})
+                             'team': a.get('team'),
+                             # ★§SOV07：触发型行为的目标（走对象 `+100`，同样不能塞进 arg）
+                             'trigger': a.get('trigger')})
             else:
                 acts.append({'type': _pair(a)[0], 'arg': _pair(a)[1]})
 
@@ -15263,8 +15334,11 @@ class SaveDoc(object):
         # ★§255：第一条行为若是"援军型 + 指定了小队"，不能交给 `create_trigger` 的第一条
         #   去建（那条只认 ac_name/waypoint/cell，写不了小队）⇒ 先建**空触发**，
         #   所有行为统一用 `add_action(team=…)` 追加。
-        _post_first = bool(first_ac and first_ac['type'] in self.SPAWN_ACTIONS
-                           and first_ac.get('team'))
+        _post_first = bool(first_ac and (
+            (first_ac['type'] in self.SPAWN_ACTIONS and first_ac.get('team'))
+            # ★§SOV07：第一条若是触发型且指定了目标，同样不能交给 create_trigger
+            #   的"第一条行为"去建（那条只写 +72）⇒ 走统一的 add_action(trigger=…)。
+            or (first_ac['type'] in ACTION_TRIG_TYPES and first_ac.get('trigger'))))
         info = self.create_trigger(
             name, evs[0][0], evs[0][1],
             None if (first_ac is None or _post_first) else first_ac['type'],
@@ -15287,7 +15361,8 @@ class SaveDoc(object):
             try:
                 self.add_action(sid, a['type'], a['arg'],
                                 name=a.get('name'), waypoint=a.get('waypoint'),
-                                cell=a.get('cell'), team=a.get('team'))
+                                cell=a.get('cell'), team=a.get('team'),
+                                trigger=a.get('trigger'))
             except Exception as e:
                 warns.append('追加行为失败（类型 %s）：%s' % (a['type'], e))
         # 回读实际结果（以引擎口径的链序为准，别信我们自己的记账）
@@ -15843,7 +15918,19 @@ class SaveDoc(object):
             return memo[1]
         m = self._instance_maps()
         k2sid = dict(m['sid'])
-        recs = {r.sid: r for r in self.records if r.kind == '触发'}
+        # ★§SOV06：同一个 sid 可能有**两条记录**（一条有实例、一条没有的副本，§224 的 22 条），
+        #   以前这里是 `{r.sid: r}` ⇒ 后出现的副本会盖掉有实例的那条，读到的 +132 是
+        #   副本帧里的垃圾。而 `set_trigger_link` 写的是 `trigger_rec()`（优先有实例的那条）
+        #   ⇒ 读写会看两个不同的帧。这里统一：优先挑"记录帧 = 实例帧 + 56"的那条。
+        inst_off = set(m['inst'].values())
+        recs = {}
+        for r in self.records:
+            if r.kind != '触发':
+                continue
+            cur = recs.get(r.sid)
+            if cur is None or ((r.off - TRIG_REC_INST_BACK) in inst_off
+                               and (cur.off - TRIG_REC_INST_BACK) not in inst_off):
+                recs[r.sid] = r
         pl = self.plain
         link = {}
         for sid, rec in recs.items():
@@ -15854,6 +15941,7 @@ class SaveDoc(object):
                 link[sid] = nxt
         # 链头 = 有标签对象的那条（tag_of_inst 只收"Tag 对象 +0xB4 指向它"的实例）
         heads = [m['sid'][k] for k in m['inst'] if m['tag_of_inst'].get(k)]
+        has_tag = set(heads)
         owner, chain = {}, {}
         for h in heads:
             seq, cur, seen = [h], h, {h}
@@ -15866,7 +15954,16 @@ class SaveDoc(object):
                 cur = nxt
             if len(seq) > 1:                 # 只有真链（≥2 条）才算"共用"
                 chain[h] = seq
+                # ★★§SOV07（2026-11-04 玩家给的 SAVE6443/all01umd.map 反例）：
+                #   **从触发不一定没有自己的标签！** 存在另一种写法：每条触发都保留自己的
+                #   标签（各自设重复类型），链只由 `+132` 串起来，靠行为里的
+                #   「54 禁止触发·参数=自己」收尾 ⇒ 不用删下级标签，删链尾也不影响上级。
+                #   旧代码在这里无条件 owner[s]=h ⇒ 会把 CCCCC（自己标签持久性 0·单次）
+                #   说成"共用 AAAAA 的标签"，挂载数/运行状态全读错。
+                #   现在：**自己有标签的就不借链头的**（用它自己的）。
                 for s in seq:
+                    if s != h and s in has_tag:
+                        continue
                     owner.setdefault(s, h)
         res = {'link': link, 'owner': owner, 'chain': chain}
         self._linkmaps = (n, res)
@@ -15899,7 +15996,9 @@ class SaveDoc(object):
         """关联触发摘要（GUI 用）→ {'owner','owner_name','up','down','chain'}；无关则 None。"""
         maps = self.trigger_link_maps()
         ow = maps['owner'].get(sid)
-        if not ow:
+        # ★§SOV07：链头自己的 owner[s]=自己 —— 那不是"共用"，是它自己的标签。
+        #   以前这里会显示"共用「它自己」的标签"，看着像 bug。
+        if not ow or ow == sid:
             return None
         names = {r.sid: r.name for r in self.records if r.kind == '触发'}
 
@@ -15912,6 +16011,234 @@ class SaveDoc(object):
                 'down': maps['link'].get(sid),
                 'chain': chain,
                 'head_name': nm(chain[0]) if chain else nm(ow)}
+
+    def trigger_link_parents(self):
+        """`{下级 sid: [上级 sid…]}` —— 谁把谁当「下级」。
+
+        ★§SOV06/07：**两种合法写法**（都由记录帧 `+132` 串链，方向 上→下，0 = 链尾）：
+          · 写 A（SAVE5739/SAVE6E3F，334 条）：链头挂标签、其余从触发**删掉自己的标签**，
+            整条链共用链头那一个标签 ⇒ 有标签 ∧ 有上级 = 0，标签数 132 = 触发 334 − 从 202。
+          · 写 B（SAVE6443/all01umd，玩家 2026-11-04 指出）：**每条触发都留着自己的标签**，
+            各自设重复类型，行为里加「54 禁止触发·参数=自己」收尾 ⇒ 不需要删下级标签，
+            从链尾往上删也不影响前面（每条都能被自己的标签驱动）。
+          ⇒ 所以"有标签 + 有上级"是**正常形态**，别再当成异常。
+        两种写法共有的硬约束：一条触发只被**一条**链指着（value 长度 = 1）。
+        """
+        out = {}
+        for up, dn in (self.trigger_link_maps().get('link') or {}).items():
+            out.setdefault(dn, []).append(up)
+        return out
+
+    def trigger_downstream(self, sid):
+        """本条**后面**还挂着几条（不含自己）—— 这些会跟着本条一起失效。
+
+        ★★§SOV07（2026-11-04 玩家实测纠正）：
+           **禁用或删除上级触发，下级触发必失效** —— 哪怕它自己也有标签、
+           自己的重复类型也可重复，一样不动。链不是"先后顺序说明"，而是
+           "上级把下级激活"：链头没被评估，后面整串都轮不到。
+        ⇒ 任何"禁用 / 软删除 / 真删除"的界面都要把这条算进去提醒玩家。
+        """
+        try:
+            ch = self.trigger_seq_info(sid).get('chain') or [sid]
+        except Exception:
+            return []
+        if sid not in ch:
+            return []
+        return ch[ch.index(sid) + 1:]
+
+    def trigger_is_disabled(self, sid):
+        """这条触发在存档里是不是"禁用"（记录帧 +123 = 0）。读不到返回 None。"""
+        rec = self.trigger_rec(sid)
+        if rec is None:
+            return None
+        p = rec.off + TRIG_REC_FLAG_COPY
+        if p + 1 > len(self.plain):
+            return None
+        return self.plain[p] == 0
+
+    def trigger_has_own_tag(self, sid):
+        """这条触发**自己**挂着标签对象吗（O(1)，走 实例键→标签键 映射）。"""
+        try:
+            k = self._sid2inst_key(sid)
+            return bool(k and self._instance_maps()['tag_of_inst'].get(k))
+        except Exception:
+            return False
+
+    def trigger_dependents(self, sid):
+        """本条一旦被禁用/删除，**会跟着一起失效**的下级（只算没有自己标签的）。
+
+        ★§SOV07（玩家 2026-11-04 第二次修正）：**有自己标签的下级不受影响** ——
+        它们按自己的标签执行，上级禁用/删除都不管用。所以警告/确认里只列这些，
+        别把整条链都算进去吓人。
+        """
+        return [s for s in self.trigger_downstream(sid)
+                if not self.trigger_has_own_tag(s)]
+
+    def trigger_events_self_contained(self, sid):
+        """本条的事件**全都不需要挂接对象**吗（流逝时间 13 / 局部变量 36·37）。
+
+        ★§SOV08：这类触发自己的标签 + 自己的计时器就能跑，链对它们没有意义。
+        读不到事件时返回 False（保守：当作需要挂接）。
+        """
+        try:
+            evs = [e.get('type') for e in self.trigger_event_list(sid)]
+        except Exception:
+            return False
+        return bool(evs) and all(t in SELF_CONTAINED_EVENTS for t in evs)
+
+    def trigger_blocked_by(self, sid):
+        """往上找第一个**被禁用**的上级（返回 sid）；不受影响时返回 None。
+
+        ★★§SOV08（玩家请教红警权威后的定案，覆盖前两轮的结论）：
+          · 「关联触发」的本意是**共享挂接对象**（一栋楼只能挂一个标签）：
+            A=进入、B=摧毁，B 做 A 的下级 ⇒ B 能"摧毁 A 挂着的那栋楼"；
+          · **下级事件是"流逝时间"这类（不需要挂接对象）⇒ 这套写法对它没意义，
+            也**不受上级限制**（自己的标签 + 自己的计时器就够）；
+          · 没有自己标签的下级（写 A）⇒ 无论什么事件，命都在链上，上游一停就没了。
+        ⇒ 豁免条件只有一条：**自足型事件 + 有自己的标签**。
+        """
+        try:
+            if self.trigger_has_own_tag(sid) and self.trigger_events_self_contained(sid):
+                return None             # 计时/自足型 + 自己的标签 ⇒ 不靠上级挂接
+        except Exception:
+            pass
+        try:
+            chain = self.trigger_seq_info(sid).get('chain') or [sid]
+        except Exception:
+            return None
+        if sid not in chain:
+            return None
+        for up in chain[:chain.index(sid)]:
+            if self.trigger_is_disabled(up):
+                return up
+        return None
+
+    def trigger_seq_info(self, sid):
+        """这条触发在链上的位置 → `{'up','down','head','tail','chain','is_head'}`。
+
+        只走 `+132` 链（不依赖标签），GUI 用来显示「上级 → 本条 → 下级」。
+        链头 = 走到头的那条（`up` 为 None）；`is_head` 另外要求"自己挂着标签"。
+        ⚠ 下游是否存活**完全取决于本条**（§SOV07 玩家实测）：本条被禁用/删除，
+          `down` 那串全部失效，与它们自己有没有标签无关。
+        """
+        maps = self.trigger_link_maps()
+        link = maps.get('link') or {}
+        parents = self.trigger_link_parents()
+        up = (parents.get(sid) or [None])[0]
+        chain, cur, guard = [sid], sid, 0
+        while cur and guard < 4096:               # 往下走
+            cur = link.get(cur)
+            if cur and cur not in chain:
+                chain.append(cur)
+            guard += 1
+        cur, guard, pre = up, 0, []
+        while cur and guard < 4096:               # 往上走
+            pre.append(cur)
+            cur = (parents.get(cur) or [None])[0]
+            guard += 1
+        full = list(reversed(pre)) + chain
+        # ★§SOV07：这里以前走 `trigger_objects()`（要扫事件/行为表），列表 334 行逐行调
+        #   太贵；改成 O(1) 的实例→标签映射。`is_head` 现在只有本函数自己在用。
+        try:
+            _k = self._sid2inst_key(sid)
+            has_tag = bool(_k and self._instance_maps()['tag_of_inst'].get(_k))
+        except Exception:
+            has_tag = False
+        return {'up': up, 'down': link.get(sid), 'chain': full,
+                'head': full[0] if full else sid, 'tail': full[-1] if full else sid,
+                'is_head': has_tag}
+
+    def set_trigger_link(self, sid, target=None, dry=False):
+        """改「下级（关联）触发」 —— **只写记录帧 +132 这 4 个字节**（实例键；0 = 链尾）。
+
+        ★§SOV06（2026-11-04 玩家要求"下级触发的显示和写入"）：
+          · 字段语义：`记录帧 +132` = 下级触发的**实例键**，0 = 这条触发是链尾（§SOV03 定位）；
+          · 为什么只改这一个字段就够了：链是**键链**，引擎沿 +132 走，
+            改它不增删任何字节、不动任何对象、不动序号 ⇒ 4 字节、可逆、随时能改回来；
+          · **不改**目标的标签：FA2 里把一条触发"关联"成从触发，它自己的标签会被删掉；
+            本工具没有"删标签对象"的安全原语（CellTag `+56` 还指着标签键），
+            所以这里只连链，标签要不要合请看返回值里的 warnings。
+
+        参数：
+          sid    要改的那条触发
+          target 新的下级 sid；`None` / `''` / `0` / `'（无 · 链尾）'` = 清成链尾
+          dry    True = 只做校验、返回会写什么（GUI 先拿 warnings 弹确认）
+
+        返回 `{'sid','old','old_sid','new_sid','changed','warnings'}`。
+        成环 / 自指 / 目标不存在 / 目标没实例 ⇒ 抛 RuntimeError（一个字节都不改）。
+        """
+        pl = self.plain
+        rec = self.trigger_rec(sid)
+        if rec is None:
+            raise RuntimeError('找不到触发 %s' % sid)
+        o = self.trigger_objects(sid)
+        if o['inst'] is None:
+            raise RuntimeError('触发 %s 在本档里只有「定义」、没有实例 —— '
+                               '链接字段无处可写' % sid)
+        p = rec.off + TRIG_REC_LINK_OFF
+        if p + 4 > len(pl):
+            raise RuntimeError('记录帧越界，已中止（未改动存档）')
+        old = int.from_bytes(pl[p:p + 4], 'little')
+        old_sid = self.trigger_link_sid(sid)
+        # ---- 目标解析 ----
+        if target is None or (isinstance(target, str)
+                              and (not target.strip() or target.strip().startswith('（无'))):
+            new_key, new_sid = 0, None
+        elif target in (0, '0'):
+            new_key, new_sid = 0, None
+        else:
+            target = str(target).strip()
+            tgt = self.trigger_rec(target)
+            if tgt is None:
+                raise RuntimeError('目标触发不存在：%s' % target)
+            if target == sid:
+                raise RuntimeError('不能把触发自己设成自己的下级（引擎会原地打转）')
+            link = self.trigger_link_maps().get('link') or {}
+            cur, guard = target, 0                    # 目标往下走，撞回本条 = 成环
+            while cur and guard < 4096:
+                if cur == sid:
+                    raise RuntimeError('这会让链成环：%s 的下级链里已经绕回 %s'
+                                       % (target, sid))
+                cur = link.get(cur)
+                guard += 1
+            to = self.trigger_objects(target)
+            if to['inst'] is None:
+                raise RuntimeError('目标触发 %s 没有实例（只有定义），不能当别人的下级'
+                                   % target)
+            new_key, new_sid = to['inst_key'], target
+        # ---- 实档里没见过的形态：只提醒，不拦（4 字节、可逆） ----
+        warnings = []
+        if new_sid:
+            try:
+                if self.trigger_objects(new_sid).get('tag_key'):
+                    warnings.append(
+                        '目标「%s」自己挂着标签 —— 这是合法写法（SAVE6443/all01umd 就是'
+                        '每条触发各留一个标签、各自设重复类型，靠行为「54 禁止触发·参数=自己」'
+                        '收尾）。但注意：下级活不活完全看上级（玩家实测：禁用/删除上级，'
+                        '下级必失效，哪怕它自己也有标签）。'
+                        % new_sid)
+            except Exception:
+                pass
+            others = [x for x in (self.trigger_link_parents().get(new_sid) or [])
+                      if x != sid]
+            if others:
+                warnings.append(
+                    '目标「%s」已经有上级 %s ⇒ 改完是一条触发被**两条链**同时指着'
+                    '（实档里 0 例，可能有一边永远走不到）。'
+                    % (new_sid, '、'.join(others)))
+        if old_sid and old_sid != new_sid:
+            warnings.append(
+                '本条原来的下级「%s」会失去上级（如果它自己没标签，就没人驱动它了）。'
+                % old_sid)
+        changed = (new_key != old)
+        if dry or not changed:
+            return {'sid': sid, 'old': old, 'old_sid': old_sid, 'new_sid': new_sid,
+                    'changed': changed, 'warnings': warnings}
+        pl[p:p + 4] = struct.pack('<I', new_key)
+        # 4 字节原地写 ⇒ 长度不变，只需让"跟着 +132 走"的映射作废，不用重扫
+        self.invalidate_caches()
+        return {'sid': sid, 'old': old, 'old_sid': old_sid, 'new_sid': new_sid,
+                'changed': True, 'warnings': warnings}
 
     def _tag_objs_by_key(self):
         """标签自键 → 标签对象帧偏移。
@@ -16097,6 +16424,19 @@ class SaveDoc(object):
                     else:
                         a['arg_text'] = ('小队 %s%s'
                                          % ('%08X' % tk, ('「%s」' % tmn) if tmn else ''))
+                elif a.get('type') in ACTION_TRIG_TYPES:
+                    # ★§SOV07：触发型行为（53/54/12/22/499）的目标在 **+100**（实例键）。
+                    #   以前这里没有分支 ⇒ 编辑器里「54 禁止触发」的参数恒显示 0，
+                    #   看不出它禁的是哪一条（玩家给的写法正是"禁止自身"）。
+                    trk = int.from_bytes(
+                        pl[obj + OBJ_TYPE_OFF + ACT_TRIG_OFF:
+                           obj + OBJ_TYPE_OFF + ACT_TRIG_OFF + 4], 'little')
+                    tsid = self._instance_maps()['sid'].get(trk) if trk else None
+                    a = dict(a)
+                    a['trigger_key'] = trk
+                    a['trigger'] = tsid
+                    a['arg_text'] = ('→ %s%s' % (tsid, '（自己）' if tsid == sid else '')
+                                     if tsid else '（没指定触发）')
                 d['actions'].append(a)
         if not d['editable']:
             d['note'] = '这条记录在本档里只有「触发定义」，没有运行期实例 ⇒ 只能看'
@@ -16270,7 +16610,8 @@ class SaveDoc(object):
                 'next': 0, 'chain_head': int.from_bytes(
                     pl[inst + 192:inst + 196], 'little'), 'ev_size': ev_size}
 
-    def add_action(self, sid, atype, arg=0, name=None, waypoint=None, cell=None, team=None):
+    def add_action(self, sid, atype, arg=0, name=None, waypoint=None, cell=None, team=None,
+                   trigger=None):
         """给触发**追加一条行为**（§193 修正版）。
 
         ★2026-10-23 修正（原实现在 7MB 小档上"静默无效"的根因）：
@@ -16330,6 +16671,19 @@ class SaveDoc(object):
         if atype in ACTION_VAR_TYPES:
             buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', 0)
             buf[ACT_VAR_OFF:ACT_VAR_OFF + 4] = struct.pack('<I', arg & 0xFFFFFFFF)
+        if atype in ACTION_TRIG_TYPES:
+            # ★§SOV07：触发型行为的目标在 **+100**（实例键）。先清 +72（那格没意义），
+            #   再把 trigger 写成目标键；不给就留 0（= 引擎眼里"没指定触发"，不会乱指别人）。
+            buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', 0)
+            tk = 0
+            if trigger not in (None, '', 0):
+                tk = (self._sid2inst_key(str(trigger).upper())
+                      if isinstance(trigger, str) else int(trigger)) or 0
+                if not tk:
+                    raise RuntimeError('认不出触发 %r 的实例键（它可能只有定义、没有实例）'
+                                       % (trigger,))
+            buf[OBJ_TYPE_OFF + ACT_TRIG_OFF:OBJ_TYPE_OFF + ACT_TRIG_OFF + 4] = \
+                struct.pack('<I', tk)
         if atype == 125:
             if not name or (waypoint is None and cell is None):
                 raise RuntimeError('行为 125「将建筑建于…」必须同时给 name（建筑类型名）'
@@ -16681,6 +17035,12 @@ class SaveDoc(object):
             spans.append((o['cell'], TRIG_CELL_SIZE, 'CellTag'))
         # ① 建筑挂接
         detached = []
+        # ★§SOV06（2026-11-04）：被删的这条如果是链中间/链尾，**上级的 +132 就成了野键**
+        #   （实档 334 条里"指不到任何触发"的值 = 0 个，说明这是个不该被破坏的不变式）。
+        #   ⇒ 删完把上级直接接到本条的**下级**上（摘链：A→B→C 变成 A→C），本条是链尾就置 0。
+        #   记录一下"链头被删、后面的从触发就没人驱动了"，返回给 GUI 提示。
+        link_ups = [x for x in (self.trigger_link_parents().get(sid) or []) if x != sid]
+        link_down = self.trigger_link_sid(sid)
         if clear_attach and o['cell_key'] is not None:
             ck = o['cell_key']
             try:
@@ -16734,9 +17094,32 @@ class SaveDoc(object):
         # ⑤ 重排序号
         self.renumber_triggers()
         self.invalidate_caches(rescan=True)
+        # ⑥ ★§SOV06：把原来的上级接到本条的下级上（键不变，只是换了指向）
+        spliced, orphans = [], []
+        child = link_down if (link_down and self.trigger_rec(link_down) is not None) else None
+        for up in link_ups:
+            try:
+                if self.trigger_rec(up) is None:
+                    continue
+                self.set_trigger_link(up, child)
+                spliced.append({'up': up, 'down': child})
+            except Exception:
+                pass
+        if child and not link_ups:
+            # ★§SOV07（2026-11-04 玩家实测）：**删除上级 ⇒ 下级必失效**，
+            #   跟下级自己有没有标签无关（写 B 那种"每条各留标签"也一样）。
+            #   ⇒ 删的这条若没有上级（= 链头/链首），它后面整串全废，原样报给 GUI。
+            #   （有上级的会被上面"摘链"接到下级，链不断，不算孤儿。）
+            try:
+                _ch = list(self.trigger_seq_info(child)['chain'])
+            except Exception:
+                _ch = [child]
+            # ★§SOV07（玩家第二次修正）：删/禁上级**只**拖死"没有自己标签"的下级
+            #   （它们的命全靠链头那个标签）；有自己标签的照常按自己的标签执行。
+            orphans.extend([x for x in _ch if not self.trigger_has_own_tag(x)])
         return {'sid': sid, 'name': o['name'], 'bytes_removed': sum(s[1] for s in spans),
                 'objects': [s[2] for s in spans], 'detached': detached,
-                'timer_entry': timer}
+                'timer_entry': timer, 'spliced': spliced, 'orphans': orphans}
 
     def renumber_triggers(self):
         """把「集群内序号」重写成**数组位置**（实例/标签 +172、事件/行为 +56）。
