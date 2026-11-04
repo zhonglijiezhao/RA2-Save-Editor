@@ -226,8 +226,22 @@ def apply(app):
     st.map('Treeview.Heading', background=[('active', T['surface_3'])],
            foreground=[('active', T['ink'])])
     # 去掉 clam 表头的立体边
+    # ★★§SOV12（2026-11-04 修的真 bug）：原来只写了
+    #   `st.layout('Treeview.Heading', [('Treeheading.cell', {'sticky': 'nswe'})])`
+    #   —— **没给 children**，等于把 heading 里画背景/文字的 border→padding→text
+    #   整条链砍掉了 ⇒ **全工具所有表格都没有列标题**（表头高度 0，第一行数据
+    #   直接顶到 y=2）。现在给完整链路，只保留"无立体边"的效果。
     try:
-        st.layout('Treeview.Heading', [('Treeheading.cell', {'sticky': 'nswe'})])
+        st.layout('Treeview.Heading', [
+            ('Treeheading.cell', {'sticky': 'nswe', 'children': [
+                ('Treeheading.border', {'sticky': 'nswe', 'children': [
+                    ('Treeheading.padding', {'sticky': 'nswe', 'children': [
+                        ('Treeheading.image', {'side': 'right', 'sticky': ''}),
+                        ('Treeheading.text', {'sticky': 'we'}),
+                    ]}),
+                ]}),
+            ]}),
+        ])
     except Exception:
         pass
 

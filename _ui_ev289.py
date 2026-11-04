@@ -99,7 +99,8 @@ for title, body in sections:
             except Exception:
                 menus[label] = None
 ck(set(menus) == {'叠加 ▾', '更多 ▾', '修旧楼 ▾'}, '三个折叠菜单：%s' % sorted(menus))
-for label, want in (('叠加 ▾', 3), ('更多 ▾', 4), ('修旧楼 ▾', 3)):
+# ★§SOV12：叠加菜单 +3 项（单元标记勾选 / 删除该格单元标记 / 列出全部单元标记）
+for label, want in (('叠加 ▾', 6), ('更多 ▾', 4), ('修旧楼 ▾', 3)):
     menu = menus.get(label)
     n = 0
     if menu is not None:

@@ -1866,6 +1866,7 @@ class SaveDoc(object):
         self._events = None
         self._actions = None
         self._celltags = None
+        self._cellmarks = None       # ★§SOV12：单元标记索引（跟着 CellClass +80 走）
         self._btypes = None
         self._house_keys_memo = None
         self._bld_tmp = None
@@ -15850,6 +15851,11 @@ class SaveDoc(object):
     def invalidate_caches(self, rescan=False):
         """把"跟着明文偏移走"的缓存全部作废（增删字节后必须调）。"""
         for a in ('_objs', '_events', '_actions', '_ticks', '_celltags', '_ctimerlist',
+                  '_cellmarks',                    # ★§SOV12：单元标记索引
+                  # ★注意：**不要**在这里清 `_attov` —— 它的 key 自带「明文长度」，
+                  #   插删对象后本来就会失效；而触发编辑（改名之外的原地改）都不变长度，
+                  #   每次清它就要重算 1.7 秒（§256 的优化就白做了）。
+                  #   原地改计数（clear_cell_marker）自己显式清。
                   '_instmaps', '_house_econ', '_custom_houses', '_house_keys_memo',
                   '_linkmaps',              # ★§SOV03：关联触发链（跟着记录帧 +132 走）
                   '_sid2inst',              # ★§SOV03：sid → 实例自键（同上，偏移相关）
@@ -16129,6 +16135,131 @@ class SaveDoc(object):
                                                 o['cell'] + CELL_COUNT_OFF + 4], 'little')
         out['cells'] = self.celltag_marker_cells(o['cell'])
         return out
+
+    # ---- ★★§SOV12（2026-11-04 玩家："加入显示 单元标记 并能删除"）----
+    # 跨档实测（SAVE6784 18/18、SAVE5739 274/274）确认的定位规则：
+    #   · 命中「== CellTag 自键 且 +8..+12 = ff ff ff ff」的 u32；
+    #   · 该命中 = **CellClass 对象 +80**（命中 −80 处正是 16 字节 CellClass GUID）；
+    #   · (x,y) 在命中 −24（两个 u16）。
+    # 全档 CellClass 里 +80 = 0 才是大头（12702/12720、15202/15480）
+    #   ⇒ **清 0 即解挂**，对象本身不动（不需要删 348 字节、不用重排偏移）。
+    CELL_TAGLINK_OFF = 80      # CellClass +80 = 它挂的 CellTag 键（0 = 没挂）
+
+    def cell_markers(self):
+        """全档**所有**单元标记 → `[{x,y,cell_off,cell_key,tag_key,count,tagid,
+        trigger,trigger_name,obj_off,link_off}…]`（按 y、x 排序）。
+
+        数据来自两半：坐标/键靠扫 `CellClass +80`，归属（标签/触发名）复用
+        `attach_overview()` 的键链解析（它已有缓存）。
+        """
+        self._invalidate_if_shifted()
+        c = getattr(self, '_cellmarks', None)
+        if c is not None and c[0] == len(self.plain):
+            return c[1]
+        pl = self.plain
+        n = len(pl)
+        try:
+            meta = {b.get('node'): b for b in (self.attach_overview() or [])}
+        except Exception:
+            meta = {}
+        out = []
+        for nd in self.celltag_nodes():
+            off, key, cnt = nd['node'], nd['x'], nd['count']
+            if not key:
+                continue
+            m = meta.get(off) or {}
+            tag_key = struct.unpack_from('<I', pl, off + CELL_TAGKEY_OFF)[0]
+            pat = struct.pack('<I', key)
+            q = 0
+            while True:
+                i = pl.find(pat, q)
+                if i < 0:
+                    break
+                q = i + 1
+                if off <= i < off + TRIG_CELL_SIZE:
+                    continue                  # CellTag 自己的自键字段
+                if i < self.CELL_TAGLINK_OFF or i + 12 > n:
+                    continue
+                if pl[i + 8:i + 12] != self.CELL_MARK_TAIL:
+                    continue                  # 挂接点后面恒为 -1
+                obj = i - self.CELL_TAGLINK_OFF
+                if pl[obj:obj + 16] != self.CELL_GUID:
+                    continue                  # 不是 CellClass 对象 ⇒ 不认
+                x = int.from_bytes(pl[i + self.CELL_MARK_DX:i + self.CELL_MARK_DX + 2],
+                                   'little')
+                y = int.from_bytes(pl[i + self.CELL_MARK_DX + 2:
+                                      i + self.CELL_MARK_DX + 4], 'little')
+                if not (0 <= x < 2048 and 0 <= y < 2048):
+                    continue
+                out.append({'x': int(x), 'y': int(y),
+                            'cell_off': off, 'cell_key': int(key),
+                            'tag_key': int(tag_key), 'count': int(cnt),
+                            'tagid': m.get('tagid'),
+                            'trigger': m.get('trigger_id'),
+                            'trigger_name': m.get('trigger_name'),
+                            'obj_off': obj, 'link_off': i})
+        out.sort(key=lambda r: (r['y'], r['x'], r['cell_key']))
+        self._cellmarks = (n, out)
+        return out
+
+    def cell_markers_at(self, x, y):
+        """某一格上的单元标记（可能多个 CellTag 落在同一格）→ 同 `cell_markers()` 的 dict 列表。"""
+        try:
+            return [m for m in self.cell_markers() if (m['x'], m['y']) == (int(x), int(y))]
+        except Exception:
+            return []
+
+    def clear_cell_marker(self, marker, dry_run=False, rescan=True):
+        """把一个单元标记从 CellTag 上摘掉（**原地改 8 字节**，长度不变）。
+
+        做两件事：
+          ① `CellClass +80`（挂接键）清 0 ⇒ 这格不再属于该 CellTag（引擎不再在那触发）；
+          ② `CellTag +64`（挂接数）−1 ⇒ 否则持久 1 的「剩余挂载」永远减不到 0。
+        **不删** CellClass 对象本身：全档 99% 的 CellClass 都是 +80 = 0 的常态，
+        删对象要动 348 字节 + 组计数 + 偏移重排，风险远大于收益。
+
+        返回 `{'x','y','cell_key','tag_key','count_before','count_after',…}`；
+        `dry_run=True` 只算不写。参数用 `cell_markers()` 里那条 dict。
+        """
+        pl = self.plain
+        link_off = int(marker['link_off'])
+        cell_off = int(marker['cell_off'])
+        cell_key = int(marker['cell_key'])
+        if not (0 <= link_off <= len(pl) - 4):
+            raise ValueError('挂接键偏移越界：%d（存档可能已被别的操作改动）' % link_off)
+        if not (0 <= cell_off <= len(pl) - TRIG_CELL_SIZE):
+            raise ValueError('CellTag 偏移越界：%d' % cell_off)
+        cur = int.from_bytes(pl[link_off:link_off + 4], 'little')
+        if cur != cell_key:
+            raise ValueError('这格现在挂的不是该 CellTag（应为 0x%08X，实际 0x%08X）'
+                             % (cell_key, cur))
+        count_pos = cell_off + CELL_COUNT_OFF
+        before = int.from_bytes(pl[count_pos:count_pos + 4], 'little')
+        after = max(0, before - 1)
+        info = {'x': marker.get('x'), 'y': marker.get('y'),
+                'cell_key': cell_key, 'tag_key': marker.get('tag_key'),
+                'trigger': marker.get('trigger'),
+                'trigger_name': marker.get('trigger_name'),
+                'count_before': before, 'count_after': after,
+                'link_off': link_off, 'count_pos': count_pos}
+        if dry_run:
+            info['dry_run'] = True
+            return info
+        pl[link_off:link_off + 4] = b'\x00\x00\x00\x00'
+        pl[count_pos:count_pos + 4] = struct.pack('<I', after)
+        # 原地改（长度不变）⇒ `_invalidate_if_shifted()` 的判据看不出变化，
+        # 必须显式清掉这几张"与挂接/计数相关"的表。
+        for a in ('_cellmarks', '_celltags', '_attov', '_instmaps', '_linkmaps',
+                  '_celltag_timer_memo'):
+            if hasattr(self, a):
+                setattr(self, a, None)
+        if rescan:
+            # 批量删时前面几条可以先不重扫（rescan=False），最后一条再扫。
+            try:
+                self.invalidate_caches(rescan=True)
+            except Exception:
+                pass
+        return info
 
     def trigger_has_own_tag(self, sid):
         """这条触发**自己**挂着标签对象吗（O(1)，走 实例键→标签键 映射）。"""

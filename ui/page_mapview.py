@@ -60,6 +60,16 @@ class MapViewPage(object):
                        '拖远了点「居中选中」回到当前格。缩放以视口中心为锚点，不会一缩放就漂回左上。',
                   foreground=ui_theme.T['ink_2'], wraplength=700,
                   justify='left').pack(anchor='w', pady=(4, 0))
+        # ★§SOV12：单元标记（CellTag 挂接点）的用法
+        ttk.Label(_note,
+                  text='单元标记（CellTag 挂接点）：「叠加 ▾ → 单元标记（CellTag 挂接点）」勾选显示'
+                       '（默认开；同一个 CellTag 的格子画成同色，一眼看出属于哪条触发）。点中一格，'
+                       '信息栏会写「★单元标记：N 个（CellTag → 触发名）」；'
+                       '「删除该格的单元标记…」把这格从 CellTag 上解挂（清 CellClass +80、挂接数 −1，'
+                       '对象本身不删、存档长度不变）；「列出全部单元标记…」可双击跳格、多选批量删。'
+                       '只改存档、不写 .map —— 从地图重开任务，标记还会回来。',
+                  foreground=ui_theme.T['ink_2'], wraplength=700,
+                  justify='left').pack(anchor='w', pady=(4, 0))
         ttk.Label(_note,
                   text='放置建筑：勾「触发法」= 引擎自己造（有建造动画、模型完整，悬崖 / 水面等不可建'
                        '地形会被引擎拒绝）；不勾 = 直接落成（立即写档、可指定所属方，引擎仍会播一遍'
@@ -140,14 +150,22 @@ class MapViewPage(object):
         self.mv_wp = tk.BooleanVar(value=True)
         self.mv_units = tk.BooleanVar(value=False)
         self.mv_terr = tk.BooleanVar(value=False)
+        # ★★§SOV12（2026-11-04 玩家：「加入显示 单元标记 并能删除」）：
+        #   CellTag 挂接点 = 地图上的「单元标记」，默认显示（同一条 CellTag 同色）。
+        self.mv_marks = tk.BooleanVar(value=True)
         _mb0 = ttk.Menubutton(r, text='叠加 ▾', style='Ghost.TButton')
         _m0 = tk.Menu(_mb0, tearoff=0)
         _m0.add_checkbutton(label='路径点（地图 [Waypoints] + 存档）',
                             variable=self.mv_wp, command=self.mv_render)
+        _m0.add_checkbutton(label='单元标记（CellTag 挂接点）',
+                            variable=self.mv_marks, command=self._mv_on_marks)
         _m0.add_checkbutton(label='单位（≥20 倍才画）',
                             variable=self.mv_units, command=self._mv_toggle_units)
         _m0.add_checkbutton(label='树/石（Terrain 对象）',
                             variable=self.mv_terr, command=self.mv_render)
+        _m0.add_separator()
+        _m0.add_command(label='🧹 删除该格的单元标记…', command=self.mv_delete_markers)
+        _m0.add_command(label='📋 列出全部单元标记…', command=self.mv_list_markers)
         _mb0['menu'] = _m0
         _mb0.pack(side='left', padx=(10, 0))
         ttk.Button(r, text='重绘', command=self.mv_render).pack(side='left', padx=(10, 0))
@@ -298,7 +316,8 @@ class MapViewPage(object):
         self.mv_info.pack(anchor='w')
         self.mv_state = {'mp': None, 'ok': False, 'scale': 8, 'img': None,
                          'blds': [], 'occ': {}, 'sel': None, 'path': None,
-                         'gdata': None, 'wpdata': None, 'udata': None}
+                         'gdata': None, 'wpdata': None, 'udata': None,
+                         'marks': None, 'canv': None}
         return f
 
     def _mv_reset(self, lazy=False):
@@ -317,7 +336,7 @@ class MapViewPage(object):
         p = getattr(getattr(self.doc, '_map', None), 'path', st.get('path')) if self.doc else None
         st.update({'mp': None, 'ok': False, 'img': None, 'blds': [],
                    'occ': {}, 'sel': None, 'path': p, 'gdata': None, 'dims': None,
-                   'wpdata': None, 'udata': None, 'canv': None})
+                   'wpdata': None, 'udata': None, 'canv': None, 'marks': None})
         self.mv_canvas.delete('all')
         self.mv_info.config(text='')
         if self.doc and not (p and os.path.exists(p)):
@@ -657,6 +676,236 @@ class MapViewPage(object):
                 c.create_text(cx, cy - 9, text=str(n), fill=ui_theme.T['info'],
                               font=('Consolas', 7), tags=('wp',))
 
+    # ---------------- ★§SOV12 单元标记（CellTag 挂接点）：显示 / 列表 / 删除 ----------------
+    MV_MARK_PALETTE = ('#FF7A00', '#41D3FF', '#FFD400', '#8CFF41',
+                       '#FF4FD8', '#B98CFF', '#FF5A5A', '#5CFFC8')
+
+    def _mv_marks_data(self):
+        """这条存档的全部单元标记（缓存在 `st['marks']`，换档时 st 会重建）。"""
+        st = self.mv_state
+        if st.get('marks') is not None:
+            return st['marks']
+        try:
+            st['marks'] = self.doc.cell_markers() if self.doc else []
+        except Exception:
+            st['marks'] = []
+        return st['marks']
+
+    def _mv_mark_color_map(self, marks):
+        """CellTag 键 → 颜色（同一个 CellTag 的标记同色，一眼看出属于哪条触发）。"""
+        keys = sorted({m['cell_key'] for m in marks})
+        pal = self.MV_MARK_PALETTE
+        return {k: pal[i % len(pal)] for i, k in enumerate(keys)}
+
+    def _mv_draw_markers(self, c):
+        """画 CellTag 的挂接点（单元标记）。返回画了几个。"""
+        try:
+            if not (hasattr(self, 'mv_marks') and bool(self.mv_marks.get())):
+                return 0
+        except Exception:
+            return 0
+        st = getattr(self, 'mv_state', None) or {}
+        s = max(1, int(st.get('scale') or 8))
+        if s < 2:                     # 1 倍时一格只有 1 像素，画了也只是噪点
+            return 0
+        marks = self._mv_marks_data()
+        if not marks or len(marks) > 5000:
+            return 0
+        col = self._mv_mark_color_map(marks)
+        # 倍率小 ⇒ 只画 1~2px 的点；放大后补十字，密集区也能数清
+        r = 1 if s <= 3 else (2 if s < 9 else 3)
+        for m in marks:
+            cx, cy = m['x'] * s + s / 2.0, m['y'] * s + s / 2.0
+            cc = col.get(m['cell_key'], '#FF7A00')
+            c.create_rectangle(cx - r, cy - r, cx + r, cy + r,
+                               outline=cc, width=1, tags=('cellmark',))
+            if s >= 9:                # 放大后补个十字，密集区也能数清
+                c.create_line(cx - r - 2, cy, cx + r + 2, cy, fill=cc, tags=('cellmark',))
+                c.create_line(cx, cy - r - 2, cx, cy + r + 2, fill=cc, tags=('cellmark',))
+        return len(marks)
+
+    def _mv_on_marks(self):
+        """勾选变化 ⇒ **只重画标记层**（不重绘整图：大图全量要 2 秒以上）。"""
+        try:
+            c = self.mv_canvas
+            c.delete('cellmark')
+            self._mv_draw_markers(c)
+            marks = self._mv_marks_data()
+            tot = len(marks)
+            n_tag = len({m['cell_key'] for m in marks})
+            if not bool(self.mv_marks.get()):
+                self.status.set('单元标记：已隐藏（叠加 ▾ 里可再打开）')
+            elif tot and int(self.mv_state.get('scale') or 1) < 2:
+                self.status.set('单元标记：共 %d 个（%d 条 CellTag）—— 当前倍率太小画不出，'
+                                '放大到 2 倍以上就能看到' % (tot, n_tag))
+            else:
+                self.status.set('单元标记：显示 %d 个（%d 条 CellTag，同一 CellTag 同色）'
+                                % (tot, n_tag))
+        except Exception as e:
+            self.status.set('切换单元标记失败：%s' % e)
+
+    def mv_delete_markers(self):
+        """删掉「选中格」上的单元标记（解挂 + 挂接数 −1，§SOV12）。"""
+        st = getattr(self, 'mv_state', None)
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档', parent=self)
+            return
+        if not st or not st.get('sel'):
+            messagebox.showinfo(
+                '先选一格',
+                '在地图上点一下目标格（或用「定位」跳到坐标），再删它的单元标记。',
+                parent=self)
+            return
+        x, y = st['sel']
+        try:
+            ms = self.doc.cell_markers_at(x, y)
+        except Exception as e:
+            messagebox.showerror('读不到单元标记', str(e), parent=self)
+            return
+        if not ms:
+            messagebox.showinfo(
+                '这格没有单元标记',
+                '(%d,%d) 上没有 CellTag 挂接点。\n'
+                '（叠加 ▾ → 「单元标记（CellTag 挂接点）」可以在图上看到全部标记）' % (x, y),
+                parent=self)
+            return
+        lines = ['(%d, %d) 上有 %d 个单元标记：' % (x, y, len(ms))]
+        for m in ms:
+            nm = m.get('trigger_name') or (m.get('trigger') or '?')
+            lines.append('　· CellTag %08X ｜ 标签 %08X ｜ 触发「%s」｜ 挂接 %d → %d'
+                         % (m['cell_key'], m['tag_key'], nm, m['count'],
+                            max(0, m['count'] - 1)))
+        lines += ['',
+                  '做法：把这格的「CellClass +80」清 0（不再挂在这个 CellTag 上），'
+                  '同时把 CellTag 的挂接数 −1；对象本身不删，存档长度不变。',
+                  '只改存档、不写 .map —— 下次从地图重开任务，标记还会回来。',
+                  '不可撤销 —— 建议先在主窗口「备份存档」。',
+                  '',
+                  '确定删除吗？']
+        if not messagebox.askyesno('删除单元标记', '\n'.join(lines), parent=self):
+            return
+        ok, errs = [], []
+        for i, m in enumerate(ms):
+            try:
+                ok.append(self.doc.clear_cell_marker(m, rescan=(i == len(ms) - 1)))
+            except Exception as e:
+                errs.append('CellTag %08X：%s' % (m.get('cell_key') or 0, e))
+        st['marks'] = None
+        try:
+            self.mv_canvas.delete('cellmark')
+            self._mv_draw_markers(self.mv_canvas)
+        except Exception:
+            pass
+        try:
+            self.mv_info.config(text=self._mv_info_text(x, y))
+        except Exception:
+            pass
+        if errs:
+            messagebox.showwarning('部分没删成', '\n'.join(errs), parent=self)
+        if ok:
+            self.status.set('已删除 (%d,%d) 的 %d 个单元标记（挂接数 %s → %s）'
+                            % (x, y, len(ok),
+                               '、'.join(str(i['count_before']) for i in ok),
+                               '、'.join(str(i['count_after']) for i in ok)))
+
+    def mv_list_markers(self):
+        """列出全部单元标记：双击跳格、可多选删除（§SOV12）。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档', parent=self)
+            return
+        try:
+            marks = self._mv_marks_data()
+        except Exception as e:
+            messagebox.showerror('读不到单元标记', str(e), parent=self)
+            return
+        if not marks:
+            messagebox.showinfo('没有单元标记',
+                                '这份存档里没有任何 CellTag 挂接点。', parent=self)
+            return
+        col = self._mv_mark_color_map(marks)
+        dlg = tk.Toplevel(self)
+        dlg.title('单元标记（CellTag 挂接点）· 共 %d 个' % len(marks))
+        dlg.transient(self)
+        dlg.minsize(560, 320)
+        frm = ttk.Frame(dlg, padding=8)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text='双击一行 = 跳到该格；选中多行可一次删除。'
+                            '只改存档，不写 .map。',
+                  foreground=ui_theme.T['muted']).pack(anchor='w', pady=(0, 6))
+        wrap = ttk.Frame(frm)
+        wrap.pack(fill='both', expand=True)
+        tv = ttk.Treeview(wrap, columns=('x', 'y', 'cell', 'tag', 'trig', 'cnt'),
+                          show='headings', height=16, selectmode='extended')
+        for cid, txt, w in (('x', 'X', 50), ('y', 'Y', 50), ('cell', 'CellTag', 90),
+                            ('tag', '标签', 90), ('trig', '触发', 200), ('cnt', '挂接', 55)):
+            tv.heading(cid, text=txt)
+            tv.column(cid, width=w, anchor='center' if cid != 'trig' else 'w')
+        ys = ttk.Scrollbar(wrap, orient='vertical', command=tv.yview)
+        tv.configure(yscrollcommand=ys.set)
+        tv.pack(side='left', fill='both', expand=True)
+        ys.pack(side='right', fill='y')
+        for i, m in enumerate(marks):
+            tv.insert('', 'end', iid=str(i), values=(
+                m['x'], m['y'], '%08X' % m['cell_key'], '%08X' % m['tag_key'],
+                m.get('trigger_name') or (m.get('trigger') or '?'), m['count']))
+        row = ttk.Frame(frm)
+        row.pack(side='bottom', fill='x', pady=(8, 0))
+
+        def _goto(_ev=None):
+            sel = tv.selection()
+            if not sel:
+                return
+            m = marks[int(sel[0])]
+            self.mv_goto(m['x'], m['y'])
+            self.status.set('已跳到单元标记 (%d,%d) ｜ CellTag %08X ｜ %s'
+                            % (m['x'], m['y'], m['cell_key'],
+                               m.get('trigger_name') or '?'))
+        tv.bind('<Double-1>', _goto)
+
+        def _del():
+            sel = tv.selection()
+            if not sel:
+                messagebox.showinfo('提示', '先选中要删的行', parent=dlg)
+                return
+            picked = [marks[int(i)] for i in sel]
+            head = '\n'.join('　· (%d,%d) CellTag %08X ｜ %s'
+                             % (m['x'], m['y'], m['cell_key'],
+                                m.get('trigger_name') or '?')
+                             for m in picked[:12])
+            if len(picked) > 12:
+                head += '\n　… 还有 %d 个' % (len(picked) - 12)
+            if not messagebox.askyesno(
+                    '删除 %d 个单元标记' % len(picked),
+                    '将从对应 CellTag 上解挂（挂接数各 −1），只改存档：\n\n%s\n\n'
+                    '不可撤销，建议先「备份存档」。确定删除吗？' % head,
+                    parent=dlg):
+                return
+            okn = 0
+            errs = []
+            for i, m in enumerate(picked):
+                try:
+                    self.doc.clear_cell_marker(m, rescan=(i == len(picked) - 1))
+                    okn += 1
+                except Exception as e:
+                    errs.append('(%d,%d) %s' % (m['x'], m['y'], e))
+            self.mv_state['marks'] = None
+            try:
+                self.mv_canvas.delete('cellmark')
+                self._mv_draw_markers(self.mv_canvas)
+                self.mv_info.config(text=self._mv_info_text(*self.mv_state['sel'])
+                                    if self.mv_state.get('sel') else '')
+            except Exception:
+                pass
+            dlg.destroy()
+            if errs:
+                messagebox.showwarning('部分没删成', '\n'.join(errs[:8]), parent=self)
+            self.status.set('已删除 %d 个单元标记%s' % (
+                okn, '，%d 个失败' % len(errs) if errs else ''))
+
+        ttk.Button(row, text='跳到该格（或双击行）', command=_goto).pack(side='left')
+        ttk.Button(row, text='🗑 删除选中', command=_del).pack(side='left', padx=(8, 0))
+        ttk.Button(row, text='关闭', command=dlg.destroy).pack(side='right')
+
     # ---------------- 地形来源（§280） ----------------
     TERR_SRC_MODES = ('地图', '地图+存档补格', '存档')
 
@@ -896,6 +1145,10 @@ class MapViewPage(object):
                         c.create_text(x * s + s / 2, y * s + s / 2, text=str(n),
                                       fill=ui_theme.MAP['wp_text'], font=('Consolas', 7))
         try:
+            self._mv_draw_markers(c)      # ★§SOV12：单元标记
+        except Exception:
+            pass
+        try:
             self._mv_draw_terrain(c)
         except Exception:
             pass
@@ -1020,6 +1273,11 @@ class MapViewPage(object):
                 self._mv_draw_waypoints(c)
             except Exception:
                 pass
+        # ★§SOV12：单元标记（CellTag 挂接点，默认开；同一 CellTag 同色）
+        try:
+            self._mv_draw_markers(c)
+        except Exception:
+            pass
         # ★§281：树/石标记（默认关；画在路径点之上、单位之下）
         try:
             self._mv_draw_terrain(c)
@@ -1327,6 +1585,28 @@ class MapViewPage(object):
         if self.mv_goto(x, y, '路径点 %d' % n):
             self.status.set('路径点 %d（%s）在 (%d,%d)，视图已居中' % (n, where, x, y))
 
+    def _mv_mark_text(self, x, y):
+        """该格的单元标记说明（没算过且显示关着就返回空，别为了一句话全档扫一遍）。"""
+        st = getattr(self, 'mv_state', None) or {}
+        marks = st.get('marks')
+        if marks is None:
+            try:
+                if not (hasattr(self, 'mv_marks') and bool(self.mv_marks.get())):
+                    return ''
+            except Exception:
+                return ''
+            marks = self._mv_marks_data()
+        mk = [m for m in marks if (m['x'], m['y']) == (x, y)]
+        if not mk:
+            return ''
+        bits = []
+        for m in mk[:4]:
+            bits.append('%08X → %s（挂 %d）'
+                        % (m['cell_key'], m.get('trigger_name') or m.get('trigger') or '?',
+                           m['count']))
+        more = '　等 %d 个' % len(mk) if len(mk) > 4 else ''
+        return '　★单元标记：%d 个（%s%s）' % (len(mk), '、'.join(bits), more)
+
     def _mv_info_text(self, x, y):
         """选中格的信息栏文本 —— 鼠标点选与「定位」共用（§SOV11 抽出来，避免两套文案）。"""
         import map_render as mr
@@ -1357,6 +1637,10 @@ class MapViewPage(object):
             wps = [n for n, c in wp.items() if c == (x, y)]
             if wps:
                 head += '　路径点：%s' % ','.join(str(n) for n in wps)
+            try:
+                head += self._mv_mark_text(x, y)
+            except Exception:
+                pass
             W, H = self._mv_cell_space()
             head += ('\n（未挂地图：按存档坐标 %d×%d 画网格；放置建筑可直接用触发法，'
                      '不依赖地图）' % (W, H))
@@ -1370,6 +1654,10 @@ class MapViewPage(object):
                 head += '　路径点（地图定义）：%s' % ','.join(str(n) for n in a1)
             if a2:
                 head += '　路径点（只有存档里）：%s' % ','.join(str(n) for n in a2)
+        except Exception:
+            pass
+        try:
+            head += self._mv_mark_text(x, y)
         except Exception:
             pass
         try:

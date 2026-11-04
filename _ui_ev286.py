@@ -38,7 +38,13 @@ ck(st.theme_use() == 'clam', 'clam 打底')
 ck(int(st.lookup('Treeview', 'rowheight')) == 26, 'Treeview 行高 26')
 ck(st.lookup('Primary.TButton', 'background') == ui_theme.T['rail'],
    '主按钮用板岩底（%s）' % st.lookup('Primary.TButton', 'background'))
-ck(st.lookup('Treeview.Heading', 'relief') == 'flat', '表头扁平（无 3D 斜边）')
+# ★§SOV12：layout 里带上 Treeheading.border 之后，lookup 返回的是 Tcl 的 index 对象
+#   而不是 str ⇒ 用 str() 比。并额外钉住"表头有文字元素"——之前 layout 只写
+#   Treeheading.cell（无 children）导致**全工具所有表格都没有列标题**。
+_rel = st.lookup('Treeview.Heading', 'relief')
+ck(str(_rel) == 'flat', '表头扁平（无 3D 斜边）：%r' % (_rel,))
+ck('Treeheading.text' in str(st.layout('Treeview.Heading')),
+   '★表头 layout 里有 Treeheading.text（不会整行消失）')
 ck(app.cget('bg') == ui_theme.T['canvas'], '窗口底色 = canvas token')
 
 # ①b 滚动条对比度（玩家：「这两个拖动地图的条 色差太小了 看不清」）
