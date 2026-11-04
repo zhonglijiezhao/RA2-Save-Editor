@@ -27,7 +27,8 @@ from fa2_tables import (EVENT_TYPES, ACTION_TYPES,     # noqa: E402
                         event_name, event_ptype, action_name, action_ptype,
                         event_note, action_note,
                         SCRIPT_ACTIONS, SCRIPT_PARAM_TYPES,
-                        script_action_name, script_action_ptype)
+                        script_action_name, script_action_ptype,
+                        crate_name, CRATE_TYPES)
 from map_ini import MapIni, find_maps                  # noqa: E402
 
 # ---- 事件 / 行为对象：用「对象签名」确定性定位（2026-10-13 定案）----
@@ -64,7 +65,13 @@ OBJ_CLASS_EVENT = 0x4F0EC393
 #   ⇒ 运行期字段 +0x90 ↔ 存档记录 +0xA4（差 0x14 记录头，与 类型 +0x2C↔+0x40 同理）
 # ⚠ 写错到 +72 时引擎读 +164 得 0 ⇒ **永远去设置变量 0**，看起来"设了但检查的那个变量没动"。
 ACT_VAR_OFF = 164
-ACTION_VAR_TYPES = (56, 57)
+ACTION_VAR_TYPES = (56, 57)          # 变量型（参数 = 局部变量号）
+# ★★§SOV16（2026-11-04 玩家："触发 108 的行为列表为空…把 108 的所有行为都填上了"）：
+#   `108 创建工具箱` 的**奖励箱类型参数也在 `+164`**，不在默认的 `+72`。
+#   实证 SAVE2CD6 的 01000005：17 条 108 行为，`+72` 恒 0，而 `+164` 恰好是
+#   0,1,2,3,4,6,7,…,17（地编里那个"0-本钱全移回己方 … 17-一片矿"下拉）。
+#   ⇒ 读/写都走 +164 的类型集合 = 变量型 + 108。
+ACT_ARG164_TYPES = ACTION_VAR_TYPES + (108,)
 
 # ---- ★★§SOV07（2026-11-04 玩家样本 SAVE6443 + all01umd.map）：**「触发型」行为的参数不在 +72** ----
 # 地编 ptype=14 的那几个行为（12 摧毁触发 / 22 强制触发 / 53 允许触发 / 54 禁止触发 /
@@ -2089,7 +2096,7 @@ class SaveDoc(object):
         # §175：行为 56/57 的真正参数是 +164 的变量号；+72 恒 0（引擎也不看）
         pl = self.plain
         for d in out:
-            if d.get('type') in ACTION_VAR_TYPES:
+            if d.get('type') in ACT_ARG164_TYPES:
                 o = d.get('obj')
                 if o is not None and o + ACT_VAR_OFF + 4 <= len(pl):
                     v = int.from_bytes(pl[o + ACT_VAR_OFF:o + ACT_VAR_OFF + 4], 'little')
@@ -2495,6 +2502,13 @@ class SaveDoc(object):
 
     def _mk(self, kind, o):        # ★改成实例方法：参数文案要用到阵营顺序（house_order）
         t, v = o['type'], o['arg']
+        # ★§SOV16：108（创建工具箱）的参数在 `+164`，全局行为表扫描时读的是 `+72`（恒 0）
+        #   ⇒ 统一在这里改读，否则 `arg_text` 会把每条都显示成 0 号奖励箱。
+        if kind == 'action' and t in ACT_ARG164_TYPES:
+            try:
+                v = struct.unpack_from('<I', self.plain, o['obj'] + ACT_VAR_OFF)[0]
+            except Exception:
+                pass
         raw = v
         # ★★§SOV01（2026-11-03）：引擎用 `-1`（= 0xFFFFFFFF）表示"这个参数没有设置"。
         #   SOV01UMD.sav 的 01000211 / 01000213 两条事件就是这种（地图 INI 里也写 -1）。
@@ -3858,6 +3872,9 @@ class SaveDoc(object):
             return '所属方#%d' % v
         if ptype == 6:
             return str(v)
+        if ptype == 31:
+            # ★§SOV16：地编 ptype=31 = 「奖励箱类型」（108 创建工具箱 用的那个下拉）
+            return crate_name(v)
         if ptype == 7:                     # ★§283.9 小队型：翻成「ID 名称」（走缓存表）
             lab = self._team_label_map().get(v)
             if lab:
@@ -4011,7 +4028,14 @@ class SaveDoc(object):
             # ★§SOV01：-1 = 引擎的"未设置"哨兵（存档里存成 0xFFFFFFFF），允许原样写回。
             if not (-1 <= arg <= 0xFFFFFF):
                 raise ValueError('参数需在 0 ~ 16777215 之间（或 -1 = 未设置）')
-            self.plain[off + 8:off + 12] = (arg & 0xFFFFFFFF).to_bytes(4, 'little')
+            # ★§SOV16：56/57（局部变量）与 108（奖励箱类型）的参数在对象 **+164**，
+            #   不是默认的 +72。`off` 是"类型字段"= 对象+64 ⇒ +164 就是 off + 100。
+            if ac.get('type') in ACT_ARG164_TYPES:
+                _rel = ACT_VAR_OFF - OBJ_TYPE_OFF
+                self.plain[off + _rel:off + _rel + 4] = \
+                    (arg & 0xFFFFFFFF).to_bytes(4, 'little')
+            else:
+                self.plain[off + 8:off + 12] = (arg & 0xFFFFFFFF).to_bytes(4, 'little')
             ac['arg'] = arg
         # ★§255：行为 80/107 的「小队键」（对象 +0x44 = off+4）与「路径点」（对象 +0x58 = off+0x18）
         if team is not None:
@@ -4031,7 +4055,12 @@ class SaveDoc(object):
                 (tk & 0xFFFFFFFF).to_bytes(4, 'little')
             ac['trigger_key'] = tk
             ac['trigger'] = self._instance_maps()['sid'].get(tk)
-        ac['arg_text'] = self._arg_text(ac['ptype'], ac['arg'])
+        # ★§SOV16：`ac` 可能来自 `trigger_actions()`（没有 ptype）—— 别直接取键，
+        #   按类型名反推参数类型即可（以前这里 KeyError，CLI/自检传 trigger_actions 的项就炸）。
+        _pt = ac.get('ptype')
+        if _pt is None:
+            _pt = action_ptype(ac.get('type', 0))
+        ac['arg_text'] = self._arg_text(_pt, ac['arg'])
         self.pending_actions[off] = (ac['type'], ac['arg'])
         return ac
 
@@ -14761,7 +14790,7 @@ class SaveDoc(object):
             wp = struct.unpack_from('<I', pl, a + 88)[0]
             atp = struct.unpack_from('<I', pl, a + OBJ_TYPE_OFF)[0]
             argv = struct.unpack_from('<I', pl, a + OBJ_ARG_OFF)[0]
-            if atp in ACTION_VAR_TYPES:          # §175：56/57 的变量号在 +164
+            if atp in ACT_ARG164_TYPES:          # §175：56/57 的变量号在 +164
                 argv = struct.unpack_from('<I', pl, a + ACT_VAR_OFF)[0]
             # ★§255：行为 80/107（援军 / 超时空援军）的**小队键在 `+0x44`**
             #   （`+0x48` 不是！§218 实证）。这里统一回填，触发编辑器才能反查出小队名。
@@ -14884,7 +14913,7 @@ class SaveDoc(object):
             pl = self.plain
             struct.pack_into('<I', pl, a + OBJ_TYPE_OFF, ac_type)
             if ac_arg is not None:
-                if ac_type in ACTION_VAR_TYPES:      # §175：56/57 变量号在 +164
+                if ac_type in ACT_ARG164_TYPES:      # §175：56/57 变量号在 +164
                     struct.pack_into('<I', pl, a + OBJ_ARG_OFF, 0)
                     struct.pack_into('<I', pl, a + ACT_VAR_OFF, int(ac_arg) & 0xFFFFFFFF)
                 else:
@@ -15196,7 +15225,7 @@ class SaveDoc(object):
             patch(a_, 56, u32v(ac_ord))                # ★行为表内序号（max+1，§219）
             patch(a_, OBJ_TYPE_OFF, u32v(ac_type))
             patch(a_, OBJ_ARG_OFF, u32v(ac_arg))
-            if ac_type in ACTION_VAR_TYPES:      # §175：56/57 的变量号在 +164
+            if ac_type in ACT_ARG164_TYPES:      # §175：56/57 的变量号在 +164
                 patch(a_, OBJ_ARG_OFF, u32v(0))
                 patch(a_, ACT_VAR_OFF, u32v(ac_arg & 0xFFFFFFFF))
         # ★2026-10-17：行为 125「将建筑建于…」的两个专有参数（其它行为不传即不写）：
@@ -17007,7 +17036,7 @@ class SaveDoc(object):
         buf[self.ACTION_NEXT_OFF:self.ACTION_NEXT_OFF + 4] = b'\x00' * 4
         buf[OBJ_TYPE_OFF:OBJ_TYPE_OFF + 4] = struct.pack('<I', atype)
         buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', arg)
-        if atype in ACTION_VAR_TYPES:
+        if atype in ACT_ARG164_TYPES:
             buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', 0)
             buf[ACT_VAR_OFF:ACT_VAR_OFF + 4] = struct.pack('<I', arg & 0xFFFFFFFF)
         if atype in ACTION_TRIG_TYPES:

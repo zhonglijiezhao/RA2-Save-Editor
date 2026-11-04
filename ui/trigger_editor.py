@@ -1264,6 +1264,15 @@ class TriggerEditor(tk.Toplevel):
     def _fill_arg_values(self, combo, ptype, cur):
         """按参数类型给参数下拉填候选值（所属方型 = 阵营顺序，0 恒为玩家自己）。"""
         try:
+            if ptype == 31:
+                # ★§SOV16：地编 ptype=31 = 「奖励箱类型」（108 创建工具箱 的参数）。
+                #   值实测存在行为对象 +164，不是 +72。
+                from fa2_tables import CRATE_TYPES
+                vals = ['%d %s' % (k, CRATE_TYPES[k]) for k in sorted(CRATE_TYPES)]
+                combo['values'] = vals
+                if isinstance(cur, int) and 0 <= cur < len(vals):
+                    combo.set(vals[cur])
+                return
             if ptype == 14:
                 # ★§SOV07：触发型（53 允许触发 / 54 禁止触发 / 12 摧毁触发 / 22 强制触发）
                 ch = self._trig_choices()
@@ -1522,6 +1531,10 @@ class TriggerEditor(tk.Toplevel):
                     elif pt == 14:
                         nt = ('触发型：参数 = 目标触发（存档里存在行为对象 +100 的实例键，'
                               '不是 +72）—— 选「自己」就是"这条触发跑完把自己禁掉"') + \
+                             ('　' + nt if nt else '')
+                    elif pt == 31:
+                        nt = ('奖励箱类型：0 本钱全移回己方 / 1 随机单位 / … / 17 一片矿'
+                              '（实测存在行为对象 +164，不是 +72）') + \
                              ('　' + nt if nt else '')
         except Exception:
             pass
