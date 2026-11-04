@@ -363,8 +363,21 @@ class TriggersPage(object):
                 except Exception:
                     _rep = None
                 _rep_text = getattr(self.doc, 'REPEAT_TEXT', {})
+                # ★§SOV09（玩家 2026-11-04 总结）：这个坑只有一句 ——
+                #   **进入事件 + 挂接多个对象 + 重复类型 1 ⇒ 永不执行**（其余持久性都正常）。
+                #   以前列表只在"触发类型"列挂个光秃秃的 ⚠，得点开才知道为什么；
+                #   现在状态列直接写清楚，扫一眼就能把这批触发挑出来。
+                _pit = ''
+                if _rep == '1':
+                    try:
+                        _pit = self.doc.repeat_pitfall(r.sid, '1') or ''
+                    except Exception:
+                        _pit = ''
                 rt = rtmap.get(r.sid)
-                if blkmap.get(r.sid):
+                if _pit.startswith('⚠ 已知 BUG'):
+                    rts = '进入事件挂多个 + 持久1 ⇒ 永不执行'
+                    st_key = '永不执行'
+                elif blkmap.get(r.sid):
                     _bn = blkmap[r.sid]
                     rts = '上级已禁用·永不触发（%s）' % _bn
                     st_key = '已禁用'
@@ -420,14 +433,16 @@ class TriggersPage(object):
                 # ★§SOV03：从触发没有自己的标签，类型/状态都借链头的 ⇒ 标「共用」
                 if shared.get(r.sid) and _rep:
                     rep_cell = '（共用）' + rep_cell
-                # ★§158：持久性 1 的两种坑（挂 0 个对象 / 进入事件挂多个对象）
-                #   直接在"触发类型"列打 ⚠，不用点开也能看见。只对 1 判，避免拖慢列表。
-                if _rep == '1':
-                    try:
-                        if self.doc.repeat_pitfall(r.sid, '1'):
-                            rep_cell += ' ⚠'
-                    except Exception:
-                        pass
+                # ★§158：持久性 1 的坑在"触发类型"列也打个 ⚠（_pit 上面已经算好）
+                if _pit:
+                    rep_cell += ' ⚠'
+                # ★§SOV09（玩家 2026-11-04 总结）：这个坑只有一句 ——
+                #   **进入事件 + 挂接多个对象 + 重复类型 1 ⇒ 永不执行**（其余持久性都正常）。
+                #   以前列表只在"触发类型"列挂一个光秃秃的 ⚠，得点开才知道为什么；
+                #   现在状态列直接写清楚，扫一眼就能把这批触发挑出来。
+                if _pit.startswith('⚠ 已知 BUG'):
+                    rts = '进入事件挂多个 + 持久1 ⇒ 永不执行'
+                    st_key = '永不执行'
                 ntags = len(tags_of.get(r.sid, ()))
                 tags_cell = ('%d' % ntags) if ntags else '—'
                 if shared.get(r.sid) and not ntags:
@@ -598,6 +613,8 @@ class TriggersPage(object):
             extra = '｜已执行 %d · 等待 %d · 已禁用 %d · 未启用 %d · 无组件 %d' % (
                 c.get('已执行', 0), c.get('等待', 0), c.get('已禁用', 0),
                 c.get('未启用', 0), c.get('无组件', 0))
+            if c.get('永不执行'):
+                extra += ' · ⚠ 注定不执行 %d' % c['永不执行']
             self.lbl_trig_count.config(
                 text='显示 %d / %d 条%s%s' % (shown, len(rows),
                                             '' if show_tags else '（标签已隐藏）', extra))
@@ -1707,6 +1724,8 @@ class TriggersPage(object):
                             '**7 被任一所属方摧毁 = 只算摧毁**（碎片伤害/占领/变卖/心控都不算）；'
                             '**29 = 摧毁/占领/心控/变卖都算，不含"渗透后消失"**；'
                             '**48 = 摧毁/占领/心控/变卖都算，可用于有子机的单位**。\n'
+                            '★一句话记住那个 BUG：**进入事件 + 挂接多个建筑 + 重复类型 1 ⇒ 永不执行**；\n'
+                            '   重复类型 0 / 2 挂多少个都正常（任一进入即满足，挂单元标记同理）。\n'
                             '★两个坑：① **挂接 0 个对象**（地图触发）写 1 ⇒ 永远减不到 0 ⇒ 永不触发；'
                             '② **进入事件（1）挂多个对象**写 1 ⇒ 进入不会摘对象、计数不降 ⇒'
                             '**已知 BUG，永不执行** ——'

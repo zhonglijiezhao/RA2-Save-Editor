@@ -3259,6 +3259,14 @@ class SaveDoc(object):
                         '最后一次执行' % (r['old'], live, live)}
 
     def repeat_pitfall(self, sid, persistence=None, attached=None):
+        """持久性选择的**坑**提示串（'' = 没问题）。
+
+        ★§SOV09：这些字符串会原样进 tkinter 的 messagebox（不认 markdown）⇒
+          这里统一去掉 `**` 强调，免得玩家看到一堆星号。
+        """
+        return (self._repeat_pitfall_raw(sid, persistence, attached) or '').replace('**', '')
+
+    def _repeat_pitfall_raw(self, sid, persistence=None, attached=None):
         """持久性选择的**坑**提示串（'' = 没问题）。GUI 写盘前弹确认用。
 
         ★§158 定案（持久性 1 = 计数型，见上面注释）：
