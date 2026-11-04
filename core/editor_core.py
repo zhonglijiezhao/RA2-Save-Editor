@@ -84,28 +84,42 @@ ACT_ARG164_TYPES = ACTION_VAR_TYPES + (108,)
 ACT_ARG164_PTYPES = frozenset((3, 6, 31))
 
 
-def action_arg_off(atype):
-    """行为参数相对**对象起点**的偏移：`+164`（ptype 3/6/31）或 `+72`（其余）。
+# 实测（6 个档 2064 个行为对象）：只有这 2 个类型把参数放 `+72`，其余 41 种全在 `+164`；
+# 而且**没有任何一条**是 +72/+164 同时非 0 ⇒ 可以用"现场哪个非 0 就认哪个"来定位。
+#   · 40  调整玩家视野大小（+72=4，+164=0）
+#   · 609 设置雷达模式（Phobos）
+ACTION_ARG72_TYPES = frozenset((40, 609))
 
-    以前只有"56/57 + 108"三个类型号写死在 `ACT_ARG164_TYPES` 里，漏掉了整个
-    ptype=6 数值家族（最典型的就是「27 计时设置」）⇒ 参数写到 +72、引擎读 +164。
+
+def action_arg_off(atype, v72=None, v164=None):
+    """行为参数相对**对象起点**的偏移 —— `+72` 还是 `+164`。
+
+    ★★§SOV19（2026-11-04，跨 6 档 2064 条行为实测）：
+      · 地编/引擎把参数写在 **+164** 的占绝大多数（590 条、41 种类型）；
+      · 只有 4 条（`40 调整玩家视野大小`、`609 设置雷达模式`）在 +72；
+      · **0 条**是两个字段同时非 0。
+    ⇒ 规则：现场 `+164` 非 0 就用它；只有 `+72` 非 0 就沿用 +72；
+      两者都是 0（新建）时，除 `ACTION_ARG72_TYPES` 外一律写 +164。
+
+    以前"参数 = +72"是错的：`27 计时设置` 的 600、`99 播放音效在…` 的音效号、
+    `108 创建工具箱` 的奖励箱类型、`56/57` 的变量号全在 +164，
+    工具却读/写 +72 ⇒ 界面上参数显示 0、改了不起作用（玩家就是这样发现"不触发"的）。
     """
+    if v164:
+        return ACT_VAR_OFF
+    if v72:
+        return OBJ_ARG_OFF
     try:
-        if action_ptype(int(atype)) in ACT_ARG164_PTYPES:
-            return ACT_VAR_OFF
+        if int(atype) in ACTION_ARG72_TYPES:
+            return OBJ_ARG_OFF
     except Exception:
         pass
-    try:
-        if int(atype) in ACT_ARG164_TYPES:
-            return ACT_VAR_OFF
-    except Exception:
-        pass
-    return OBJ_ARG_OFF
+    return ACT_VAR_OFF
 
 
-def action_arg_is_164(atype):
-    """这个行为类型的参数是否在对象 `+164`（而不是默认的 `+72`）。"""
-    return action_arg_off(atype) == ACT_VAR_OFF
+def action_arg_is_164(atype, v72=None, v164=None):
+    """这个行为的参数是否在对象 `+164`（传现场值可让判断更准）。"""
+    return action_arg_off(atype, v72, v164) == ACT_VAR_OFF
 
 # ---- ★★§SOV07（2026-11-04 玩家样本 SAVE6443 + all01umd.map）：**「触发型」行为的参数不在 +72** ----
 # 地编 ptype=14 的那几个行为（12 摧毁触发 / 22 强制触发 / 53 允许触发 / 54 禁止触发 /
@@ -2127,15 +2141,18 @@ class SaveDoc(object):
             return self._actions
         acts, _ = self._split_tables()
         out = [self._mk('action', o) for o in acts]
-        # §175：行为 56/57 的真正参数是 +164 的变量号；+72 恒 0（引擎也不看）
+        # §175/§SOV19：参数在 +164 的行为顺带把 `var` 也填上（56/57 用它显示变量名）。
+        #   ★判据用"现场值"，且只在 +164 确实是这个行为的参数时才覆盖 `arg`
+        #   （否则会把 40/609 这类写在 +72 的行为的 arg 冲成 0）。
         pl = self.plain
         for d in out:
-            if action_arg_is_164(d.get('type')):
-                o = d.get('obj')
-                if o is not None and o + ACT_VAR_OFF + 4 <= len(pl):
-                    v = int.from_bytes(pl[o + ACT_VAR_OFF:o + ACT_VAR_OFF + 4], 'little')
-                    d['var'] = v
-                    d['arg'] = v
+            o = d.get('obj')
+            if o is None or o + ACT_VAR_OFF + 4 > len(pl):
+                continue
+            v164 = int.from_bytes(pl[o + ACT_VAR_OFF:o + ACT_VAR_OFF + 4], 'little')
+            if action_arg_off(d.get('type'), d.get('arg_raw'), v164) == ACT_VAR_OFF:
+                d['var'] = v164
+                d['arg'] = v164
         self._actions = out
         return out
 
@@ -2536,11 +2553,16 @@ class SaveDoc(object):
 
     def _mk(self, kind, o):        # ★改成实例方法：参数文案要用到阵营顺序（house_order）
         t, v = o['type'], o['arg']
-        # ★§SOV16：108（创建工具箱）的参数在 `+164`，全局行为表扫描时读的是 `+72`（恒 0）
-        #   ⇒ 统一在这里改读，否则 `arg_text` 会把每条都显示成 0 号奖励箱。
-        if kind == 'action' and action_arg_is_164(t):
+        # ★★§SOV19：参数到底在 +72 还是 +164 —— 看**现场哪个非 0**（跨 6 档 2064 条实测：
+        #   590 条在 +164、4 条在 +72、0 条两者同时非 0）。
+        #   以前这里只对 ptype 3/6/31 改读 +164，于是「99 播放音效在…」的音效号、
+        #   「30 造成伤害」的数值、「2 所属方」的归属……在界面上全显示成 0。
+        if kind == 'action':
             try:
-                v = struct.unpack_from('<I', self.plain, o['obj'] + ACT_VAR_OFF)[0]
+                _v72 = struct.unpack_from('<I', self.plain, o['obj'] + OBJ_ARG_OFF)[0]
+                _v164 = struct.unpack_from('<I', self.plain, o['obj'] + ACT_VAR_OFF)[0]
+                if action_arg_off(t, _v72, _v164) == ACT_VAR_OFF:
+                    v = _v164
             except Exception:
                 pass
         raw = v
@@ -4068,7 +4090,9 @@ class SaveDoc(object):
             #   写一边的同时**把另一边清 0**：以前 27「计时设置」的 600 落在 +72，
             #   引擎读 +164 得 0，右下角就没有倒计时（玩家的实测现象）。
             _rel = ACT_VAR_OFF - OBJ_TYPE_OFF
-            if action_arg_is_164(ac.get('type')):
+            _cur72 = struct.unpack_from('<I', self.plain, off + 8)[0]
+            _cur164 = struct.unpack_from('<I', self.plain, off + _rel)[0]
+            if action_arg_off(ac.get('type'), _cur72, _cur164) == ACT_VAR_OFF:
                 self.plain[off + _rel:off + _rel + 4] = \
                     (arg & 0xFFFFFFFF).to_bytes(4, 'little')
                 self.plain[off + 8:off + 12] = b'\x00\x00\x00\x00'
@@ -14828,9 +14852,10 @@ class SaveDoc(object):
                 break
             wp = struct.unpack_from('<I', pl, a + 88)[0]
             atp = struct.unpack_from('<I', pl, a + OBJ_TYPE_OFF)[0]
-            argv = struct.unpack_from('<I', pl, a + OBJ_ARG_OFF)[0]
-            if action_arg_is_164(atp):            # §SOV19：ptype 3/6/31 的参数在 +164
-                argv = struct.unpack_from('<I', pl, a + ACT_VAR_OFF)[0]
+            _v72 = struct.unpack_from('<I', pl, a + OBJ_ARG_OFF)[0]
+            _v164 = struct.unpack_from('<I', pl, a + ACT_VAR_OFF)[0]
+            # ★§SOV19：按**现场**哪个非 0 取（2064 条实测：590 在 +164、4 在 +72、0 条两者同时非 0）
+            argv = (_v164 if action_arg_off(atp, _v72, _v164) == ACT_VAR_OFF else _v72)
             # ★§255：行为 80/107（援军 / 超时空援军）的**小队键在 `+0x44`**
             #   （`+0x48` 不是！§218 实证）。这里统一回填，触发编辑器才能反查出小队名。
             # ★§283.9：4/5/7 也是小队型（小队键同样在 +0x44），别只认 80/107

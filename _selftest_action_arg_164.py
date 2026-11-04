@@ -48,13 +48,20 @@ def argpair(d, act_off):
 DJ = r'E:\YURI\地编写触发.SAV'      # 地编写入、游戏内正常
 TMP = os.path.join(tempfile.gettempdir(), '_sov19_arg164.SAV')
 
-print('== A. 判据表（按 ptype）==')
-cases = [(23, 72), (24, 72), (16, 72), (125, 72), (40, 72), (80, 72),
+print('== A. 判据表（默认 +164，只有 40/609 用 +72）==')
+cases = [(40, 72), (609, 72),
+         (23, 164), (24, 164), (16, 164), (125, 164), (80, 164), (99, 164),
          (25, 164), (26, 164), (27, 164), (73, 164), (110, 164), (127, 164),
          (139, 164), (142, 164), (56, 164), (57, 164), (108, 164)]
 bad = [(t, w, action_arg_off(t)) for t, w in cases if action_arg_off(t) != w]
-chk(not bad, '17 个类型的位置全对（23/24/16/125/40/80 → +72；25/26/27/73/110/127/139/142/56/57/108 → +164）', bad)
-chk(action_arg_is_164(27) and not action_arg_is_164(23), 'is_164：27 是、23 不是')
+chk(not bad, '19 个类型的默认位置全对（40/609 → +72；其余 → +164）', bad)
+chk(action_arg_is_164(27) and not action_arg_is_164(40), 'is_164：27 是、40 不是')
+
+print('\n== A2. 现场值优先（2064 条实测：0 条两者同时非 0）==')
+chk(action_arg_off(27, 0, 600) == 164, '27 现场 +164=600 → +164')
+chk(action_arg_off(40, 4, 0) == 72, '40 现场 +72=4 → +72')
+chk(action_arg_off(23, 0, 7) == 164, '23 现场只有 +164=7 → +164（地编写法）')
+chk(action_arg_off(23, 7, 0) == 72, '23 现场只有 +72=7 → +72（沿用老位置）')
 
 print('\n== B. 读地编档（游戏内 600 秒倒计时的真身）==')
 if os.path.exists(DJ):
@@ -99,12 +106,12 @@ chk(p72 == 0 and p164 == 600, '改回 600 → 仍是 (+72=0, +164=600)', (p72, p
 chk(bytes(d.plain[off27:off27 + ACTION_SIZE]) == before[0],
     '★改回原值 ⇒ 该行为对象逐字节复原')
 
-print('\n== D. 非 164 类型不被带歪（23 仍写 +72）==')
+print('\n== D. 两格都为 0 时按默认写 +164 ==')
 a23 = d.trigger_actions('01000007')[0]
 off23 = a23['action_off']
 d.set_action(a23, arg=7)
 p72, p164 = argpair(d, off23)
-chk(p72 == 7 and p164 == 0, '行为 23 写 7 → (+72=7, +164=0)', (p72, p164))
+chk(p72 == 0 and p164 == 7, '行为 23（原来两格都是 0）写 7 → (+72=0, +164=7)，按默认 +164', (p72, p164))
 d.set_action(d.trigger_actions('01000007')[0], arg=0)
 
 print('\n== E. add_action(27, 600) 也写 +164 ==')
