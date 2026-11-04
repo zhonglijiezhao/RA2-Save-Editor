@@ -180,7 +180,7 @@ class TriggerEditor(tk.Toplevel):
         self.btn_clrflag.pack(side='right', padx=(4, 0))
 
         # ===== 事件设置（§174：可多条，与地编一致） =====
-        ev = ttk.Labelframe(self, text='事件设置（可多条 · 同一触发内的多个事件**恒为 AND**）',
+        ev = ttk.Labelframe(self, text='事件设置（可多条 · 同一触发内的多个事件恒为 AND）',
                             padding=8)
         ev.pack(fill='x', padx=8, pady=4)
         r4 = ttk.Frame(ev)
@@ -433,14 +433,24 @@ class TriggerEditor(tk.Toplevel):
         rp = det['repeat'] or '0'
         self.cb_rep.current(int(rp) if rp in ('0', '1', '2') else 0)
         # ★§158：持久性 1 是"计数型"，两种坑要实时提示
+        # ★★§SOV09（2026-11-04 玩家纠正）：**"进入事件挂多个对象"只有持久 1 才有问题**。
+        #   持久 0 / 2 时，挂多少个对象都只是"任意一个进入就满足"，完全正常
+        #   （挂到单元标记上同理）。以前这句红字不分持久性一律弹，把正常写法报成"永不执行"。
         tip, col = '', ui_theme.T['danger']
         try:
             natt = det['attached'] or 0
             etypes = [e['type'] for e in self.doc.trigger_event_list(sid)]
-            if 1 in etypes and natt >= 2:
-                tip = '⚠ 进入事件挂 %d 个对象：持久1 是已知 BUG（永不执行）' % natt
-            elif natt == 0:
+            if rp == '1' and 1 in etypes and natt >= 2:
+                tip = '⚠ 进入事件 + 持久1 挂 %d 个对象：已知 BUG（永不执行）' % natt
+            elif rp in ('0', '2') and 1 in etypes and natt >= 2:
+                tip = ('进入事件挂 %d 个对象 · 重复类型 %s ⇒ 任意一个进入就满足（正常写法）'
+                       % (natt, rp))
+                col = ui_theme.T['muted']
+            elif natt == 0 and rp == '1':
                 tip = '⚠ 挂接 0 个对象：持久1 永不触发'
+                col = ui_theme.T['muted']
+            elif natt == 0:
+                tip = '挂接 0 个对象：没有东西能"进入"它 ⇒ 不会被满足（先挂到建筑/单元标记上）'
                 col = ui_theme.T['muted']
             elif len([t for t in etypes if t != 8]) > 1 and rp == '1':
                 # ★§163/§166：离场记账被"还没满足的其它事件"卡住（8 任何事件恒真，不算）
@@ -458,7 +468,7 @@ class TriggerEditor(tk.Toplevel):
         if det['has_node']:
             state += ' · TagNode ✓'
         if det['has_cell']:
-            state += ' · CellTag ✓（挂接 %d 栋）' % det['attached']
+            state += ' · CellTag ✓ · %s' % self._attach_text(det)
         if det['ticks']:
             state += ' · 计时 %g 秒' % (det['ticks'] / 15.0)
         # ★§159/§160：运行期状态（CellTag 节点消失 = 已执行的唯一可靠指纹）
@@ -480,8 +490,12 @@ class TriggerEditor(tk.Toplevel):
                     #   "仍在定时表 + 帧数归零"（详见 runtime_status 文档）
                     state += ' · ✔ 已执行（计时已归零，引擎仍留着条目）'
                 else:
-                    state += (' · 未执行（节点还在，剩余挂载 %s）'
-                              % (_rs['remain'] if _rs['remain'] is not None else '—'))
+                    if det.get('repeat') == '0':
+                        # ★§SOV09：持久 0 不记数，没有"剩余挂载"这回事
+                        state += ' · 未执行（节点还在；持久0 不计数，任一挂接满足即执行一次）'
+                    else:
+                        state += (' · 未执行（节点还在，剩余挂载 %s）'
+                                  % (_rs['remain'] if _rs['remain'] is not None else '—'))
                 if _rs['ev_fired']:
                     state += '·事件已满足'
                 # 持久 1 才有意义：把"还差几个"直接摆出来
@@ -942,8 +956,19 @@ class TriggerEditor(tk.Toplevel):
                         parts.append('⚠ 本条的事件要挂接对象（进入/摧毁…）⇒ 挂接对象来自'
                                      '上级的标签，上级被禁用/删除就不触发')
                 deps = self.doc.trigger_dependents(sid)
+                down_all = self.doc.trigger_downstream(sid)
                 if deps:
                     parts.append('⚠ 禁用/删除本条 ⇒ 下面 %d 条（无标签的）一起失效' % len(deps))
+                elif down_all:
+                    # 下级都"有自己的标签"或"根本没有事件对象" —— 都比"被拖死"更准确地说清楚
+                    n_own = sum(1 for x in down_all if self.doc.trigger_has_own_tag(x))
+                    n_empty = len(down_all) - n_own - len(deps)
+                    bits = []
+                    if n_own:
+                        bits.append('%d 条有自己的标签（不受影响）' % n_own)
+                    if n_empty:
+                        bits.append('%d 条没有事件对象（本来就空转，不会触发）' % n_empty)
+                    parts.append('下级：' + '、'.join(bits))
                 elif up:
                     parts.append('本条是链尾')
             except Exception:
@@ -1077,6 +1102,28 @@ class TriggerEditor(tk.Toplevel):
             return
         self.after_change('清 CellTag 标志 %s → (0, 0)' % (r['old'],))
 
+    def _attach_text(self, det):
+        """CellTag 挂接说明 —— 挂接点**不一定都是建筑**（单元标记常常是空地格）。
+
+        ★§SOV09（2026-11-04 玩家指出）：这个档的触发挂在 18 个**单元标记**上，
+          以前一律写成"挂接 18 栋"，看着像 18 栋楼。
+        """
+        n = int(det.get('attached') or 0)
+        nb = 0
+        try:
+            tk = (self.doc.trigger_objects(det.get('sid') or '') or {}).get('tag_key')
+            for b in (self.doc.attach_overview() or []):
+                if tk is not None and b.get('tag_key') != tk:
+                    continue
+                nb += len(b.get('buildings') or [])
+        except Exception:
+            nb = 0
+        if n and nb >= n:
+            return '挂接 %d 栋建筑' % n
+        if nb:
+            return '挂接 %d 个（%d 个查到建筑，其余是单元标记/空地）' % (n, nb)
+        return '挂接 %d 个单元标记/空地（本档没查到建筑）' % n
+
     def _refresh_state_only(self):
         """只重刷顶部那一行状态（不重建整个触发列表，保持用户当前选中）。"""
         try:
@@ -1088,7 +1135,7 @@ class TriggerEditor(tk.Toplevel):
         if det['has_node']:
             state += ' · TagNode ✓'
         if det['has_cell']:
-            state += ' · CellTag ✓（挂接 %d 栋）' % det['attached']
+            state += ' · CellTag ✓ · %s' % self._attach_text(det)
         vmap = {'executed': ' · ✔ 已执行（挂载数归零、标签已销毁）',
                 'fired': ' · ✔ 已执行（计时已归零，引擎仍留着条目）',
                 'no_tag': ' · 本档无标签对象',
@@ -1098,6 +1145,8 @@ class TriggerEditor(tk.Toplevel):
         elif rs['verdict'] == 'dead':
             state += (' · ⚠ 计数漏账 %d（还写着 %d 个 / 实际存活建筑 %d 个 ⇒ 永不执行）'
                       % (rs['leak'], rs['remain'], rs['live']))
+        elif det.get('repeat') == '0':
+            state += ' · 未执行（节点还在；持久0 不计数，任一挂接满足即执行一次）'
         else:
             state += ' · 未执行（节点还在，剩余挂载 %s）' % rs['remain']
             if det.get('repeat') == '1' and isinstance(rs['remain'], int):

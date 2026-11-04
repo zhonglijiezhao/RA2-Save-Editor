@@ -16071,8 +16071,19 @@ class SaveDoc(object):
         它们按自己的标签执行，上级禁用/删除都不管用。所以警告/确认里只列这些，
         别把整条链都算进去吓人。
         """
-        return [s for s in self.trigger_downstream(sid)
-                if not self.trigger_has_own_tag(s)]
+        out = []
+        for s in self.trigger_downstream(sid):
+            if self.trigger_has_own_tag(s):
+                continue                 # 有自己的标签 ⇒ 不靠链
+            try:
+                # ★§SOV09：连**事件对象都没有**的下级本来就不会触发（空触发），
+                #   别把它算进"会被本条拖死"的名单里（SAVE6784 的 01000004 就是这种）。
+                if not self.trigger_event_list(s):
+                    continue
+            except Exception:
+                pass
+            out.append(s)
+        return out
 
     def trigger_events_self_contained(self, sid):
         """本条的事件**全都不需要挂接对象**吗（流逝时间 13 / 局部变量 36·37）。
