@@ -72,6 +72,40 @@ ACTION_VAR_TYPES = (56, 57)          # 变量型（参数 = 局部变量号）
 #   0,1,2,3,4,6,7,…,17（地编那个"0-大量金钱 … 7-重置黑幕 … 17-一片矿"下拉）。
 #   ⇒ 读/写都走 +164 的类型集合 = 变量型 + 108。
 ACT_ARG164_TYPES = ACTION_VAR_TYPES + (108,)
+# ★★§SOV19（2026-11-04 玩家实测：行为 27「计时设置」填的 600 秒在游戏里不显示）：
+#   **参数在 +164 的不是几个特例，而是按"地编参数类型"整类走的**：
+#     · ptype 3  局部变量（56 设置 / 57 清除）
+#     · ptype 6  **数值型**（25/26 计时器增减、27 计时设置、73 环境照明、110 暂停N秒、
+#                127 全屏超时空、139 中断小地图、142-144 重绘 RGB、76-79 比例…）
+#     · ptype 31 奖励箱类型（108 创建工具箱）
+#   实证：地编档 01000007 的行为 27 = `(+72=0, +164=600)`，而工具写成 `(+72=600, +164=0)`
+#   ⇒ 引擎读 +164 得到 0 ⇒ 右下角没有 600 秒倒计时（玩家就是这样发现"不触发"的）。
+#   SOV01UMD 里行为 127（同为 ptype 6）也是 `(+72=0, +164=60)`，规则一致。
+ACT_ARG164_PTYPES = frozenset((3, 6, 31))
+
+
+def action_arg_off(atype):
+    """行为参数相对**对象起点**的偏移：`+164`（ptype 3/6/31）或 `+72`（其余）。
+
+    以前只有"56/57 + 108"三个类型号写死在 `ACT_ARG164_TYPES` 里，漏掉了整个
+    ptype=6 数值家族（最典型的就是「27 计时设置」）⇒ 参数写到 +72、引擎读 +164。
+    """
+    try:
+        if action_ptype(int(atype)) in ACT_ARG164_PTYPES:
+            return ACT_VAR_OFF
+    except Exception:
+        pass
+    try:
+        if int(atype) in ACT_ARG164_TYPES:
+            return ACT_VAR_OFF
+    except Exception:
+        pass
+    return OBJ_ARG_OFF
+
+
+def action_arg_is_164(atype):
+    """这个行为类型的参数是否在对象 `+164`（而不是默认的 `+72`）。"""
+    return action_arg_off(atype) == ACT_VAR_OFF
 
 # ---- ★★§SOV07（2026-11-04 玩家样本 SAVE6443 + all01umd.map）：**「触发型」行为的参数不在 +72** ----
 # 地编 ptype=14 的那几个行为（12 摧毁触发 / 22 强制触发 / 53 允许触发 / 54 禁止触发 /
@@ -2096,7 +2130,7 @@ class SaveDoc(object):
         # §175：行为 56/57 的真正参数是 +164 的变量号；+72 恒 0（引擎也不看）
         pl = self.plain
         for d in out:
-            if d.get('type') in ACT_ARG164_TYPES:
+            if action_arg_is_164(d.get('type')):
                 o = d.get('obj')
                 if o is not None and o + ACT_VAR_OFF + 4 <= len(pl):
                     v = int.from_bytes(pl[o + ACT_VAR_OFF:o + ACT_VAR_OFF + 4], 'little')
@@ -2504,7 +2538,7 @@ class SaveDoc(object):
         t, v = o['type'], o['arg']
         # ★§SOV16：108（创建工具箱）的参数在 `+164`，全局行为表扫描时读的是 `+72`（恒 0）
         #   ⇒ 统一在这里改读，否则 `arg_text` 会把每条都显示成 0 号奖励箱。
-        if kind == 'action' and t in ACT_ARG164_TYPES:
+        if kind == 'action' and action_arg_is_164(t):
             try:
                 v = struct.unpack_from('<I', self.plain, o['obj'] + ACT_VAR_OFF)[0]
             except Exception:
@@ -4028,14 +4062,19 @@ class SaveDoc(object):
             # ★§SOV01：-1 = 引擎的"未设置"哨兵（存档里存成 0xFFFFFFFF），允许原样写回。
             if not (-1 <= arg <= 0xFFFFFF):
                 raise ValueError('参数需在 0 ~ 16777215 之间（或 -1 = 未设置）')
-            # ★§SOV16：56/57（局部变量）与 108（奖励箱类型）的参数在对象 **+164**，
-            #   不是默认的 +72。`off` 是"类型字段"= 对象+64 ⇒ +164 就是 off + 100。
-            if ac.get('type') in ACT_ARG164_TYPES:
-                _rel = ACT_VAR_OFF - OBJ_TYPE_OFF
+            # ★★§SOV19：参数位置按**地编参数类型**决定（`action_arg_off`）——
+            #   ptype 3/6/31（局部变量 / 数值 / 奖励箱）在对象 **+164**，其余在 +72。
+            #   `off` 是"类型字段"= 对象+64 ⇒ +164 就是 off + 100。
+            #   写一边的同时**把另一边清 0**：以前 27「计时设置」的 600 落在 +72，
+            #   引擎读 +164 得 0，右下角就没有倒计时（玩家的实测现象）。
+            _rel = ACT_VAR_OFF - OBJ_TYPE_OFF
+            if action_arg_is_164(ac.get('type')):
                 self.plain[off + _rel:off + _rel + 4] = \
                     (arg & 0xFFFFFFFF).to_bytes(4, 'little')
+                self.plain[off + 8:off + 12] = b'\x00\x00\x00\x00'
             else:
                 self.plain[off + 8:off + 12] = (arg & 0xFFFFFFFF).to_bytes(4, 'little')
+                self.plain[off + _rel:off + _rel + 4] = b'\x00\x00\x00\x00'
             ac['arg'] = arg
         # ★§255：行为 80/107 的「小队键」（对象 +0x44 = off+4）与「路径点」（对象 +0x58 = off+0x18）
         if team is not None:
@@ -14790,7 +14829,7 @@ class SaveDoc(object):
             wp = struct.unpack_from('<I', pl, a + 88)[0]
             atp = struct.unpack_from('<I', pl, a + OBJ_TYPE_OFF)[0]
             argv = struct.unpack_from('<I', pl, a + OBJ_ARG_OFF)[0]
-            if atp in ACT_ARG164_TYPES:          # §175：56/57 的变量号在 +164
+            if action_arg_is_164(atp):            # §SOV19：ptype 3/6/31 的参数在 +164
                 argv = struct.unpack_from('<I', pl, a + ACT_VAR_OFF)[0]
             # ★§255：行为 80/107（援军 / 超时空援军）的**小队键在 `+0x44`**
             #   （`+0x48` 不是！§218 实证）。这里统一回填，触发编辑器才能反查出小队名。
@@ -14913,7 +14952,7 @@ class SaveDoc(object):
             pl = self.plain
             struct.pack_into('<I', pl, a + OBJ_TYPE_OFF, ac_type)
             if ac_arg is not None:
-                if ac_type in ACT_ARG164_TYPES:      # §175：56/57 变量号在 +164
+                if action_arg_is_164(ac_type):        # §SOV19：ptype 3/6/31 的参数在 +164
                     struct.pack_into('<I', pl, a + OBJ_ARG_OFF, 0)
                     struct.pack_into('<I', pl, a + ACT_VAR_OFF, int(ac_arg) & 0xFFFFFFFF)
                 else:
@@ -15225,7 +15264,7 @@ class SaveDoc(object):
             patch(a_, 56, u32v(ac_ord))                # ★行为表内序号（max+1，§219）
             patch(a_, OBJ_TYPE_OFF, u32v(ac_type))
             patch(a_, OBJ_ARG_OFF, u32v(ac_arg))
-            if ac_type in ACT_ARG164_TYPES:      # §175：56/57 的变量号在 +164
+            if action_arg_is_164(ac_type):        # §SOV19：ptype 3/6/31 的参数在 +164
                 patch(a_, OBJ_ARG_OFF, u32v(0))
                 patch(a_, ACT_VAR_OFF, u32v(ac_arg & 0xFFFFFFFF))
         # ★2026-10-17：行为 125「将建筑建于…」的两个专有参数（其它行为不传即不写）：
@@ -17036,7 +17075,7 @@ class SaveDoc(object):
         buf[self.ACTION_NEXT_OFF:self.ACTION_NEXT_OFF + 4] = b'\x00' * 4
         buf[OBJ_TYPE_OFF:OBJ_TYPE_OFF + 4] = struct.pack('<I', atype)
         buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', arg)
-        if atype in ACT_ARG164_TYPES:
+        if action_arg_is_164(atype):
             buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', 0)
             buf[ACT_VAR_OFF:ACT_VAR_OFF + 4] = struct.pack('<I', arg & 0xFFFFFFFF)
         if atype in ACTION_TRIG_TYPES:
