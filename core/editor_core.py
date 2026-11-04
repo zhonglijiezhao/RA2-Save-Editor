@@ -3914,21 +3914,26 @@ class SaveDoc(object):
         return None
 
     def game_lists(self):
-        """当前存档所在游戏目录里的 rulesmd.ini 列表（动画/粒子等）。
+        """当前存档所在游戏目录里的**游戏侧列表表**（动画/音效/语音/音乐/影片/文本）。
 
         ★★§SOV20（玩家 2026-11-04：「存档是不同任务的存档，用的规则是不同的，
           以游戏下的规则为准」）⇒ **绝不能写死某个目录**：
-          按 `self.path`（存档路径）的目录向上逐级找 `rulesmd.ini` / `rules.ini`，
-          找不到就返回 None（界面上只显示数字，不乱翻）。
-          结果按 (rules 路径, mtime) 缓存，换任务/换 MOD 会自动重新解析。
+          按 `self.path`（存档路径）的目录向上逐级找规则，找不到再自动探测游戏安装目录，
+          最后才返回 None（界面上只显示数字，不乱翻）。
+          结果按 (目录, 指纹) 缓存，换任务/换 MOD 会自动重新解析。
+
+        ★2026-11-04：取文件的活已经全部交给 `game_tables` → `mix_vfs` ——
+          散文件优先，MIX 文件名数字大的优先（expandmd99 > expandmd90），
+          **加密 MIX 也能直接读**（Westwood RSA + Blowfish，纯标准库）。
+          所以玩家装上 exe 就能用，不需要先用 XCC Mixer 把规则解出来。
         """
         import os.path as _osp
         try:
             from game_tables import lists_for_dir
         except Exception:
             return None
-        # ★「以游戏下的规则为准」：优先用 GUI 显式指定的**游戏目录**（线程里那个
-        #   「游戏目录」框 → `set_game_dir`），其次存档所在目录，最后最近打开过的目录。
+        # ★「以游戏下的规则为准」：优先用 GUI 显式指定的**游戏目录**（「游戏目录」框 →
+        #   `set_game_dir`），其次存档所在目录，最后自动探测到的安装目录。
         cands = []
         gd = getattr(type(self), 'GAME_DIR', None)
         if gd:
@@ -3950,6 +3955,20 @@ class SaveDoc(object):
                 data = None
             if data:
                 break
+        if not data:
+            # ★开箱即用：存档放在桌面、游戏装在别的盘时，靠注册表/盘符扫描兜底
+            #   （结果有磁盘缓存，正常启动不会每次都扫盘）。
+            try:
+                import game_ini
+                for d in (game_ini.auto_detect_game_dirs() or []):
+                    try:
+                        data = lists_for_dir(d)
+                    except Exception:
+                        data = None
+                    if data:
+                        break
+            except Exception:
+                data = None
         self._gamelists = (key, data)
         return data
 
@@ -3971,16 +3990,20 @@ class SaveDoc(object):
         if ptype == 31:
             # ★§SOV16：地编 ptype=31 = 「奖励箱类型」（108 创建工具箱 用的那个下拉）
             return crate_name(v)
-        if ptype in (25, 26):
-            # ★★§SOV20：ptype 25 = 动画（rulesmd `[Animations]`）、26 = 粒子系统
-            #   （`[ParticleSystems]`）。参数存的是**表里的编号**，地编就是按这两张表
-            #   下拉的（FAData.ini 的 [Filenames] 也印证：动画/规则都取自 rulesmd.ini）。
+        if ptype in (12, 13, 16, 17, 18, 25, 26):
+            # ★★§SOV20 / 2026-11-04：参数存的是**游戏列表里的编号**，翻成人话：
+            #   12 影片(artmd [Movies])  13 文本(ra2md.csf)  16 音效(soundmd [SoundList])
+            #   17 音乐(thememd [Themes]) 18 语音(evamd [DialogList])
+            #   25 动画(rulesmd [Animations]) 26 粒子系统([ParticleSystems])
+            #   ★取文件全走 game_tables → mix_vfs（散文件 > MIX 数字大优先，自动解密），
+            #     玩家不需要手动解包（玩家 2026-11-04 的硬要求）。
             tb = self.game_lists()
             if tb:
-                from game_tables import label_of
-                tbl = tb['animations' if ptype == 25 else 'particle_systems']
-                if tbl:
-                    return label_of(tbl, v)
+                try:
+                    from game_tables import arg_label
+                    return arg_label(tb, ptype, v)
+                except Exception:
+                    pass
             return str(v)
         if ptype == 7:                     # ★§283.9 小队型：翻成「ID 名称」（走缓存表）
             lab = self._team_label_map().get(v)

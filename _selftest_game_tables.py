@@ -65,13 +65,13 @@ if tb:
 print('\n== B. 换一个 MOD 目录 ⇒ 表必须跟着变（玩家：以游戏下的规则为准）==')
 if os.path.isfile(os.path.join(OTHER, 'rulesmd.ini')):
     tb2 = lists_for_dir(OTHER)
-    chk(tb2 is not None and tb2['path'].lower().startswith(OTHER.lower()),
+    chk(tb2 is not None and tb2['dir'].lower().startswith(OTHER.lower()),
         '别处的存档取到的是它自己的 rulesmd.ini',
-        None if tb2 is None else tb2['path'])
+        None if tb2 is None else tb2['dir'])
     if tb2:
         print('     该 MOD：animations=%d systems=%d' % (
             len(tb2['animations']), len(tb2['particle_systems'])))
-        chk(tb2['path'] != tb['path'], '两份表的路径不同（没有复用 YURI 的）', tb2['path'])
+        chk(tb2['dir'] != tb['dir'], '两份表的目录不同（没有复用 YURI 的）', tb2['dir'])
     # SaveDoc.game_lists 走存档目录
     d_other = SaveDoc(os.path.join(OTHER, 'SOV01UMD.SAV')) if os.path.exists(
         os.path.join(OTHER, 'SOV01UMD.SAV')) else None
@@ -93,8 +93,8 @@ except Exception:
 print('\n== D. SaveDoc._arg_text 接上表（ptype 25/26）==')
 d = SaveDoc(r'E:\YURI\SOV01UMD_修改_2.SAV')
 tbx = d.game_lists()
-chk(tbx is not None and tbx['path'].lower().startswith(GAME.lower()),
-    '存档 → 取到同目录的 rulesmd.ini', None if tbx is None else tbx['path'])
+chk(tbx is not None and tbx['dir'].lower().startswith(GAME.lower()),
+    '存档 → 取到同目录的 rulesmd.ini', None if tbx is None else tbx['dir'])
 chk(d._arg_text(25, 25) == '25 PARACH', 'ptype25 / 25 → "25 PARACH"', d._arg_text(25, 25))
 chk('表里没有' in d._arg_text(25, 256), 'ptype25 / 256 → 明确提示表里没有',
     d._arg_text(25, 256))
@@ -103,10 +103,13 @@ chk(d._arg_text(26, 3) == '3 BigGreySmokeSys', 'ptype26 / 3 → 粒子系统名'
 chk(d._arg_text(0, 0) == '', 'ptype0 不受影响（仍返回空文案）', d._arg_text(0, 0))
 
 print('\n== E. ptype → 表的映射 ==')
-chk(PTYPE_TABLES.get(25) == ('animations', '动画（rulesmd [Animations]）'),
-    'ptype25 → animations 表')
-chk(PTYPE_TABLES.get(26) == ('particle_systems', '粒子系统（rulesmd [ParticleSystems]）'),
-    'ptype26 → particle_systems 表')
+chk((PTYPE_TABLES.get(25) or ('',))[0] == 'animations', 'ptype25 → animations 表')
+chk((PTYPE_TABLES.get(26) or ('',))[0] == 'particle_systems', 'ptype26 → particle_systems 表')
+# ★2026-11-04：音效/语音/音乐/影片/文本 也要有表（玩家要求内置解密，不靠手动解包）
+for _pt, _key in ((12, 'movies'), (13, 'csf'), (16, 'sounds'), (17, 'themes'), (18, 'eva')):
+    chk((PTYPE_TABLES.get(_pt) or ('',))[0] == _key, 'ptype%d → %s 表' % (_pt, _key))
+    chk(len(tb.get(_key) or {}) > 0, 'ptype%d 的 %s 表非空（%d 项）'
+        % (_pt, _key, len(tb.get(_key) or {})))
 
 print('\n§SOV20：PASS %d / FAIL %d' % (OK, FAIL))
 sys.exit(1 if FAIL else 0)

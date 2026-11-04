@@ -108,13 +108,26 @@ def _find_first(d, names):
 
 
 def _pair_in(d):
-    """某目录里若有一套完整规则 → (目录, rules, art)；art 可缺（缺就 None）。"""
+    """某目录里若有一套完整规则 → (目录, rules, art)；art 可缺（缺就 None）。
+
+    ★2026-11-04：rules **和 art 各自独立按优先级取**，互不牵连 ——
+      mod 目录里"只有 rulesmd.ini、没有 artmd.ini"极为常见（美术仍在 ra2md.mix 里），
+      以前的做法是"散装找不到 art 就整对放弃/留 None"，于是界面上美术信息全丢。
+      现在：散装 art 没有 ⇒ 单独去归档里捞（`_pair_in_mix`，散文件优先/MIX 数字大优先）。
+    """
     if not d or not os.path.isdir(d):
         return None
     rules = _find_first(d, ['rulesmd.ini', 'rules.ini'])
     if not rules:
         return None
     art = _find_first(d, ['artmd.ini', 'art.ini'])
+    if not art:
+        try:
+            got = _pair_in_mix(d)
+            if got:
+                art = got[2]
+        except Exception:
+            pass
     return (d, rules, art)
 
 
@@ -210,91 +223,61 @@ def _looks_art(b):
 
 
 def _pair_in_mix(d):
-    """目录里的 MIX 归档中找 rules/art → (目录, rules路径, art路径, rules所在的mix名)。
+    """目录里的归档中找 rules/art → (目录, rules路径, art路径, rules所在的mix名)。
 
-    ★2026-10-21 重写（三条硬约束）：
-      ① **按文件名序号降序**试（expandmd99 → expandmd67 → …，玩家实测游戏就是这么读的）；
-      ② rules 和 art **分别独立挑**优先级最高的那份 —— 它们完全可以来自不同归档
-         （本机：规则在 expandmd01.mix，美术在 ra2.mix）；
-      ③ Westwood 的 MIX ID **不是标准 CRC32**，所以名字找不到时靠**内容判据**（`_looks_rules`
-         / `_looks_art`）递归往套娃里找（`ra2md.mix → localmd.mix → artmd.ini`）。
+    ★2026-11-04 重写：改走 `mix_vfs`（虚拟文件系统），优先级只有一处实现 ——
+      ① **散文件**（`rulesmd.ini` / `artmd.ini` 直接放在游戏目录）
+      ② **归档按文件名数字降序**（玩家定案：`expandmd99.mix` 压 `expandmd90.mix`）
+      ③ 基础包（ra2.mix / language.mix / ra2md.mix / langmd.mix）在 expandmd* 之后
+      ④ 套娃（`ra2md.mix → langmd.mix → artmd.ini`）也能钻进去
+      ⑤ **加密 MIX 直接解**（Westwood RSA + Blowfish，纯标准库）—— 玩家装上 exe
+         就能用，不需要先用 XCC Mixer 把规则解出来。
+      rules 与 art **分别独立**挑优先级最高的那份（本机：规则在 expandmd01，美术在 ra2md）。
+      取出来的字节落盘到缓存目录（`%LOCALAPPDATA%\\RA2SED_cache\\mix_rules`），
+      因为上层 `parse_ini()` / 界面显示都还要一个文件路径。
     """
     if not d or not os.path.isdir(d):
         return None
     try:
-        import mix as _mix
+        import mix_vfs
     except Exception:
         return None
     cdir = _extract_cache_dir()
     if not cdir:
         return None
-    cands = []
     try:
-        for fn in os.listdir(d):
-            if fn.lower().endswith(('.mix', '.mmx')):
-                cands.append((os.path.getsize(os.path.join(d, fn)), fn))
+        v = mix_vfs.game_vfs(d)
+        if not v.index():
+            return None
     except Exception:
         return None
 
-    # ★2026-10-21 玩家定案：`expandmd06.mix` 是 **TX 地形包**（任何任务都有、从不含 rules/art），
-    #   实测 69 MB / 4665 条目、7 个 ini（地形清单 `;ver2.03 bata`），**没有** [InfantryTypes]。
-    #   ⇒ 不删它、但要**降到最低优先**（真有人把规则塞进去仍然找得到，只是排在最后）。
-    TERRAIN_PACKS = {'expandmd06.mix'}
+    def _dump(name):
+        """取出一个文件 → (缓存文件路径, 来源名)；没有返回 (None, None)。"""
+        try:
+            b, src = v.read(name)
+        except Exception:
+            return None, None
+        if not b:
+            return None, None
+        tag = re.sub(r'[^A-Za-z0-9._-]', '', (src or 'mix').split(' ')[0]) or 'mix'
+        p = os.path.join(cdir, '%s_%s_%d_%s' % (tag, name, len(b), name))
+        try:
+            if not os.path.isfile(p) or os.path.getsize(p) != len(b):
+                with open(p, 'wb') as f:
+                    f.write(b)
+        except Exception:
+            return None, None
+        return p, tag
 
-    def _rank(item):
-        _sz, fn = item
-        low = fn.lower()
-        if low in TERRAIN_PACKS:
-            return (-2, _sz)
-        m = re.search(r'(\d{2,})\.[^.]+$', low)
-        if m is None and low.startswith(('expand', 'ecache', 'patch')):
-            m = re.search(r'(\d+)\.[^.]+$', low)
-        return (int(m.group(1)) if m else -1, _sz)
-
-    cands.sort(key=_rank, reverse=True)
-
-    def _dump(sub_mix, ent, fn, tag):
-        b = _mix.entry_bytes(sub_mix, ent)
-        p = os.path.join(cdir, '%s_%08X_%d_%s.ini' % (fn, ent[0], len(b), tag))
-        if not os.path.isfile(p) or os.path.getsize(p) != len(b):
-            with open(p, 'wb') as f:
-                f.write(b)
-        return p
-
-    def _pick(want):
-        """按优先级找其中一个文件 → (路径, mix名)；找不到 (None, None)。"""
-        if want == 'rules':
-            ids, match, mx, name = MIX_RULES_IDS, _looks_rules, 6 * 1024 * 1024, 'rulesmd.ini'
-        else:
-            ids, match, mx, name = MIX_ART_IDS, _looks_art, 4 * 1024 * 1024, 'artmd.ini'
-        for _sz, fn in cands:
-            m = _mix.parse_mix(os.path.join(d, fn))
-            if not m or not m.get('entries'):
-                continue
-            e = None
-            for fid in ids:
-                e = _mix.find_by_id(m, fid)
-                if e:
-                    break
-            sub = m
-            if e is not None and not match(bytes(_mix.entry_bytes(m, e))):
-                e = None
-            if e is None:
-                _lvl, sub2, e = _mix.find_nested(m, name, match=match, max_size=mx)
-                if e is not None:
-                    sub = sub2
-            if e is None:
-                continue
-            try:
-                return _dump(sub, e, fn, want), fn
-            except Exception:
-                continue
-        return None, None
-
-    rules, fn_r = _pick('rules')
+    rules, fn_r = _dump('rulesmd.ini')
+    if not rules:
+        rules, fn_r = _dump('rules.ini')
     if not rules:
         return None
-    art, _fn_a = _pick('art')
+    art, _fn_a = _dump('artmd.ini')
+    if not art:
+        art, _fn_a = _dump('art.ini')
     return (d, rules, art, fn_r)
 
 

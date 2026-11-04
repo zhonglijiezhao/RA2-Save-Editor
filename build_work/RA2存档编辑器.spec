@@ -43,6 +43,11 @@ a = Analysis(
     datas=_datas,
     hiddenimports=['editor_core', 'cfb', 'cfb_write', 'map_render', 'map_ini', 'game_ini',
                    'unit_comp_lib', 'mix', 'lzo_fast', 'ai_objects',
+                   # ★2026-11-04：内置 MIX 解密链路 —— mix_vfs（散文件 > MIX 数字大优先）
+                   #   → mix（Westwood RSA + Blowfish）→ game_tables / csf（列表表）。
+                   #   这些模块都是函数内动态 import，不列在这里会被 PyInstaller 裁掉，
+                   #   打出来的 exe 一选参数就 ImportError。
+                   'mix_vfs', 'blowfish_tables', 'game_tables', 'csf', 'fa2_tables',
                    'script_actions'],   # ★§253 脚本动作中文名表（动态 import，必须列在这里）
     hookspath=[],
     hooksconfig={},

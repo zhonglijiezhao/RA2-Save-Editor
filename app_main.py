@@ -20,6 +20,9 @@ r"""RA2 存档编辑器 —— 命令行入口 / PyInstaller 入口
     RA2存档编辑器.exe --units <in>                        # 列出单位实例 + 型号统计（只读）
     RA2存档编辑器.exe --tags <in>                         # 列出标签对象全字段（§192，只读）
     RA2存档编辑器.exe --types <in>                        # 列出可放置的全部型号（步兵/载具）
+    RA2存档编辑器.exe --tables [游戏目录或存档]            # 游戏侧列表表从哪来、有多少条
+        # ↑ 排查"触发参数下拉是空的"用：内置 MIX 解密（散文件 > MIX 数字大优先）读
+        #   rules/art/soundmd/evamd/thememd/ra2md.csf，报告写到 exe 旁的「自检结果.txt」。
     RA2存档编辑器.exe --putunit <in> <out> <类型> <cx> <cy> [--house 阵营] [--vet 0|1|2]
                               # ★克隆放置单位（同类型克隆，U2 游戏内已验收）
                               #   带 --house ⇒ **给对面刷兵**（改记录 +352/+560 的所属方）
@@ -79,6 +82,80 @@ sys.path.insert(0, BASE)
 sys.path.insert(0, os.path.join(BASE, 'core'))
 
 REPORT = os.path.join(BASE, '自检结果.txt')
+
+
+def gametables(arg):
+    """headless：报告**游戏侧列表表**从哪来、有多少条（排查"参数下拉是空的"）。
+
+    用法：`RA2存档编辑器.exe --tables [游戏目录或存档]`
+    报告写到 exe 旁边的「自检结果.txt」。
+
+    ★2026-11-04（玩家要求内置 MIX 解密）：这个开关的价值是**可实测** ——
+      玩家说"下拉没有东西"时，跑一条命令就能看出到底是
+      ① 没找到游戏目录、② MIX 解不开、还是 ③ 表里确实没有那一号，
+      不用靠猜。它同时也是"打包后 RSA+Blowfish 还在不在"的验收手段。
+    """
+    import game_tables
+    import mix_vfs
+    d = (arg or '').strip().strip('"')
+    lines = ['时间: %s' % datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+             'exe : %s' % (sys.executable if getattr(sys, 'frozen', False) else '(源码)'),
+             '目录: %s' % (d or '(自动探测)'), '']
+    cands = []
+    if d:
+        cands.append(d)
+    else:
+        try:
+            import game_ini
+            cands += (game_ini.auto_detect_game_dirs() or [])
+        except Exception as e:
+            lines.append('自动探测失败：%s' % e)
+    if not cands:
+        lines.append('没找到游戏目录。请在界面上「游戏目录」框指定一次，再跑本命令。')
+        _write_report('\n'.join(lines))
+        return 1
+    tb = None
+    used = None
+    for c in cands:
+        if not c or not os.path.isdir(c):
+            continue
+        try:
+            tb = game_tables.lists_for_dir(c)
+        except Exception as e:
+            lines.append('  %s → 解析失败：%s' % (c, e))
+            tb = None
+        if tb:
+            used = c
+            break
+    if not tb:
+        lines.append('这些目录里都读不到规则（MIX 全部解不开？）：')
+        lines += ['  ' + str(c) for c in cands]
+        _write_report('\n'.join(lines))
+        return 1
+    lines.append('游戏目录: %s' % used)
+    lines.append('')
+    lines.append('归档优先级（高 → 低）：')
+    for fn, rank in mix_vfs.describe_layers(used, 12):
+        lines.append('  %-20s %5d' % (fn, rank))
+    lines.append('')
+    lines.append('列表表（来源 ← 条数）：')
+    NAMES = [('animations', '动画', 25), ('particle_systems', '粒子系统', 26),
+             ('sounds', '音效', 16), ('eva', '语音', 18), ('themes', '音乐主题', 17),
+             ('movies', '影片', 12), ('csf', '文本(CSF)', 13)]
+    for key, cn, pt in NAMES:
+        tbl = tb.get(key) or {}
+        src = tb['source'].get({'animations': 'rulesmd.ini', 'particle_systems': 'rulesmd.ini',
+                                'sounds': 'soundmd.ini', 'eva': 'evamd.ini',
+                                'themes': 'thememd.ini', 'movies': 'artmd.ini',
+                                'csf': 'ra2md.csf'}[key], '?')
+        lines.append('  %-12s ptype %-3d %5d 项   ← %s' % (cn, pt, len(tbl), src))
+        sample = game_tables.choices_of(tbl, limit=3)
+        if sample:
+            lines.append('               例: %s' % ' / '.join(sample))
+    lines.append('')
+    lines.append('一句话: %s' % game_tables.describe(used))
+    _write_report('\n'.join(lines))
+    return 0
 
 
 def _write_report(txt):
@@ -2343,6 +2420,12 @@ def main():
                           '用法: %s --selftest <存档.SAV>' % (sav, sys.argv[0]))
             return 2
         return selftest(sav)
+    if '--tables' in sys.argv:
+        # ★2026-11-04：报告游戏侧列表表（动画/音效/语音/音乐/影片/文本）的来源与条数。
+        #   也给"打包后的 MIX 解密还能不能用"提供了一个可实测的入口。
+        i = sys.argv.index('--tables')
+        arg = sys.argv[i + 1] if len(sys.argv) > i + 1 and not sys.argv[i + 1].startswith('-') else ''
+        return gametables(arg)
     if '--owner' in sys.argv:
         i = sys.argv.index('--owner')
         return owner(sys.argv[i + 1:])

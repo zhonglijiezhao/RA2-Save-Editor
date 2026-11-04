@@ -33,6 +33,22 @@ HDR_LEN = 24          # ★实测 label 表从 0x18 开始（不是 16，也不�
 _CACHE = {}           # (路径, 大小, mtime) → Csf
 
 
+def _find_rts(raw, pos):
+    """在 `pos` 附近定位一个 value 头 `RTS` → 它的起始下标（找不到 -1）。
+
+    ★2026-11-04 实测（`E:\\YURI\\ra2md.csf`）：标准写法是 `' RTS'`（4 字节，前导空格），
+      但这个 mod 的 csf 里 `VOX:*` 那一批 label 的 **key 长度字段少算了 1 字节** ⇒
+      key 后面直接跟 `RTS`（前导空格被 key 吃掉了）。还有极少数写成 `'  RTS'`。
+      ⇒ 在 `pos-1 .. pos+2` 里找 `RTS`，谁中就用谁；不靠猜偏移量。
+    """
+    for i in (pos, pos + 1, pos - 1, pos + 2):
+        if i < 0:
+            continue
+        if raw[i:i + 3] == b'RTS':
+            return i
+    return -1
+
+
 def _score(text):
     """给候选解码结果打分：汉字/ASCII 可打印 +2，控制字符 −3。"""
     if not text:
@@ -74,8 +90,13 @@ def _decode(raw):
 class Csf(object):
     """一个 ra2md.csf。键大小写不敏感。"""
 
-    def __init__(self, path):
+    def __init__(self, path=None, raw=None):
+        """`path` = 磁盘上的 csf；`raw` = **内存里的字节**（从 MIX 里解出来的）。
+
+        ★2026-11-04：`mix_vfs` 从加密 MIX 里取出 ra2md.csf 后直接喂字节，不落盘。
+        """
         self.path = path
+        self._raw = raw
         self.keys = {}          # 小写键 → 文本（多条 value 取第一条）
         self.error = None
         self.count = 0
@@ -83,7 +104,11 @@ class Csf(object):
 
     def _load(self):
         try:
-            raw = open(self.path, 'rb').read()
+            if self._raw is not None:
+                raw = self._raw
+            else:
+                with open(self.path, 'rb') as f:
+                    raw = f.read()
         except Exception as e:
             self.error = '读不到：%s' % e
             return
@@ -95,33 +120,86 @@ class Csf(object):
         except Exception as e:
             self.error = '头部解析失败：%s' % e
             return
+        self._parse(raw, nlab)
+
+    def _parse(self, raw, nlab):
+        """容错扫描：label 头/值头对不上时**重同步到下一个 ` LBL`**，不整体放弃。
+
+        ★2026-11-04 实测（`E:\\YURI\\ra2md.csf`，5211 个 label）：第 1722 条附近
+          有一条 label 的 key 长度少算了 1 字节（`VOX:ceva001W` 被记成 11），
+          老实现直接 `break` ⇒ 只解出 1721 条，后面 3490 条全丢（含大量任务文本）。
+          现在改成"跳过坏记录、从下一个 ` LBL` 继续"，`self.skipped` 记录跳过的条数。
+        """
         p, n = HDR_LEN, len(raw)
-        try:
-            for _ in range(nlab):
-                if raw[p:p + 4] != MAG_LBL:
-                    self.error = 'label 头不对 @%#x' % p
+        self.skipped = 0
+        guard = 0
+        while p < n and self.count < nlab and guard < nlab * 4:
+            guard += 1
+            if raw[p:p + 4] != MAG_LBL:
+                nxt = raw.find(MAG_LBL, p + 1, min(n, p + 1 + 65536))
+                if nxt < 0:
+                    self.error = 'label 头不对 @%#x（后面没有 LBL 了）' % p
                     break
-                npairs = struct.unpack_from('<I', raw, p + 4)[0]
-                klen = struct.unpack_from('<I', raw, p + 8)[0]
-                key = raw[p + 12:p + 12 + klen].decode('latin-1').lower()
-                p += 12 + klen
-                vals = []
-                for _j in range(npairs):
-                    if raw[p:p + 4] != MAG_RTS:
-                        self.error = 'value 头不对 @%#x' % p
-                        raise StopIteration
-                    ln = struct.unpack_from('<I', raw, p + 4)[0]
-                    p += 8
-                    body = raw[p:p + 2 * ln]      # ★长度是**字符数**
-                    p += 2 * ln
-                    vals.append(_decode(body))
-                if key not in self.keys and vals:
-                    self.keys[key] = vals[0]
-                self.count += 1
-        except StopIteration:
-            pass
-        except Exception as e:
-            self.error = '解析中断：%s' % e
+                self.skipped += 1
+                p = nxt
+                continue
+            npairs, klen = struct.unpack_from('<II', raw, p + 4)
+            if klen > 1024 or npairs > 64:          # 明显是坏记录
+                nxt = raw.find(MAG_LBL, p + 1, min(n, p + 1 + 65536))
+                if nxt < 0:
+                    self.error = 'label 字段异常 @%#x（klen=%d npairs=%d）' % (p, klen, npairs)
+                    break
+                self.skipped += 1
+                p = nxt
+                continue
+            key_end = p + 12 + klen
+            q = _find_rts(raw, key_end)
+            if q < 0:
+                # key 后面直接是下一条 ` LBL` = 这个 label 没有 value（引擎里有这种空标签）
+                if raw[key_end:key_end + 4] == MAG_LBL:
+                    p = key_end
+                    self.count += 1
+                    continue
+                nxt = raw.find(MAG_LBL, p + 1, min(n, p + 1 + 65536))
+                if nxt < 0:
+                    self.error = 'value 头不对 @%#x' % key_end
+                    break
+                self.skipped += 1
+                p = nxt
+                continue
+            key = raw[p + 12:q].decode('latin-1').strip().lower()
+            p = q + 3
+            vals = []
+            bad = False
+            for _j in range(npairs):
+                if p + 4 > n:
+                    bad = True
+                    break
+                ln = struct.unpack_from('<I', raw, p)[0]
+                p += 4
+                if ln > 1 << 20 or p + 2 * ln > n:   # 长度离谱 → 坏记录
+                    bad = True
+                    break
+                body = raw[p:p + 2 * ln]             # ★长度是**字符数**
+                p += 2 * ln
+                vals.append(_decode(body))
+                if _j + 1 < npairs:
+                    q2 = _find_rts(raw, p)
+                    if q2 < 0:
+                        bad = True
+                        break
+                    p = q2 + 3
+            if bad:
+                nxt = raw.find(MAG_LBL, p + 1, min(n, p + 1 + 65536))
+                if nxt < 0:
+                    self.error = 'value 头不对 @%#x' % p
+                    break
+                self.skipped += 1
+                p = nxt
+                continue
+            if key not in self.keys and vals:
+                self.keys[key] = vals[0]
+            self.count += 1
 
     # ---------------- 查询 ----------------
     def get(self, key, default=None):
