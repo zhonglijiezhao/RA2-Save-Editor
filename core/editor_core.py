@@ -16064,6 +16064,72 @@ class SaveDoc(object):
             return None
         return self.plain[p] == 0
 
+    # ---- ★★§SOV10（2026-11-04 玩家："能扫到那18个单元标记吗"）：把挂接点全部列出来 ----
+    # CellTag 对象里的「挂接数」只是个**计数**（+64，u32）；具体挂在哪几个格子，
+    # 是**宿主记录里存着 CellTag 的键**（= 每个挂接点自己带一个"我挂了哪个 CellTag"）。
+    # 所以扫法：全档找 "== CellTag 自键" 的 u32，每条命中所在的记录里
+    #   命中-24 起是 (x u16, y u16) —— 就是那个单元标记的坐标；
+    #   命中+8 起是 ffffffff（4 个 0xFF，实测 18/18 都是）。
+    # SAVE6784 实测：18 个挂接点 = x 74..79 × y 76..78 的 6×3 方阵。
+    CELL_MARK_DX = -24        # 命中 → (x, y)（两个 u16）
+    CELL_MARK_TAIL = b'\xff\xff\xff\xff'   # 命中 +8 起恒为 -1
+
+    def celltag_marker_cells(self, cell_off_or_key):
+        """一个 CellTag 上挂的**每个**单元标记的坐标 → `[(x, y), …]`（按 y、x 排序）。
+
+        参数可以是 CellTag 对象帧偏移，也可以是它的自键。读不到返回 []。
+        """
+        pl = self.plain
+        n = len(pl)
+        if isinstance(cell_off_or_key, int) and 0 <= cell_off_or_key < n - 20:
+            off, key = cell_off_or_key, int.from_bytes(
+                pl[cell_off_or_key + 16:cell_off_or_key + 20], 'little')
+        else:
+            off, key = None, int(cell_off_or_key)
+        if not key:
+            return []
+        pat = struct.pack('<I', key)
+        out, q = [], 0
+        while True:
+            i = pl.find(pat, q)
+            if i < 0:
+                break
+            q = i + 1
+            if off is not None and off <= i < off + TRIG_CELL_SIZE:
+                continue                     # CellTag 自己的自键字段
+            if i < 24 or i + 12 > n:
+                continue
+            if pl[i + 8:i + 12] != self.CELL_MARK_TAIL:
+                continue
+            x = int.from_bytes(pl[i + self.CELL_MARK_DX:i + self.CELL_MARK_DX + 2],
+                               'little')
+            y = int.from_bytes(pl[i + self.CELL_MARK_DX + 2:i + self.CELL_MARK_DX + 4],
+                               'little')
+            if not (0 <= x < 1024 and 0 <= y < 1024):
+                continue
+            if (x, y) not in out:
+                out.append((x, y))
+        return sorted(out, key=lambda c: (c[1], c[0]))
+
+    def trigger_markers(self, sid):
+        """这条触发的 CellTag 上挂的单元标记 → `{'tag_key','cell_key','count','cells'}`。
+
+        关联触发的从触发自己没有标签 ⇒ 和别的标签类字段一样，看链头那条。
+        """
+        out = {'tag_key': None, 'cell_key': None, 'count': None, 'cells': []}
+        try:
+            o = self.trigger_objects(self.trigger_tag_sid(sid))
+        except Exception:
+            return out
+        out['tag_key'] = o.get('tag_key')
+        out['cell_key'] = o.get('cell_key')
+        if o.get('cell') is None:
+            return out
+        out['count'] = int.from_bytes(self.plain[o['cell'] + CELL_COUNT_OFF:
+                                                o['cell'] + CELL_COUNT_OFF + 4], 'little')
+        out['cells'] = self.celltag_marker_cells(o['cell'])
+        return out
+
     def trigger_has_own_tag(self, sid):
         """这条触发**自己**挂着标签对象吗（O(1)，走 实例键→标签键 映射）。"""
         try:

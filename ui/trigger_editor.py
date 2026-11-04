@@ -149,6 +149,11 @@ class TriggerEditor(tk.Toplevel):
         self.btn_link_jump = ttk.Button(r2b, text='跳到下级 →', width=11,
                                         command=self.jump_link)
         self.btn_link_jump.pack(side='left', padx=(2, 0))
+        # ★§SOV10（2026-11-04 玩家："能扫到那18个单元标记吗"）：CellTag 的挂接数只是个数，
+        #   具体挂在哪几格 = 宿主记录里存着 CellTag 键，能一个个扫出来。
+        self.btn_markers = ttk.Button(r2b, text='📍 单元标记…', width=13,
+                                      command=self.show_markers)
+        self.btn_markers.pack(side='left', padx=(2, 0))
         # 链关系单独一行（链可能几十条，塞在同一行会把窗口撑到两千像素）
         self.lbl_link = ttk.Label(top, text='', foreground=ui_theme.T['muted'],
                                   wraplength=640, justify='left')
@@ -1017,6 +1022,82 @@ class TriggerEditor(tk.Toplevel):
             messagebox.showerror('写入失败（存档未改动）', str(e), parent=self)
             return
         self.after_change('下级触发 → %s' % (r['new_sid'] or '（无 · 链尾）'))
+
+    def show_markers(self):
+        """把这条触发的 CellTag 上挂的**每个单元标记**列出来（§SOV10）。"""
+        if not self._cur:
+            return
+        try:
+            mk = self.doc.trigger_markers(self._cur)
+        except Exception as e:
+            messagebox.showerror('读不到单元标记', str(e), parent=self)
+            return
+        det = self._det or {}
+        cells = mk.get('cells') or []
+        cnt = mk.get('count')
+        lines = ['触发 %s %s' % (self._cur, det.get('name') or ''),
+                 '标签 %s · CellTag %s · 挂接数 %s'
+                 % (('%08X' % mk['tag_key']) if mk.get('tag_key') else '—',
+                    ('%08X' % mk['cell_key']) if mk.get('cell_key') else '—',
+                    cnt if cnt is not None else '—'), '']
+        if not cells:
+            lines.append('扫不到任何单元标记（挂接数 %s）。' % (cnt,))
+            if cnt:
+                lines.append('挂接数不为 0 但一条记录都没扫到 —— 挂接对象可能已全部离场（§163）。')
+        else:
+            byy = {}
+            for x, y in cells:
+                byy.setdefault(y, []).append(x)
+            lines.append('扫到 %d 个单元标记（按 y 分行，列出 x）：' % len(cells))
+            for y in sorted(byy):
+                lines.append('  y=%-3d  x= %s' % (y, ', '.join(str(v) for v in sorted(byy[y]))))
+            xs = [c[0] for c in cells]
+            ys = [c[1] for c in cells]
+            lines.append('')
+            lines.append('范围：x %d..%d · y %d..%d（共 %d 个）'
+                         % (min(xs), max(xs), min(ys), max(ys), len(cells)))
+            if cnt is not None and cnt != len(cells):
+                lines.append('⚠ 挂接数 %s ≠ 扫到 %d 个：差的 %d 个挂接对象已经不在存档里'
+                             '（引擎的计数没减，就是 §163 说的"漏账"）。'
+                             % (cnt, len(cells), cnt - len(cells)))
+        text = '\n'.join(lines)
+
+        dlg = tk.Toplevel(self)
+        dlg.title('单元标记（CellTag 挂接点）')
+        dlg.transient(self)
+        dlg.minsize(420, 240)
+        frm = ttk.Frame(dlg, padding=10)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text=text.split('\n')[0], font=('', 10, 'bold')).pack(anchor='w')
+        ttk.Label(frm, text=text.split('\n')[1], foreground=ui_theme.T['muted']
+                  ).pack(anchor='w', pady=(0, 6))
+        # ★先 pack 底部按钮行（side='bottom'），再 pack 文本框 ——
+        #   pack 按调用顺序分配空间，文本 expand=True 会把后 pack 的按钮挤出可视区。
+        row = ttk.Frame(frm)
+        row.pack(side='bottom', fill='x', pady=(8, 0))
+        # 高度按内容行数给足，**不 expand** —— 让窗口的自然高度正好装下所有控件，
+        # 否则文本框会把底部按钮顶出可视区（2026-11-04 自己踩的）。
+        tv = tk.Text(frm, width=56, height=min(16, max(4, len(lines) - 2)),
+                     wrap='none',
+                     font=(getattr(ui_theme, 'FONT_MONO', '') or 'Consolas', 9))
+        tv.insert('1.0', '\n'.join(lines[2:]))
+        tv.configure(state='disabled')
+        tv.pack(side='top', fill='x')
+        dlg.resizable(True, True)
+        # ★显式给尺寸（按行数算）：Tk 的自然尺寸算不准 Text 的行高，
+        #   只靠 pack 自适应会把底部按钮挤出可视区（2026-11-04 试了三轮才定下来）。
+        _lines = max(4, len(lines) - 2)
+        dlg.geometry('560x%d' % min(620, 200 + 18 * _lines))
+
+        def _copy():
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(text)
+                self.app.status.set('已复制 %d 个单元标记坐标' % len(cells))
+            except Exception:
+                pass
+        ttk.Button(row, text='复制全部', command=_copy).pack(side='left')
+        ttk.Button(row, text='关闭', command=dlg.destroy).pack(side='right')
 
     def jump_link(self):
         """切到「下级」那条触发（顺着链往下走，不用在下拉里翻）。"""
