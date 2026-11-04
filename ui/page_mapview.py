@@ -52,6 +52,14 @@ class MapViewPage(object):
                         '（点右边「备份存档」一键搞定；改完也建议先另存为新文件再进游戏验证）。',
             foreground=ui_theme.T['danger'], wraplength=700, justify='left')
         self.mv_warn.pack(anchor='w', pady=(4, 0))
+        # ★§SOV11：定位行的用法（放在说明里，页面上只留控件，不再多占一行）
+        ttk.Label(_note,
+                  text='定位：「X / Y」填格子坐标 → 「跳到格」；「路径点」填号（或从下拉选）→ 「跳到点」。'
+                       '两者都会选中那一格并把视图居中（贴边的格子只能贴边，滚不到正中）。'
+                       '反向也通：在地图上点任意一格，坐标会回填到 X / Y，改完再点「跳到格」；'
+                       '拖远了点「居中选中」回到当前格。缩放以视口中心为锚点，不会一缩放就漂回左上。',
+                  foreground=ui_theme.T['ink_2'], wraplength=700,
+                  justify='left').pack(anchor='w', pady=(4, 0))
         ttk.Label(_note,
                   text='放置建筑：勾「触发法」= 引擎自己造（有建造动画、模型完整，悬崖 / 水面等不可建'
                        '地形会被引擎拒绝）；不勾 = 直接落成（立即写档、可指定所属方，引擎仍会播一遍'
@@ -143,6 +151,36 @@ class MapViewPage(object):
         _mb0['menu'] = _m0
         _mb0.pack(side='left', padx=(10, 0))
         ttk.Button(r, text='重绘', command=self.mv_render).pack(side='left', padx=(10, 0))
+
+        # ★§SOV11（2026-11-04 玩家要求）：地图动辄 1024×1024，靠拖滚动条找一格太费劲
+        #   ⇒ 加一行「定位」：填 (x,y) 或路径点号，选中那一格并**把视图居中**到它；
+        #   反方向也给：点地图任意格 ⇒ 坐标回填到这两个框里（可微调后再跳）。
+        r = ttk.Frame(b2, style=SUF)
+        r.pack(fill='x', pady=(4, 0))
+        ttk.Label(r, text='定位', style=LB).pack(side='left')
+        ttk.Label(r, text='X', style=MU, font=SM).pack(side='left', padx=(6, 0))
+        self.mv_gx = tk.StringVar()
+        self._e_mv_gx = ttk.Entry(r, textvariable=self.mv_gx, width=5)
+        self._e_mv_gx.pack(side='left', padx=(2, 0))
+        ttk.Label(r, text='Y', style=MU, font=SM).pack(side='left', padx=(6, 0))
+        self.mv_gy = tk.StringVar()
+        self._e_mv_gy = ttk.Entry(r, textvariable=self.mv_gy, width=5)
+        self._e_mv_gy.pack(side='left', padx=(2, 0))
+        for _e in (self._e_mv_gx, self._e_mv_gy):
+            _e.bind('<Return>', lambda e: self.mv_goto_xy())
+        ttk.Button(r, text='跳到格', width=7,
+                   command=self.mv_goto_xy).pack(side='left', padx=(4, 0))
+        ttk.Label(r, text='路径点', style=LB).pack(side='left', padx=(10, 0))
+        self.mv_gwp = tk.StringVar()
+        # 可键入号，也能从下拉挑（下拉项 = 本图 [Waypoints] ∪ 存档里有的号）
+        self._cb_mv_gwp = ttk.Combobox(r, textvariable=self.mv_gwp, width=6)
+        self._cb_mv_gwp.pack(side='left', padx=(4, 0))
+        self._cb_mv_gwp.bind('<Return>', lambda e: self.mv_goto_wp())
+        self._cb_mv_gwp.bind('<<ComboboxSelected>>', lambda e: self.mv_goto_wp())
+        ttk.Button(r, text='跳到点', width=7,
+                   command=self.mv_goto_wp).pack(side='left', padx=(4, 0))
+        ttk.Button(r, text='居中选中', width=8,
+                   command=self.mv_center_sel).pack(side='left', padx=(8, 0))
 
         # ── ③ 放置：建筑 / 单位 / 触发法（都作用于选中格）──
         _s, b3 = ui_theme.section(f, '放置', '作用于选中格')
@@ -279,7 +317,7 @@ class MapViewPage(object):
         p = getattr(getattr(self.doc, '_map', None), 'path', st.get('path')) if self.doc else None
         st.update({'mp': None, 'ok': False, 'img': None, 'blds': [],
                    'occ': {}, 'sel': None, 'path': p, 'gdata': None, 'dims': None,
-                   'wpdata': None, 'udata': None})
+                   'wpdata': None, 'udata': None, 'canv': None})
         self.mv_canvas.delete('all')
         self.mv_info.config(text='')
         if self.doc and not (p and os.path.exists(p)):
@@ -825,6 +863,7 @@ class MapViewPage(object):
         st = self.mv_state
         c = self.mv_canvas
         W, H = self._mv_dims()
+        st['canv'] = (int(W), int(H))       # ★§SOV11：网格模式的画布格子数
         s = max(2, int(st.get('scale') or 8))
         st['scale'] = s
         bld, unit, wp = self._mv_grid_data()
@@ -869,10 +908,14 @@ class MapViewPage(object):
             self._mv_draw_units(c)
         except Exception:
             pass
-        if st.get('sel'):
-            x, y = st['sel']
-            c.create_rectangle(x * s, y * s, (x + 1) * s, (y + 1) * s,
-                               outline=ui_theme.MAP['cursor'], width=2)
+        try:
+            self._mv_draw_sel()
+        except Exception:
+            pass
+        try:
+            self._mv_fill_wp_combo()
+        except Exception:
+            pass
 
     def _ovl_colors(self):
         """覆盖物索引 → 颜色（按类别，一次算好给整张图用）。
@@ -954,8 +997,11 @@ class MapViewPage(object):
             if self.doc:
                 self._mv_grid_safe()
             return
+        # ★★§SOV11：选中格**不再烘焙进位图**（原来每次点格子都要整图重渲染：
+        #   509×493 @10 倍 = 2.5 秒）。现在选中框是画布图元，点选/跳转只更新这一层。
         W, H, buf, meta = mr.render_rgb(st['mp'], st['blds'], st['scale'],
-                                        sel=st['sel'], grid=bool(self.mv_grid.get()))
+                                        sel=None, grid=bool(self.mv_grid.get()))
+        st['canv'] = (int(W), int(H))       # ★§SOV11：居中/越界要用**这块画布**的格子数
         png = mr.to_png(W * st['scale'], H * st['scale'], buf)
         try:
             st['img'] = tk.PhotoImage(data=base64.b64encode(png))
@@ -990,13 +1036,57 @@ class MapViewPage(object):
         except Exception:
             pass
         c.configure(scrollregion=(0, 0, W * st['scale'], H * st['scale']))
+        try:
+            self._mv_draw_sel()
+        except Exception:
+            pass
+        # ★§SOV11：路径点下拉的候选 = 本图 [Waypoints] ∪ 存档里的号（渲染后必已就绪）
+        try:
+            self._mv_fill_wp_combo()
+        except Exception:
+            pass
+
+    def _mv_view_center_cell(self):
+        """视口正中那一格（缩放的锚点用）；算不出来返回 None。"""
+        st = getattr(self, 'mv_state', None) or {}
+        c = getattr(self, 'mv_canvas', None)
+        if c is None:
+            return None
+        s = self._mv_scale_now()
+        W, H = self._mv_cell_space()
+        try:
+            cx = c.canvasx(max(1, c.winfo_width()) / 2.0)
+            cy = c.canvasy(max(1, c.winfo_height()) / 2.0)
+        except Exception:
+            return None
+        x, y = int(cx // s), int(cy // s)
+        if 0 <= x < W and 0 <= y < H:
+            return (x, y)
+        return None
 
     def mv_zoom(self, d):
         st = getattr(self, 'mv_state', None)
         if not st or not st['ok']:
             return
+        # ★§SOV11：缩放前记住视口正中那格，缩放后把它放回正中 ——
+        #   否则每点一次 ± 视图就漂回左上，找远处的格子等于白找。
+        anchor = self._mv_view_center_cell()
         st['scale'] = max(1, min(24, st['scale'] + d))
+        # 全量重绘在大图上要 2~4 秒（纯 Python 逐像素）⇒ 先给一句"正在画"，
+        # 免得玩家以为点空了又去点（§SOV11）
+        try:
+            self.status.set('正在按 %d 倍重绘地图…' % st['scale'])
+            self.update_idletasks()
+        except Exception:
+            pass
         self.mv_render()
+        if anchor:
+            self._mv_center_on(*anchor)
+        try:
+            self.status.set('缩放 = 每格 %d 像素（滚轮/± 再调；「适应窗口」一键铺满）'
+                            % st['scale'])
+        except Exception:
+            pass
 
     def mv_fit(self):
         st = getattr(self, 'mv_state', None)
@@ -1019,8 +1109,292 @@ class MapViewPage(object):
         st['scale'] = max(1, min(16, int(min(cw / float(W), ch / float(H))) or 1))
         self.mv_render()
 
-    def mv_click(self, event):
+    def _mv_draw_sel(self):
+        """只画「选中格」这一层（画布图元，tag='selbox'）。
+
+        ★§SOV11：以前选中格是烘焙进位图的（`render_rgb(sel=…)`），于是每点一格都要
+        整图重渲染 —— 509×493 @10 倍要 2.5 秒。改成图元后点选/跳转是毫秒级。
+        """
+        c = getattr(self, 'mv_canvas', None)
+        st = getattr(self, 'mv_state', None) or {}
+        if c is None:
+            return
+        try:
+            c.delete('selbox')
+        except Exception:
+            pass
+        sel = st.get('sel')
+        if not sel:
+            return
+        s = self._mv_scale_now()
+        x, y = sel
+        try:
+            c.create_rectangle(x * s, y * s, (x + 1) * s, (y + 1) * s,
+                               outline='#FFD400', width=2, tags=('selbox',))
+            c.create_rectangle(x * s + 1, y * s + 1, (x + 1) * s - 1, (y + 1) * s - 1,
+                               outline='#1E78C8', width=1, tags=('selbox',))
+        except Exception:
+            pass
+
+    def _mv_refresh_sel(self):
+        """更新选中格但不重绘整图（点选 / 跳转走这条）；还没渲染过才回落全量。"""
+        st = getattr(self, 'mv_state', None) or {}
+        if st.get('ok') and st.get('mp'):
+            if st.get('img') is None:
+                self.mv_render()
+                return
+        elif not st.get('canv'):
+            self._mv_grid_safe()
+            return
+        self._mv_draw_sel()
+
+    # ---------------- ★§SOV11（2026-11-04）按坐标 / 路径点定位并居中 ----------------
+    def _mv_cell_space(self):
+        """当前视图的格子范围 `(W, H)` —— 必须与 `scrollregion` / 渲染用的是同一套。
+
+        优先取上一次渲染实际用的画布格子数（`canvas_size()` 会被建筑/地形撑大，
+        不一定等于地图声明的 `size`，用错了居中就会偏）。
+        """
+        st = getattr(self, 'mv_state', None) or {}
+        if st.get('canv'):
+            try:
+                W, H = st['canv']
+                return int(W), int(H)
+            except Exception:
+                pass
+        if st.get('ok') and st.get('mp'):
+            try:
+                W, H = st['mp']['size']
+                return int(W), int(H)
+            except Exception:
+                pass
+        try:
+            W, H = self._mv_dims()
+        except Exception:
+            W, H = 160, 160
+        return int(W), int(H)
+
+    def _mv_scale_now(self):
+        """当前每格像素数（渲染用同一套口径，别各算各的）。"""
+        st = getattr(self, 'mv_state', None) or {}
+        s = int(st.get('scale') or 8)
+        return max(1, s) if (st.get('ok') and st.get('mp')) else max(2, s)
+
+    def _mv_fill_wp_combo(self):
+        """把路径点号填进「路径点」下拉（本图 [Waypoints] ∪ 存档里的号）。"""
+        cb = getattr(self, '_cb_mv_gwp', None)
+        if cb is None:
+            return
+        try:
+            mp, only = self._mv_wp_points()
+        except Exception:
+            return
+        vals = [str(n) for n in sorted(set(mp) | set(only))]
+        try:
+            cur = list(cb.cget('values') or [])
+            if cur != vals:
+                cb['values'] = vals
+        except Exception:
+            try:
+                cb['values'] = vals
+            except Exception:
+                pass
+
+    def _mv_center_on(self, x, y):
+        """把画布滚到让 (x,y) 落在视口正中（整图比视口小 ⇒ 贴左上，滚也无意义）。"""
+        st = getattr(self, 'mv_state', None) or {}
+        c = getattr(self, 'mv_canvas', None)
+        if c is None:
+            return
+        try:
+            c.update_idletasks()
+        except Exception:
+            pass
+        s = self._mv_scale_now()
+        W, H = self._mv_cell_space()
+        tw, th = W * s, H * s
+        vw = max(1, c.winfo_width())
+        vh = max(1, c.winfo_height())
+        cx, cy = (x + 0.5) * s, (y + 0.5) * s
+        left = 0 if tw <= vw else max(0, min(tw - vw, cx - vw / 2.0))
+        top = 0 if th <= vh else max(0, min(th - vh, cy - vh / 2.0))
+        try:
+            # scrollregion = (0,0,tw,th) ⇒ moveto 的参数是「左边界 / 总宽」
+            c.xview_moveto(0.0 if tw <= vw else left / float(tw))
+            c.yview_moveto(0.0 if th <= vh else top / float(th))
+        except Exception:
+            pass
+
+    def mv_center_sel(self):
+        """把视图重新居中到当前选中格（拖远了想回来用这个）。"""
+        st = getattr(self, 'mv_state', None) or {}
+        if not (st.get('sel')):
+            self.status.set('先在地图上点一格，或在 X / Y 里填坐标后点「跳到格」')
+            return
+        x, y = st['sel']
+        self._mv_center_on(x, y)
+        self.status.set('视图已居中到 (%d,%d)' % (x, y))
+
+    def mv_goto(self, x, y, why=''):
+        """选中 (x,y) 并居中；越界/没开档返回 False（由调用方给提示）。"""
+        st = getattr(self, 'mv_state', None)
+        if not st:
+            return False
+        if not self.doc:
+            self.status.set('先打开一个存档')
+            return False
+        W, H = self._mv_cell_space()
+        if not (0 <= int(x) < W and 0 <= int(y) < H):
+            self.status.set('%s 超出范围：当前这张图是 %d×%d（x 0..%d，y 0..%d）'
+                            % (why or '目标坐标', W, H, W - 1, H - 1))
+            return False
+        x, y = int(x), int(y)
+        st['sel'] = (x, y)
+        self._mv_refresh_sel()          # ★只换选中框：跳转不再等 2 秒重绘
+        self._mv_center_on(x, y)
+        # 跳转后画个醒目的十字准星（下次重绘就清掉 —— 正好只标"这一次跳转"）
+        try:
+            s = self._mv_scale_now()
+            c = self.mv_canvas
+            cx, cy = (x + 0.5) * s, (y + 0.5) * s
+            r = max(9.0, s * 1.8)
+            c.create_line(cx - r, cy, cx + r, cy, fill='#FFD400', width=2, tags=('goto',))
+            c.create_line(cx, cy - r, cx, cy + r, fill='#FFD400', width=2, tags=('goto',))
+            c.create_oval(cx - r * 0.55, cy - r * 0.55, cx + r * 0.55, cy + r * 0.55,
+                          outline='#FFD400', width=2, tags=('goto',))
+        except Exception:
+            pass
+        try:
+            self.mv_gx.set(str(x))
+            self.mv_gy.set(str(y))
+        except Exception:
+            pass
+        try:
+            self.mv_info.config(text=self._mv_info_text(x, y))
+        except Exception:
+            pass
+        return True
+
+    def mv_goto_xy(self):
+        """「跳到格」：按 X / Y 框里的坐标定位。"""
+        if not getattr(self, 'mv_state', None):
+            return
+        if not self.doc:
+            self.status.set('先打开一个存档')
+            return
+        tx = (self.mv_gx.get() or '').strip()
+        ty = (self.mv_gy.get() or '').strip()
+        try:
+            x, y = int(tx), int(ty)
+        except Exception:
+            self.status.set('X / Y 要填整数（现在是 “%s” / “%s”）' % (tx, ty))
+            return
+        W, H = self._mv_cell_space()
+        if self.mv_goto(x, y, '坐标 (%d,%d)' % (x, y)):
+            self.status.set('已跳到 (%d,%d)　当前图 %d×%d' % (x, y, W, H))
+
+    def mv_goto_wp(self):
+        """「跳到点」：按路径点号定位（先查地图定义的，再查只有存档里的）。"""
+        if not getattr(self, 'mv_state', None):
+            return
+        if not self.doc:
+            self.status.set('先打开一个存档')
+            return
+        raw = (self.mv_gwp.get() or '').strip()
+        if not raw:
+            self.status.set('填一个路径点号（也可以从下拉里选）')
+            return
+        try:
+            n = int(raw.split()[0])
+        except Exception:
+            self.status.set('路径点号要填数字（现在是 “%s”）' % raw)
+            return
+        try:
+            mp, only = self._mv_wp_points()
+        except Exception:
+            mp, only = {}, {}
+        where, pos = '地图定义', mp.get(n)
+        if pos is None:
+            pos, where = only.get(n), '只有存档里'
+        if pos is None:
+            have = sorted(set(mp) | set(only))
+            self.status.set(
+                '没有 %d 号路径点（本图/本档共 %d 个：%s%s）'
+                % (n, len(have), ','.join(str(v) for v in have[:14]),
+                   ' …' if len(have) > 14 else ''))
+            return
+        x, y = pos
+        if self.mv_goto(x, y, '路径点 %d' % n):
+            self.status.set('路径点 %d（%s）在 (%d,%d)，视图已居中' % (n, where, x, y))
+
+    def _mv_info_text(self, x, y):
+        """选中格的信息栏文本 —— 鼠标点选与「定位」共用（§SOV11 抽出来，避免两套文案）。"""
         import map_render as mr
+        st = getattr(self, 'mv_state', None) or {}
+        head = '选中格 (%d,%d)' % (x, y)
+        try:
+            if self.doc and self.doc.cell_visible(x, y, map_path=st.get('path')) is False:
+                head += '　⚠ 在蓝线外（游戏里不显示这块地图）'
+        except Exception:
+            pass
+        try:
+            head += self._mv_terr_text(x, y)
+        except Exception:
+            pass
+        try:
+            head += self._mv_ovl_text(x, y)
+        except Exception:
+            pass
+        if not (st.get('ok') and st.get('mp')):
+            # 无地图模式：建筑 / 单位 / 路径点全来自存档
+            try:
+                bld, unit, wp = self._mv_grid_data()
+            except Exception:
+                bld, unit, wp = {}, {}, {}
+            head += ('　建筑：%s' % bld[(x, y)]) if (x, y) in bld else '　建筑：无'
+            if (x, y) in unit:
+                head += '　单位：%s' % unit[(x, y)]
+            wps = [n for n, c in wp.items() if c == (x, y)]
+            if wps:
+                head += '　路径点：%s' % ','.join(str(n) for n in wps)
+            W, H = self._mv_cell_space()
+            head += ('\n（未挂地图：按存档坐标 %d×%d 画网格；放置建筑可直接用触发法，'
+                     '不依赖地图）' % (W, H))
+            return head
+        # 有地图：路径点（两组）/ 单位 / 该格建筑详情 + 落位判定
+        try:
+            mp_w, only_w = self._mv_wp_points()
+            a1 = [n for n, cc in sorted(mp_w.items()) if cc == (x, y)]
+            a2 = [n for n, cc in sorted(only_w.items()) if cc == (x, y)]
+            if a1:
+                head += '　路径点（地图定义）：%s' % ','.join(str(n) for n in a1)
+            if a2:
+                head += '　路径点（只有存档里）：%s' % ','.join(str(n) for n in a2)
+        except Exception:
+            pass
+        try:
+            us = [t for (ux, uy, t, _h) in self._mv_units() if (ux, uy) == (x, y)]
+            if us:
+                show = '、'.join(us[:6])
+                if len(us) > 6:
+                    show += ' …（共 %d 台）' % len(us)
+                head += '　单位：%s' % show
+        except Exception:
+            pass
+        b = (st.get('occ') or {}).get((x, y))
+        if b:
+            head += ('　该格建筑：%s（耐久 %d，所属方指针 0x%08X，挂接键 0x%08X，对象 @0x%X）'
+                     % (b['type'], b['hp'], b['house'], b['tag'], b['base']))
+        else:
+            head += '　空（无建筑）'
+        try:
+            msgs = mr.check_cell(st['mp'], st['blds'], x, y)
+        except Exception:
+            msgs = []
+        return head + ('\n' + '\n'.join(msgs) if msgs else '')
+
+    def mv_click(self, event):
+        """点画布 → 选中该格（信息栏与「定位」共用同一套文案，§SOV11）。"""
         st = getattr(self, 'mv_state', None)
         if not st:
             return
@@ -1035,68 +1409,21 @@ class MapViewPage(object):
             if not (0 <= x < W and 0 <= y < H):
                 return
             st['sel'] = (x, y)
-            self._mv_grid_safe()
-            bld, unit, wp = self._mv_grid_data()
-            head = '选中格 (%d,%d)' % (x, y)
-            try:
-                _mp = (getattr(self, 'mv_state', None) or {}).get('path')
-                if self.doc and self.doc.cell_visible(x, y, map_path=_mp) is False:
-                    head += '　⚠ 在蓝线外（游戏里不显示这块地图）'
-            except Exception:
-                pass
-            head += self._mv_terr_text(x, y)
-            head += self._mv_ovl_text(x, y)
-            head += '　建筑：%s' % bld[(x, y)] if (x, y) in bld else '　建筑：无'
-            if (x, y) in unit:
-                head += '　单位：%s' % unit[(x, y)]
-            wps = [n for n, c in wp.items() if c == (x, y)]
-            if wps:
-                head += '　路径点：%s' % ','.join(str(n) for n in wps)
-            head += '\n（未挂地图：按存档坐标 %d×%d 画网格；放置建筑可直接用触发法，不依赖地图）' % (W, H)
-            self.mv_info.config(text=head)
-            return
-        s = st['scale']
-        x = int(self.mv_canvas.canvasx(event.x) // s)
-        y = int(self.mv_canvas.canvasy(event.y) // s)
-        st['sel'] = (x, y)
-        self.mv_render()
-        msgs = mr.check_cell(st['mp'], st['blds'], x, y)
-        b = st['occ'].get((x, y))
-        head = '选中格 (%d,%d)' % (x, y)
-        try:
-            if self.doc and self.doc.cell_visible(x, y, map_path=st.get('path')) is False:
-                head += '　⚠ 在蓝线外（游戏里不显示这块地图）'
-        except Exception:
-            pass
-        head += self._mv_terr_text(x, y)
-        head += self._mv_ovl_text(x, y)
-        # ★§266：点到的格子若正好是路径点，直接把号说出来（填「出现于/运输机起始」时不用猜）
-        try:
-            mp_w, only_w = self._mv_wp_points()
-            a1 = [n for n, cc in sorted(mp_w.items()) if cc == (x, y)]
-            a2 = [n for n, cc in sorted(only_w.items()) if cc == (x, y)]
-            if a1:
-                head += '　路径点（地图定义）：%s' % ','.join(str(n) for n in a1)
-            if a2:
-                head += '　路径点（只有存档里）：%s' % ','.join(str(n) for n in a2)
-        except Exception:
-            pass
-        # ★§267：该格有哪些单位（不受"≥20 倍"限制，点一下就报）
-        try:
-            us = [t for (ux, uy, t, _h) in self._mv_units() if (ux, uy) == (x, y)]
-            if us:
-                show = '、'.join(us[:6])
-                if len(us) > 6:
-                    show += ' …（共 %d 台）' % len(us)
-                head += '　单位：%s' % show
-        except Exception:
-            pass
-        if b:
-            head += '　该格建筑：%s（耐久 %d，所属方指针 0x%08X，挂接键 0x%08X，对象 @0x%X）' % (
-                b['type'], b['hp'], b['house'], b['tag'], b['base'])
+            self._mv_refresh_sel()
         else:
-            head += '　空（无建筑）'
-        self.mv_info.config(text=head + '\n' + '\n'.join(msgs))
+            s = st['scale']
+            x = int(self.mv_canvas.canvasx(event.x) // s)
+            y = int(self.mv_canvas.canvasy(event.y) // s)
+            st['sel'] = (x, y)
+            self._mv_refresh_sel()
+        # ★§SOV11：坐标回填到「定位」的两个输入框 —— 点一格就能看到精确坐标，
+        #   想微调/复制也不必再算（拖到别处后点「居中选中」也能回来）。
+        try:
+            self.mv_gx.set(str(x))
+            self.mv_gy.set(str(y))
+        except Exception:
+            pass
+        self.mv_info.config(text=self._mv_info_text(x, y))
 
     def mv_backup(self):
         """一键备份当前存档（只复制、不删改；用户钦定：尺寸一致即认定同图 ⇒ 动手前先备份）"""
