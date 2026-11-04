@@ -66,9 +66,10 @@ class MapViewPage(object):
                   justify='left').pack(anchor='w', pady=(4, 0))
         # ★§SOV12：单元标记（CellTag 挂接点）的用法
         ttk.Label(_note,
-                  text='显示（视图区第二行）：路径点 / 单元标记 / 单位 / 树·石 四个勾选直接横排 ——'
-                       '路径点绿圆 = 地图 [Waypoints] 定义的号、蓝框 = 只有存档里有的号、'
-                       '橙圈「号*」= 两边都有但坐标不一致（以存档为准）；单位要 ≥20 倍才画。\n'
+                  text='显示（视图区第二行）：路径点 / 单元标记 / 单位 / 树·石 四个勾选直接横排。'
+                       '路径点**以存档为准**（引擎读档走存档）：绿圆白字 = 存档里的号、画在存档坐标；'
+                       '橙圈 +「号*」= 地图 [Waypoints] 里同号坐标不同（两边不一致，看绿圆）；'
+                       '灰空心圈 = 只有地图有、存档里没有的号。单位要 ≥20 倍才画。\n'
                        '单元标记（CellTag 挂接点）：默认开，同一个 CellTag 的格子画成同色。点中一格，'
                        '信息栏会写「★单元标记：N 个（CellTag → 触发名）」；'
                        '「🧹 删该格标记」把这格从 CellTag 上解挂（清 CellClass +80、挂接数 −1，'
@@ -661,17 +662,30 @@ class MapViewPage(object):
         return st['wpdata']
 
     def _mv_draw_waypoints(self, c):
-        """在画布上叠加路径点：**绿底白字圆 = 地图定义的号**，蓝框 = 只有存档里有的。"""
+        """画路径点。**以存档为准**（引擎读档走存档），地图 [Waypoints] 只作对照。
+
+        ★★§SOV14（2026-11-04 玩家："把路径点 35 移动到 16,104 好像无效"）：
+          以前绿圆画的是**地图 [Waypoints]** 的坐标 ⇒ 只改存档时圆点留在老地方，
+          看着就像"没生效"。现在：
+            · 绿底白字圆 = **存档里有的号**，画在**存档坐标**（引擎实际用的位置）；
+            · 橙圈套在外面 + `号*` = 地图里同号但坐标不同（两边不一致，以绿圆为准）；
+            · 灰空心圈 + 灰号 = **只有地图有、存档里没有**的号（填参数时看着有，引擎未必认）。
+        """
         st = self.mv_state
         s = max(1, int(st.get('scale') or 8))
         try:
             W, H = (st['mp']['size'] if st.get('mp') else self._mv_dims())
         except Exception:
             W, H = 160, 160
-        mp, only = self._mv_wp_points()
+        mp, _only = self._mv_wp_points()
+        try:
+            sv = dict(self.doc.waypoints_save() or {}) if self.doc else {}
+        except Exception:
+            sv = {}
         r = max(5.0, min(13.0, s * 0.62))
         fs = max(6, min(11, int(s * 0.52)))
-        for n, (x, y) in sorted(mp.items()):
+        # ① 存档里的点（权威）
+        for n, (x, y) in sorted(sv.items()):
             if not (0 <= x < W and 0 <= y < H):
                 continue
             cx, cy = x * s + s / 2.0, y * s + s / 2.0
@@ -680,34 +694,28 @@ class MapViewPage(object):
                           tags=('wp',))
             c.create_text(cx, cy, text=str(n), fill=ui_theme.T['on_dark'],
                           font=('Consolas', fs, 'bold'), tags=('wp',))
-        for n, (x, y) in sorted(only.items()):
+            p = mp.get(n)
+            if p and (int(p[0]), int(p[1])) != (int(x), int(y)):
+                c.create_oval(cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2,
+                              outline=ui_theme.T['warn'], width=1, tags=('wp',))
+                if s >= 8:
+                    c.create_text(cx, cy - r - 8, text='%d*' % n,
+                                  fill=ui_theme.T['warn'],
+                                  font=('Consolas', 7), tags=('wp',))
+        # ② 只有地图有、存档里没有的号（灰空心圈）
+        _grey = ui_theme.T.get('muted_soft') or ui_theme.T['muted']
+        for n, (x, y) in sorted(mp.items()):
+            if n in sv:
+                continue
             if not (0 <= x < W and 0 <= y < H):
                 continue
             cx, cy = x * s + s / 2.0, y * s + s / 2.0
-            c.create_rectangle(cx - 4, cy - 4, cx + 4, cy + 4,
-                               outline=ui_theme.T['info'], width=1, tags=('wp',))
-            if s >= 12:
-                c.create_text(cx, cy - 9, text=str(n), fill=ui_theme.T['info'],
-                              font=('Consolas', 7), tags=('wp',))
-        # ★★§SOV13：地图与存档**都有但坐标不一样**的号 ⇒ 在**存档实际坐标**画橙圈 + `号*`。
-        #   引擎读档后按存档走，所以存档才是权威；地图那份只作对照（本工具不写地图）。
-        try:
-            _sv = dict(self.doc.waypoints_save() or {}) if self.doc else {}
-        except Exception:
-            _sv = {}
-        for n, (sx, sy) in sorted(_sv.items()):
-            p = mp.get(n)
-            if not p or (int(p[0]), int(p[1])) == (int(sx), int(sy)):
-                continue
-            if not (0 <= sx < W and 0 <= sy < H):
-                continue
-            cx, cy = sx * s + s / 2.0, sy * s + s / 2.0
             c.create_oval(cx - r, cy - r, cx + r, cy + r,
-                          outline=ui_theme.T['warn'], width=2, tags=('wp',))
+                          outline=_grey, width=1, tags=('wp',))
             if s >= 10:
-                c.create_text(cx, cy - r - 8, text='%d*' % n,
-                              fill=ui_theme.T['warn'],
+                c.create_text(cx, cy + r + 7, text='%d' % n, fill=ui_theme.T['muted'],
                               font=('Consolas', 7), tags=('wp',))
+
 
     # ---------------- ★§SOV12 单元标记（CellTag 挂接点）：显示 / 列表 / 删除 ----------------
     MV_MARK_PALETTE = ('#FF7A00', '#41D3FF', '#FFD400', '#8CFF41',
@@ -1766,14 +1774,26 @@ class MapViewPage(object):
                      '不依赖地图）' % (W, H))
             return head
         # 有地图：路径点（两组）/ 单位 / 该格建筑详情 + 落位判定
+        # ★§SOV14：路径点**以存档为准**报（地图那份只作对照），否则改完存档点这一格
+        #   会说"没有路径点"，和画布上的绿圆对不上。
         try:
-            mp_w, only_w = self._mv_wp_points()
-            a1 = [n for n, cc in sorted(mp_w.items()) if cc == (x, y)]
-            a2 = [n for n, cc in sorted(only_w.items()) if cc == (x, y)]
-            if a1:
-                head += '　路径点（地图定义）：%s' % ','.join(str(n) for n in a1)
-            if a2:
-                head += '　路径点（只有存档里）：%s' % ','.join(str(n) for n in a2)
+            sv = dict(self.doc.waypoints_save() or {}) if self.doc else {}
+            mp_w, _only = self._mv_wp_points()
+            here = [n for n, cc in sorted(sv.items())
+                    if (int(cc[0]), int(cc[1])) == (x, y)]
+            if here:
+                head += '　路径点（存档）：%s' % ','.join(str(n) for n in here)
+                diff = [n for n in here if n in mp_w
+                        and (int(mp_w[n][0]), int(mp_w[n][1])) != (x, y)]
+                if diff:
+                    head += '　⚠ 地图里这些号在别处：%s' % '、'.join(
+                        '%d(%d,%d)' % (n, int(mp_w[n][0]), int(mp_w[n][1]))
+                        for n in diff[:3])
+            onlymap = [n for n, cc in sorted(mp_w.items())
+                       if (int(cc[0]), int(cc[1])) == (x, y) and n not in sv]
+            if onlymap:
+                head += '　路径点（只有地图有、存档没有）：%s' % ','.join(
+                    str(n) for n in onlymap)
         except Exception:
             pass
         try:

@@ -87,8 +87,22 @@ chk(all(sv1[k] == sv0[k] for k in sv0 if k != n0), '其它 %d 个路径点一个
     [(k, sv0[k], sv1.get(k)) for k in sv0 if k != n0 and sv1.get(k) != sv0[k]][:3])
 chk(app.mv_gx.get() == str(new0[0]) and app.mv_gy.get() == str(new0[1]),
     'X / Y 框停在新坐标', (app.mv_gx.get(), app.mv_gy.get()))
-chk(('(%d,%d)' % new0) in app.mv_info.cget('text'),
-    '信息栏也刷新到新坐标', app.mv_info.cget('text')[:60])
+chk('路径点（存档）' in app.mv_info.cget('text')
+    and str(n0) in app.mv_info.cget('text'),
+    '信息栏按**存档**报这格有路径点 %d' % n0, app.mv_info.cget('text')[:70])
+
+# ★§SOV14：画布上的绿圆必须画在**存档坐标**（以前画的是地图坐标 ⇒ 改完看着没动）
+def _wp_label_pos(num):
+    for i in app.mv_canvas.find_withtag('wp'):
+        if app.mv_canvas.type(i) == 'text' and app.mv_canvas.itemcget(i, 'text') == str(num):
+            return app.mv_canvas.coords(i)
+    return None
+_s = app._mv_scale_now()
+_pos = _wp_label_pos(n0)
+chk(_pos is not None and abs(_pos[0] - (new0[0] + 0.5) * _s) < 2
+    and abs(_pos[1] - (new0[1] + 0.5) * _s) < 2,
+    '★%d 号标签画在存档坐标 %s（画布 %s，期望 %.0f,%.0f）'
+    % (n0, new0, _pos, (new0[0] + 0.5) * _s, (new0[1] + 0.5) * _s), _pos)
 
 print('== B. 写回原值 ⇒ 逐字节复原 ==')
 app.mv_gwp.set(str(n0))
