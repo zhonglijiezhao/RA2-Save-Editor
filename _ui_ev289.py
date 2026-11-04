@@ -98,9 +98,11 @@ for title, body in sections:
                 menus[label] = menu
             except Exception:
                 menus[label] = None
-ck(set(menus) == {'叠加 ▾', '更多 ▾', '修旧楼 ▾'}, '三个折叠菜单：%s' % sorted(menus))
-# ★§SOV12：叠加菜单 +3 项（单元标记勾选 / 删除该格单元标记 / 列出全部单元标记）
-for label, want in (('叠加 ▾', 6), ('更多 ▾', 4), ('修旧楼 ▾', 3)):
+# ★★§SOV13（2026-11-04 玩家：「路径点、单元标记、单位、树石这些选项，不用叠加，
+#   直接向右边排列显示」）⇒ 原来的「叠加 ▾」整个撤掉，4 个勾选摊平成一行。
+ck(set(menus) == {'更多 ▾', '修旧楼 ▾'},
+   '两个折叠菜单（叠加 ▾ 已摊平）：%s' % sorted(menus))
+for label, want in (('更多 ▾', 4), ('修旧楼 ▾', 3)):
     menu = menus.get(label)
     n = 0
     if menu is not None:
@@ -121,6 +123,12 @@ for name in ('mv_type', 'mv_house', 'mv_unit', 'mv_u_house', 'mv_u_vet', 'mv_u_n
     ck(hasattr(app, name), '属性 %s 还在' % name)
 
 ck(app.mv_clip is None, '剪贴板初始为空（mv_clip 定义在按钮之后也没事）')
+# ★§SOV13：显示行 4 个勾选摊平 + 单元标记两个命令按钮 + 路径点写入按钮
+for name in ('mv_wp', 'mv_marks', 'mv_units', 'mv_terr'):
+    ck(hasattr(app, name), '显示勾选 %s 还在' % name)
+ck(all(hasattr(app, f) for f in ('mv_list_markers', 'mv_delete_markers',
+                                 'mv_set_wp_xy')),
+   '列出标记 / 删该格标记 / 写到 X-Y 三个回调都在')
 ck(app._cb_theater.cget('values') and len(app._cb_theater.cget('values')) == 6,
    '剧场下拉 6 个选项')
 

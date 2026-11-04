@@ -57,16 +57,22 @@ class MapViewPage(object):
                   text='定位：「X / Y」填格子坐标 → 「跳到格」；「路径点」填号（或从下拉选）→ 「跳到点」。'
                        '两者都会选中那一格并把视图居中（贴边的格子只能贴边，滚不到正中）。'
                        '反向也通：在地图上点任意一格，坐标会回填到 X / Y，改完再点「跳到格」；'
-                       '拖远了点「居中选中」回到当前格。缩放以视口中心为锚点，不会一缩放就漂回左上。',
+                       '拖远了点「居中选中」回到当前格。缩放以视口中心为锚点，不会一缩放就漂回左上。\n'
+                       '✏ 写到 X/Y：把「路径点」框里那号路径点**改到** X / Y 的坐标 —— 只写存档'
+                       '（原地 4 字节、长度不变、可再改回来），.map 一律不动。'
+                       '改完若地图 [Waypoints] 里同号在别处，图上会在**存档实际位置**多画一个橙圈，'
+                       '标签写成「号*」，表示"地图与存档不一致，以存档为准"。',
                   foreground=ui_theme.T['ink_2'], wraplength=700,
                   justify='left').pack(anchor='w', pady=(4, 0))
         # ★§SOV12：单元标记（CellTag 挂接点）的用法
         ttk.Label(_note,
-                  text='单元标记（CellTag 挂接点）：「叠加 ▾ → 单元标记（CellTag 挂接点）」勾选显示'
-                       '（默认开；同一个 CellTag 的格子画成同色，一眼看出属于哪条触发）。点中一格，'
+                  text='显示（视图区第二行）：路径点 / 单元标记 / 单位 / 树·石 四个勾选直接横排 ——'
+                       '路径点绿圆 = 地图 [Waypoints] 定义的号、蓝框 = 只有存档里有的号、'
+                       '橙圈「号*」= 两边都有但坐标不一致（以存档为准）；单位要 ≥20 倍才画。\n'
+                       '单元标记（CellTag 挂接点）：默认开，同一个 CellTag 的格子画成同色。点中一格，'
                        '信息栏会写「★单元标记：N 个（CellTag → 触发名）」；'
-                       '「删除该格的单元标记…」把这格从 CellTag 上解挂（清 CellClass +80、挂接数 −1，'
-                       '对象本身不删、存档长度不变）；「列出全部单元标记…」可双击跳格、多选批量删。'
+                       '「🧹 删该格标记」把这格从 CellTag 上解挂（清 CellClass +80、挂接数 −1，'
+                       '对象本身不删、存档长度不变）；「📋 列出标记…」可双击跳格、多选批量删。'
                        '只改存档、不写 .map —— 从地图重开任务，标记还会回来。',
                   foreground=ui_theme.T['ink_2'], wraplength=700,
                   justify='left').pack(anchor='w', pady=(4, 0))
@@ -146,29 +152,33 @@ class MapViewPage(object):
         self.mv_ovl = tk.BooleanVar(value=True)
         ttk.Checkbutton(r, text='覆盖物', variable=self.mv_ovl, command=self.mv_render,
                         style='Surface.TCheckbutton').pack(side='left', padx=(8, 0))
-        # ★§266/§267/§281：路径点 / 单位 / 树石 —— 低频，收进菜单
-        self.mv_wp = tk.BooleanVar(value=True)
-        self.mv_units = tk.BooleanVar(value=False)
-        self.mv_terr = tk.BooleanVar(value=False)
-        # ★★§SOV12（2026-11-04 玩家：「加入显示 单元标记 并能删除」）：
-        #   CellTag 挂接点 = 地图上的「单元标记」，默认显示（同一条 CellTag 同色）。
-        self.mv_marks = tk.BooleanVar(value=True)
-        _mb0 = ttk.Menubutton(r, text='叠加 ▾', style='Ghost.TButton')
-        _m0 = tk.Menu(_mb0, tearoff=0)
-        _m0.add_checkbutton(label='路径点（地图 [Waypoints] + 存档）',
-                            variable=self.mv_wp, command=self.mv_render)
-        _m0.add_checkbutton(label='单元标记（CellTag 挂接点）',
-                            variable=self.mv_marks, command=self._mv_on_marks)
-        _m0.add_checkbutton(label='单位（≥20 倍才画）',
-                            variable=self.mv_units, command=self._mv_toggle_units)
-        _m0.add_checkbutton(label='树/石（Terrain 对象）',
-                            variable=self.mv_terr, command=self.mv_render)
-        _m0.add_separator()
-        _m0.add_command(label='🧹 删除该格的单元标记…', command=self.mv_delete_markers)
-        _m0.add_command(label='📋 列出全部单元标记…', command=self.mv_list_markers)
-        _mb0['menu'] = _m0
-        _mb0.pack(side='left', padx=(10, 0))
         ttk.Button(r, text='重绘', command=self.mv_render).pack(side='left', padx=(10, 0))
+
+        # ★★§SOV13（2026-11-04 玩家：「路径点、单元标记、单位、树石这些选项，不用叠加，
+        #   直接向右边排列显示」）⇒ 原来收在「叠加 ▾」里的 4 个勾选**摊平成一行**，
+        #   CellTag 相关的两个命令也摆在这一行右边（勾选与操作放一起更好找）。
+        r = ttk.Frame(b2, style=SUF)
+        r.pack(fill='x', pady=(4, 0))
+        ttk.Label(r, text='显示', style=LB).pack(side='left')
+        self.mv_wp = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r, text='路径点', variable=self.mv_wp, command=self.mv_render,
+                        style='Surface.TCheckbutton').pack(side='left', padx=(6, 0))
+        # CellTag 挂接点 = 地图上的「单元标记」，默认显示（同一条 CellTag 同色）
+        self.mv_marks = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r, text='单元标记', variable=self.mv_marks,
+                        command=self._mv_on_marks,
+                        style='Surface.TCheckbutton').pack(side='left', padx=(10, 0))
+        self.mv_units = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r, text='单位', variable=self.mv_units,
+                        command=self._mv_toggle_units,
+                        style='Surface.TCheckbutton').pack(side='left', padx=(10, 0))
+        self.mv_terr = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r, text='树/石', variable=self.mv_terr, command=self.mv_render,
+                        style='Surface.TCheckbutton').pack(side='left', padx=(10, 0))
+        ttk.Button(r, text='📋 列出标记…',
+                   command=self.mv_list_markers).pack(side='left', padx=(14, 0))
+        ttk.Button(r, text='🧹 删该格标记',
+                   command=self.mv_delete_markers).pack(side='left', padx=(4, 0))
 
         # ★§SOV11（2026-11-04 玩家要求）：地图动辄 1024×1024，靠拖滚动条找一格太费劲
         #   ⇒ 加一行「定位」：填 (x,y) 或路径点号，选中那一格并**把视图居中**到它；
@@ -178,11 +188,11 @@ class MapViewPage(object):
         ttk.Label(r, text='定位', style=LB).pack(side='left')
         ttk.Label(r, text='X', style=MU, font=SM).pack(side='left', padx=(6, 0))
         self.mv_gx = tk.StringVar()
-        self._e_mv_gx = ttk.Entry(r, textvariable=self.mv_gx, width=5)
+        self._e_mv_gx = ttk.Entry(r, textvariable=self.mv_gx, width=4)
         self._e_mv_gx.pack(side='left', padx=(2, 0))
         ttk.Label(r, text='Y', style=MU, font=SM).pack(side='left', padx=(6, 0))
         self.mv_gy = tk.StringVar()
-        self._e_mv_gy = ttk.Entry(r, textvariable=self.mv_gy, width=5)
+        self._e_mv_gy = ttk.Entry(r, textvariable=self.mv_gy, width=4)
         self._e_mv_gy.pack(side='left', padx=(2, 0))
         for _e in (self._e_mv_gx, self._e_mv_gy):
             _e.bind('<Return>', lambda e: self.mv_goto_xy())
@@ -197,8 +207,12 @@ class MapViewPage(object):
         self._cb_mv_gwp.bind('<<ComboboxSelected>>', lambda e: self.mv_goto_wp())
         ttk.Button(r, text='跳到点', width=7,
                    command=self.mv_goto_wp).pack(side='left', padx=(4, 0))
-        ttk.Button(r, text='居中选中', width=8,
-                   command=self.mv_center_sel).pack(side='left', padx=(8, 0))
+        # ★★§SOV13（2026-11-04 玩家：「改路径点坐标这个功能可以做」）：
+        #   把「路径点」框里那号改到 X / Y 框的坐标（只写存档的路径点表）。
+        ttk.Button(r, text='✏ 写到X/Y', width=10,
+                   command=self.mv_set_wp_xy).pack(side='left', padx=(4, 0))
+        ttk.Button(r, text='居中', width=6,
+                   command=self.mv_center_sel).pack(side='left', padx=(6, 0))
 
         # ── ③ 放置：建筑 / 单位 / 触发法（都作用于选中格）──
         _s, b3 = ui_theme.section(f, '放置', '作用于选中格')
@@ -674,6 +688,25 @@ class MapViewPage(object):
                                outline=ui_theme.T['info'], width=1, tags=('wp',))
             if s >= 12:
                 c.create_text(cx, cy - 9, text=str(n), fill=ui_theme.T['info'],
+                              font=('Consolas', 7), tags=('wp',))
+        # ★★§SOV13：地图与存档**都有但坐标不一样**的号 ⇒ 在**存档实际坐标**画橙圈 + `号*`。
+        #   引擎读档后按存档走，所以存档才是权威；地图那份只作对照（本工具不写地图）。
+        try:
+            _sv = dict(self.doc.waypoints_save() or {}) if self.doc else {}
+        except Exception:
+            _sv = {}
+        for n, (sx, sy) in sorted(_sv.items()):
+            p = mp.get(n)
+            if not p or (int(p[0]), int(p[1])) == (int(sx), int(sy)):
+                continue
+            if not (0 <= sx < W and 0 <= sy < H):
+                continue
+            cx, cy = sx * s + s / 2.0, sy * s + s / 2.0
+            c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                          outline=ui_theme.T['warn'], width=2, tags=('wp',))
+            if s >= 10:
+                c.create_text(cx, cy - r - 8, text='%d*' % n,
+                              fill=ui_theme.T['warn'],
                               font=('Consolas', 7), tags=('wp',))
 
     # ---------------- ★§SOV12 单元标记（CellTag 挂接点）：显示 / 列表 / 删除 ----------------
@@ -1606,6 +1639,93 @@ class MapViewPage(object):
                            m['count']))
         more = '　等 %d 个' % len(mk) if len(mk) > 4 else ''
         return '　★单元标记：%d 个（%s%s）' % (len(mk), '、'.join(bits), more)
+
+    def mv_set_wp_xy(self):
+        """把「路径点」框里那号路径点改到 X / Y 框的坐标（只写存档，§SOV13）。
+
+        底层是 `SaveDoc.set_waypoint()`：**原地改 4 字节**（x、y 各 u16），
+        存档长度不变、写完立刻回读校验。`.MAP` 那份一律不动 ——
+        本项目铁律：路径点只写存档，地图上的点请玩家自己在地编里改。
+        """
+        st = getattr(self, 'mv_state', None)
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档', parent=self)
+            return
+        raw = (self.mv_gwp.get() or '').strip()
+        if not raw:
+            messagebox.showinfo('先选一个路径点',
+                                '在「路径点」框里填号（或从下拉里选），再点「✏ 写到 X/Y」。',
+                                parent=self)
+            return
+        try:
+            n = int(raw.split()[0])
+        except Exception:
+            self.status.set('路径点号要填数字（现在是 “%s”）' % raw)
+            return
+        if not (0 <= n < self.doc.WP_COUNT):
+            self.status.set('路径点号要 0..%d（现在是 %d）' % (self.doc.WP_COUNT - 1, n))
+            return
+        tx = (self.mv_gx.get() or '').strip()
+        ty = (self.mv_gy.get() or '').strip()
+        try:
+            x, y = int(tx), int(ty)
+        except Exception:
+            self.status.set('X / Y 要填整数（现在是 “%s” / “%s”）' % (tx, ty))
+            return
+        W, H = self._mv_cell_space()
+        if not (0 <= x < W and 0 <= y < H):
+            self.status.set('坐标 (%d,%d) 超出范围：当前这张图是 %d×%d（x 0..%d，y 0..%d）'
+                            % (x, y, W, H, W - 1, H - 1))
+            return
+        try:
+            old = self.doc.waypoint_cell(n)
+        except Exception:
+            old = None
+        map_pos = None                       # 地图那份只作对照（绝不写）
+        try:
+            _mp, _only = self._mv_wp_points()
+            map_pos = _mp.get(n)
+        except Exception:
+            pass
+        extra = []
+        if map_pos and (int(map_pos[0]), int(map_pos[1])) != (x, y):
+            extra.append('地图 [Waypoints] 里 %d 号在 (%d,%d) —— 本工具只写存档，'
+                         '改完两边会不一致（地图那份请你自己在地编里改）。'
+                         % (n, map_pos[0], map_pos[1]))
+        if old is None:
+            extra.append('这一号原来没有坐标 ⇒ 等于新建一个路径点。')
+        if not messagebox.askyesno(
+                '改 %d 号路径点' % n,
+                '把 %d 号路径点从 %s 改到 (%d, %d)？\n\n'
+                '只写存档的路径点表（原地 4 字节，存档长度不变），不写 .map。\n'
+                '不可撤销 —— 建议先「备份存档」。%s'
+                % (n, ('(%d, %d)' % tuple(old)) if old else '（空）', x, y,
+                   ''.join('\n\n' + e for e in extra)),
+                parent=self):
+            return
+        try:
+            res = self.doc.set_waypoint(n, x, y)
+        except Exception as e:
+            messagebox.showerror('写不进去', str(e), parent=self)
+            return
+        st['wpdata'] = None                  # 路径点缓存要重算（这号坐标变了）
+        try:
+            self._mv_fill_wp_combo()
+        except Exception:
+            pass
+        try:
+            self.mv_canvas.delete('wp')
+            if bool(getattr(self, 'mv_wp', None) and self.mv_wp.get()):
+                self._mv_draw_waypoints(self.mv_canvas)
+        except Exception:
+            pass
+        self.mv_goto(res[0], res[1])         # 跳到新位置，让玩家看到
+        self.status.set('已把 %d 号路径点写到 (%d,%d)%s%s'
+                        % (n, res[0], res[1],
+                           '（原来 (%d,%d)）' % tuple(old) if old else '（新建）',
+                           '　⚠ 与地图 [Waypoints] 不一致（只改了存档）'
+                           if (map_pos and (int(map_pos[0]), int(map_pos[1])) != res)
+                           else ''))
 
     def _mv_info_text(self, x, y):
         """选中格的信息栏文本 —— 鼠标点选与「定位」共用（§SOV11 抽出来，避免两套文案）。"""
