@@ -212,6 +212,11 @@ class MapViewPage(object):
         #   把「路径点」框里那号改到 X / Y 框的坐标（只写存档的路径点表）。
         ttk.Button(r, text='✏ 写到X/Y', width=10,
                    command=self.mv_set_wp_xy).pack(side='left', padx=(4, 0))
+        # ★★§SOV38（2026-11-05 玩家：「在地图选位页面增加新建路径点功能」）：
+        #   「写到X/Y」要求先有号；想**凭空造一个新号**（比如给行为 108 的箱子找个落点）
+        #   就得自己猜哪个号没被占。这个按钮自动挑空号，或者在「路径点」框里指定号。
+        ttk.Button(r, text='＋ 新建点', width=9,
+                   command=self.mv_new_wp).pack(side='left', padx=(4, 0))
         ttk.Button(r, text='居中', width=6,
                    command=self.mv_center_sel).pack(side='left', padx=(6, 0))
 
@@ -1647,6 +1652,119 @@ class MapViewPage(object):
                            m['count']))
         more = '　等 %d 个' % len(mk) if len(mk) > 4 else ''
         return '　★单元标记：%d 个（%s%s）' % (len(mk), '、'.join(bits), more)
+
+    def mv_new_wp(self):
+        """「＋ 新建点」：在 X / Y 框（或选中格）上**新建**一个路径点（§SOV38）。
+
+        号怎么定：
+          · 「路径点」框里有号、且那个号当前是空的 ⇒ **就用它**（想指定号时先填它）；
+          · 没填 / 那号已被占用 ⇒ 自动挑空号：优先「当前最大号 +1」，再退回最小的空号。
+
+        底层还是 `SaveDoc.ensure_waypoint_at()` + `set_waypoint()`：**原地写 4 字节**，
+        存档长度不变；`.MAP` 那份一律不动（本项目铁律：路径点只写存档）。
+        该格**已经有**路径点时不会重复建 —— 直接跳过去并告知是几号。
+        """
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档', parent=self)
+            return
+        W, H = self._mv_cell_space()
+        # 目标格：优先 X / Y 框（点地图会自动回填，可手改成精确坐标），其次选中格
+        tx = (self.mv_gx.get() or '').strip()
+        ty = (self.mv_gy.get() or '').strip()
+        x = y = None
+        if tx or ty:
+            try:
+                x, y = int(tx), int(ty)
+            except Exception:
+                self.status.set('X 和 Y 要一起填整数（现在是 “%s” / “%s”）' % (tx, ty))
+                return
+        if x is None:
+            sel = (getattr(self, 'mv_state', None) or {}).get('sel')
+            if sel:
+                x, y = int(sel[0]), int(sel[1])
+        if x is None:
+            self.status.set('先在地图上点一格，或在 X / Y 里填坐标，再点「＋ 新建点」')
+            return
+        if not (0 <= x < W and 0 <= y < H):
+            self.status.set('坐标 (%d,%d) 超出范围：当前这张图是 %d×%d（x 0..%d，y 0..%d）'
+                            % (x, y, W, H, W - 1, H - 1))
+            return
+        # ① 这格已经有路径点？不重复建（同格多点没意义，引擎也只用最小编号那个）
+        try:
+            same = sorted(n for n, c in (self.doc.waypoints_save() or {}).items()
+                          if tuple(c) == (x, y))
+        except Exception:
+            same = []
+        if same:
+            n = same[0]
+            try:
+                self.mv_gwp.set(str(n))
+            except Exception:
+                pass
+            self.mv_goto(x, y, '路径点 %d' % n)
+            self.status.set('(%d,%d) 已经有路径点了（%s 号）⇒ 不重复新建'
+                            % (x, y, '、'.join(str(v) for v in same)))
+            return
+        # ② 想用的号（可以不给）
+        want = None
+        raw = (self.mv_gwp.get() or '').strip()
+        if raw:
+            try:
+                cand = int(raw.split()[0])
+            except Exception:
+                cand = None
+            if cand is None:
+                self.status.set('「路径点」框里要填数字（现在是 “%s”），或者清空让它自动挑号'
+                                % raw)
+                return
+            if not (0 <= cand < self.doc.WP_COUNT):
+                self.status.set('路径点号要 0..%d（现在是 %d）'
+                                % (self.doc.WP_COUNT - 1, cand))
+                return
+            want = cand
+        lim = self.doc.waypoint_limit()
+        try:
+            n = self.doc.ensure_waypoint_at(x, y, prefer=want)
+        except Exception as e:
+            messagebox.showerror('新建不了', str(e), parent=self)
+            return
+        if n is None:
+            messagebox.showerror(
+                '新建不了',
+                '路径点表已经满了（0..%d 全被占用），没有空号可用。\n\n'
+                '先把不用的点清掉（把它的坐标写成 0）再新建。' % lim,
+                parent=self)
+            return
+        # ③ 让所有缓存与视图跟上（路径点表变了）
+        st = getattr(self, 'mv_state', None) or {}
+        st['wpdata'] = None
+        st['gdata'] = None
+        try:
+            self._mv_fill_wp_combo()
+        except Exception:
+            pass
+        try:
+            self.mv_canvas.delete('wp')
+            if bool(getattr(self, 'mv_wp', None) and self.mv_wp.get()):
+                self._mv_draw_waypoints(self.mv_canvas)
+        except Exception:
+            pass
+        try:
+            self.mv_gwp.set(str(n))
+        except Exception:
+            pass
+        self.mv_goto(x, y, '新路径点 %d' % n)
+        extra = []
+        if want is not None and n != want:
+            extra.append('%d 号已经被占了，改用空号 %d' % (want, n))
+        try:
+            mmax = self.doc.map_waypoint_max()
+        except Exception:
+            mmax = None
+        if mmax is not None and n > mmax:
+            extra.append('地图 [Waypoints] 里没有这一号 —— 只写进存档，游戏内照样可用')
+        self.status.set('已新建 %d 号路径点 @ (%d,%d)%s　→ 记得「保存」写盘'
+                        % (n, x, y, ('　（' + '；'.join(extra) + '）') if extra else ''))
 
     def mv_set_wp_xy(self):
         """把「路径点」框里那号路径点改到 X / Y 框的坐标（只写存档，§SOV13）。
