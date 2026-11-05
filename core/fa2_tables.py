@@ -238,10 +238,10 @@ ACTION_TYPES = {
     91: ('暴走(无效)', 0),
     92: ('启动火风暴围墙 (Ares平台有效)', 0),
     93: ('关闭火风暴围墙 (Ares平台有效)', 0),
-    94: ('离子炮打击...(无效)', 30),
+    94: ('离子炮打击...', 30),
     95: ('核弹打击...', 0),
     96: ('化学导弹打击...(无效)', 30),
-    97: ('切换货物火车状态(无效)', 0),
+    97: ('切换货物火车状态', 0),
     98: ('播放音效在(随机路径点)', 16),
     99: ('播放音效在...', 16),
     100: ('在小地图窗口播放影片', 12),
@@ -446,6 +446,21 @@ def action_ptype(n):
 # ---------------------------------------------------------------------------
 _INVALID_TAG = '(无效)'
 
+# ★★2026-11-05 玩家定案：「最现实的做法就是**抄地编中的列表**，就是我给的那六张图片中的列表」
+#   ⇒ 下面这份是**逐条对着玩家给的 6 张地编截图抄下来的可见编号**（区间写法）。
+#   不进这份名单的编号**一律不进下拉**（数据仍留在 ACTION_TYPES 里，老存档照样能翻译成名字）。
+#   名单与 `FAData.ini [ActionsRA2]` 的差别（都被地编界面藏起来了）：
+#     15 允许胜利 / 58 流星雨（FAData 说明：会导致 IE 崩溃）/ 64-66 在…闪烁(小中大)
+#     77-79 战机·步兵·载具作战小队比例 / 85 矿石生长 / 87 冰层延伸 / 91 暴走 / 96 化学导弹
+#   ⚠ 地编换了版本要照着新截图更新这份表。
+FA2_LIST_RUNS = (
+    (1, 14), (16, 38), (40, 43), (46, 57), (59, 63), (67, 76),
+    (80, 84), (86, 86), (88, 90), (92, 95), (97, 104), (105, 149),
+    (500, 506), (510, 512), (600, 600), (606, 611), (800, 802),
+)
+FA2_VISIBLE_ACTIONS = frozenset(
+    n for _a, _b in FA2_LIST_RUNS for n in range(_a, _b + 1))
+
 
 def is_invalid_name(nm):
     return _INVALID_TAG in (nm or '')
@@ -460,13 +475,18 @@ def event_invalid(n):
 
 
 def action_keys(include_invalid=False):
-    """行为下拉用的编号序列（升序，不含 0；默认跳过标了「(无效)」的条目）。"""
-    return [k for k in sorted(ACTION_TYPES)
-            if k != 0 and (include_invalid or not action_invalid(k))]
+    """行为下拉用的编号序列。
+
+    默认**只列地编列表里有的**（`FA2_VISIBLE_ACTIONS`，玩家 2026-11-05 定案：
+    照抄地编那 6 张截图）。`include_invalid=True` 时返回全部非 0 编号（排查用）。
+    """
+    if include_invalid:
+        return [k for k in sorted(ACTION_TYPES) if k != 0]
+    return [k for k in sorted(ACTION_TYPES) if k in FA2_VISIBLE_ACTIONS]
 
 
 def event_keys(include_invalid=False):
-    """事件下拉用的编号序列（同上）。"""
+    """事件下拉用的编号序列（跳过名字里带「(无效)」的）。"""
     return [k for k in sorted(EVENT_TYPES)
             if k != 0 and (include_invalid or not event_invalid(k))]
 
