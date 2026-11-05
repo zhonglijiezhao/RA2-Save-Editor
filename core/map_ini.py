@@ -20,6 +20,56 @@ RA2/YR 地图文件是 INI 文本（UTF-8 或 GBK），相关段：
 import os
 
 
+# ---------------------------------------------------------------- 路径点字母编码
+# ★★2026-11-05 定案：地图 INI 里凡是要写"第几号路径点"的地方（[Actions] 每块第 8 个字段、
+#   [TaskForces] 的 `Waypoint=`），用的都是**双射 26 进制（bijective base-26）**：
+#       A=1, B=2, … Z=26, AA=27, AB=28, …
+#   而**路径点号 = 这个值 − 1**（A=0、Z=25、AA=26）。
+#
+#   证据链（不再是"看着像"）：
+#     ① FA2sp（地编）的 PDB 里有符号 `STDHelpers::WaypointToString` / `Waypoint_To_String`；
+#        反汇编 `STDHelpers::WaypointToString`（RVA 0x3CEA50）逐条读出来就是：
+#            ecx = n + 1
+#            循环 { eax = ecx % 26; if (eax == 0) eax = 26;       // 余 0 当作 26
+#                   putchar('A' + eax - 1);                        // 1..26 → 'A'..'Z'
+#                   ecx = (ecx - eax) / 26; }                      // 继续取商
+#        除法用的是魔数 `0x4EC4EC4F` + `sar edx,3`（= 有符号除以 26），26 在 `lea edi,[esi+0x13]` 里。
+#     ② `sov01umd.map`：[Actions] 里出现的 **293 种**字母串，按此公式解码后
+#        **293/293** 都落在 `[Waypoints]` 的键里；`所有触发全禁用.map` 330/330。
+#     ③ `all01umd.map` 的 `CV` / `CU` → 99 / 98，与存档里行为 108 的 `+0x58` 逐一对上。
+#   ⇒ 以前"CV=99、CU=98，不是朴素 36 进制"的疑惑到此结束。
+def wp_encode(n):
+    """路径点号 → 地图 INI 的字母串（0→`A`、25→`Z`、26→`AA`、99→`CV`）。"""
+    n = int(n)
+    if n < 0:
+        raise ValueError('路径点号不能是负数：%d' % n)
+    v = n + 1
+    out = ''
+    while v > 0:
+        v, r = divmod(v - 1, 26)          # 双射：先减 1 再取余，余 0 就是 'A'
+        out = chr(0x41 + r) + out
+    return out
+
+
+def wp_decode(s):
+    """地图 INI 的字母串 → 路径点号（`A`→0、`Z`→25、`AA`→26）；认不出返回 None。
+
+    ★只认字母，**不要顺手把纯数字也当路径点号**：`[Actions]` 每块第 8 个字段的语义
+      随行为类型变 —— 需要落点的行为（80 援军 / 107 / 125 建建筑 / 108 工具箱）是路径点，
+      而 **131「闪烁特定类型的建筑…」那一位是「闪烁帧数」**（地编原文：1 秒 = 15 帧），
+      实测那张图里就写着 `500` / `1000`。混进来会张冠李戴。
+    """
+    t = (s or '').strip().upper()
+    if not (1 <= len(t) <= 3):
+        return None
+    v = 0
+    for ch in t:
+        if not ('A' <= ch <= 'Z'):
+            return None
+        v = v * 26 + (ord(ch) - 0x40)
+    return v - 1
+
+
 class MapIni(object):
     def __init__(self, path):
         self.path = path
@@ -171,11 +221,13 @@ class MapIni(object):
 
     # ---------- 路径点（waypoint） ----------
     def waypoints(self):
-        """`[Waypoints]` → {号: (x, y)}（号 0..99）。
+        """`[Waypoints]` → {号: (x, y)}（号 0..701，实测大图有 557 个）。
 
         ★值编码 = **y×1000 + x**（2026-10-17 实测 `all01umd.map`：
           `98=80080` → (80,80)，`99=79080` → (80,79)；
           而玩家用「将建筑建于… 路径点 99」刷出来的光棱塔正好在 (80,79) ⇒ 编码实锤）。
+        ★键是**十进制数字**，别和 `[Actions]` / `[TaskForces]` 里的字母串混
+          （那些是 `wp_decode()` 的输入；`A` = 0 号）。2026-11-05 补。
         """
         out = {}
         for k, v in self.sections.get('waypoints', {}).items():
