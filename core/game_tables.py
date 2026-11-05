@@ -22,6 +22,9 @@
     ptype 18 语音    → eva(md).ini      `[DialogList]`
     ptype 25 动画    → rules(md).ini    `[Animations]`
     ptype 26 粒子    → rules(md).ini    `[ParticleSystems]`
+    ptype 41 武器/弹头 → rules(md).ini   `[WeaponTypes]` 优先、缺则 `[Warheads]`
+                        （行为 42「武器（弹头）爆炸在...」用；地编 ActionsRA2 第 42 条原文
+                         就是这么规定的 —— 玩家 2026-11-05 指出这一栏也没接上）
 
 用法：
     from game_tables import lists_for_dir, label_of, choices_of
@@ -246,7 +249,17 @@ def load_tables(game_dir):
         'eva': _parse_num_map(texts.get('evamd.ini'), 'DialogList'),
         'themes': _parse_num_map(texts.get('thememd.ini'), 'Themes'),
         'movies': _parse_num_map(art, 'Movies'),
+        # ★2026-11-05（玩家：「42 武器（弹头）爆炸在... 的选项列表为空，
+        #   这个选项应该读取 RULESMD 的 [Warheads] 注册表」）：
+        #   地编原文（FAData.ini ActionsRA2 第 42 条）——
+        #   「参数为 [WeaponTypes] 里的武器 ID（从 1 开始），**若无该注册表（或者注册表里
+        #     没有所填 ID）则取 [Warheads] 里的弹头 ID**」
+        #   ⇒ 两张表各自的，再合成一张"先行后弹"的表（见下方 merge）。
+        'weapontypes': _parse_num_map(rules, 'WeaponTypes'),
+        'warheads': _parse_num_map(rules, 'Warheads'),
     }
+    data['weap_warhead'], data['weap_src'] = merge_weapon_warhead(
+        data['weapontypes'], data['warheads'])
     # ★影片：地编 `FAData.ini` 里 `[MovieList] Start=66` —— 1..65 是原版过场，
     #   下拉里只列 66 之后的（玩家要改的一般是自己的片子）。表里保留全量。
     data['movies_from'] = 66
@@ -324,6 +337,9 @@ PTYPE_TABLES = {
     18: ('eva', '语音（evamd.ini [DialogList]）'),
     25: ('animations', '动画（rulesmd.ini [Animations]）'),
     26: ('particle_systems', '粒子系统（rulesmd.ini [ParticleSystems]）'),
+    # ★2026-11-05：41 = 「武器/弹头」型（行为 42「武器（弹头）爆炸在...」）。
+    #   地编口径：[WeaponTypes] 优先，没有该表 / 表里没这个 ID ⇒ 取 [Warheads]。
+    41: ('weap_warhead', '武器/弹头（rulesmd [WeaponTypes] 优先，缺则 [Warheads]）'),
 }
 
 # 这些 ptype 的表不从上面几处来（保留旧名字，别的地方可能引用）
@@ -365,12 +381,31 @@ def choices_of(table, limit=4000, skip_disabled=True):
     return out
 
 
+def _ww_suffix(src, k):
+    """「武器/弹头」表的来源后缀（地编同一栏里混着两种 ID，不标就分不清）。"""
+    return '（武器）' if src.get(k) == 'W' else ('（弹头）' if src.get(k) == 'H' else '')
+
+
 def arg_choices(tb, ptype, limit=4000):
     """按 ptype 给参数下拉填候选（`编号 名字`）；没有对应表就返回 []。"""
     ent = PTYPE_TABLES.get(ptype)
     if not tb or not ent:
         return []
     tbl = tb.get(ent[0]) or {}
+    if ptype == 41:
+        # 行为 42「武器（弹头）爆炸在...」：编号可能是武器 ID 也可能是弹头 ID，
+        # 地编也是混在一列里选的 ⇒ 后缀标出来源，省得对着编号猜。
+        src = tb.get('weap_src') or {}
+        out = []
+        for k in sorted(tbl):
+            v = tbl[k]
+            if not v or _is_disabled(v):
+                continue
+            out.append('%d %s%s' % (k, v[1:] if _is_disabled(v) else v,
+                                    _ww_suffix(src, k)))
+            if len(out) >= limit:
+                break
+        return out
     if ptype == 13:
         # CSF 有 5000+ 条，下拉限流；每条带上正文前 24 字，否则光看标签名认不出是什么
         text = tb.get('csf_text') or {}
@@ -389,6 +424,15 @@ def arg_label(tb, ptype, v):
     if not tb or not ent:
         return str(v)
     tbl = tb.get(ent[0]) or {}
+    if ptype == 41:
+        try:
+            n = int(v)
+        except Exception:
+            return str(v)
+        name = tbl.get(n)
+        if not name:
+            return '%s（[WeaponTypes]/[Warheads] 里都没有这个号）' % v
+        return '%d %s%s' % (n, name, _ww_suffix(tb.get('weap_src') or {}, n))
     if ptype == 13:
         # CSF 文本：`编号 标签｜内容前 40 字`
         key = tbl.get(v)
@@ -399,6 +443,27 @@ def arg_label(tb, ptype, v):
             return '%s %s｜%s%s' % (v, key, txt[:40], '…' if len(txt) > 40 else '')
         return '%s %s' % (v, key)
     return label_of(tbl, v)
+
+
+def merge_weapon_warhead(weapons, warheads):
+    """按地编口径合成「武器/弹头」表 → ({编号: 名字}, {编号: 'W'|'H'})。
+
+    地编 `ActionsRA2` 第 42 条原文：
+      「参数为 [WeaponTypes] 里的武器 ID（从 1 开始），**若无该注册表（或者注册表里没有
+        所填 ID）则取 [Warheads] 里的弹头 ID**」
+    ⇒ 同一个编号两张表都有时，**武器优先**；只有弹头表有时用弹头。
+      原版 YR 没有 `[WeaponTypes]`（那是 Ares 引入的）⇒ 原版档里就是纯 `[Warheads]`。
+    """
+    out, src = {}, {}
+    for k, v in (weapons or {}).items():
+        if v:
+            out[k] = v
+            src[k] = 'W'
+    for k, v in (warheads or {}).items():
+        if v and k not in out:
+            out[k] = v
+            src[k] = 'H'
+    return out, src
 
 
 def describe(base_dir):

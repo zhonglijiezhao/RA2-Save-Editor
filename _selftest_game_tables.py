@@ -19,7 +19,8 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, 'core'))
 
 from game_tables import (lists_for_dir, find_rules, load_rules,   # noqa: E402
-                         label_of, choices_of, PTYPE_TABLES)
+                         label_of, choices_of, PTYPE_TABLES,
+                         arg_choices, arg_label)
 from editor_core import SaveDoc                                   # noqa: E402
 
 OK = FAIL = 0
@@ -106,10 +107,22 @@ print('\n== E. ptype → 表的映射 ==')
 chk((PTYPE_TABLES.get(25) or ('',))[0] == 'animations', 'ptype25 → animations 表')
 chk((PTYPE_TABLES.get(26) or ('',))[0] == 'particle_systems', 'ptype26 → particle_systems 表')
 # ★2026-11-04：音效/语音/音乐/影片/文本 也要有表（玩家要求内置解密，不靠手动解包）
-for _pt, _key in ((12, 'movies'), (13, 'csf'), (16, 'sounds'), (17, 'themes'), (18, 'eva')):
+for _pt, _key in ((12, 'movies'), (13, 'csf'), (16, 'sounds'), (17, 'themes'), (18, 'eva'),
+                  (41, 'weap_warhead')):
     chk((PTYPE_TABLES.get(_pt) or ('',))[0] == _key, 'ptype%d → %s 表' % (_pt, _key))
     chk(len(tb.get(_key) or {}) > 0, 'ptype%d 的 %s 表非空（%d 项）'
         % (_pt, _key, len(tb.get(_key) or {})))
+
+print('\n== F. 行为 42「武器（弹头）爆炸在...」＝ ptype 41（玩家 2026-11-05）==')
+_ch = arg_choices(tb, 41)
+chk(len(_ch) > 50, '武器/弹头候选 %d 条' % len(_ch), _ch[:3])
+chk(all(('（武器）' in c or '（弹头）' in c) for c in _ch),
+    '每条都标了来源（武器 / 弹头），不靠编号猜', _ch[:3])
+chk(len(tb['warheads']) > 50, '[Warheads] 表 %d 项' % len(tb['warheads']))
+_lab = arg_label(tb, 41, 5)
+chk('5' in _lab and ('武器' in _lab or '弹头' in _lab), 'arg_label(5) = %r' % _lab, _lab)
+chk('都没有这个号' in arg_label(tb, 41, 999999), '越界编号有明确提示',
+    arg_label(tb, 41, 999999))
 
 print('\n§SOV20：PASS %d / FAIL %d' % (OK, FAIL))
 sys.exit(1 if FAIL else 0)

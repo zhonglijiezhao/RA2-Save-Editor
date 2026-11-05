@@ -141,13 +141,14 @@ def gametables(arg):
     lines.append('列表表（来源 ← 条数）：')
     NAMES = [('animations', '动画', 25), ('particle_systems', '粒子系统', 26),
              ('sounds', '音效', 16), ('eva', '语音', 18), ('themes', '音乐主题', 17),
-             ('movies', '影片', 12), ('csf', '文本(CSF)', 13)]
+             ('movies', '影片', 12), ('csf', '文本(CSF)', 13),
+             ('weap_warhead', '武器/弹头', 41)]
     for key, cn, pt in NAMES:
         tbl = tb.get(key) or {}
         src = tb['source'].get({'animations': 'rulesmd.ini', 'particle_systems': 'rulesmd.ini',
                                 'sounds': 'soundmd.ini', 'eva': 'evamd.ini',
                                 'themes': 'thememd.ini', 'movies': 'artmd.ini',
-                                'csf': 'ra2md.csf'}[key], '?')
+                                'csf': 'ra2md.csf', 'weap_warhead': 'rulesmd.ini'}[key], '?')
         lines.append('  %-12s ptype %-3d %5d 项   ← %s' % (cn, pt, len(tbl), src))
         sample = game_tables.choices_of(tbl, limit=3)
         if sample:

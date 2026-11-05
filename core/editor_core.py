@@ -4012,7 +4012,7 @@ class SaveDoc(object):
         if ptype == 31:
             # ★§SOV16：地编 ptype=31 = 「奖励箱类型」（108 创建工具箱 用的那个下拉）
             return crate_name(v)
-        if ptype in (12, 13, 16, 17, 18, 25, 26):
+        if ptype in (12, 13, 16, 17, 18, 25, 26, 41):
             # ★★§SOV20 / 2026-11-04：参数存的是**游戏列表里的编号**，翻成人话：
             #   12 影片(artmd [Movies])  13 文本(ra2md.csf)  16 音效(soundmd [SoundList])
             #   17 音乐(thememd [Themes]) 18 语音(evamd [DialogList])

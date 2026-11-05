@@ -1271,12 +1271,13 @@ class TriggerEditor(tk.Toplevel):
     def _fill_arg_values(self, combo, ptype, cur):
         """按参数类型给参数下拉填候选值（所属方型 = 阵营顺序，0 恒为玩家自己）。"""
         try:
-            if ptype in (12, 13, 16, 17, 18, 25, 26):
+            if ptype in (12, 13, 16, 17, 18, 25, 26, 41):
                 # ★★§SOV20 / 2026-11-04：这些 ptype 的参数是**游戏列表里的编号**，
                 #   地编就是按表下拉、把编号存进存档的：
                 #     12 影片(artmd [Movies]) 13 文本(ra2md.csf) 16 音效(soundmd [SoundList])
                 #     17 音乐(thememd [Themes]) 18 语音(evamd [DialogList])
                 #     25 动画(rulesmd [Animations]) 26 粒子系统([ParticleSystems])
+                #     41 武器/弹头([WeaponTypes] 优先、缺则 [Warheads]，行为 42 用)
                 #   ★取文件的活交给 game_tables（散文件 > MIX 数字大优先，自动解密），
                 #     玩家不需要先解包 —— 这是玩家 2026-11-04 的硬要求。
                 try:
