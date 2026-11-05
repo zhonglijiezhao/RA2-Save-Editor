@@ -6223,6 +6223,16 @@ class SaveDoc(object):
     #   （`+0x40` 类型、`+0x44` 小队键、`+0x58` 路径点，`+0x48` 恒 0），
     #   已用 SAVE0029 的 47 个 80 号 + 250 个 107 号真对象逐一核对。
     SPAWN_ACTIONS = (80, 107)
+    # ★★2026-11-05（玩家：「108 创建工具箱 是要填路径点的，也就是这个箱子要刷到那里」）：
+    #   `108 创建工具箱` 有**两个**参数：奖励箱类型（`+164`，地编 ptype 31）
+    #   + **路径点**（`+0x58`，和 80/107/125 同一个字段）。
+    #   实证 `ALL01UMD.sav` 01000005 的 17 条 108：
+    #     · `+164` = 0,1,2,3,4,6,7,…,16（奖励箱类型）
+    #     · `+0x58` = **99 / 98** 两组，正好对应地图 `[Actions]` 里最后那个字母字段
+    #       `CV` / `CU`（= 路径点 99 / 98），而 `[Waypoints]` 全图只有 98、99 两个点 ⇒ 铁证。
+    CRATE_ACTION = 108
+    # 「要填路径点」的行为（参数写对象 `+0x58`）：援军 80/107、建建筑 125、创建工具箱 108
+    WAYPOINT_ACTIONS = SPAWN_ACTIONS + (CRATE_ACTION,)
     # ★★§283.9：**小队型行为**（地编口径参数类型 7）= 4 建立 / 5 解散 / 7 援军 / 80 / 107。
     #   实测（Z17 档，386 支小队）：4/7 的小队键和 80/107 一样写在行为对象 **`+0x44`**，
     #   `+0x48` 恒 0 ⇒ 以前只认 SPAWN_ACTIONS，导致 4/7 读出来 team=0、界面上选不了小队。
@@ -15264,7 +15274,25 @@ class SaveDoc(object):
                 else:
                     struct.pack_into('<I', pl, a + OBJ_ARG_OFF, int(ac_arg))
                 info['arg'] = int(ac_arg)
-            if ac_name or ac_cell is not None or ac_waypoint is not None:
+            # ★★2026-11-05（玩家：108 创建工具箱 要填路径点）：108 也用 ac_waypoint，
+            #   落在对象 `+0x58`（与 80/107/125 同字段）；ac_name/ac_cell 仍只对 125 有效。
+            if ac_type == self.CRATE_ACTION:
+                _wp = ac_waypoint
+                if _wp is None and ac_cell is not None:
+                    _wp = self.ensure_waypoint_at(int(ac_cell[0]), int(ac_cell[1]))
+                if _wp:
+                    pl = self.plain
+                    struct.pack_into('<I', pl, a + 0x58, int(_wp))
+                    info['waypoint'] = int(_wp)
+                    try:
+                        info['cell'] = self.waypoint_cell(int(_wp))
+                    except Exception:
+                        pass
+                else:
+                    warnings.append('行为 108「创建工具箱」没给路径点 ⇒ 箱子不会刷（引擎找不到落点）')
+                if ac_name:
+                    warnings.append('ac_name 只对行为 125 有效，已忽略')
+            elif ac_name or ac_cell is not None or ac_waypoint is not None:
                 warnings.append('ac_name/ac_cell/ac_waypoint 只对行为 125 有效，已忽略')
             info['type'] = ac_type
         info['action_off'] = a
@@ -15588,6 +15616,7 @@ class SaveDoc(object):
         #   +88  = 路径点编号（建筑落在该路径点上）
         #   +104 = 8 字节 ASCII 建筑类型名（如 b"ATESLA"）
         ac_note = ''
+        ac_extra = {}          # ★108 的 waypoint/cell 回填（其余类型为空）
         if ac_type == 125:
             if not ac_name or (ac_waypoint is None and ac_cell is None):
                 raise RuntimeError('行为 125「将建筑建于…」必须同时给 ac_name（建筑类型名）'
@@ -15608,6 +15637,24 @@ class SaveDoc(object):
             patch(a_, 104, _nm)
             patch(a_, 88, u32v(int(ac_waypoint)))
             ac_note = '行为125：%s @ 路径点 %d' % (ac_name, int(ac_waypoint))
+        elif ac_type == self.CRATE_ACTION:
+            # ★★2026-11-05（玩家：108 创建工具箱 要刷到路径点）：路径点在对象 `+0x58`
+            #   （和 80/107/125 同一个字段）。`ac_cell` 给了就先补一个路径点。
+            _wp = ac_waypoint
+            if _wp is None and ac_cell is not None:
+                _wp = self.ensure_waypoint_at(int(ac_cell[0]), int(ac_cell[1]))
+            if _wp:
+                patch(a_, 0x58, u32v(int(_wp)))
+                ac_note = '行为108：箱子 @ 路径点 %d' % int(_wp)
+                ac_extra['waypoint'] = int(_wp)
+                try:
+                    ac_extra['cell'] = self.waypoint_cell(int(_wp))
+                except Exception:
+                    pass
+            else:
+                warnings.append('行为 108「创建工具箱」没给路径点 ⇒ 箱子不会刷（引擎找不到落点）')
+            if ac_name:
+                warnings.append('ac_name 只对行为 125 有效，已忽略')
         elif ac_name or ac_waypoint is not None or ac_cell is not None:
             warnings.append('ac_name/ac_waypoint/ac_cell 只对行为 125 有效，已忽略')
         nb = cb = None
@@ -15791,7 +15838,7 @@ class SaveDoc(object):
                 'ev_off': ev_off, 'ac_off': ac_off, 'owner': owner,
                 'persistence': persistence,
                 'ac_note': ac_note,
-                'attached': attached, 'warnings': warnings}
+                'attached': attached, 'warnings': warnings, **ac_extra}
 
     # ---------- FA2 风格：一条触发 = 多事件 + 多行为 ----------
     def create_trigger_multi(self, name, events, actions=None, **kw):
@@ -17175,6 +17222,21 @@ class SaveDoc(object):
                     a['tag'] = (next((t['sid'] for t in self.tag_objects()
                                       if t['key'] == tgk), None) if tgk else None)
                     a['arg_text'] = self._arg_text(38, tgk)
+                elif a.get('type') == self.CRATE_ACTION:
+                    # ★★2026-11-05（玩家：108 要填路径点）：`108 创建工具箱` 是**两参数**行为 ——
+                    #   奖励箱类型在 `+164`（ptype 31），路径点在 **`+0x58`**（与 80/107/125 同字段）。
+                    #   以前只读 +164 ⇒ 编辑器里看不到箱子刷在哪，也没法改。
+                    wpk = int.from_bytes(pl[obj + 0x58:obj + 0x5C], 'little')
+                    try:
+                        cell = self.waypoint_cell(wpk) if wpk else None
+                    except Exception:
+                        cell = None
+                    a = dict(a)
+                    a['waypoint'] = wpk
+                    a['cell'] = cell
+                    a['arg_text'] = ('%s @ 路径点 %s%s'
+                                     % (self._arg_text(31, a.get('arg') or 0), wpk,
+                                        (' 格%s' % (cell,)) if cell else ''))
                 d['actions'].append(a)
         if not d['editable']:
             d['note'] = '这条记录在本档里只有「触发定义」，没有运行期实例 ⇒ 只能看'
@@ -17473,6 +17535,17 @@ class SaveDoc(object):
             buf[0x48:0x4C] = b'\x00' * 4
             if atype in self.SPAWN_ACTIONS:
                 buf[0x58:0x5C] = struct.pack('<I', int(waypoint))
+        if atype == self.CRATE_ACTION:
+            # ★★2026-11-05（玩家：108 要填路径点）：箱子刷到哪个路径点在 **`+0x58`**。
+            #   没给就报错，别默默写 0（写 0 = 引擎找不到路径点，箱子不刷）。
+            if waypoint is None:
+                if cell is None:
+                    raise RuntimeError('行为 108「创建工具箱」还要给 waypoint（路径点号）'
+                                       '或 cell=(x,y) —— 箱子就刷在那里')
+                waypoint = self.ensure_waypoint_at(int(cell[0]), int(cell[1]))
+                if waypoint is None:
+                    raise RuntimeError('格 %s 处建不了路径点（号段用满且无近点可复用）' % (cell,))
+            buf[0x58:0x5C] = struct.pack('<I', int(waypoint))
         pl[pos:pos] = bytes(buf)
         self.invalidate_caches(rescan=True)
         pl = self.plain

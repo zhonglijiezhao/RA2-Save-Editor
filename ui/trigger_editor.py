@@ -247,8 +247,10 @@ class TriggerEditor(tk.Toplevel):
         self.row_wp = ttk.Frame(ac)
         ttk.Label(self.row_wp, text='路径点').pack(side='left')
         ttk.Entry(self.row_wp, textvariable=self.var_wp, width=8).pack(side='left', padx=6)
-        ttk.Label(self.row_wp, text='（上面的「参数」= 小队，这里 = 刷出来的位置；留空 = 0）',
-                  foreground=ui_theme.T['muted']).pack(side='left')
+        self.lbl_wp_hint = ttk.Label(
+            self.row_wp, text='（上面的「参数」= 小队，这里 = 刷出来的位置；留空 = 0）',
+            foreground=ui_theme.T['muted'])
+        self.lbl_wp_hint.pack(side='left')
 
         body = ttk.Frame(ac)
         body.pack(fill='both', expand=True, pady=(6, 0))
@@ -729,6 +731,15 @@ class TriggerEditor(tk.Toplevel):
             if atype in self.doc.SPAWN_ACTIONS:
                 return '%s · 路径点 %s' % (nm, waypoint)
             return nm
+        if atype == self.doc.CRATE_ACTION:
+            # ★★2026-11-05：`108 创建工具箱` = 奖励箱类型（+164）+ **路径点（+0x58）**
+            box = self.doc._arg_text(action_ptype(atype), arg) or '（未设置）'
+            try:
+                cell = self.doc.waypoint_cell(waypoint) if waypoint else None
+            except Exception:
+                cell = None
+            return '%s @ 路径点 %s%s' % (box, waypoint or '（未填）',
+                                        (' 格%s' % (cell,)) if cell else '')
         return self.doc._arg_text(action_ptype(atype), arg)
 
     def _trig_ref_text(self, sid):
@@ -1525,6 +1536,18 @@ class TriggerEditor(tk.Toplevel):
                 return None
         return None
 
+    def _set_wp_hint(self, atype):
+        """「路径点」这一行的说明文字按行为类型变（108 是箱子落点，不是小队出兵点）。"""
+        try:
+            if atype == self.doc.CRATE_ACTION:
+                self.lbl_wp_hint.config(
+                    text='（箱子刷到哪个路径点；和地图上编号一致，留空 / 0 ⇒ 箱子不刷）')
+            else:
+                self.lbl_wp_hint.config(
+                    text='（上面的「参数」= 小队，这里 = 刷出来的位置；留空 = 0）')
+        except Exception:
+            pass
+
     def _show_wp(self, show):
         try:
             if show:
@@ -1573,6 +1596,15 @@ class TriggerEditor(tk.Toplevel):
                     raise ValueError('路径点必须是整数')
                 return 0, {'team': tkey, 'waypoint': wp}
             return 0, {'team': tkey}
+        if atype == self.doc.CRATE_ACTION:
+            # ★★2026-11-05（玩家：箱子要刷到路径点）：奖励箱类型走 +164，路径点走 +0x58
+            try:
+                wp = int((self.var_wp.get() or '0').strip())
+            except ValueError:
+                raise ValueError('路径点必须是整数（箱子刷到那个路径点）')
+            if wp <= 0:
+                raise ValueError('108「创建工具箱」要给路径点：箱子就刷在那个点')
+            return self._parse_arg(self.var_acarg.get()), {'waypoint': wp}
         return self._parse_arg(self.var_acarg.get()), {}
 
     def _ac_hint(self):
@@ -1608,7 +1640,9 @@ class TriggerEditor(tk.Toplevel):
                     #   只有 80/107 另外带一个路径点输入。
                     _ch = self._fill_team_values(
                         self.cb_acarg, self._team_key_from_text(self.var_acarg.get())) or []
-                    _spawn = k in self.doc.SPAWN_ACTIONS
+                    # ★★2026-11-05：108 创建工具箱 也要路径点（箱子刷到那里）
+                    _spawn = k in self.doc.WAYPOINT_ACTIONS
+                    self._set_wp_hint(k)
                     self._show_wp(_spawn)
                     nt = ('小队型：参数下拉 = 作战小队（本档 %d 个）' % len(_ch)) + \
                          ('；「路径点」= 刷出来的位置' if _spawn else '') + \
@@ -1623,7 +1657,9 @@ class TriggerEditor(tk.Toplevel):
                     elif pt == 38:                     # ★§SOV31：标签型参数 = 标签 sid
                         cur = self._tag_from_text()
                     self._fill_arg_values(self.cb_acarg, pt, cur)
-                    self._show_wp(False)
+                    # ★★2026-11-05：108 创建工具箱 在**非小队型**这一支，也要显示「路径点」
+                    self._set_wp_hint(k)
+                    self._show_wp(k in self.doc.WAYPOINT_ACTIONS)
                     if pt == 2:
                         hs = self.doc.house_order() or []
                         nt = ('所属方型：0 = 玩家自己（本档 %s）；其余按存档阵营顺序'
@@ -1637,6 +1673,10 @@ class TriggerEditor(tk.Toplevel):
                         # ★★§SOV31：标签型（70 摧毁标签）—— 参数在对象 +96，不是 +72/+164
                         nt = ('标签型：参数 = 目标标签（存在行为对象 +96 的实例键）—— '
                               '执行后这个标签连同挂在它上面的所有触发一起被销毁') + \
+                             ('　' + nt if nt else '')
+                    elif k == self.doc.CRATE_ACTION:
+                        nt = ('创建工具箱：参数 = 奖励箱类型（+164）；下面「路径点」= 箱子刷到哪个点'
+                              '（+0x58，和援军/建建筑同一个字段）。路径点留空/为 0 ⇒ 箱子不刷。') + \
                              ('　' + nt if nt else '')
                     elif pt in (25, 26):
                         _tb = self.doc.game_lists() if self.doc else None
@@ -1702,6 +1742,10 @@ class TriggerEditor(tk.Toplevel):
             # ★★§SOV31：标签型 —— 参数框显示「SID 名字」，写的是 +96 的标签实例键
             self.var_acarg.set(self._tag_ref_text(a.get('tag') or a.get('tag_key')))
             self.var_wp.set('')
+        elif a['type'] == self.doc.CRATE_ACTION:
+            # ★★2026-11-05：108 创建工具箱 —— 参数框 = 箱子类型，另有「路径点」
+            self.var_acarg.set(self.doc._arg_text(action_ptype(a['type']), a['arg']))
+            self.var_wp.set(str(a.get('waypoint') or ''))
         else:
             self.var_acarg.set(str(a['arg']))
             self.var_wp.set('')
