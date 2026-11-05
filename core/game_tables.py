@@ -62,6 +62,9 @@ def _read_text(path):
 # 值以 ';' 开头的条目 = 被注释掉了（`2=;Grinder`）：编号仍在、但引擎不认。
 _COMMENT_VAL = ';'
 
+# 合法名字长什么样（纯 ASCII 标识符）。用来区分"值是名字"和"值是中文说明"。
+_NAME_TOKEN = re.compile(r'^[A-Za-z0-9_.\-]{1,40}$')
+
 
 def _parse_num_map(text, section):
     """解析 `[section]` 里 `编号=值` 的行 → {int: str}。
@@ -95,6 +98,18 @@ def _parse_num_map(text, section):
             continue
         mm = re.match(r'^(\d+)\s*=\s*(.*)$', s)
         if not mm:
+            # ★键不是数字的条目：`MYANIM=说明文字`（键是名字）、`ANY=REALNAME`（值是名字）。
+            #   玩家 2026-11-05：「[VehicleTypes] 里 `SCHP1=SCHP1在扩展平台中` 这种写法也是允许的」
+            m2 = re.match(r'^([^=]+?)\s*=\s*(.*)$', s)
+            if not m2:
+                continue
+            key = m2.group(1).strip()
+            val = _cut_comment(m2.group(2)).strip()
+            v0 = val.split(',')[0].split(':')[0].strip()
+            if v0 and _NAME_TOKEN.match(v0):
+                adds.append(v0)                    # 值是合法名字 ⇒ 标准语义
+            elif _NAME_TOKEN.match(key):
+                adds.append(key)                   # 值是说明文字 ⇒ 用键
             continue
         n = int(mm.group(1))
         raw = mm.group(2)

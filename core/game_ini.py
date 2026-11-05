@@ -50,6 +50,29 @@ def config_path():
 LIST_SECTIONS = [('InfantryTypes', 'infantry'), ('VehicleTypes', 'vehicle'),
                  ('AircraftTypes', 'aircraft'), ('BuildingTypes', 'building')]
 
+# 合法类型名长什么样（纯 ASCII 标识符）—— 用来挡掉"键里写了中文说明"的脏数据
+_TYPE_TOKEN = re.compile(r'^[A-Za-z0-9_.\-]+$')
+
+
+def _resolve_named_entry(key, val, sections):
+    """列表段里**键不是数字**的条目 → 该注册的类型名（大写）；认不出返回 ''。
+
+    玩家 2026-11-05 指出两种写法都合法：
+        SCHP1=SCHP1在扩展平台中      ← 键是类型名，值是说明文字（有的平台/工具这么写）
+        ANY=REALNAME                 ← 标准语义：值是类型名
+    判据：**值**能对上规则/美术/地图里的同名段 ⇒ 用值；对不上（是中文说明之类）⇒ 用键。
+    值里带逗号/冒号时只取第一段（`SCHP1,A` / `Image:SCHP1`）。
+    """
+    key = (key or '').strip()
+    if not key or key in ('+', '-', '*'):        # `+=` / `-=` 另走 add 列表
+        return ''
+    v = (val or '').split(',')[0].split(':')[0].strip()
+    if v and v.lower() in sections:
+        return v.upper()
+    if not _TYPE_TOKEN.match(key):               # 键里带中文/空格 ⇒ 不是类型名，别瞎注册
+        return ''
+    return key.upper()
+
 
 def read_text(path):
     """规则文件常是 GBK/ANSI，也见过 UTF-8 ⇒ 依次尝试。"""
@@ -108,9 +131,11 @@ def parse_ini(path):
         k = k.strip()
         val = _strip_comment(v)
         if k == '+':
-            # `+=NAME` —— 追加注册，没有数字编号
+            # `+=NAME` —— 追加注册，没有数字编号；在 order 里留一个 `+` 占位，
+            # 这样 `+=` 和「键是类型名」的写法能**保持文件里的先后顺序**（引擎按顺序分配）
             if val:
                 cur['add'].append(val)
+                cur['order'].append('+')
         else:
             k = k.lower()
             cur['order'].append(k)
@@ -581,6 +606,8 @@ class GameTypes(object):
                 self.map_sec = {}
         # 类型 ID → (类别, 建造栏序号)
         self.order = {}
+        # 所有已知段名（小写）—— 用来判"这一行的键/值到底哪个是类型名"
+        sections = set(self.rules) | set(self.art) | set(self.map_sec)
         for src in (self.map_sec, self.rules):
             for sec, kind in LIST_SECTIONS:
                 d = src.get(sec.lower())
@@ -600,17 +627,35 @@ class GameTypes(object):
                 for idx, nm in nums:
                     if nm:
                         self.order.setdefault(nm, {'kind': kind, 'index': idx})
-                # ② `+=名字` 追加项（Ares / Phobos）：按出现顺序接在**当前最大编号**之后
-                #    引擎就是这么分配的（不是补空洞），所以自建型号的序号是 max+1、max+2…
+                # ② `+=名字` 与「键是类型名」两种写法：**按文件里的先后顺序**接在最大号之后。
+                #    · `+=名字`  —— Ares / Phobos 的追加注册
+                #    · `SCHP1=SCHP1在扩展平台中` —— 玩家 2026-11-05：键是类型名、值是说明
+                #      （值能对上规则/美术/地图里的同名段时用值，否则用键）
+                #    引擎就是这么依次分配的（max+1、max+2…，不补空洞）。
                 nxt = (nums[-1][0] + 1) if nums else 0
-                for nm in (d.get('add') or []):
-                    nm = (nm or '').strip().upper()
-                    if nm.startswith('='):        # 容错：`+ = X` 之类
-                        nm = nm.lstrip('= ').strip()
-                    if not nm:
+                adds = [str(x).strip() for x in (d.get('add') or [])]
+                ai = 0
+                for k in (d.get('order') or []):
+                    if k == '+':
+                        if ai < len(adds):
+                            nm = adds[ai].upper().lstrip('= ').strip()
+                            ai += 1
+                            if nm:
+                                self.order.setdefault(nm, {'kind': kind, 'index': nxt})
+                                nxt += 1
                         continue
-                    self.order.setdefault(nm, {'kind': kind, 'index': nxt})
-                    nxt += 1
+                    if k.isdigit() or k.lstrip('-').isdigit():
+                        continue
+                    nm = _resolve_named_entry(k, d['kv'].get(k) or '', sections)
+                    if nm:
+                        self.order.setdefault(nm, {'kind': kind, 'index': nxt})
+                        nxt += 1
+                while ai < len(adds):          # 兜底：order 里没有 `+` 占位的旧结构
+                    nm = adds[ai].upper().lstrip('= ').strip()
+                    ai += 1
+                    if nm:
+                        self.order.setdefault(nm, {'kind': kind, 'index': nxt})
+                        nxt += 1
 
     # ---------- 查询 ----------
     def ok(self):

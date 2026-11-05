@@ -70,6 +70,9 @@ SAMPLE = """[VehicleTypes]
 1=BB
 +=MYANIM1
 +=MYANIM2
+MYANIM3=我的新动画
+OTHERANIM=REALANIM
+; 键是名字、值是中文说明；值是合法名字时用值
 
 [ParticleSystems]
 1=SYS1
@@ -78,6 +81,25 @@ SAMPLE = """[VehicleTypes]
 [SCHP1]
 Name=测试载具
 Strength=1000
+
+[SCHP2]
+[SCHP3]
+[REALANIM]
+"""
+
+# ★玩家 2026-11-05：「[VehicleTypes] 里 SCHP1=SCHP1在扩展平台中 这种写法也是允许的」
+NAMED = """[VehicleTypes]
+0=AMCV
++=PLUS1
+NAMED1=NAMED1在扩展平台中
++= PLUS2
+NAMED2=REALVEH
+NAMED3=NAMED3,B
+[NAMED1]
+[PLUS1]
+[PLUS2]
+[NAMED3]
+[REALVEH]
 """
 
 TMP = tempfile.mkdtemp(prefix='_pleq_')
@@ -119,6 +141,10 @@ try:
         game_tables.label_of(anim, 2))
     ps = tb['particle_systems']
     chk(ps.get(2) == 'MYSYS', '粒子系统：+= → 2', ps)
+    chk(anim.get(4) == 'MYANIM3', '[Animations] 里「键是名字」也收（MYANIM3=我的新动画）',
+        anim.get(4))
+    chk(anim.get(5) == 'REALANIM', '[Animations] 里值是合法名字时用值（OTHERANIM=REALANIM）',
+        anim.get(5))
 
     print('\n== E: 参数的兜底 ==')
     chk(tb['animations'].get(0) == 'AA' and tb['animations'].get(1) == 'BB',
@@ -156,6 +182,26 @@ try:
             % (max(tb2['animations']), len(tb2['animations'])))
     else:
         print('     （没有 桌面/RA，跳过）')
+
+    print('\n== G: 键是类型名、值是中文说明（玩家 2026-11-05）==')
+    ND = os.path.join(TMP, 'named')
+    os.makedirs(ND, exist_ok=True)
+    with open(os.path.join(ND, 'rulesmd.ini'), 'w', encoding='utf-8') as f:
+        f.write(NAMED)
+    g3 = game_ini.GameTypes(game_dir=ND)
+    seq = sorted(g3.order.items(), key=lambda kv: kv[1]['index'])
+    print('     ' + ' / '.join('%s=%d' % (n, v['index']) for n, v in seq))
+    chk(g3.order.get('NAMED1', {}).get('index') == 2,
+        'NAMED1=NAMED1在扩展平台中 → 注册 NAMED1（用键，丢掉说明文字）',
+        g3.order.get('NAMED1'))
+    chk(g3.order.get('REALVEH', {}).get('index') == 4,
+        'NAMED2=REALVEH → 注册 REALVEH（值是合法名字时用值）', g3.order.get('NAMED2'))
+    chk('NAMED2' not in g3.order, '那一行没有把键也顺手注册进去')
+    chk(g3.order.get('NAMED3', {}).get('index') == 5, 'NAMED3=NAMED3,B → 注册 NAMED3',
+        g3.order.get('NAMED3'))
+    names = [n for n, _v in seq]
+    chk(names[:3] == ['AMCV', 'PLUS1', 'NAMED1'],
+        '`+=` 和「键是名字」按**文件顺序**交替排号', names)
 finally:
     import shutil
     shutil.rmtree(TMP, ignore_errors=True)
