@@ -14,7 +14,7 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from editor_core import EVENT_TYPES
+from editor_core import EVENT_TYPES, event_keys
 from editor_core import event_name
 from editor_core import event_note
 from ui.msg import messagebox
@@ -232,7 +232,7 @@ class EventsPage(object):
         dlg.grab_set()
         dlg.resizable(False, False)
         # ⚠ 0 = 「-无事件-」：引擎没有该类型的处理器，写进去会让**读档崩溃** ⇒ 下拉框里去掉
-        keys = [k for k in sorted(EVENT_TYPES) if k != 0]
+        keys = event_keys()          # 跳过地编标「(无效)」的（2026-11-05 玩家要求）
         # ★ 该事件所属触发的运行期组件状态（缺 TagNode ⇒ 引擎不执行，改了也白改）
         try:
             _node_off, _inst_off = self.doc.node_of_event(ev)

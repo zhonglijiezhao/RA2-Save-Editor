@@ -14,7 +14,7 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from editor_core import ACTION_TYPES
+from editor_core import ACTION_TYPES, action_keys
 from editor_core import action_name
 from editor_core import action_note
 from ui.msg import filedialog
@@ -221,7 +221,7 @@ class ActionsPage(object):
         dlg.grab_set()
         dlg.resizable(False, False)
         # ⚠ 0 = 「-无行为-」：同上，禁止写入
-        keys = [k for k in sorted(ACTION_TYPES) if k != 0]
+        keys = action_keys()         # 跳过地编标「(无效)」的（2026-11-05 玩家要求）
 
         ttk.Label(dlg, text='行为类型').grid(row=0, column=0, sticky='e', padx=(12, 6), pady=(12, 4))
         cvar = tk.StringVar()

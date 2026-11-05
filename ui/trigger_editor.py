@@ -12,7 +12,7 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from editor_core import ACTION_TYPES
+from editor_core import ACTION_TYPES, action_keys, event_keys
 from editor_core import ACTION_TRIG_TYPES
 from editor_core import ENGINE_PTYPE_TEXT
 from editor_core import EVENT_TYPES
@@ -327,7 +327,7 @@ class TriggerEditor(tk.Toplevel):
         self.var_norm.set(True)
         self.var_hard.set(True)
         # 事件
-        keys = [k for k in sorted(EVENT_TYPES) if k != 0]
+        keys = event_keys()          # 跳过地编标「(无效)」的（2026-11-05 玩家要求）
         self._ev_keys = keys
         self.cb_ev['values'] = ['%d  %s' % (k, EVENT_TYPES[k][0]) for k in keys]
         pend = getattr(self, '_pending_events', [(8, 0)])
@@ -336,7 +336,7 @@ class TriggerEditor(tk.Toplevel):
             self.cb_ev.current(keys.index(et))
         self.var_evarg.set(str(ea))
         # 行为
-        akeys = [k for k in sorted(ACTION_TYPES) if k != 0]
+        akeys = action_keys()        # 跳过地编标「(无效)」的（2026-11-05 玩家要求）
         self._ac_keys = akeys
         self.cb_ac['values'] = ['%d  %s' % (k, ACTION_TYPES[k][0]) for k in akeys]
         self.cb_ac.set('')
@@ -531,7 +531,7 @@ class TriggerEditor(tk.Toplevel):
         self._fill_link(sid)
         # 事件下拉（选项 = 编号 + 名称）
         # ★2026-10-20：0 = 地编占位项「-无事件-」，写进存档会崩 ⇒ 下拉里**直接不列**
-        keys = [k for k in sorted(EVENT_TYPES) if k != 0]
+        keys = event_keys()          # 跳过地编标「(无效)」的（2026-11-05 玩家要求）
         self._ev_keys = keys
         self.cb_ev['values'] = ['%d  %s' % (k, EVENT_TYPES[k][0]) for k in keys]
         self.cb_ev.current(keys.index(8) if 8 in keys else 0)   # 默认「8 任何事件」
@@ -546,7 +546,7 @@ class TriggerEditor(tk.Toplevel):
             self.cb_ev.set('—')
             self.var_evarg.set('')
         # 行为下拉 + 列表
-        akeys = [k for k in sorted(ACTION_TYPES) if k != 0]
+        akeys = action_keys()        # 跳过地编标「(无效)」的（2026-11-05 玩家要求）
         self._ac_keys = akeys
         self.cb_ac['values'] = ['%d  %s' % (k, ACTION_TYPES[k][0]) for k in akeys]
         # ★2026-10-20 玩家要求：**行为类型默认留空**（以前预选 21 让人以为"只能新增一条"）。

@@ -14,7 +14,7 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from editor_core import ACTION_TYPES
+from editor_core import ACTION_TYPES, action_keys
 from editor_core import action_name
 from editor_core import event_name
 from ui.msg import filedialog
@@ -1344,7 +1344,7 @@ class TriggersPage(object):
         r1 = ttk.Frame(w)
         r1.pack(fill='x', padx=8)
         cb_a = ttk.Combobox(r1, width=34, state='readonly')
-        akeys = [k for k in sorted(ACTION_TYPES) if k != 0]
+        akeys = action_keys()        # 跳过地编标「(无效)」的（2026-11-05 玩家要求）
         cb_a['values'] = ['%d  %s' % (k, ACTION_TYPES[k][0]) for k in akeys]
         cb_a.pack(side='left')
         if 21 in akeys:

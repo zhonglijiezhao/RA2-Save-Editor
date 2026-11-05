@@ -28,7 +28,8 @@ from fa2_tables import (EVENT_TYPES, ACTION_TYPES,     # noqa: E402
                         event_note, action_note,
                         SCRIPT_ACTIONS, SCRIPT_PARAM_TYPES,
                         script_action_name, script_action_ptype,
-                        crate_name, CRATE_TYPES)
+                        crate_name, CRATE_TYPES,
+                        action_keys, event_keys, action_invalid, event_invalid)
 from map_ini import MapIni, find_maps                  # noqa: E402
 
 # ---- 事件 / 行为对象：用「对象签名」确定性定位（2026-10-13 定案）----

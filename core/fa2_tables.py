@@ -418,6 +418,41 @@ def action_ptype(n):
     return ACTION_TYPES.get(n, ('', 0))[1]
 
 
+# ---------------------------------------------------------------------------
+# 「(无效)」条目的处理（玩家 2026-11-05：「明确是无效的行为 应该删除」）
+#
+# ★**编号不能真删**：存档的行为对象里存的就是这个 u32 编号，删掉序号会整体错位
+#   ⇒ 这里把"删除"定义成 **下拉里不列**，存档里已有的值照样能翻译成名字。
+# 地编原文标「(无效)」的动作 9 条：39/44/45/87/91/94/96/97/105；
+# 事件 5 条：2/3/18/53/54 —— 已经与 FAData.ini 一致（名字里带「(无效)」）。
+# ---------------------------------------------------------------------------
+_INVALID_TAG = '(无效)'
+
+
+def is_invalid_name(nm):
+    return _INVALID_TAG in (nm or '')
+
+
+def action_invalid(n):
+    return is_invalid_name(action_name(n))
+
+
+def event_invalid(n):
+    return is_invalid_name(event_name(n))
+
+
+def action_keys(include_invalid=False):
+    """行为下拉用的编号序列（升序，不含 0；默认跳过标了「(无效)」的条目）。"""
+    return [k for k in sorted(ACTION_TYPES)
+            if k != 0 and (include_invalid or not action_invalid(k))]
+
+
+def event_keys(include_invalid=False):
+    """事件下拉用的编号序列（同上）。"""
+    return [k for k in sorted(EVENT_TYPES)
+            if k != 0 and (include_invalid or not event_invalid(k))]
+
+
 # ============================================================================
 # 动作脚本（ScriptType）里那一列动作 —— ★与触发器「行为」是**两套完全不同的编号表**！
 #   例：脚本动作 3 =「移动到路径点」，行为 3 =「生产开始」⇒ 混用就会出现#   “脚本读出来是生产开始”这种错（2026-10-19 玩家指出）。
