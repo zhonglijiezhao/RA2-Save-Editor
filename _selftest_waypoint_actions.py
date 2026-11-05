@@ -7,6 +7,9 @@
     稀疏档（路径点 < 140 个、随机数命中率 < 1%）上 80 是 6/6、108 是 316/316。
 
 用法：python _selftest_waypoint_actions.py
+
+⚠ 样本来自 `E://YURI//*.SAV`。**游戏根目录的档会被同名默认档覆盖**（例如盟军任务一开局
+  就写 `ALL01UMD.sav`）⇒ C 段"稀疏档"断言依赖实际样本，样本变少时自动跳过、不判失败。
 """
 import glob
 import io
@@ -110,9 +113,15 @@ for f in files:
             tot += 1
             if v in wps:
                 hit += 1
-chk(sparse_checked > 0, '找到 %d 个稀疏档（路径点 < 140）' % sparse_checked)
-chk(tot == 0 or hit == tot,
-    '稀疏档里表内行为共 %d 条，落在路径点表 %d 条（应全中）' % (tot, hit), (hit, tot))
+# ★2026-11-05 玩家提醒：`E:/YURI` 根目录里的档**随时会被游戏的同名默认档覆盖**
+#   （盟军任务一开局就存一个 ALL01UMD.sav）。所以样本集不稳定 ⇒ 没有稀疏档时跳过，不判 FAIL。
+if sparse_checked == 0:
+    print('  （跳过）E:/YURI 下没有"稀疏档"，样本可能被游戏的同名默认档覆盖了 ——'
+          '这条断言依赖样本，不算失败')
+else:
+    chk(True, '找到 %d 个稀疏档（路径点 < 140）' % sparse_checked)
+    chk(tot == 0 or hit == tot,
+        '稀疏档里表内行为共 %d 条，落在路径点表 %d 条（应全中）' % (tot, hit), (hit, tot))
 
 print('\n== D. 提示文字都在 ==')
 for t in (41, 48, 55, 95, 109, 112, 125, 128):

@@ -71,8 +71,20 @@ try:
         n = sum(1 for a in acs if a['type'] == 108)
         if n > best:
             best, TID = n, r.sid
-    chk(TID is not None, '档里找到含 108 的触发（%s，%d 条）' % (TID, best), best)
-    acs = d.trigger_actions(TID)
+    if TID:
+        print('     档里含 108 最多的触发：%s（%d 条）' % (TID, best))
+    else:
+        print('     档里一条 108 都没有 —— 下面现场建')
+    acs = d.trigger_actions(TID) if TID else []
+    if not any(a['type'] == 108 for a in acs):
+        # ★样本被游戏的同名默认档覆盖过（盟军任务一开局就写 ALL01UMD.sav），
+        #   里面可能一条 108 都没有 ⇒ 现场建一条，别让自检变成"看运气"。
+        print('     （样本里没有 108 行为，现场建一条带路径点的）')
+        _info = d.create_trigger_multi('108自检', [(13, 5)],
+                                       [{'type': 108, 'arg': 0, 'cell': (10, 10)}],
+                                       persistence=0)
+        TID = _info['trigger_id']
+        acs = d.trigger_actions(TID)
     c108 = [a for a in acs if a['type'] == 108]
     wps = [a.get('waypoint') for a in c108]
     chk(all(w for w in wps), '每条 108 都有路径点号', wps[:6])
