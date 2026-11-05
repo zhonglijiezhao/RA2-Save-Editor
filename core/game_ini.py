@@ -63,11 +63,32 @@ def read_text(path):
     return raw.decode('latin-1', 'ignore')
 
 
+def _strip_comment(v):
+    """去掉值里 `;` 之后的注释（引号内的不切），再去掉两端引号/空白。"""
+    q = False
+    buf = []
+    for ch in v:
+        if ch == '"':
+            q = not q
+        if ch == ';' and not q:
+            break
+        buf.append(ch)
+    return ''.join(buf).strip().strip('"').strip()
+
+
 def parse_ini(path):
-    """极简 INI 解析 → {段名小写: {'order': [...], 'kv': {键小写: 值}}}。
+    """极简 INI 解析 → {段名小写: {'order': [...], 'kv': {键小写: 值}, 'add': [...]}}。
 
     · 去掉 `;` 之后的注释（只在不处于引号内时切）
     · 键值按第一个 `=` 切，键与段名都转小写（RA2 的 INI 本身不区分大小写）
+    · ★★`+=新名字`（Ares / Phobos 的**列表追加**语法）单独收进 `add`，**按出现顺序**：
+        这两个平台的文档写法是
+            [VehicleTypes]
+            +=SCHP1
+            +=SCHP2
+          以前 `split('=',1)` 会得到键 `'+'`，而 `kv` 是 dict ⇒ 多行互相覆盖，
+          只剩最后一条；`int('+')` 又失败 ⇒ **整批自建型号在工具里彻底失踪**
+          （本机 `桌面/RA/rulesmd.ini`：载具 415 条、建筑 97 条、动画 650 条都是这么注册的）。
     """
     out = {}
     cur = None
@@ -78,24 +99,22 @@ def parse_ini(path):
         if s.startswith('['):
             end = s.find(']')
             if end > 0:
-                cur = out.setdefault(s[1:end].strip().lower(), {'order': [], 'kv': {}})
+                cur = out.setdefault(s[1:end].strip().lower(),
+                                     {'order': [], 'kv': {}, 'add': []})
             continue
         if cur is None or '=' not in s:
             continue
         k, v = s.split('=', 1)
-        # 去注释（引号内的 ; 不切）
-        q = False
-        buf = []
-        for ch in v:
-            if ch == '"':
-                q = not q
-            if ch == ';' and not q:
-                break
-            buf.append(ch)
-        val = ''.join(buf).strip().strip('"').strip()
-        k = k.strip().lower()
-        cur['order'].append(k)
-        cur['kv'][k] = val
+        k = k.strip()
+        val = _strip_comment(v)
+        if k == '+':
+            # `+=NAME` —— 追加注册，没有数字编号
+            if val:
+                cur['add'].append(val)
+        else:
+            k = k.lower()
+            cur['order'].append(k)
+            cur['kv'][k] = val
     return out
 
 
@@ -557,7 +576,7 @@ class GameTypes(object):
                                'digest', 'preview', 'previewpack', 'specialflags'):
                         continue
                     low = {str(k).lower(): v for k, v in kv.items()}
-                    self.map_sec[sec] = {'order': list(low.keys()), 'kv': low}
+                    self.map_sec[sec] = {'order': list(low.keys()), 'kv': low, 'add': []}
             except Exception:
                 self.map_sec = {}
         # 类型 ID → (类别, 建造栏序号)
@@ -567,6 +586,8 @@ class GameTypes(object):
                 d = src.get(sec.lower())
                 if not d:
                     continue
+                # ① 数字编号的条目（先排好序，`max` 才是真的最大号）
+                nums = []
                 for k, v in d['kv'].items():
                     if not v:
                         continue
@@ -574,7 +595,22 @@ class GameTypes(object):
                         idx = int(k)
                     except ValueError:
                         continue
-                    self.order.setdefault(v.strip().upper(), {'kind': kind, 'index': idx})
+                    nums.append((idx, v.strip().upper()))
+                nums.sort()
+                for idx, nm in nums:
+                    if nm:
+                        self.order.setdefault(nm, {'kind': kind, 'index': idx})
+                # ② `+=名字` 追加项（Ares / Phobos）：按出现顺序接在**当前最大编号**之后
+                #    引擎就是这么分配的（不是补空洞），所以自建型号的序号是 max+1、max+2…
+                nxt = (nums[-1][0] + 1) if nums else 0
+                for nm in (d.get('add') or []):
+                    nm = (nm or '').strip().upper()
+                    if nm.startswith('='):        # 容错：`+ = X` 之类
+                        nm = nm.lstrip('= ').strip()
+                    if not nm:
+                        continue
+                    self.order.setdefault(nm, {'kind': kind, 'index': nxt})
+                    nxt += 1
 
     # ---------- 查询 ----------
     def ok(self):

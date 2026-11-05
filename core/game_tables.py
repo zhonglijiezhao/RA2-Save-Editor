@@ -70,6 +70,9 @@ def _parse_num_map(text, section):
     · 值里 `;` 之后当注释切掉（引号内的不算）
     · 切完为空但原文有内容（`2=;Grinder`）⇒ 记成 `';Grinder'`：
       编号占位、但标记为「不可用」（`choices_of` 会跳过它）
+    · ★★`+=名字`（Ares / Phobos 的**追加注册**语法）：按**出现顺序**接在当前最大编号之后。
+      本机 `桌面/RA/rulesmd.ini` 里 [Animations] 有 **650 条**、[ParticleSystems] 3 条
+      是这么注册的 —— 以前一条都读不到（正则只认 `^数字=`），下拉里少一大半。
     """
     if not text:
         return {}
@@ -80,9 +83,15 @@ def _parse_num_map(text, section):
     nxt = re.search(r'^\s*\[', rest, re.M)
     body = rest[:nxt.start()] if nxt else rest
     out = {}
+    adds = []
     for line in body.splitlines():
         s = line.strip()
         if not s or s.startswith(';'):
+            continue
+        if s.startswith('+='):
+            val = _cut_comment(s[2:]).strip()
+            if val:
+                adds.append(val)
             continue
         mm = re.match(r'^(\d+)\s*=\s*(.*)$', s)
         if not mm:
@@ -98,6 +107,16 @@ def _parse_num_map(text, section):
                 out[n] = ''
         else:
             out[n] = val
+    if adds:
+        # ★编号 = 当前最大 + 1，依次递增。
+        #   实测这类 mod 的编号是连续的（桌面 RA：[Animations] 713 项、max=712），
+        #   max+1 与引擎"追加到列表末尾"的结果一致。
+        cur = (max(out) + 1) if out else 0
+        for val in adds:
+            while cur in out:
+                cur += 1
+            out[cur] = val
+            cur += 1
     return out
 
 
