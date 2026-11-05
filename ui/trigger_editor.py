@@ -1840,8 +1840,13 @@ class TriggerEditor(tk.Toplevel):
         self._pending_name = None
         self._pending_actions = []
         self._pending_events = []
-        # ★§158：持久性 1 是计数型，两个坑在"新建"这一步就要提醒
-        _per = self.cb_rep.current() if self.cb_rep.current() >= 0 else 0
+        # ★§158：持久性 1 是计数型，两个坑在"新建"这一步就要提醒。
+        #   ★2026-11-05：要用**真正写进去的那个值**（`info['persistence']`）——
+        #   core 在"没挂对象"时会把 1 自动降级成 0 并给出说明，
+        #   这里若还按下拉框的 1 去提醒，等于对着已修好的结果喊"会永不触发"。
+        _per = info.get('persistence')
+        if _per is None:
+            _per = self.cb_rep.current() if self.cb_rep.current() >= 0 else 0
         if _per == 1:
             if et == 1:
                 warn.append('进入事件（1）+ 持久性 1 挂到多个对象上是**已知 BUG**（永不执行）；'
