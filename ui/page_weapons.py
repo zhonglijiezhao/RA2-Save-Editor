@@ -10,6 +10,19 @@ import os
 import sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _slot_text(sl):
+    """武器槽的显示文字：有名字就给名字，**有指针但认不出**就显示 `?地址`，真的空才 `—`。
+
+    ★2026-11-05（玩家 SAVE6952）：以前一律 `name or '—'`，于是「指针明明有、只是那个
+      武器对象没在名字表里」的槽看着跟"没装武器"一模一样（HORNET/ORCA/TNKD 三处）。
+    """
+    nm = (sl or {}).get('name')
+    if nm:
+        return nm
+    a = (sl or {}).get('addr') or 0
+    return ('?%08X' % a) if a else '—'
 for _p in (_ROOT, os.path.join(_ROOT, 'core')):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -287,8 +300,8 @@ class WeaponsPage(object):
             sl = r['slots']
             self.utw.insert('', 'end', iid=str(i),
                             values=(r['type'], r['cn'] or '—',
-                                    sl['primary']['name'] or '—',
-                                    sl['secondary']['name'] or '—'),
+                                    _slot_text(sl['primary']),
+                                    _slot_text(sl['secondary'])),
                             tags=('ingame',) if r['in_game'] else ())
             self._unit_rows[str(i)] = r
         try:

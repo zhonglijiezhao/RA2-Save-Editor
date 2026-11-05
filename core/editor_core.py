@@ -6942,8 +6942,71 @@ class SaveDoc(object):
         return out
 
     # ---------- 单位（步兵/载具）★2026-10-17 新定位 ----------
+    def unit_type_objects(self):
+        """**全部** Type 对象（含 `Name:` ≠ 类型 ID 的那批）→ `{ID: {name, uiname, off, key}}`。
+
+        ★★2026-11-05（玩家 SAVE6952：「这个单位武器的表…好多没读出来」）：
+          老 `unit_types()` 要求 `Name:` 后面的字符串 **等于** 类型 ID 才收，可存档里
+          `+80` 存的是 **UIName 键**，只有一部分类型刚好同名：
+
+            | 类型 ID | 存档里 `Name:` |
+            |---|---|
+            | GGI | `Name:GuardianGI` |
+            | TANY | `Name:TANYA` |
+            | LTNK | `Name:Lasher` |
+            | YURI | `Name:YuriClone` |
+            | BFRT | `Name:Battlefortress` |
+
+          SAVE6952 实测：525 个带 `Name:` 的对象里 **181 个**被那条判据丢掉
+          ⇒ 武器表里 43 个型号（守卫大兵/谭雅/拉舍/战斗要塞…）整行缺席。
+          这里改用**结构判据**：`Name:` 恒在对象 **`+81`**（实测 532/532 命中，
+          因为 `+80` 是长度/保留字节），只要 GUID 对得上就收。
+
+        返回的 `off` 是**对象起点**（GUID 处），可直接加 `UNIT_WEAPON_SLOTS` 的偏移。
+        """
+        memo = getattr(self, '_utypes_full', None)
+        if memo is not None:
+            return memo
+        pl = self.plain
+        tail = b'\x00\x60\x08\x05\x5b\xb5'
+        out = {}
+        i = 0
+        while True:
+            j = pl.find(b'Name:', i)
+            if j < 0:
+                break
+            i = j + 1
+            o = None
+            for k in range(j - 40, j - 160, -1):
+                if k >= 0 and pl[k + 6:k + 8] == b'\xd2\x11' \
+                        and bytes(pl[k + 10:k + 16]) == tail:
+                    o = k
+                    break
+            if o is None or (j - o) not in (80, 81):
+                continue
+            nm = bytes(pl[o + 56:o + 72]).split(b'\x00')[0]
+            if not nm or len(nm) > 16:
+                continue
+            try:
+                nm_s = nm.decode('ascii')
+            except Exception:
+                continue
+            if not all((c.isalnum() or c in '_-') for c in nm_s):
+                continue
+            ui = bytes(pl[j + 5:j + 37]).split(b'\x00')[0] \
+                .decode('latin-1', 'ignore').strip()
+            key = struct.unpack_from('<I', pl, o + 16)[0]
+            out.setdefault(nm_s.upper(), {'name': nm_s, 'uiname': ui,
+                                          'off': o, 'key': key})
+        self._utypes_full = out
+        return out
+
     def unit_types(self):
         """类型空间（步兵/载具/建筑通用）：{类型键: 'E1'|'MTNK'|…}。
+
+        ⚠**这份是不完整的**（只收 `Name:` 值刚好等于类型 ID 的那些，SAVE6952 里
+          525 个对象要丢 181 个）—— 需要"全部型号"时用 `unit_type_objects()`。
+          这里保持原语义不动：侧栏/地图/赠礼等功能都按它的口径验过，不能随便改。
 
         类型对象布局（实测）：`+0` GUID、`+16` 自键、`+20..+35` 四条类常量、
         `+56` 类型名（16B ASCII，如 `E1`/`MTNK`）、`+80` `"Name:E1"`、`+120` 显示名（"G.I."）。
@@ -14180,7 +14243,15 @@ class SaveDoc(object):
                 v = struct.unpack_from('<I', pl, off + self.TYPE_SELF_ADDR_OFF)[0]
             except Exception:
                 continue
-            if 0x04000000 <= v <= 0x3FFFFFFF:
+            if 0x00010000 <= v < 0x80000000 and (v & 7) == 0:
+                # ★★2026-11-05（玩家 SAVE6952：「好多没读出来」）：原来的下界写死
+                #   `0x04000000`，但同一份存档里**对象地址分属好几段堆** ——
+                #   SAVE6952 实测：1121 个 Type 对象里 **224 个在 `0x02B8xxxx`~`0x02C1xxxx`**
+                #   （M60 / Para / TankBolt / ATGUN / CRATER… 全在这段），被这条下界整批丢掉
+                #   ⇒ 单位武器表里 E1、AENGINEER、AEGIS… 的槽位明明有指针却全显示「—」。
+                #   现在只要求「像指针」：≥64KB、<2GB（用户态）、**8 字节对齐**
+                #   （RA2 是 32 位进程，`new` 出来的对象至少 8 对齐；实测 1121 个里
+                #    只有 1 个不满足，是名字叫 `30` 的假对象 `0x000F49FA`）。
                 out.setdefault(v, []).append(nm)
         self._addr_memo = out
         return out
@@ -14226,8 +14297,9 @@ class SaveDoc(object):
         if c is not None and c[0] == len(self.plain):
             data = c[1]
         else:
-            ut = self.unit_types()
-            offs = getattr(self, '_utypes_off', None) or {}
+            # ★★§SOV32（2026-11-05）：改用 `unit_type_objects()` —— 老 `unit_types()`
+            #   要求 `Name:` == 类型 ID，会把 181 个对象（GGI/TANY/LTNK/BFRT…）整批丢掉。
+            ut = self.unit_type_objects()
             rules = self._rules_all() or {}
             amap = self.type_addr_map()
 
@@ -14240,7 +14312,8 @@ class SaveDoc(object):
             except Exception:
                 in_game = set()
             out = []
-            for k, name in ut.items():
+            for _idkey, _info in ut.items():
+                name = _info['name']
                 kv = rules.get(name) or rules.get(name.upper()) or {}
                 # ★排除建筑：**不能用 `Foundation`** —— 这份 rules 的建筑段里根本没有这个键。
                 #   实测 `BuildCat=` 才是可靠判据：8 个防御建筑（NALASR/NASAM/TESLA/ATESLA/
@@ -14251,7 +14324,8 @@ class SaveDoc(object):
                 #   （`Neutral` 的 +0x8AC 会读到 `CRIVEXP`，就是靠这条挡掉的）
                 if not any(x in kv for x in self.UNIT_WEAPON_RULEKEYS):
                     continue
-                off = offs.get(k)
+                off = _info['off']
+                k = _info['key']
                 if off is None or off + 0xAC8 > len(self.plain):
                     continue
                 slots = {}
@@ -14262,6 +14336,7 @@ class SaveDoc(object):
                     continue
                 out.append({'type': name, 'cn': kv.get('Name', ''), 'off': off,
                             'key': k, 'slots': slots,
+                            'uiname': _info.get('uiname') or '',
                             'in_game': name.upper() in in_game})
             out.sort(key=lambda r: (not r['in_game'], r['type'].upper()))
             self._unitwpns = (len(self.plain), out)
@@ -16308,7 +16383,9 @@ class SaveDoc(object):
                   # ★2026-10-29：武器类标记扫描（off 相关，同上）
                   '_wpnmarks_memo',
                   # ★2026-10-29：类型对象 地址→名字 表（指针相关，改动后要重扫）
-                  '_addr_memo'):
+                  '_addr_memo',
+                  # ★2026-11-05：全部 Type 对象扫描（名字偏移相关，增删字节后必须重扫）
+                  '_utypes_full'):
             if hasattr(self, a):
                 setattr(self, a, None)
         if rescan:
