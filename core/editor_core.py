@@ -6231,8 +6231,26 @@ class SaveDoc(object):
     #     · `+0x58` = **99 / 98** 两组，正好对应地图 `[Actions]` 里最后那个字母字段
     #       `CV` / `CU`（= 路径点 99 / 98），而 `[Waypoints]` 全图只有 98、99 两个点 ⇒ 铁证。
     CRATE_ACTION = 108
-    # 「要填路径点」的行为（参数写对象 `+0x58`）：援军 80/107、建建筑 125、创建工具箱 108
-    WAYPOINT_ACTIONS = SPAWN_ACTIONS + (CRATE_ACTION,)
+    # 「要填路径点」的行为 —— 参数写在行为对象 **`+0x58`**（= 地图 `[Actions]` 每块第 8 字段）。
+    #
+    # ★★2026-11-05 全量核对（地编 `[ActionsRA2]` 的说明原文 + 存档 `+0x58` 实测）：
+    #     41 播放动画在…        「在特定的路径点播放特定的动画」
+    #     48 移动并居中视野…     「将玩家视野移动到特定的路径点」
+    #     55 建立小地图事件      「在特定的路径点建立雷达小地图事件」
+    #     80 援军(作战小队)      「在特定的路径点创建援军作战小队」
+    #     95 核弹打击           「在特定的路径点实施核弹打击」
+    #     107 超时空传送援军      「在特定的路径点创建援军」
+    #     108 创建工具箱         「在指定路径点创建…工具箱」
+    #     109 铁幕作用于         「铁幕作用于特定的路径点」
+    #     112 居中视野到路径点    「立即将指挥视野移动到特定的路径点」
+    #     125 将建筑建于         「触发所属方会在特定路径点获得指定类型的建筑」
+    #     128 超时空传送所有单位到  「所有单位会被传送到特定的路径点」
+    #   存档侧佐证：扫 38 个档，这 10 类（除 125 无样本）的 `+0x58` 全部为非 0 且落在
+    #   **本档路径点表**里；在"稀疏档"（路径点 < 140 个、随机数命中率 <1%）上
+    #   80 有 6/6、108 有 316/316 命中 ⇒ 不是巧合。
+    # ⚠ `+0x58` 对这个表以外的行为**不是**路径点：`131 闪烁特定类型的建筑` 那一位是
+    #   **闪烁帧数**（十进制，1 秒 = 15 帧；实测写着 500/1000）⇒ 千万别把它加进来。
+    WAYPOINT_ACTIONS = (41, 48, 55, 80, 95, 107, 108, 109, 112, 125, 128)
     # ★★§283.9：**小队型行为**（地编口径参数类型 7）= 4 建立 / 5 解散 / 7 援军 / 80 / 107。
     #   实测（Z17 档，386 支小队）：4/7 的小队键和 80/107 一样写在行为对象 **`+0x44`**，
     #   `+0x48` 恒 0 ⇒ 以前只认 SPAWN_ACTIONS，导致 4/7 读出来 team=0、界面上选不了小队。
@@ -17237,6 +17255,24 @@ class SaveDoc(object):
                     a['arg_text'] = ('%s @ 路径点 %s%s'
                                      % (self._arg_text(31, a.get('arg') or 0), wpk,
                                         (' 格%s' % (cell,)) if cell else ''))
+                elif a.get('type') in self.WAYPOINT_ACTIONS:
+                    # ★★2026-11-05：其余「要填路径点」的行为（41 播放动画 / 48 移动视野 /
+                    #   55 小地图事件 / 95 核弹打击 / 109 铁幕 / 112 居中视野 / 125 建建筑 /
+                    #   128 传送所有单位）—— 路径点同样在对象 `+0x58`。
+                    #   以前这里没有分支 ⇒ 编辑器里参数恒显示 0，看不出这个行为落在哪个点。
+                    wpk = int.from_bytes(pl[obj + 0x58:obj + 0x5C], 'little')
+                    try:
+                        cell = self.waypoint_cell(wpk) if wpk else None
+                    except Exception:
+                        cell = None
+                    a = dict(a)
+                    a['waypoint'] = wpk
+                    a['cell'] = cell
+                    _base = (self._arg_text(a.get('ptype') or 0, a.get('arg') or 0)
+                             if (a.get('arg') or 0) else '')
+                    a['arg_text'] = ('%s@ 路径点 %s%s'
+                                     % ((_base + ' ') if _base else '', wpk or '（未填）',
+                                        (' 格%s' % (cell,)) if cell else ''))
                 d['actions'].append(a)
         if not d['editable']:
             d['note'] = '这条记录在本档里只有「触发定义」，没有运行期实例 ⇒ 只能看'
@@ -17546,6 +17582,17 @@ class SaveDoc(object):
                 if waypoint is None:
                     raise RuntimeError('格 %s 处建不了路径点（号段用满且无近点可复用）' % (cell,))
             buf[0x58:0x5C] = struct.pack('<I', int(waypoint))
+        elif atype in self.WAYPOINT_ACTIONS:
+            # ★★2026-11-05：其余「要填路径点」的行为（41 播放动画 / 48 移动视野 / 55 小地图
+            #   事件 / 95 核弹打击 / 109 铁幕 / 112 居中视野 / 125 建建筑 / 128 传送所有单位）
+            #   —— 路径点同样写对象 `+0x58`。以前这里只认 108 和 80/107 ⇒ 追加这些行为时
+            #   就算传了 waypoint 也会被**静默丢掉**。
+            #   口径比 108 宽松：给了就写；没给但有 cell 就从 cell 造一个；都没有就留 0
+            #   （这些行为允许先建后改，不像 108 会刷出个看不见的箱子）。
+            if waypoint is None and cell is not None:
+                waypoint = self.ensure_waypoint_at(int(cell[0]), int(cell[1]))
+            if waypoint:
+                buf[0x58:0x5C] = struct.pack('<I', int(waypoint))
         pl[pos:pos] = bytes(buf)
         self.invalidate_caches(rescan=True)
         pl = self.plain

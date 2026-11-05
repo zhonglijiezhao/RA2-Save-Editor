@@ -740,6 +740,19 @@ class TriggerEditor(tk.Toplevel):
                 cell = None
             return '%s @ 路径点 %s%s' % (box, waypoint or '（未填）',
                                         (' 格%s' % (cell,)) if cell else '')
+        if atype in self.doc.WAYPOINT_ACTIONS:
+            # ★★2026-11-05：其余「要填路径点」的行为（41 播放动画 / 48 移动视野 / 55 小地图
+            #   事件 / 95 核弹打击 / 109 铁幕 / 112 居中视野 / 125 建建筑 / 128 传送所有单位）
+            #   路径点也在 +0x58，参数列显示「参数 @ 路径点 N 格(x,y)」。
+            try:
+                cell = self.doc.waypoint_cell(waypoint) if waypoint else None
+            except Exception:
+                cell = None
+            base = self.doc._arg_text(action_ptype(atype), arg)
+            base = base if (base and base != '0') else ''
+            return '%s@ 路径点 %s%s' % ((base + ' ') if base else '',
+                                        waypoint or '（未填）',
+                                        (' 格%s' % (cell,)) if cell else '')
         return self.doc._arg_text(action_ptype(atype), arg)
 
     def _trig_ref_text(self, sid):
@@ -1542,6 +1555,11 @@ class TriggerEditor(tk.Toplevel):
             if atype == self.doc.CRATE_ACTION:
                 self.lbl_wp_hint.config(
                     text='（箱子刷到哪个路径点；和地图上编号一致，留空 / 0 ⇒ 箱子不刷）')
+            elif (atype in self.doc.WAYPOINT_ACTIONS
+                  and not self.doc.is_team_action(atype)):
+                # ★2026-11-05：41/48/55/95/109/112/125/128 —— 路径点 = 行为生效的位置
+                self.lbl_wp_hint.config(
+                    text='（这个行为在哪个路径点生效；填路径点号，留空 / 0 ⇒ 引擎找不到落点）')
             else:
                 self.lbl_wp_hint.config(
                     text='（上面的「参数」= 小队，这里 = 刷出来的位置；留空 = 0）')
@@ -1604,6 +1622,19 @@ class TriggerEditor(tk.Toplevel):
                 raise ValueError('路径点必须是整数（箱子刷到那个路径点）')
             if wp <= 0:
                 raise ValueError('108「创建工具箱」要给路径点：箱子就刷在那个点')
+            return self._parse_arg(self.var_acarg.get()), {'waypoint': wp}
+        if atype in self.doc.WAYPOINT_ACTIONS:
+            # ★★2026-11-05：41/48/55/95/109/112/125/128 —— 路径点同样走 +0x58。
+            #   和 108 不同：这里允许留空（写 0），不硬拦（先建行为、后补落点也行）。
+            raw = (self.var_wp.get() or '').strip()
+            if not raw:
+                return self._parse_arg(self.var_acarg.get()), {}
+            try:
+                wp = int(raw)
+            except ValueError:
+                raise ValueError('路径点必须是整数（这个行为要在哪个路径点生效）')
+            if wp < 0:
+                raise ValueError('路径点号不能是负数')
             return self._parse_arg(self.var_acarg.get()), {'waypoint': wp}
         return self._parse_arg(self.var_acarg.get()), {}
 
@@ -1744,6 +1775,10 @@ class TriggerEditor(tk.Toplevel):
             self.var_wp.set('')
         elif a['type'] == self.doc.CRATE_ACTION:
             # ★★2026-11-05：108 创建工具箱 —— 参数框 = 箱子类型，另有「路径点」
+            self.var_acarg.set(self.doc._arg_text(action_ptype(a['type']), a['arg']))
+            self.var_wp.set(str(a.get('waypoint') or ''))
+        elif a['type'] in self.doc.WAYPOINT_ACTIONS:
+            # ★★2026-11-05：41/48/55/95/109/112/125/128 —— 参数照常，另带路径点（+0x58）
             self.var_acarg.set(self.doc._arg_text(action_ptype(a['type']), a['arg']))
             self.var_wp.set(str(a.get('waypoint') or ''))
         else:

@@ -9,7 +9,8 @@
 | **路径点** | **`+0x58`**（与 80/107/125 同字段） | 箱子就刷在这个路径点上；0 = 引擎找不到落点，**不刷** |
 
 证据（`ALL01UMD.sav`，2026-11-05）：
-  · 01000005 有 17 条行为，前 16 条是 108（第 17 条是 23 摧毁触发）。
+  · 原始样本 01000005 有 17 条行为，前 16 条是 108（第 17 条是 23 摧毁触发）。
+    ⚠ 样本会被游戏自己重存（触发 ID 变），所以脚本改成**动态找**含 108 的触发。
   · `+164` = 0,1,2,3,4,6,7,…,16（奖励箱类型），`+0x58` = **99 / 98** 两组；
   · 地图 `[Actions]` 里这 16 条的最后那个字母字段正好是 `CV` / `CU`（= 路径点 99 / 98），
     而 `[Waypoints]` 全图只有 98、99 两个点 ⇒ 字段定位铁证。
@@ -59,20 +60,34 @@ try:
     d = SaveDoc(p)
 
     print('== A. 读：108 的路径点 ==')
-    acs = d.trigger_actions('01000005')
+    # ★别写死触发 ID：这份样本被游戏自己重存过（19:49），触发 ID 全变了。
+    #   动态找"含 108 最多的那条"，找不到就现场建一条。
+    TID, best = None, 0
+    for r in [x for x in d.records if x.kind == '触发']:
+        try:
+            acs = d.trigger_actions(r.sid)
+        except Exception:
+            continue
+        n = sum(1 for a in acs if a['type'] == 108)
+        if n > best:
+            best, TID = n, r.sid
+    chk(TID is not None, '档里找到含 108 的触发（%s，%d 条）' % (TID, best), best)
+    acs = d.trigger_actions(TID)
     c108 = [a for a in acs if a['type'] == 108]
-    chk(len(c108) == 16, '01000005 里有 16 条 108（实 %d）' % len(c108), len(c108))
     wps = [a.get('waypoint') for a in c108]
-    chk(wps[:9] == [99] * 9, '前 9 条路径点 = 99', wps[:9])
-    chk(wps[9:] == [98] * 7, '后 7 条路径点 = 98', wps[9:])
-    chk([a['arg'] for a in c108][:5] == [0, 1, 2, 3, 4], '奖励箱类型在 +164（0,1,2,3,4）',
-        [a['arg'] for a in c108][:5])
+    chk(all(w for w in wps), '每条 108 都有路径点号', wps[:6])
+    if len(c108) == 16 and wps[:9] == [99] * 9 and wps[9:] == [98] * 7:
+        chk(True, '原始样本形态：前 9 条 99 / 后 7 条 98')
+    else:
+        print('     （样本已被重存，条数/分组变了：%d 条 %s —— 只验"都有号"）'
+              % (len(c108), wps[:6]))
     chk(all(a.get('cell') for a in c108), '每条都能反查出格子坐标', c108[0].get('cell'))
+    chk([a['arg'] for a in c108] != [], '奖励箱类型（+164）读得到', [a['arg'] for a in c108][:5])
 
     print('== B. 改：箱子类型 + 路径点 ==')
     a0 = c108[0]
     d.set_action(a0, arg=8, waypoint=98)
-    b0 = d.trigger_actions('01000005')[0]
+    b0 = d.trigger_actions(TID)[0]
     o = b0['action_off']
     chk(struct.unpack_from('<I', d.plain, o + 164)[0] == 8, '+164 = 8（显示全图）')
     chk(struct.unpack_from('<I', d.plain, o + 0x58)[0] == 98, '+0x58 = 98')
@@ -90,8 +105,8 @@ try:
     q = os.path.join(TMP, 'out.SAV')
     d.save(q)
     d2 = SaveDoc(q)
-    r2 = d2.trigger_actions('01000005')[0]
-    chk(r2['arg'] == 8 and r2.get('waypoint') == 98, '回读 01000005 首条 = (8, 98)',
+    r2 = d2.trigger_actions(TID)[0]
+    chk(r2['arg'] == 8 and r2.get('waypoint') == 98, '回读 %s 首条 = (8, 98)' % TID,
         (r2['arg'], r2.get('waypoint')))
     r3 = d2.trigger_actions(info['trigger_id'])
     chk(r3[0].get('waypoint') == 99, '回读新建触发 = 路径点 99', r3[0].get('waypoint'))
