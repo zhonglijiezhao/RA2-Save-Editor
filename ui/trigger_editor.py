@@ -14,6 +14,7 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
 
 from editor_core import ACTION_TYPES, action_keys, event_keys
 from editor_core import ACTION_TRIG_TYPES
+from editor_core import ACTION_TAG_TYPES
 from editor_core import ENGINE_PTYPE_TEXT
 from editor_core import EVENT_TYPES
 from editor_core import action_name
@@ -715,10 +716,13 @@ class TriggerEditor(tk.Toplevel):
             return
         self.after_change('已删事件 %s' % event_name(r['type']))
 
-    def _ac_text(self, atype, arg, team=0, waypoint=0, trigger=None):
+    def _ac_text(self, atype, arg, team=0, waypoint=0, trigger=None, tag=None):
         """「参数含义」列的文字：80/107 显示「小队名 · 路径点」，触发型显示「→ 哪条触发」。"""
         if atype in ACTION_TRIG_TYPES:
             return self._trig_ref_text(trigger)
+        if atype in ACTION_TAG_TYPES:
+            # ★★§SOV31：标签型（70 摧毁标签）—— 参数是标签对象的实例键
+            return self._tag_ref_text(tag or arg)
         if self.doc.is_team_action(atype):
             nm = next((lab for lab, k in self._team_choices() if k == team), '')
             nm = nm or ('小队 %08X' % team if team else '（没选小队）')
@@ -754,6 +758,48 @@ class TriggerEditor(tk.Toplevel):
             pass
         return out
 
+    def _tag_ref_text(self, v):
+        """标签型行为的参数显示：`01000006 aaaa 1` / `（没指定标签）`。
+
+        ★★§SOV31（2026-11-05 玩家：「地编的做法就是列表就是标签的列表」）：
+        行为 `70 摧毁标签` 的参数 = **标签对象**，地编就是拿标签列表下拉的；
+        存档里存的是标签对象 `+16` 的**实例键**（对象 `+96` 处，不是 +72/+164）。
+        """
+        if v in (None, '', 0):
+            return '（没指定标签）'
+        if isinstance(v, str):
+            sid = v.strip().upper()
+            nm = next((r.name for r in self.doc.records
+                       if r.kind == '标签' and r.sid == sid), '') or ''
+            return ('%s %s' % (sid, nm)).strip()
+        try:
+            return self.doc.tag_label(int(v)) or ('标签 %08X' % (int(v) & 0xFFFFFFFF))
+        except Exception:
+            return str(v)
+
+    def _tag_choices(self):
+        """标签型参数的下拉候选 → `[(显示文字, 标签SID), …]`（含「（没指定标签）」）。"""
+        out = [('（没指定标签）', None)]
+        try:
+            for t in self.doc.tag_objects():
+                nm = ('%s %s' % (t['sid'], t['name'])).strip()
+                if t['sid'] == getattr(self, '_cur_tag', None):
+                    nm += '（自己的标签）'
+                out.append((nm, t['sid']))
+        except Exception:
+            pass
+        return out
+
+    def _tag_from_text(self):
+        """从参数框文字里取标签 sid（`01000006 aaaa 1` → `01000006`）。"""
+        t = (self.var_acarg.get() or '').strip()
+        if not t:
+            return None
+        for tok in t.split():
+            if len(tok) == 8 and all(c in '0123456789ABCDEFabcdef' for c in tok):
+                return tok.upper()
+        return None
+
     def _fill_actions(self):
         self.tv_ac.delete(*self.tv_ac.get_children())
         if getattr(self, '_new_mode', False):
@@ -762,13 +808,17 @@ class TriggerEditor(tk.Toplevel):
                     t, a = int(it['type']), int(it.get('arg') or 0)
                     tm, wp = it.get('team') or 0, it.get('waypoint') or 0
                     tg = it.get('trigger')
+                    ttag = it.get('tag')
                 else:
                     t, a = int(it[0]), int(it[1])
                     tm, wp = 0, 0
                     tg = None
+                    ttag = None
                 self.tv_ac.insert('', 'end', iid=str(i), values=(
-                    i, t, action_name(t), wp if t in self.doc.SPAWN_ACTIONS else a,
-                    self._ac_text(t, a, tm, wp, tg)))
+                    i, t, action_name(t),
+                    (ttag if t in ACTION_TAG_TYPES else
+                     (wp if t in self.doc.SPAWN_ACTIONS else a)),
+                    self._ac_text(t, a, tm, wp, tg, ttag)))
             return
         for i, a in enumerate(self._det.get('actions') or [], 1):
             # ★§219.8：援军行为 80/107 的参数在 +0x44（小队键）/+0x58（路径点），
@@ -779,6 +829,9 @@ class TriggerEditor(tk.Toplevel):
             elif a.get('type') in ACTION_TRIG_TYPES:
                 # ★§SOV07：触发型行为的参数列显示**目标触发 ID**（在 +100，不是 +72）
                 argcol = a.get('trigger') or 0
+            elif a.get('type') in ACTION_TAG_TYPES:
+                # ★★§SOV31：标签型（70 摧毁标签）参数列显示**目标标签 ID**（在 +96）
+                argcol = a.get('tag') or (a.get('tag_key') or 0)
             elif self.doc.is_team_action(a.get('type')):
                 # ★§283.9：小队型（4/5/7）参数列显示**小队 ID**（不是 0，避免看着像空的）
                 _tk = a.get('team_key') or a.get('team') or 0
@@ -789,7 +842,8 @@ class TriggerEditor(tk.Toplevel):
                 self._ac_text(a['type'], a['arg'],
                               a.get('team') or a.get('team_key') or 0,
                               a.get('waypoint') or 0,
-                              a.get('trigger'))))
+                              a.get('trigger'),
+                              a.get('tag') or a.get('tag_key'))))
 
     # ---------------- 触发设置 ----------------
     def apply_name(self):
@@ -1271,6 +1325,15 @@ class TriggerEditor(tk.Toplevel):
     def _fill_arg_values(self, combo, ptype, cur):
         """按参数类型给参数下拉填候选值（所属方型 = 阵营顺序，0 恒为玩家自己）。"""
         try:
+            if ptype == 38:
+                # ★★§SOV31（2026-11-05 玩家：「地编的做法就是列表就是标签的列表」）：
+                #   行为 `70 摧毁标签` —— 下拉 = 本档全部标签（Tag），存的是标签对象的实例键。
+                _ch = self._tag_choices()
+                combo['values'] = [c[0] for c in _ch]
+                if cur:
+                    lab = next((l for l, s in _ch if s and s == str(cur).upper()), None)
+                    combo.set(lab or self._tag_ref_text(cur))
+                return
             if ptype in (12, 13, 16, 17, 18, 25, 26, 41):
                 # ★★§SOV20 / 2026-11-04：这些 ptype 的参数是**游戏列表里的编号**，
                 #   地编就是按表下拉、把编号存进存档的：
@@ -1491,6 +1554,13 @@ class TriggerEditor(tk.Toplevel):
                 raise ValueError('这条行为的参数是「触发」—— 先在「参数」里选一条'
                                  '（要"禁止自己"就选（自己）那条）')
             return 0, {'trigger': sid}
+        if atype in ACTION_TAG_TYPES:
+            # ★★§SOV31：标签型（70 摧毁标签）参数写**对象 +96**（标签对象的实例键），
+            #   不是 +72/+164 —— 写错位置的表现是"参数恒 0、进游戏什么也不摧毁"。
+            sid = self._tag_from_text()
+            if not sid:
+                raise ValueError('这条行为的参数是「标签」—— 先在「参数」里选一个标签')
+            return 0, {'tag': sid}
         if self.doc.is_team_action(atype):
             # ★§283.9：小队型（4 建立 / 5 解散 / 7 援军 / 80 / 107）—— 参数 = 小队键（+0x44）
             tkey = self._team_key_from_text(self.var_acarg.get())
@@ -1550,6 +1620,8 @@ class TriggerEditor(tk.Toplevel):
                         cur = None
                     if pt == 14:                       # ★§SOV07：触发型参数 = 目标 sid
                         cur = self._trig_from_text()
+                    elif pt == 38:                     # ★§SOV31：标签型参数 = 标签 sid
+                        cur = self._tag_from_text()
                     self._fill_arg_values(self.cb_acarg, pt, cur)
                     self._show_wp(False)
                     if pt == 2:
@@ -1560,6 +1632,11 @@ class TriggerEditor(tk.Toplevel):
                     elif pt == 14:
                         nt = ('触发型：参数 = 目标触发（存档里存在行为对象 +100 的实例键，'
                               '不是 +72）—— 选「自己」就是"这条触发跑完把自己禁掉"') + \
+                             ('　' + nt if nt else '')
+                    elif pt == 38:
+                        # ★★§SOV31：标签型（70 摧毁标签）—— 参数在对象 +96，不是 +72/+164
+                        nt = ('标签型：参数 = 目标标签（存在行为对象 +96 的实例键）—— '
+                              '执行后这个标签连同挂在它上面的所有触发一起被销毁') + \
                              ('　' + nt if nt else '')
                     elif pt in (25, 26):
                         _tb = self.doc.game_lists() if self.doc else None
@@ -1621,6 +1698,10 @@ class TriggerEditor(tk.Toplevel):
             # ★§SOV07：触发型 —— 参数框显示「SID 名字（自己）」，写的是 +100 的实例键
             self.var_acarg.set(self._trig_ref_text(a.get('trigger')))
             self.var_wp.set('')
+        elif a['type'] in ACTION_TAG_TYPES:
+            # ★★§SOV31：标签型 —— 参数框显示「SID 名字」，写的是 +96 的标签实例键
+            self.var_acarg.set(self._tag_ref_text(a.get('tag') or a.get('tag_key')))
+            self.var_wp.set('')
         else:
             self.var_acarg.set(str(a['arg']))
             self.var_wp.set('')
@@ -1658,7 +1739,8 @@ class TriggerEditor(tk.Toplevel):
             self.app.status.set('新建触发：第 %d 条行为 → %s（%s）'
                                 % (i + 1, ACTION_TYPES[_t][0],
                                    self._ac_text(_t, arg, kw.get('team') or 0,
-                                                 kw.get('waypoint') or 0)))
+                                                 kw.get('waypoint') or 0,
+                                                 kw.get('trigger'), kw.get('tag'))))
             return
         sel = self.tv_ac.focus()
         acts = (self._det or {}).get('actions') or []
@@ -1684,7 +1766,8 @@ class TriggerEditor(tk.Toplevel):
         self.after_change('行为 #%s → %s（%s）'
                           % (sel, ACTION_TYPES[_t][0],
                              self._ac_text(_t, arg, kw.get('team') or 0,
-                                           kw.get('waypoint') or 0)))
+                                           kw.get('waypoint') or 0,
+                                           kw.get('trigger'), kw.get('tag'))))
 
     def add_action(self):
         if getattr(self, '_new_mode', False):
@@ -1704,7 +1787,8 @@ class TriggerEditor(tk.Toplevel):
             self.app.status.set('新建触发：已加第 %d 条行为 %s（%s）—— 还没写入存档'
                                 % (len(self._pending_actions), ACTION_TYPES[_t][0],
                                    self._ac_text(_t, arg, kw.get('team') or 0,
-                                                 kw.get('waypoint') or 0)))
+                                                 kw.get('waypoint') or 0,
+                                                 kw.get('trigger'), kw.get('tag'))))
             return
         i = self.cb_ac.current()
         if i < 0 or not self._cur:
@@ -1736,7 +1820,8 @@ class TriggerEditor(tk.Toplevel):
         self.after_change('已添加行为：%s（%s）'
                           % (ACTION_TYPES[_t][0],
                              self._ac_text(_t, arg, kw.get('team') or 0,
-                                           kw.get('waypoint') or 0)))
+                                           kw.get('waypoint') or 0,
+                                           kw.get('trigger'), kw.get('tag'))))
 
     def dup_action(self):
         if getattr(self, '_new_mode', False):

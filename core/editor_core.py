@@ -135,6 +135,24 @@ def action_arg_is_164(atype, v72=None, v164=None):
 ACTION_TRIG_TYPES = frozenset(k for k, v in ACTION_TYPES.items() if v[1] == 14)
 ACT_TRIG_OFF = 36          # 相对"类型字段"（= 对象 +0x40 + 36 = 对象 +100）
 
+# ---- ★★§SOV31（2026-11-05 玩家样本 `摧毁标签前.SAV` / `摧毁标签后.SAV`）----
+#   **「标签型」行为的参数在对象 `+96`**，也是 u32 **实例键**（和触发型一个套路，只是位置差 4）。
+#   地编 ptype=38 目前只有一条：`70 摧毁标签...`（原译"摧毁标记"，玩家 2026-11-05 纠正）。
+#   证据链（两档对照，行为对象逐字节相同、只有运行时状态不同）：
+#     · `摧毁标签前.SAV` 的 01000007「新触发1」行为 70：`+72=0`、`+164=0`、**`+96=0D70B9B0`**；
+#     · `0D70B9B0` = 标签 `01000006`「aaaa 1」对象的自键（标签对象 `+16`）；
+#     · 同一个值在文件里只出现 3 次：标签对象 `+16`（自身）、CellTag 对象 `+56`（指向它）、
+#       以及**行为 70 的 `+96`** ⇒ 行为 70 摧毁的就是这条标签；
+#     · 存档 `后`：该标签的 CellTag 节点消失（`trigger_objects()['cell'] is None`），
+#       `0D70B9B0` 只剩 2 次（少了 CellTag 那处）⇒ 游戏内执行成功。
+#   ⚠ 写错到 +72/+164 的表现：界面参数恒 0、进游戏什么也不摧毁。
+ACTION_TAG_TYPES = frozenset(k for k, v in ACTION_TYPES.items() if v[1] == 38)
+ACT_TAG_OFF = 32           # 相对"类型字段"（= 对象 +0x40 + 32 = 对象 +96）
+# 标签（Tag）对象布局（本档实测）：`+16` = 自键(u32)、`+56` = 8 字符 ID（"01000006"）。
+#   `Rec.off`（记录定义偏移）正好指向 `+56` 那个 ID ⇒ 标签对象起点 = `Rec.off - 56`。
+TAGOBJ_KEY_OFF = 16
+TAGOBJ_ID_OFF = 56
+
 # ---- §175 局部变量表（ScenarioClass 里的定长槽数组）----
 # 引擎侧（gamemd.exe）：
 #   GetLocalVariable 0x689A00: `if (i >= 0x64) return false;`
@@ -2558,12 +2576,21 @@ class SaveDoc(object):
         #   590 条在 +164、4 条在 +72、0 条两者同时非 0）。
         #   以前这里只对 ptype 3/6/31 改读 +164，于是「99 播放音效在…」的音效号、
         #   「30 造成伤害」的数值、「2 所属方」的归属……在界面上全显示成 0。
+        _tag_key, _tag_sid = 0, None
         if kind == 'action':
             try:
                 _v72 = struct.unpack_from('<I', self.plain, o['obj'] + OBJ_ARG_OFF)[0]
                 _v164 = struct.unpack_from('<I', self.plain, o['obj'] + ACT_VAR_OFF)[0]
                 if action_arg_off(t, _v72, _v164) == ACT_VAR_OFF:
                     v = _v164
+                # ★★§SOV31：标签型（`70 摧毁标签`）的目标在 **+96**（标签对象实例键），
+                #   +72/+164 对这一型没意义（实测恒 0）⇒ 单独读，供「参数含义」列翻译。
+                if t in ACTION_TAG_TYPES:
+                    _tag_key = struct.unpack_from(
+                        '<I', self.plain, o['obj'] + OBJ_TYPE_OFF + ACT_TAG_OFF)[0]
+                    if _tag_key:
+                        _tag_sid = next((x['sid'] for x in self.tag_objects()
+                                         if x['key'] == _tag_key), None)
             except Exception:
                 pass
         raw = v
@@ -2575,7 +2602,9 @@ class SaveDoc(object):
         nm, pt = (event_name(t), event_ptype(t)) if kind == 'event' else \
                  (action_name(t), action_ptype(t))
         return {'off': o['off'], 'obj': o['obj'], 'type': t, 'arg': v, 'arg_raw': raw,
-                'name': nm, 'ptype': pt, 'arg_text': self._arg_text(pt, v),
+                'name': nm, 'ptype': pt,
+                'arg_text': self._arg_text(pt, _tag_key if _tag_key else v),
+                'tag_key': _tag_key, 'tag': _tag_sid,
                 'key': o.get('key'),
                 'owner': None, 'map_type': None, 'map_arg': None}
 
@@ -4028,6 +4057,13 @@ class SaveDoc(object):
                 except Exception:
                     pass
             return str(v)
+        if ptype == 38:
+            # ★★§SOV31：标签型（`70 摧毁标签`）—— 参数是标签对象的**实例键**（+96），
+            #   翻成「01000006 aaaa 1」。认不出就给键值，别硬猜。
+            lab = self.tag_label(v)
+            if lab:
+                return lab
+            return ('标签 %08X' % (v & 0xFFFFFFFF)) if v else ''
         if ptype == 7:                     # ★§283.9 小队型：翻成「ID 名称」（走缓存表）
             lab = self._team_label_map().get(v)
             if lab:
@@ -4137,7 +4173,8 @@ class SaveDoc(object):
         self.pending_events[ev['off']] = (ev['type'], ev['arg'])
         return ev
 
-    def set_action(self, ac, atype=None, arg=None, team=None, waypoint=None, trigger=None):
+    def set_action(self, ac, atype=None, arg=None, team=None, waypoint=None, trigger=None,
+                   tag=None):
         """改一条行为的类型 / 参数（**行为 80/107 还能改小队与路径点**）
 
         `ac` 需要带偏移，两种写法都认（§255 修正）：
@@ -4215,12 +4252,23 @@ class SaveDoc(object):
                 (tk & 0xFFFFFFFF).to_bytes(4, 'little')
             ac['trigger_key'] = tk
             ac['trigger'] = self._instance_maps()['sid'].get(tk)
+        # ★★§SOV31：标签型行为（`70 摧毁标签`）的目标在 **+96**（标签对象的实例键），
+        #   不在 +72/+164。`tag` 收 sid（'01000006'）或实例键（整数）；None 表示"不动"。
+        if tag is not None:
+            tk = (self.tag_key_of(str(tag).upper()) if isinstance(tag, str) else int(tag))
+            if not tk:
+                raise ValueError('认不出标签 %r 的实例键（先看「标签」有没有这条）' % (tag,))
+            self.plain[off + ACT_TAG_OFF:off + ACT_TAG_OFF + 4] = \
+                (tk & 0xFFFFFFFF).to_bytes(4, 'little')
+            ac['tag_key'] = tk
+            ac['tag'] = next((t['sid'] for t in self.tag_objects() if t['key'] == tk), None)
         # ★§SOV16：`ac` 可能来自 `trigger_actions()`（没有 ptype）—— 别直接取键，
         #   按类型名反推参数类型即可（以前这里 KeyError，CLI/自检传 trigger_actions 的项就炸）。
         _pt = ac.get('ptype')
         if _pt is None:
             _pt = action_ptype(ac.get('type', 0))
-        ac['arg_text'] = self._arg_text(_pt, ac['arg'])
+        ac['arg_text'] = self._arg_text(
+            _pt, ac['tag_key'] if (_pt == 38 and ac.get('tag_key')) else ac['arg'])
         self.pending_actions[off] = (ac['type'], ac['arg'])
         return ac
 
@@ -14962,6 +15010,14 @@ class SaveDoc(object):
             if atp in ACTION_TRIG_TYPES:
                 trg_key = struct.unpack_from('<I', pl, a + OBJ_TYPE_OFF + ACT_TRIG_OFF)[0]
                 trg_sid = self._instance_maps()['sid'].get(trg_key) if trg_key else None
+            # ★★§SOV31：标签型（70 摧毁标签）的目标在 **+96**，值 = 标签对象的实例键
+            #   （实测：行为和标签对象 `+16` 的自键逐位相同，2026-11-05 玩家样本）。
+            tag_key, tag_sid = 0, None
+            if atp in ACTION_TAG_TYPES:
+                tag_key = struct.unpack_from('<I', pl, a + OBJ_TYPE_OFF + ACT_TAG_OFF)[0]
+                if tag_key:
+                    tag_sid = next((t['sid'] for t in self.tag_objects()
+                                    if t['key'] == tag_key), None)
             out.append({'ordinal': i + 1,
                         'index': r['start'] + i,
                         'action_off': a,
@@ -14970,15 +15026,68 @@ class SaveDoc(object):
                         'team': team,
                         'trigger_key': trg_key,
                         'trigger': trg_sid,
+                        'tag_key': tag_key,
+                        'tag': tag_sid,
                         'name': bytes(pl[a + 104:a + 112]).split(b'\x00')[0]
                                   .decode('ascii', 'ignore').strip(),
                         'waypoint': wp, 'cell': self.waypoint_cell(wp),
                         'key': struct.unpack_from('<I', pl, a + 16)[0]})
         return out
 
+    # ---------- 标签（Tag）对象：行为 70「摧毁标签」的目标表 ----------
+    def tag_objects(self):
+        """本档全部**标签（Tag）**对象 → `[{sid, key, name, off}]`（按 sid 升序）。
+
+        ★★§SOV31（2026-11-05 玩家样本 摧毁标签前/后.SAV）：
+          · `Rec.kind == '标签'` 的 `Rec.off` 指向标签对象 **`+56`** 的 8 字符 ID
+            （"01000006"），所以对象起点 = `Rec.off - 56`；
+          · 标签对象的**自键**在 **`+16`**（u32），行为 70 的 `+96` 就是拿它对照。
+        """
+        pl = self.plain
+        out = []
+        for r in self.records:
+            if getattr(r, 'kind', '') != '标签':
+                continue
+            rid = int(getattr(r, 'off', 0) or 0)
+            off = rid - TAGOBJ_ID_OFF
+            if off < 0 or off + TAGOBJ_ID_OFF + 8 > len(pl):
+                continue
+            try:
+                key = struct.unpack_from('<I', pl, off + TAGOBJ_KEY_OFF)[0]
+                sid = bytes(pl[off + TAGOBJ_ID_OFF:off + TAGOBJ_ID_OFF + 8]) \
+                    .decode('ascii', 'ignore').strip()
+            except Exception:
+                continue
+            out.append({'sid': (sid or r.sid).upper(), 'key': int(key),
+                        'name': r.name or '', 'off': off})
+        out.sort(key=lambda t: t['sid'])
+        return out
+
+    def tag_key_of(self, sid):
+        """标签 ID（`01000006`）→ 实例键；找不到返回 0。"""
+        s = str(sid or '').strip().upper()
+        if not s:
+            return 0
+        for t in self.tag_objects():
+            if t['sid'] == s:
+                return t['key']
+        return 0
+
+    def tag_label(self, key):
+        """实例键 → `01000006 aaaa 1`；认不出返回 ''。"""
+        try:
+            k = int(key or 0)
+        except Exception:
+            return ''
+        if not k:
+            return ''
+        for t in self.tag_objects():
+            if t['key'] == k:
+                return ('%s %s' % (t['sid'], t['name'])).strip()
+        return ''
+
     def trigger_action(self, trigger_id, ac_index=1):
         """读一条**已有触发**第 `ac_index` 条行为（默认第 1 条）。
-
         定位链（2026-10-18 修正后）：记录 ID → 实例对象 → `+0xC4` 键 → 行为对象 `+0x10`；
         条数与后续行为用 `_action_runs()` 的连续序号规则。
         返回 dict：{trigger_id,index,action_off,count,ordinal,type,arg,name,waypoint,cell}
@@ -15695,7 +15804,7 @@ class SaveDoc(object):
                 self.add_action(sid, a['type'], a['arg'],
                                 name=a.get('name'), waypoint=a.get('waypoint'),
                                 cell=a.get('cell'), team=a.get('team'),
-                                trigger=a.get('trigger'))
+                                trigger=a.get('trigger'), tag=a.get('tag'))
             except Exception as e:
                 warns.append('追加行为失败（类型 %s）：%s' % (a['type'], e))
         # 回读实际结果（以引擎口径的链序为准，别信我们自己的记账）
@@ -16977,6 +17086,18 @@ class SaveDoc(object):
                     a['trigger'] = tsid
                     a['arg_text'] = ('→ %s%s' % (tsid, '（自己）' if tsid == sid else '')
                                      if tsid else '（没指定触发）')
+                elif a.get('type') in ACTION_TAG_TYPES:
+                    # ★★§SOV31（2026-11-05）：标签型（`70 摧毁标签`）的目标在 **+96**
+                    #   （标签对象的实例键），不是 +72/+164 —— 以前这里没有分支，
+                    #   编辑器里参数恒显示 0，看不出它摧毁的是哪个标签。
+                    tgk = int.from_bytes(
+                        pl[obj + OBJ_TYPE_OFF + ACT_TAG_OFF:
+                           obj + OBJ_TYPE_OFF + ACT_TAG_OFF + 4], 'little')
+                    a = dict(a)
+                    a['tag_key'] = tgk
+                    a['tag'] = (next((t['sid'] for t in self.tag_objects()
+                                      if t['key'] == tgk), None) if tgk else None)
+                    a['arg_text'] = self._arg_text(38, tgk)
                 d['actions'].append(a)
         if not d['editable']:
             d['note'] = '这条记录在本档里只有「触发定义」，没有运行期实例 ⇒ 只能看'
@@ -17151,7 +17272,7 @@ class SaveDoc(object):
                     pl[inst + 192:inst + 196], 'little'), 'ev_size': ev_size}
 
     def add_action(self, sid, atype, arg=0, name=None, waypoint=None, cell=None, team=None,
-                   trigger=None):
+                   trigger=None, tag=None):
         """给触发**追加一条行为**（§193 修正版）。
 
         ★2026-10-23 修正（原实现在 7MB 小档上"静默无效"的根因）：
@@ -17224,6 +17345,20 @@ class SaveDoc(object):
                                        % (trigger,))
             buf[OBJ_TYPE_OFF + ACT_TRIG_OFF:OBJ_TYPE_OFF + ACT_TRIG_OFF + 4] = \
                 struct.pack('<I', tk)
+        if atype in ACTION_TAG_TYPES:
+            # ★★§SOV31：标签型（`70 摧毁标签`）的目标在 **+96**（标签对象的实例键）。
+            #   参数位置 +72/+164 对这一型没有意义，一并清 0；不给 tag 就留 0
+            #   （引擎眼里 = 没指定标签，不会误毁别人的标签）。
+            buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', 0)
+            buf[ACT_VAR_OFF:ACT_VAR_OFF + 4] = struct.pack('<I', 0)
+            tkk = 0
+            if tag not in (None, '', 0):
+                tkk = (self.tag_key_of(str(tag).upper())
+                       if isinstance(tag, str) else int(tag)) or 0
+                if not tkk:
+                    raise RuntimeError('认不出标签 %r 的实例键' % (tag,))
+            buf[OBJ_TYPE_OFF + ACT_TAG_OFF:OBJ_TYPE_OFF + ACT_TAG_OFF + 4] = \
+                struct.pack('<I', tkk)
         if atype == 125:
             if not name or (waypoint is None and cell is None):
                 raise RuntimeError('行为 125「将建筑建于…」必须同时给 name（建筑类型名）'
@@ -17312,9 +17447,31 @@ class SaveDoc(object):
             persistence=int(d['repeat'] or 0))
         newsid = info['trigger_id']
         warns = list(info.get('warnings') or [])
+        # ★§SOV31：`create_trigger()` 建首条行为时只写 type+arg —— 小队/触发/标签这三种
+        #   目标挂在别的字段上，会丢。建完按原样补写一次（以前复制 80/107/53/54/70 会掉目标）。
+        if acs:
+            try:
+                _rows = self.trigger_actions(newsid)
+                _a0 = acs[0]
+                _kw = {}
+                if _a0['type'] in ACTION_TAG_TYPES and _a0.get('tag'):
+                    _kw['tag'] = _a0['tag']
+                elif _a0['type'] in ACTION_TRIG_TYPES and _a0.get('trigger'):
+                    _kw['trigger'] = _a0['trigger']
+                elif self.is_team_action(_a0['type']) and _a0.get('team'):
+                    _kw['team'] = _a0['team']
+                    if _a0['type'] in self.SPAWN_ACTIONS:
+                        _kw['waypoint'] = _a0.get('waypoint') or 0
+                if _kw and _rows:
+                    self.set_action(_rows[0], **_kw)
+            except Exception as e:
+                warns.append('首条行为的目标没复制全：%s' % e)
         for a in acs[1:]:
             try:
-                self.add_action(newsid, a['type'], a['arg'])
+                self.add_action(newsid, a['type'], a['arg'],
+                                name=a.get('name'), waypoint=a.get('waypoint'),
+                                cell=a.get('cell'), team=a.get('team'),
+                                trigger=a.get('trigger'), tag=a.get('tag'))
             except Exception as e:
                 warns.append('复制行为失败（类型 %s）：%s' % (a['type'], e))
         if d['disabled'] is not None:

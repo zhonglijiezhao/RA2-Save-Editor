@@ -116,7 +116,9 @@ class ActionsPage(object):
             bad = (a['type'] == 0)
             if bad:
                 tag += ' ⚠非法类型(0)会崩档'
-            self._ac_rows.append((i, (i, a['type'], a['name'], a['arg'],
+            # ★§SOV31：标签型（70 摧毁标签）的参数在 +96，参数列显示标签 ID
+            self._ac_rows.append((i, (i, a['type'], a['name'],
+                                      a.get('tag') or a['arg'],
                                       a['arg_text'], tag, '0x%X' % a['off']),
                                   ('bad',) if bad else ()))
         self._fill_ac_tree()
