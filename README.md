@@ -130,8 +130,8 @@ docs/
   其它                   现场笔记 / 历史交接档
 .github/workflows/selftest.yml   CI：语法编译 + 纯逻辑自检（不依赖样本/游戏目录/tkinter）
 ci_compile.py          CI 第一步：按 git ls-files 把仓库里的 .py 全编译一遍（语法门禁）
-icon.ico / icon.png    程序图标（16~256 七档 + 256 PNG）；源图不入库，用 make_icon.py 生成
-make_icon.py           从源图裁切生成图标（裁切参数写在文件头部常数里）
+icon.ico / icon.png    程序图标：**透明底**，16~256 八档，小尺寸单独出图（大尺寸整只鹰、小尺寸中心放大）
+make_icon.py           从源图抠背景 + 分档生成图标（裁切/描边/阈值都是文件头部的常数）
 _selftest_*.py         自检脚本（144 个，覆盖触发、局部变量、AI、单位、标签字段……）
   _selftest_all.py     总入口（基线对比；`--ci` / `--reasons` / `--drop-fixed`）
   _selftest_ci_pure.py CI 用的纯逻辑自检（几秒钟，无外部依赖）
