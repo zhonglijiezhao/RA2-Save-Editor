@@ -15,6 +15,14 @@ import os
 import subprocess
 import sys
 
+# ★2026-11-07：Windows 控制台默认 cp1252，一 print 中文就 UnicodeEncodeError。
+#   CI 里已经用 PYTHONUTF8=1 兜着，这里再兜一层 —— 保证这个脚本在哪都能跑。
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 

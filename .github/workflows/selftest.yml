@@ -25,6 +25,12 @@ jobs:
     name: 纯逻辑自检（Windows / Python 3.13）
     runs-on: windows-latest
     timeout-minutes: 15
+    env:
+      # ★2026-11-07 第一次跑 CI 就踩了：Windows runner 的控制台是 cp1252，
+      #   脚本一 print 中文就 UnicodeEncodeError（'charmap' codec can't encode）。
+      #   PYTHONUTF8 让 Python 自己走 UTF-8，PYTHONIOENCODING 兜住子进程/重定向。
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: 'utf-8'
 
     steps:
       - name: 检出

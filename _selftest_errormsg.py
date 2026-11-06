@@ -17,6 +17,14 @@ at least 512 bytes` —— 技术上没错，但等于"这软件坏了"。
 """
 import os
 import sys
+
+# ★2026-11-07：Windows 控制台默认 cp1252，一 print 中文就 UnicodeEncodeError。
+#   CI 里用 PYTHONUTF8=1 兜着，这里再兜一层 —— 脚本在哪都能跑。
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
 import ast
 import shutil
 import tempfile
