@@ -96,23 +96,16 @@ def to_square(img, size=512, frac=0.96, zoom=1.0, dy=0.0):
     return canvas
 
 
-def center_crop(sub, side_ratio=1.0, top_bias=0.0):
-    """从主体里裁一个正方形（横向居中），side_ratio 越小 → 越贴近鹰头+三角。"""
-    sw, sh = sub.size
-    side = min(int(sh * side_ratio), sw)
-    left = max(0, min((sw - side) // 2, sw - side))
-    top = max(0, min(int((sh - side) * top_bias), sh - side))
-    return sub.crop((left, top, left + side, top + side))
+def master_for(size, sub):
+    """所有尺寸都用**整只鹰**（翅膀不能裁）。
 
-
-def master_for(size, sub, full):
-    """按目标尺寸选构图 —— 大尺寸忠实、小尺寸可辨认。"""
-    if size >= 128:
-        return full                                     # 整只鹰
-    if size >= 48:
-        return to_square(center_crop(sub, 1.0, 0.0), frac=0.94)
-    zoom = 1.10 if size >= 24 else 1.22                 # 越小越放大
-    return to_square(center_crop(sub, 0.86, 0.02), frac=0.90, zoom=zoom, dy=-0.02)
+    ★2026-11-07 玩家指出：早先 48 以下用"中心裁切"（放大鹰头+三角）虽然小尺寸更显眼，
+      但翅膀被切掉了一半 —— 一放上任务栏就能看出来，观感是坏的。
+      现在统一整只鹰：小尺寸会变窄，但形状是完整的。
+      为了小尺寸不吃亏，宽度占比随尺寸略微加大（16/24 用满，96 以上留 4% 边）。
+    """
+    frac = 1.0 if size <= 32 else (0.98 if size <= 64 else 0.96)
+    return to_square(sub, 512, frac=frac)
 
 
 def sharpen(img, size):
@@ -192,11 +185,11 @@ def build(src_path, do_cutout=True):
     elif im.mode != 'RGBA':
         im = im.convert('RGBA')
     sub = tight(im)
-    full = to_square(sub, 512, frac=0.96)
+    full = to_square(sub, 512, frac=0.96)   # 256 用的母版
 
     frames = []
     for s in SIZES:
-        m = master_for(s, sub, full)
+        m = master_for(s, sub)
         px = sharpen(m.resize((s, s), Image.LANCZOS), s)
         if s <= 48:
             px = add_edge(px, s)                 # 小尺寸：先描边（在主体 a 上）
