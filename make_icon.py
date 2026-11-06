@@ -38,44 +38,56 @@ SIZES = [16, 24, 32, 48, 64, 96, 128, 256]
 
 # ---------------------------------------------------------------- 抠图
 def cutout(im):
-    """去掉蓝渐变背景，只留主体，返回 RGBA（尺寸同源图）。"""
+    """去掉蓝色背景，只留主体，返回 RGBA（尺寸同源图）。
+
+    ★两代源图都适用（都是"饱和蓝底 + 银白主体"）：
+      · 第一版是平滑竖直渐变；
+      · 第二版是放射条纹（明暗条纹对比很强）。
+      一开始用"逐行多项式拟合背景"只对第一版有效；换成**颜色筛选 + 连通性**后通吃：
+        ① 背景 = 饱和的蓝（`B-R>45` 且 `饱和度>0.40`）—— 银色主体的饱和度只有 0.15~0.2，
+           天然被排除，这是整套判据的立足点；
+        ② 只有**与画布边缘连通**的候选才算"外部"（从四边做迭代膨胀），
+           这样主体内部的蓝色发光描边不会被当成背景挖出空洞；
+        ③ alpha：外部 0、内部 255，再羽化 1.2px 并收 1px 去掉边缘的背景渗色。
+
+    ⚠ Pillow 13 的 `ImageDraw.floodfill` 阈值语义变了（不再按"与种子色的差"填充），
+      实测连纯色块都填不动 ⇒ 这里自己用 numpy 做膨胀，1024×733 约 1 秒。
+    """
     a = np.asarray(im.convert('RGB')).astype(np.float32)
     h, w, _ = a.shape
-    mn = a.min(axis=2)                                  # min(R,G,B)：银色判据
-    blue = a[:, :, 2] - np.maximum(a[:, :, 0], a[:, :, 1])
+    R, G, B = a[:, :, 0], a[:, :, 1], a[:, :, 2]
+    mx = a.max(axis=2)
+    mn = a.min(axis=2)
+    sat = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1), 0)
 
-    # ① 逐行取背景样本：整行里"暗蓝"像素的中位数（翅膀占满整行的行跳过）
-    ys, cols = [], []
-    for y in range(h):
-        m = (mn[y] < 45) & (blue[y] > 25)
-        if m.sum() >= w * 0.25:
-            ys.append(y)
-            cols.append(np.median(a[y][m], axis=0))
-    if len(ys) < 8:
-        raise SystemExit('背景样本太少（%d 行）—— 这张图可能不是渐变蓝底' % len(ys))
+    # ① 背景候选：偏蓝且饱和
+    bgish = ((B - R) > 45) & (sat > 0.40)
+    if bgish.mean() < 0.15:
+        raise SystemExit('几乎找不到蓝色背景（%.0f%%）—— 这张图可能已经是透明底，'
+                         '试试 --no-cutout' % (100 * bgish.mean()))
 
-    # ② 三次多项式拟合竖直渐变
-    ys = np.array(ys, np.float32)
-    cols = np.array(cols, np.float32)
-    bg = np.zeros((h, 3), np.float32)
-    for c in range(3):
-        k = np.polyfit(ys, cols[:, c], 3)
-        bg[:, c] = np.clip(np.polyval(k, np.arange(h)), 0, 255)
+    # ② 从四边膨胀，只保留与边界连通的部分
+    cur = np.zeros_like(bgish)
+    cur[0, :] |= bgish[0, :]
+    cur[-1, :] |= bgish[-1, :]
+    cur[:, 0] |= bgish[:, 0]
+    cur[:, -1] |= bgish[:, -1]
+    while True:
+        nb = cur.copy()
+        nb[1:, :] |= cur[:-1, :]
+        nb[:-1, :] |= cur[1:, :]
+        nb[:, 1:] |= cur[:, :-1]
+        nb[:, :-1] |= cur[:, 1:]
+        nb &= bgish
+        if nb.sum() == cur.sum():
+            break
+        cur = nb
 
-    # ③ 残差 → alpha；银色强制不透明；蓝辉光压暗（否则白底上一团蓝雾）
-    diff = np.linalg.norm(a - bg[:, None, :], axis=2)
-    alpha = np.clip((diff - 22) * (255.0 / 60.0), 0, 255)
-    silver = mn > 95
-    alpha = np.where(silver, 255.0, alpha)
-    glow = (blue > 35) & (~silver)
-    alpha = np.where(glow, alpha * 0.30, alpha)
-
-    # ④ 去杂散：低 alpha 清零 → 开运算去小点 → 闭运算补小洞 → 轻微柔化
-    alpha[alpha < 26] = 0
-    al = Image.fromarray(alpha.astype(np.uint8), 'L')
-    al = al.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
-    al = al.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
-    al = al.filter(ImageFilter.GaussianBlur(0.6))
+    # ③ 羽化 + 收边
+    alpha = np.where(cur, 0, 255).astype(np.uint8)
+    al = Image.fromarray(alpha, 'L')
+    al = al.filter(ImageFilter.GaussianBlur(1.2))
+    al = al.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.7))
     return Image.fromarray(np.dstack([a.astype(np.uint8), np.asarray(al)]), 'RGBA')
 
 
