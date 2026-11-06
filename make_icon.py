@@ -43,7 +43,7 @@ import sys
 from collections import deque
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ICO = os.path.join(HERE, 'icon.ico')
@@ -173,19 +173,48 @@ def contrast(img, k):
     return Image.fromarray(np.dstack([rgb, a[:, :, 3:]]).astype(np.uint8), 'RGBA')
 
 
+def plate(size):
+    """深蓝竖向渐变的圆角底板。
+
+    ★为什么最后改成"有底板"：这幅画的宽高比是 1.64:1（翅膀很宽），塞进正方形图标格
+      宽度占满、高度只剩六成 —— 放到任务栏里（24×24）跟旁边那些方形图标一比，
+      明显"小一号"（玩家 2026-11-07 量出来的：别人 24×24，我们 24×14）。
+      加一层铺满格子的底板后，视觉占位跟其它程序一致。
+      **这一版就不再是"透明底"了**，是玩家的取舍。
+    圆角用 4× 超采样后缩小，缩到 16px 也不出毛边。
+    """
+    ss = size * 4
+    img = Image.new('RGBA', (ss, ss), (0, 0, 0, 0))
+    grad = Image.new('RGBA', (1, ss))
+    for y in range(ss):
+        t = y / max(1, ss - 1)
+        grad.putpixel((0, y), (int(24 - 14 * t), int(56 - 38 * t), int(104 - 74 * t), 255))
+    grad = grad.resize((ss, ss))
+    mask = Image.new('L', (ss, ss), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, ss - 1, ss - 1],
+                                           radius=int(ss * 0.20), fill=255)
+    img.paste(grad, (0, 0), mask)
+    return img.resize((size, size), Image.LANCZOS)
+
+
 def make_frame(base, size):
-    """按目标尺寸出图：越小越要"压对比 + 锐化 + 描边"，大尺寸保持金属质感。"""
+    """出某一档的图：底板 + 主体（按尺寸调对比/锐化）。"""
+    inner = max(8, int(round(size * 0.90)))
+    art = base
+    usm = 0
     if size <= 32:
-        px = downscale(contrast(base, 1.30), size)
-        px = px.filter(ImageFilter.UnsharpMask(radius=0.7, percent=150, threshold=1))
-        return add_edge(px, 0.55)                  # 深色任务栏/浅色标题栏都要看得见
-    if size <= 64:
-        px = downscale(contrast(base, 1.15), size)
-        px = px.filter(ImageFilter.UnsharpMask(radius=0.8, percent=90, threshold=1))
-        return add_shadow(add_edge(px, 0.35), size, 0.25)
-    px = downscale(base, size)
-    px = px.filter(ImageFilter.UnsharpMask(radius=1.0, percent=45, threshold=2))
-    return add_shadow(px, size, 0.35)
+        art = contrast(base, 1.45)          # 底板是深色，主体再压对比才不"发灰"
+        usm = 160
+    elif size <= 64:
+        art = contrast(base, 1.20)
+        usm = 110
+    art = downscale(art, inner)
+    canvas = plate(size)
+    off = (size - inner) // 2
+    canvas.alpha_composite(art, (off, off))
+    if usm:
+        canvas = canvas.filter(ImageFilter.UnsharpMask(radius=0.6, percent=usm, threshold=1))
+    return canvas
 
 
 def add_edge(img, strength=0.40):
