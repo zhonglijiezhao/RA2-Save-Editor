@@ -6,6 +6,17 @@
   所以 `self.xxx` 照旧指向同一个 App 实例，行为零变化。
   边界 = 原来 `_tab_xxx()` 那整段（含它引用的私有辅助方法）。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 import sys
 
@@ -163,7 +174,7 @@ class EventsPage(object):
         try:
             tree_fit.autosize(self.te, caps={'name': 280, 'argtext': 320, 'owner': 160})
         except Exception:
-            pass
+            _swallow()
 
     def make_never_satisfied(self):
         """把选中的事件改成「永不满足」的条件 —— **等效禁用**该触发。
@@ -185,7 +196,7 @@ class EventsPage(object):
                 if self._guard_executed(self._sid_of_row(self._evlist[int(_iid)])):
                     return
             except Exception:
-                pass
+                _swallow()
         if not messagebox.askyesno(
                 '等效禁用',
                 '把选中的 %d 条事件改成「永不满足」？\n\n'

@@ -6,6 +6,17 @@
   所以 `self.xxx` 照旧指向同一个 App 实例，行为零变化。
   边界 = 原来 `_tab_xxx()` 那整段（含它引用的私有辅助方法）。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 import sys
 
@@ -159,11 +170,11 @@ class OverviewPage(object):
         try:
             self.lbl_ignore_ai.config(text=doc.ignore_ai_text(r['new']))
         except Exception:
-            pass
+            _swallow()
         try:
             self.app._lists_dirty = True
         except Exception:
-            pass
+            _swallow()
         self.status.set('忽略全局AI触发：%s → %s（内存已改，点「保存」才落盘）'
                         % (doc.ignore_ai_text(r['old']), doc.ignore_ai_text(r['new'])))
 
@@ -224,7 +235,7 @@ class OverviewPage(object):
         try:
             self._refresh_title()
         except Exception:
-            pass
+            _swallow()
         messagebox.showinfo(
             '清除空气墙',
             '已清除 %d 处空气墙。\n\n'

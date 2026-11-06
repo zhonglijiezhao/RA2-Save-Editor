@@ -14,6 +14,17 @@
     apply(app)              # 必须在建控件之前
 """
 
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 from tkinter import ttk
 import tkinter as tk
 
@@ -115,7 +126,7 @@ def apply(app):
     try:
         st.theme_use('clam')
     except Exception:
-        pass
+        _swallow()
 
     # ---------- 基础 ----------
     st.configure('.', background=T['canvas'], foreground=T['ink'],
@@ -243,7 +254,7 @@ def apply(app):
             ]}),
         ])
     except Exception:
-        pass
+        _swallow()
 
     # ---------- 滚动条 ----------
     # ★§286：thumb 原来跟槽只差 8 级灰度 ⇒ 几乎看不见。现在 thumb 明显深一档，

@@ -25,6 +25,17 @@
 核对结果：ID/名字/Group/老兵/Max/Priority/House/Script/TaskForce 指针
 `223/223`；TaskForce 成员种数 `144/144`；脚本条目数与动作-参数 `151/151`。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import struct
 
 try:
@@ -230,12 +241,12 @@ def read_ai(doc):
         for k, v in doc.unit_types().items():
             tname[k] = v
     except Exception:
-        pass
+        _swallow()
     try:
         for nm, k in doc.building_types().items():
             tname.setdefault(k, nm)
     except Exception:
-        pass
+        _swallow()
     try:
         hname = doc._house_key_names()
     except Exception:
@@ -254,7 +265,7 @@ def read_ai(doc):
                 continue
             tag_sid[struct.unpack_from('<I', pl, _i + 16)[0]] = _dec(pl[_i + 56:_i + 64])
     except Exception:
-        pass
+        _swallow()
 
     scripts, tfs = [], []
     for o in _walk(pl, *AI_CLASSES['scripttype']):
@@ -371,7 +382,7 @@ def set_team_veteran(doc, team_id, level):
             try:
                 setattr(doc, attr, None)
             except Exception:
-                pass
+                _swallow()
     return {'team_id': t['id'], 'name': t['name'], 'off': off,
             'old': old, 'new': lv, 'house': t['house'],
             'taskforce': t['taskforce'], 'script': t['script']}
@@ -389,12 +400,12 @@ def _type_index(doc):
         for k, v in doc.unit_types().items():
             out[str(v).upper()] = k
     except Exception:
-        pass
+        _swallow()
     try:
         for nm, k in doc.building_types().items():
             out.setdefault(str(nm).upper(), k)
     except Exception:
-        pass
+        _swallow()
     return out
 
 
@@ -563,7 +574,7 @@ def set_team_script(doc, team_id, script):
             try:
                 setattr(doc, attr, None)
             except Exception:
-                pass
+                _swallow()
     return {'team_id': t['id'], 'name': t['name'], 'changed': True,
             'old': (old['id'] if old else '（空）'),
             'old_name': (old['name'] if old else ''),

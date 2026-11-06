@@ -6,6 +6,17 @@
   所以 `self.xxx` 照旧指向同一个 App 实例，行为零变化。
   边界 = 原来 `_tab_xxx()` 那整段（含它引用的私有辅助方法）。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 import sys
 
@@ -352,7 +363,7 @@ class MapViewPage(object):
             if self.nb.index(self.nb.select()) == 6:
                 self.after_idle(self._mv_ensure_types)
         except Exception:
-            pass
+            _swallow()
         p = getattr(getattr(self.doc, '_map', None), 'path', st.get('path')) if self.doc else None
         st.update({'mp': None, 'ok': False, 'img': None, 'blds': [],
                    'occ': {}, 'sel': None, 'path': p, 'gdata': None, 'dims': None,
@@ -369,12 +380,12 @@ class MapViewPage(object):
                     self.mv_lbl.config(text='没有 .MAP ｜ 切到本页时用**存档**画地形',
                                        foreground=ui_theme.T['warn'])
                 except Exception:
-                    pass
+                    _swallow()
             else:
                 try:
                     self.mv_load(None)
                 except Exception:
-                    pass
+                    _swallow()
             return
         if self.doc and p and os.path.exists(p):
             if lazy:
@@ -478,7 +489,7 @@ class MapViewPage(object):
         try:
             self.mv_theater_var.set(theater)
         except Exception:
-            pass
+            _swallow()
         st['gdata'] = None          # 换地图/换档 ⇒ 缓存的建筑/单位/路径点全部作废
         st['wpdata'] = None
         st['udata'] = None
@@ -583,7 +594,7 @@ class MapViewPage(object):
             if hasattr(self, 'mv_unit'):
                 self.mv_unit['values'] = self._unit_type_names()
         except Exception:
-            pass
+            _swallow()
 
     def _mv_dims(self):
         """网格模式的坐标范围 = **菱形坐标空间**（0..2W-1 / 0..2H-1）∪ 实际数据。
@@ -607,7 +618,7 @@ class MapViewPage(object):
             for (x, y) in wp.values():
                 W, H = max(W, x + 1), max(H, y + 1)
         except Exception:
-            pass
+            _swallow()
         st['dims'] = (max(16, min(W, 512)), max(16, min(H, 512)))
         return st['dims']
 
@@ -623,16 +634,16 @@ class MapViewPage(object):
                 if x is not None and y is not None and x >= 0 and y >= 0:
                     bld[(x, y)] = b.get('type')
         except Exception:
-            pass
+            _swallow()
         try:
             for u in self.doc.house_placements():
                 unit[(u['x'], u['y'])] = '%s/%s' % (u['type'], u['house'])
         except Exception:
-            pass
+            _swallow()
         try:
             wp = dict(self.doc.waypoints_save())
         except Exception:
-            pass
+            _swallow()
         st['gdata'] = (bld, unit, wp)
         return st['gdata']
 
@@ -841,11 +852,11 @@ class MapViewPage(object):
             self.mv_canvas.delete('cellmark')
             self._mv_draw_markers(self.mv_canvas)
         except Exception:
-            pass
+            _swallow()
         try:
             self.mv_info.config(text=self._mv_info_text(x, y))
         except Exception:
-            pass
+            _swallow()
         if errs:
             messagebox.showwarning('部分没删成', '\n'.join(errs), parent=self)
         if ok:
@@ -941,7 +952,7 @@ class MapViewPage(object):
                 self.mv_info.config(text=self._mv_info_text(*self.mv_state['sel'])
                                     if self.mv_state.get('sel') else '')
             except Exception:
-                pass
+                _swallow()
             dlg.destroy()
             if errs:
                 messagebox.showwarning('部分没删成', '\n'.join(errs[:8]), parent=self)
@@ -990,7 +1001,7 @@ class MapViewPage(object):
         try:
             self.mv_src_save.set(self._mv_terr_mode() == 'save')
         except Exception:
-            pass
+            _swallow()
         finally:
             self._mv_terr_sync = False
         self._mv_reload_terrain()
@@ -1006,7 +1017,7 @@ class MapViewPage(object):
             elif self._mv_terr_mode() == 'save':
                 self.mv_terr_src.set('地图')
         except Exception:
-            pass
+            _swallow()
         finally:
             self._mv_terr_sync = False
 
@@ -1029,7 +1040,7 @@ class MapViewPage(object):
             try:
                 self.status.set('单位标记只在 ≥20 倍显示（太小会糊成一片），已自动放大到 20 倍')
             except Exception:
-                pass
+                _swallow()
             return
         self.mv_render()
 
@@ -1151,7 +1162,7 @@ class MapViewPage(object):
                     16, 16, anchor='nw', fill=ui_theme.T['danger'], width=880, justify='left',
                     text='网格绘制出错（请把这段发给开发者）：\n\n' + traceback.format_exc()[-900:])
             except Exception:
-                pass
+                _swallow()
 
     def _mv_render_grid(self):
         """**无地图模式**：按坐标范围画格子 —— 依然可以点选格子（触发法放置不需要地图）。"""
@@ -1193,28 +1204,28 @@ class MapViewPage(object):
         try:
             self._mv_draw_markers(c)      # ★§SOV12：单元标记
         except Exception:
-            pass
+            _swallow()
         try:
             self._mv_draw_terrain(c)
         except Exception:
-            pass
+            _swallow()
         # §283：覆盖物标记（默认开；画在树/石之下、单位之上）
         try:
             self._mv_draw_overlays(c)
         except Exception:
-            pass
+            _swallow()
         try:
             self._mv_draw_units(c)
         except Exception:
-            pass
+            _swallow()
         try:
             self._mv_draw_sel()
         except Exception:
-            pass
+            _swallow()
         try:
             self._mv_fill_wp_combo()
         except Exception:
-            pass
+            _swallow()
 
     def _ovl_colors(self):
         """覆盖物索引 → 颜色（按类别，一次算好给整张图用）。
@@ -1318,37 +1329,37 @@ class MapViewPage(object):
             try:
                 self._mv_draw_waypoints(c)
             except Exception:
-                pass
+                _swallow()
         # ★§SOV12：单元标记（CellTag 挂接点，默认开；同一 CellTag 同色）
         try:
             self._mv_draw_markers(c)
         except Exception:
-            pass
+            _swallow()
         # ★§281：树/石标记（默认关；画在路径点之上、单位之下）
         try:
             self._mv_draw_terrain(c)
         except Exception:
-            pass
+            _swallow()
         # ★§283：覆盖物标记（默认开；画在树/石之下、单位之上）
         try:
             self._mv_draw_overlays(c)
         except Exception:
-            pass
+            _swallow()
         # ★§267：单位标记（默认关；≥20 倍才画，画在路径点之上）
         try:
             self._mv_draw_units(c)
         except Exception:
-            pass
+            _swallow()
         c.configure(scrollregion=(0, 0, W * st['scale'], H * st['scale']))
         try:
             self._mv_draw_sel()
         except Exception:
-            pass
+            _swallow()
         # ★§SOV11：路径点下拉的候选 = 本图 [Waypoints] ∪ 存档里的号（渲染后必已就绪）
         try:
             self._mv_fill_wp_combo()
         except Exception:
-            pass
+            _swallow()
 
     def _mv_view_center_cell(self):
         """视口正中那一格（缩放的锚点用）；算不出来返回 None。"""
@@ -1382,7 +1393,7 @@ class MapViewPage(object):
             self.status.set('正在按 %d 倍重绘地图…' % st['scale'])
             self.update_idletasks()
         except Exception:
-            pass
+            _swallow()
         self.mv_render()
         if anchor:
             self._mv_center_on(*anchor)
@@ -1390,7 +1401,7 @@ class MapViewPage(object):
             self.status.set('缩放 = 每格 %d 像素（滚轮/± 再调；「适应窗口」一键铺满）'
                             % st['scale'])
         except Exception:
-            pass
+            _swallow()
 
     def mv_fit(self):
         st = getattr(self, 'mv_state', None)
@@ -1426,7 +1437,7 @@ class MapViewPage(object):
         try:
             c.delete('selbox')
         except Exception:
-            pass
+            _swallow()
         sel = st.get('sel')
         if not sel:
             return
@@ -1438,7 +1449,7 @@ class MapViewPage(object):
             c.create_rectangle(x * s + 1, y * s + 1, (x + 1) * s - 1, (y + 1) * s - 1,
                                outline='#1E78C8', width=1, tags=('selbox',))
         except Exception:
-            pass
+            _swallow()
 
     def _mv_refresh_sel(self):
         """更新选中格但不重绘整图（点选 / 跳转走这条）；还没渲染过才回落全量。"""
@@ -1465,13 +1476,13 @@ class MapViewPage(object):
                 W, H = st['canv']
                 return int(W), int(H)
             except Exception:
-                pass
+                _swallow()
         if st.get('ok') and st.get('mp'):
             try:
                 W, H = st['mp']['size']
                 return int(W), int(H)
             except Exception:
-                pass
+                _swallow()
         try:
             W, H = self._mv_dims()
         except Exception:
@@ -1502,7 +1513,7 @@ class MapViewPage(object):
             try:
                 cb['values'] = vals
             except Exception:
-                pass
+                _swallow()
 
     def _mv_center_on(self, x, y):
         """把画布滚到让 (x,y) 落在视口正中（整图比视口小 ⇒ 贴左上，滚也无意义）。"""
@@ -1513,7 +1524,7 @@ class MapViewPage(object):
         try:
             c.update_idletasks()
         except Exception:
-            pass
+            _swallow()
         s = self._mv_scale_now()
         W, H = self._mv_cell_space()
         tw, th = W * s, H * s
@@ -1527,7 +1538,7 @@ class MapViewPage(object):
             c.xview_moveto(0.0 if tw <= vw else left / float(tw))
             c.yview_moveto(0.0 if th <= vh else top / float(th))
         except Exception:
-            pass
+            _swallow()
 
     def mv_center_sel(self):
         """把视图重新居中到当前选中格（拖远了想回来用这个）。"""
@@ -1567,16 +1578,16 @@ class MapViewPage(object):
             c.create_oval(cx - r * 0.55, cy - r * 0.55, cx + r * 0.55, cy + r * 0.55,
                           outline='#FFD400', width=2, tags=('goto',))
         except Exception:
-            pass
+            _swallow()
         try:
             self.mv_gx.set(str(x))
             self.mv_gy.set(str(y))
         except Exception:
-            pass
+            _swallow()
         try:
             self.mv_info.config(text=self._mv_info_text(x, y))
         except Exception:
-            pass
+            _swallow()
         return True
 
     def mv_goto_xy(self):
@@ -1700,7 +1711,7 @@ class MapViewPage(object):
             try:
                 self.mv_gwp.set(str(n))
             except Exception:
-                pass
+                _swallow()
             self.mv_goto(x, y, '路径点 %d' % n)
             self.status.set('(%d,%d) 已经有路径点了（%s 号）⇒ 不重复新建'
                             % (x, y, '、'.join(str(v) for v in same)))
@@ -1742,17 +1753,17 @@ class MapViewPage(object):
         try:
             self._mv_fill_wp_combo()
         except Exception:
-            pass
+            _swallow()
         try:
             self.mv_canvas.delete('wp')
             if bool(getattr(self, 'mv_wp', None) and self.mv_wp.get()):
                 self._mv_draw_waypoints(self.mv_canvas)
         except Exception:
-            pass
+            _swallow()
         try:
             self.mv_gwp.set(str(n))
         except Exception:
-            pass
+            _swallow()
         self.mv_goto(x, y, '新路径点 %d' % n)
         extra = []
         if want is not None and n != want:
@@ -1812,7 +1823,7 @@ class MapViewPage(object):
             _mp, _only = self._mv_wp_points()
             map_pos = _mp.get(n)
         except Exception:
-            pass
+            _swallow()
         extra = []
         if map_pos and (int(map_pos[0]), int(map_pos[1])) != (x, y):
             extra.append('地图 [Waypoints] 里 %d 号在 (%d,%d) —— 本工具只写存档，'
@@ -1838,13 +1849,13 @@ class MapViewPage(object):
         try:
             self._mv_fill_wp_combo()
         except Exception:
-            pass
+            _swallow()
         try:
             self.mv_canvas.delete('wp')
             if bool(getattr(self, 'mv_wp', None) and self.mv_wp.get()):
                 self._mv_draw_waypoints(self.mv_canvas)
         except Exception:
-            pass
+            _swallow()
         self.mv_goto(res[0], res[1])         # 跳到新位置，让玩家看到
         self.status.set('已把 %d 号路径点写到 (%d,%d)%s%s'
                         % (n, res[0], res[1],
@@ -1862,15 +1873,15 @@ class MapViewPage(object):
             if self.doc and self.doc.cell_visible(x, y, map_path=st.get('path')) is False:
                 head += '　⚠ 在蓝线外（游戏里不显示这块地图）'
         except Exception:
-            pass
+            _swallow()
         try:
             head += self._mv_terr_text(x, y)
         except Exception:
-            pass
+            _swallow()
         try:
             head += self._mv_ovl_text(x, y)
         except Exception:
-            pass
+            _swallow()
         if not (st.get('ok') and st.get('mp')):
             # 无地图模式：建筑 / 单位 / 路径点全来自存档
             try:
@@ -1886,7 +1897,7 @@ class MapViewPage(object):
             try:
                 head += self._mv_mark_text(x, y)
             except Exception:
-                pass
+                _swallow()
             W, H = self._mv_cell_space()
             head += ('\n（未挂地图：按存档坐标 %d×%d 画网格；放置建筑可直接用触发法，'
                      '不依赖地图）' % (W, H))
@@ -1913,11 +1924,11 @@ class MapViewPage(object):
                 head += '　路径点（只有地图有、存档没有）：%s' % ','.join(
                     str(n) for n in onlymap)
         except Exception:
-            pass
+            _swallow()
         try:
             head += self._mv_mark_text(x, y)
         except Exception:
-            pass
+            _swallow()
         try:
             us = [t for (ux, uy, t, _h) in self._mv_units() if (ux, uy) == (x, y)]
             if us:
@@ -1926,7 +1937,7 @@ class MapViewPage(object):
                     show += ' …（共 %d 台）' % len(us)
                 head += '　单位：%s' % show
         except Exception:
-            pass
+            _swallow()
         b = (st.get('occ') or {}).get((x, y))
         if b:
             head += ('　该格建筑：%s（耐久 %d，所属方指针 0x%08X，挂接键 0x%08X，对象 @0x%X）'
@@ -1968,7 +1979,7 @@ class MapViewPage(object):
             self.mv_gx.set(str(x))
             self.mv_gy.set(str(y))
         except Exception:
-            pass
+            _swallow()
         self.mv_info.config(text=self._mv_info_text(x, y))
 
     def mv_backup(self):
@@ -2044,7 +2055,7 @@ class MapViewPage(object):
                     with open(p, 'w', encoding='utf-8') as f:
                         json.dump(data, f, ensure_ascii=False, indent=2)
                 except Exception:
-                    pass
+                    _swallow()
         return p
 
     def _cfg_get(self, key, default=None):
@@ -2065,7 +2076,7 @@ class MapViewPage(object):
             with open(p, 'w', encoding='utf-8') as f:
                 json.dump(d, f, ensure_ascii=False, indent=2)
         except Exception:
-            pass
+            _swallow()
 
     def _sync_game_dir(self, persist=False):
         """把界面上的「游戏目录」交给 core —— rules/art 的定位全看这个。
@@ -2078,7 +2089,7 @@ class MapViewPage(object):
         try:
             SaveDoc.set_game_dir(d)
         except Exception:
-            pass
+            _swallow()
         if persist and d:
             self._cfg_set('game_dir', d)
 

@@ -1,0 +1,63 @@
+name: selftest
+
+# 最小 CI（审核 §4.2）
+#
+# 设计原则：**不依赖样本存档、不依赖游戏目录、不依赖 tkinter**。
+#   样本 `.SAV` / `.MAP` 涉及版权与玩家隐私，不能进仓库（`.gitignore` 也挡着 `_exp/`），
+#   所以 CI 只跑"纯逻辑"那一批：解析边界、LZO 往返、INI 的 `+=` 语法、事件表、
+#   错误提示文案、静默异常观测器、保存链路（没有样本时用例自己 SKIP 并 exit 0）。
+#
+# 本地等价命令：
+#   python _selftest_all.py --ci        # 跑基线里标了 "ci": true 的那批
+#   python _selftest_ci_pure.py         # 只有纯逻辑，几秒钟
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pure:
+    name: 纯逻辑自检（Windows / Python 3.13）
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # 语法都过不了就没必要往下跑了。这一步能挡住"缩进坏了/括号没配平"这种低级事故。
+      # 编译清单以 `git ls-files` 为准（见 ci_compile.py 里的说明）：
+      # 主程序叫 `RA2存档编辑器.py`，命令行传非 ASCII 文件名在 Windows runner 上容易翻车。
+      - name: 全仓语法编译
+        run: python ci_compile.py
+
+      - name: 纯逻辑自检（无样本 / 无游戏目录 / 无 tkinter）
+        run: python _selftest_ci_pure.py
+
+      - name: 坏档提示（审核 §1.3）
+        run: python _selftest_errormsg.py
+
+      - name: 静默异常观测器（审核 §3.3）
+        run: python _selftest_diag.py
+
+      - name: 保存链路（无样本时自动 SKIP）
+        run: python _selftest_save_atomic.py
+
+      - name: 基线里的 CI 用例（有就一起跑）
+        shell: bash
+        run: |
+          if grep -q '"ci": true' _selftest_baseline.json 2>/dev/null; then
+            python _selftest_all.py --ci
+          else
+            echo "基线里还没有标 ci:true 的用例，跳过"
+          fi

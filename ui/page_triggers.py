@@ -6,6 +6,17 @@
   所以 `self.xxx` 照旧指向同一个 App 实例，行为零变化。
   边界 = 原来 `_tab_xxx()` 那整段（含它引用的私有辅助方法）。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 import sys
 
@@ -241,7 +252,7 @@ class TriggersPage(object):
                 self.tt.selection_set(iid)      # 让选中跟着双击的那一行走
                 self.tt.focus(iid)
             except Exception:
-                pass
+                _swallow()
         if iid is None:
             sel = self.tt.selection()
             iid = sel[0] if sel else None
@@ -269,7 +280,7 @@ class TriggersPage(object):
                     if r.kind == '触发':
                         sid = r.sid
                 except Exception:
-                    pass
+                    _swallow()
         try:
             TriggerEditor(self, sid)
         except Exception as e:
@@ -297,7 +308,7 @@ class TriggersPage(object):
         try:
             rtmap = {s['sid']: s for s in self.doc.runtime_status()}
         except Exception:
-            pass
+            _swallow()
         self._rtmap = rtmap
         # ★2026-10-20：标签→触发只算一次（每行都调 trigger_tag_pairs() 在大档上是 O(n²)）
         try:
@@ -499,7 +510,7 @@ class TriggersPage(object):
             if self.doc.trigger_repeat_type(rec.sid) == '2':
                 return False
         except Exception:
-            pass
+            _swallow()
         return True
 
     def _is_fired(self, rec):
@@ -519,13 +530,13 @@ class TriggersPage(object):
             if item.get('owner'):
                 return item['owner']
         except Exception:
-            pass
+            _swallow()
         try:
             for sid, d in self.doc.runtime_links().items():
                 if d.get('ev') == item.get('key') or d.get('ac') == item.get('key'):
                     return sid
         except Exception:
-            pass
+            _swallow()
         return None
 
     def _guard_executed(self, sid, what='这条触发'):
@@ -574,7 +585,7 @@ class TriggersPage(object):
             try:
                 self.tt.after_cancel(job)
             except Exception:
-                pass
+                _swallow()
         try:
             self._fit_job = self.tt.after(
                 120, lambda: tree_fit.autosize(self.tt, caps=self.TRIG_COL_CAPS))
@@ -594,7 +605,7 @@ class TriggersPage(object):
             self.tt.tag_configure('done', foreground=ui_theme.T['danger'])      # 已执行 ⇒ 红（改不了）
             self.tt.tag_configure('warn', foreground=ui_theme.T['warn'])      # 已挂钩/可能已触发 ⇒ 橙
         except Exception:
-            pass
+            _swallow()
         q = ((self._q_trig.get() if hasattr(self, '_q_trig') else '') or '').strip().lower()
         show_tags = bool(self._show_tags.get()) if hasattr(self, '_show_tags') else False
         rows = getattr(self, '_trig_rows', [])
@@ -628,7 +639,7 @@ class TriggersPage(object):
         try:
             tree_fit.autosize(self.tt, caps=self.TRIG_COL_CAPS)
         except Exception:
-            pass
+            _swallow()
 
 
     # ★2026-10-28 删：这里原本有一份 128 行的 `repair_runtime_dialog` 和一份 `_repair_verdict`，
@@ -672,7 +683,7 @@ class TriggersPage(object):
             tv.tag_configure('risk', foreground=ui_theme.T['danger'])     # 确定已执行 ⇒ 再触发风险
             tv.tag_configure('mid', foreground=ui_theme.T['warn'])      # 分不清/类型未读出 ⇒ 仍可能再触发
         except Exception:
-            pass
+            _swallow()
         self._repair_iids = []
         n_risk = n_mid = 0
         for s in bad:
@@ -831,11 +842,11 @@ class TriggersPage(object):
         try:
             links = self.doc.runtime_links()
         except Exception:
-            pass
+            _swallow()
         try:
             aown = self.doc.action_owner_sids()
         except Exception:
-            pass
+            _swallow()
         hit_sids = {s for s in sids if s in links}
         if names and links:
             all_names = {d['name'] for d in links.values()}
@@ -883,13 +894,13 @@ class TriggersPage(object):
                 self._mark_hits(self.te, getattr(self, '_ev_rows', []), set())
                 self._mark_hits(self.ta, getattr(self, '_ac_rows', []), set())
             except Exception:
-                pass
+                _swallow()
             return
         try:
             self._highlight_events_for_trigger()
             self._highlight_actions_for_trigger()
         except Exception:
-            pass
+            _swallow()
 
     # ---------------- 触发 ↔ 事件/行为 高亮（★2026-10-20） ----------------
     HIT_BG = ui_theme.MAP['hit_bg']          # 命中行底色（浅琥珀，浅色主题下足够醒目）
@@ -907,7 +918,7 @@ class TriggersPage(object):
             tree.tag_configure(tag, background=self.HIT_BG, foreground=self.HIT_FG)
             tree.tag_raise(tag)
         except Exception:
-            pass
+            _swallow()
         try:
             present = set(tree.get_children())
         except Exception:
@@ -921,7 +932,7 @@ class TriggersPage(object):
             try:
                 tree.item(iid, tags=newtags)
             except Exception:
-                pass
+                _swallow()
 
     def _owner_col_matches(self, col, names, sids):
         """「所属触发」列文字是否属于选中的触发（运行期链 = `★名字（运行期链）`，地图 = `sid 名字`）。"""
@@ -967,13 +978,13 @@ class TriggersPage(object):
                         self.update_idletasks()
                         self.mv_load(_p)
                     except Exception:
-                        pass
+                        _swallow()
             elif idx == 10:                             # ★2026-10-28 武器·弹头页（第 11 个）
                 # 懒加载：扫类型表要 ~230ms，开档时不做，第一次切进来才填
                 if not getattr(self, '_wpn_loaded', False):
                     self.refresh_weapons()
         except Exception:
-            pass
+            _swallow()
 
     def _highlight_actions_for_trigger(self):
         """把触发页选中的触发对应的**行为**高亮 + 定位（整条行为链）。"""
@@ -1011,7 +1022,7 @@ class TriggersPage(object):
                     self._q_ac.set('')
                     self._fill_ac_tree()
         except Exception:
-            pass
+            _swallow()
         self._mark_hits(self.ta, getattr(self, '_ac_rows', []), hits)
         if hasattr(self, 'lbl_ac_count'):
             self.lbl_ac_count.config(
@@ -1062,7 +1073,7 @@ class TriggersPage(object):
                     self._q_ev.set('')
                     self._fill_ev_tree()
         except Exception:
-            pass
+            _swallow()
         self._mark_hits(self.te, getattr(self, '_ev_rows', []), hits)
         if hasattr(self, 'lbl_ev_count'):        # 命中后把提示色/文字恢复成普通计数
             self.lbl_ev_count.config(
@@ -1479,7 +1490,7 @@ class TriggersPage(object):
                 self.refresh_events()
                 self.refresh_actions()
             except Exception:
-                pass
+                _swallow()
             n = len(info['per_building'])
             msg = '已建 %d 条单栋 + %s（变量 %s）' % (
                 n, '1 条汇总' if info['result'] else '汇总（失败）', info['vars'])
@@ -1638,7 +1649,7 @@ class TriggersPage(object):
                 self.refresh_actions()
                 self.refresh_records()
             except Exception:
-                pass
+                _swallow()
             msg = ('✅ 已改造触发 %s（%s）：行为 %d→%d，建筑名 %r→%r，路径点 %d→%d %s'
                    % (rec.sid, rec.name, cur['type'], info['type'], cur['name'],
                       info['name'], cur['waypoint'], info['waypoint'], info['cell']))
@@ -1653,7 +1664,7 @@ class TriggersPage(object):
                                    '引擎静默拒绝（写进去了但游戏里什么都不刷）。'
                                    '建议改用紧邻已有建筑的格子。' % (info.get('cell'),))
             except Exception:
-                pass
+                _swallow()
             if hasattr(self, 'mv_info'):
                 self.mv_info.config(text='✅ 已改造触发 %s：目标路径点 %d %s（尚未保存到磁盘）'
                                         % (rec.sid, info['waypoint'], info['cell']))

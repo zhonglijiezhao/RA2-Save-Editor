@@ -6,6 +6,17 @@
   所以 `self.xxx` 照旧指向同一个 App 实例，行为零变化。
   边界 = 原来 `_tab_xxx()` 那整段（含它引用的私有辅助方法）。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 import sys
 
@@ -400,7 +411,7 @@ class AiPage(object):
         try:
             self._ai_tf_fill_mem(tf_id)
         except Exception:
-            pass
+            _swallow()
         # 选中哪条小队，就把「预装载」勾选框同步成它的当前值
         if hasattr(self, 'ai_load'):
             _t = self._ai_teams.get(team_id) if team_id else None
@@ -441,7 +452,7 @@ class AiPage(object):
                 tv.selection_set(str(iid))
                 tv.see(str(iid))
         except Exception:
-            pass
+            _swallow()
         try:
             self.after_idle(self._ai_unsync)
         except Exception:
@@ -861,7 +872,7 @@ class AiPage(object):
                 if t.get('defined', True):
                     out.append(('%s  %s' % (t['sid'], t['name']), t['sid'], t['key']))
         except Exception:
-            pass
+            _swallow()
         return out
 
     def _dlg_team(self, ident=None, new=False):
@@ -1284,7 +1295,7 @@ class AiPage(object):
             tv.selection_set(iid)
             tv.focus(iid)
         except Exception:
-            pass
+            _swallow()
         self._ai_tf_dialog(iid)
 
     def _ai_script_dblclick(self, event):
@@ -1300,7 +1311,7 @@ class AiPage(object):
             tv.selection_set(iid)
             tv.focus(iid)
         except Exception:
-            pass
+            _swallow()
         self._ai_script_dialog(iid)
 
     def _ai_team_dblclick(self, event):
@@ -1324,13 +1335,13 @@ class AiPage(object):
             tv.selection_set(iid)
             tv.focus(iid)
         except Exception:
-            pass
+            _swallow()
         # 先把明细/下拉同步到这一支（对话框的初始状态要用）
         self._ai_syncing = False
         try:
             self._ai_pick('team')
         except Exception:
-            pass
+            _swallow()
         try:
             r = self._dlg_team(ident=iid)
         except Exception as e:
@@ -1341,7 +1352,7 @@ class AiPage(object):
                 self._ai_select(self.tat, iid)
                 self._ai_pick('team')
             except Exception:
-                pass
+                _swallow()
             self.status.set('已修改小队 %s（尚未保存，回主窗口「保存」才写盘）' % iid)
 
     def _ai_new_team(self):
@@ -1397,7 +1408,7 @@ class AiPage(object):
         try:
             self._fill_trig_tree()
         except Exception:
-            pass
+            _swallow()
         self.status.set('已把小队挂到触发 %s' % tid)
         messagebox.showinfo('触发挂载作战小队',
                             '%s\n\n触发器：%s\n小队键：%#x\n路径点：%d\n行为：%d（%s）'
@@ -1537,7 +1548,7 @@ class AiPage(object):
         try:
             self._ai_tf_fill_mem(tf_id)
         except Exception:
-            pass
+            _swallow()
         self.status.set(msg + '（尚未保存）')
 
     def _ai_apply_tf(self):

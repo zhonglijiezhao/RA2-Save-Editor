@@ -22,6 +22,17 @@
     3) 本机已知目录：D:\\233\\RA2YR、D:\\233\\RA2LB、E:\\YURI
 每个目录里按 rulesmd.ini → rules.ini 找规则，artmd.ini → art.ini 找美术。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import io
 import json
 import os
@@ -171,7 +182,7 @@ def _pair_in(d):
             if got:
                 art = got[2]
         except Exception:
-            pass
+            _swallow()
     return (d, rules, art)
 
 
@@ -353,7 +364,7 @@ def _config_game_dir():
         if isinstance(d, str) and d.strip() and os.path.isdir(d.strip()):
             return d.strip()
     except Exception:
-        pass
+        _swallow()
     return None
 
 
@@ -484,7 +495,7 @@ def auto_detect_game_dirs(force=False):
                 _AUTO_CACHE = dirs
                 return dirs
         except Exception:
-            pass
+            _swallow()
     out, seen = [], set()
     for d in _registry_game_dirs() + _scan_game_dirs():
         if not d:
@@ -503,7 +514,7 @@ def auto_detect_game_dirs(force=False):
             with open(p, 'w', encoding='utf-8') as f:
                 json.dump({'ts': time.time(), 'dirs': out}, f, ensure_ascii=False, indent=2)
         except Exception:
-            pass
+            _swallow()
     return out
 
 

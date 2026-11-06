@@ -9,6 +9,9 @@ r"""RA2 存档编辑器 —— 命令行入口 / PyInstaller 入口
     RA2存档编辑器.exe --selftest <save.SAV>    headless check: build the UI,
         decode the save, money round-trip, write 自检结果.txt next to the exe,
         exit 0/1.  (Windowed exe has no stdout -- the txt file IS the report.)
+    RA2存档编辑器.exe --selftest-core <save.SAV>   同上，但**不建界面**（不 import tkinter）
+        ⇒ 没装 tk 的 Python / 服务器 / CI 也能验核心链路（解码·改钱·写盘·触发）。
+        报告与退出码同 --selftest，两种模式的 [1][2] 步分别标注"跳过"。
     RA2存档编辑器.exe --mktrig <in> <out> <name> <ev_type> <ev_arg> <ac_type> <ac_arg>
         headless 新写触发（六件套）—— 批量验证 / 回归用。
     RA2存档编辑器.exe --repairtrig <in> <out> <触发名或ID> [ev_type ev_arg]
@@ -63,6 +66,17 @@ r"""RA2 存档编辑器 —— 命令行入口 / PyInstaller 入口
         把档内电弧链改成**两级自我折射**：主弹 → n1 个子武器 → 每个再炸出 n2 个 ⇒ 1+n1+n1*n2 发。
         依靠"Type 对象自地址表"改写指针（只能指向档里已有的对象，且不能成环）。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 import sys
 import traceback
@@ -160,31 +174,48 @@ def gametables(arg):
 
 
 def _write_report(txt):
+    # ★2026-11-06（审核 §3.3）：headless 命令一路上被静默吞掉的异常，附在报告末尾 ——
+    #   否则"`--mktrig` 说成功、进游戏没反应"这种情况只能靠猜。没有内容时一个字都不加。
+    try:
+        from diag import summary as _diag_summary
+        _s = _diag_summary()
+        if _s:
+            txt += '\n\n' + '-' * 66 + '\n' + _s + '\n'
+    except Exception:
+        _swallow()
     try:
         with open(REPORT, 'w', encoding='utf-8-sig') as f:
             f.write(txt)
     except Exception:
-        pass
+        _swallow()
     # 源码运行时也打印一份，方便命令行看
     try:
         sys.stdout.write(txt + '\n')
     except Exception:
-        pass
+        _swallow()
 
 
-def selftest(sav):
+def selftest(sav, with_ui=True):
     lines = ['时间: %s' % datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
              'exe : %s' % (sys.executable if getattr(sys, 'frozen', False) else '(源码)'),
-             '存档: %s' % sav, '']
+             '存档: %s' % sav,
+             '模式: %s' % ('完整（含界面）' if with_ui else '仅核心（不建界面）'), '']
     try:
-        import RA2存档编辑器 as m          # noqa: E402  (frozen: bundled module)
-        lines.append('[1] 导入 GUI 模块            OK')
-        app = m.App()
-        app.withdraw()
-        app.update_idletasks()
-        rows = len(app.tree.get_children())
-        lines.append('[2] 界面构造                 OK（存档列表 %d 行）' % rows)
-        app.destroy()
+        # ★2026-11-06（审核 §4.4）：第 1、2 步是唯一依赖 tkinter 的地方 ——
+        #   `--selftest-core` 跳过它们，好让服务器 / 没装 tk 的 Python / CI 也能验核心。
+        #   编号刻意保持不变（还是 [1]..[8]），这样两种模式下的报告能直接对照。
+        if with_ui:
+            import RA2存档编辑器 as m          # noqa: E402  (frozen: bundled module)
+            lines.append('[1] 导入 GUI 模块            OK')
+            app = m.App()
+            app.withdraw()
+            app.update_idletasks()
+            rows = len(app.tree.get_children())
+            lines.append('[2] 界面构造                 OK（存档列表 %d 行）' % rows)
+            app.destroy()
+        else:
+            lines.append('[1] 导入 GUI 模块            跳过（--selftest-core）')
+            lines.append('[2] 界面构造                 跳过（--selftest-core）')
 
         from editor_core import SaveDoc
         doc = SaveDoc(sav)
@@ -478,7 +509,7 @@ def typelist(args):
         try:
             d.auto_attach_map([os.path.dirname(os.path.abspath(args[0]))])
         except Exception:
-            pass
+            _swallow()
         g = game_ini.get_types(os.path.dirname(os.path.abspath(args[0])), None,
                                getattr(getattr(d, '_map', None), 'path', None))
         pairs = d.placeable_unit_types()
@@ -553,7 +584,7 @@ def units(args):
             try:                 # 大型任务的规则写在地图 INI 里 ⇒ 先挂图再取规则
                 d.auto_attach_map([os.path.dirname(os.path.abspath(args[0]))])
             except Exception:
-                pass
+                _swallow()
             g = game_ini.get_types(os.path.dirname(os.path.abspath(args[0])), None,
                                    getattr(getattr(d, '_map', None), 'path', None))
         except Exception:
@@ -1673,7 +1704,7 @@ def retarget(args):
         try:                      # 只为了"格子 → 可建造性/占用"报告，缺地图不影响写
             d.auto_attach_map([os.path.dirname(os.path.abspath(src)), r'E:\YURI'])
         except Exception:
-            pass
+            _swallow()
         tid = who
         if not any(r.sid == who.upper() for r in d.records):
             hit = next((r for r in d.records if r.kind == '触发' and r.name == who), None)
@@ -1836,7 +1867,7 @@ def cells_cmd(args):
                 if r.get('x') is not None:
                     busy.add((r['x'], r['y']))
         except Exception:
-            pass
+            _swallow()
         score = {}
         for b in bs:
             if typ and str(b['type']).upper() != typ:
@@ -2413,6 +2444,16 @@ def main():
     if '--help' in sys.argv or '-h' in sys.argv:
         sys.stdout.write((__doc__ or '') + '\n')
         return 0
+    if '--selftest-core' in sys.argv:
+        # ★2026-11-06（审核 §4.4）：不建界面的核心自检 —— 服务器/CI/没装 tkinter 的
+        #   Python 都能跑（本机托管 Python 3.13.12 就是这种情况）。
+        i = sys.argv.index('--selftest-core')
+        sav = sys.argv[i + 1] if len(sys.argv) > i + 1 else ''
+        if not sav or not os.path.exists(sav):
+            _write_report('SELFTEST FAIL\n未提供有效的存档参数: %r\n'
+                          '用法: %s --selftest-core <存档.SAV>' % (sav, sys.argv[0]))
+            return 2
+        return selftest(sav, with_ui=False)
     if '--selftest' in sys.argv:
         i = sys.argv.index('--selftest')
         sav = sys.argv[i + 1] if len(sys.argv) > i + 1 else ''
@@ -2564,20 +2605,20 @@ def _install_crash_hooks(m):
     try:
         m._install_crash_hooks()
     except Exception:
-        pass
+        _swallow()
 
     def _thread_hook(args):
         try:
             m.write_crash_log(args.exc_type, args.exc_value, args.exc_traceback,
                               'thread:%s' % getattr(args.thread, 'name', '?'))
         except Exception:
-            pass
+            _swallow()
 
     try:
         import threading
         threading.excepthook = _thread_hook
     except Exception:
-        pass
+        _swallow()
 
 
 def _enable_dpi_awareness():
@@ -2600,7 +2641,7 @@ def _enable_dpi_awareness():
                 if json.load(f).get('dpi_aware') is False:
                     return
     except Exception:
-        pass
+        _swallow()
     try:
         import ctypes
         try:
@@ -2610,7 +2651,7 @@ def _enable_dpi_awareness():
             # Windows 7 / 老系统
             ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
-        pass
+        _swallow()
 
 
 
@@ -2621,7 +2662,7 @@ if __name__ == '__main__':
         import multiprocessing as _mp
         _mp.freeze_support()
     except Exception:
-        pass
+        _swallow()
     try:
         sys.exit(main())
     except SystemExit:
@@ -2633,6 +2674,6 @@ if __name__ == '__main__':
             import tkinter.messagebox as mb
             mb.showerror('RA2 存档编辑器 启动失败', tb[-1600:] + '\n\n详细信息:\n' + REPORT)
         except Exception:
-            pass
+            _swallow()
         _write_report('启动失败\n\n' + tb)
         raise

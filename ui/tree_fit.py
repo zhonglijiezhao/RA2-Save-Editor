@@ -14,6 +14,17 @@
     超过可视宽度时横向滚动条就真的能拖了。
   · `attach_tooltip(tv)` —— 鼠标停在**被裁切**的单元格上，弹小窗显示全文。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
@@ -32,13 +43,13 @@ def _row_font(tv):
         if f:
             return tkfont.Font(font=f)
     except Exception:
-        pass
+        _swallow()
     try:
         fs = ttk.Style().lookup('Treeview', 'font')
         if fs:
             return tkfont.Font(font=fs)
     except Exception:
-        pass
+        _swallow()
     try:
         return tkfont.nametofont('TkDefaultFont')
     except Exception:
@@ -92,7 +103,7 @@ def autosize(tv, caps=None, minw=46, pad=26, sample=400, weights=None, stretch=F
             try:
                 return f.measure(text)
             except Exception:
-                pass
+                _swallow()
         return len(text) * 8
 
     want = {}
@@ -136,7 +147,7 @@ def autosize(tv, caps=None, minw=46, pad=26, sample=400, weights=None, stretch=F
             tv.column(c, width=want[c], minwidth=min(want[c], 46),
                       stretch=(True if stretch is None else bool(stretch)))
         except Exception:
-            pass
+            _swallow()
     return want
 
 
@@ -160,13 +171,13 @@ class CellTip(object):
             try:
                 self.tv.after_cancel(self._job)
             except Exception:
-                pass
+                _swallow()
             self._job = None
         if self._win is not None:
             try:
                 self._win.destroy()
             except Exception:
-                pass
+                _swallow()
             self._win = None
         self._key = None
 
@@ -236,7 +247,7 @@ def attach_tooltip(tv, delay=380):
         try:
             tv._cell_tip = tip
         except Exception:
-            pass
+            _swallow()
     return tip
 
 
@@ -249,7 +260,7 @@ def fit_on_resize(tv, caps=None, delay=120):
             try:
                 tv.after_cancel(job)
             except Exception:
-                pass
+                _swallow()
         try:
             tv._fit_job = tv.after(delay, lambda: autosize(tv, caps=caps))
         except Exception:
@@ -257,4 +268,4 @@ def fit_on_resize(tv, caps=None, delay=120):
     try:
         tv.bind('<Configure>', _later, add='+')
     except Exception:
-        pass
+        _swallow()

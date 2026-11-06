@@ -109,8 +109,17 @@ def run_one(name, timeout):
         return {'name': name, 'status': st, 'passed': 0, 'failed': 0,
                 'secs': secs, 'note': note}
     ok, bad = res
+    note = ''
+    if bad:
+        # ★2026-11-06（审核 §4.1）：红用例只说"13 失败"没法修 —— 把**第一条失败的断言**
+        #   摘出来当 note。下次看 `--reasons` / 汇总表就知道该去改哪一行。
+        for ln in out.splitlines():
+            s = ln.strip()
+            if s.startswith('[FAIL]') or s.startswith('[NG]') or s.startswith('[✗]'):
+                note = s[:110]
+                break
     return {'name': name, 'status': 'ok' if bad == 0 else 'red',
-            'passed': ok, 'failed': bad, 'secs': secs, 'note': ''}
+            'passed': ok, 'failed': bad, 'secs': secs, 'note': note}
 
 
 def load_baseline():
@@ -127,17 +136,36 @@ def save_baseline(rows, merge=True):
     """默认**合并**：只覆盖这次跑到的用例，其余原样保留。
 
     这样加了一个新用例可以只跑它 + `--update`，不用把 140 个全跑一遍。
+
+    ★2026-11-06（审核 §4.1）：**保留 `reason` / `ci` 字段**。以前这里整个 dict 重写，
+      人手标注的"为什么红"一刷新就没了 —— 那正是"26 个 red 永远红着没人管"的成因之一。
     """
     data = load_baseline() if merge else {}
     for r in rows:
-        data[r['name']] = {'status': r['status'], 'passed': r['passed'],
-                           'failed': r['failed']}
+        old = data.get(r['name']) or {}
+        ent = {'status': r['status'], 'passed': r['passed'], 'failed': r['failed']}
+        if r['status'] != 'ok' and r.get('note'):
+            ent['note'] = r['note'][:110]      # "为什么红"的现场证据
+        for k in ('reason', 'ci'):            # 人工维护的字段，只有人能改
+            if k in old:
+                ent[k] = old[k]
+        data[r['name']] = ent
     tmp = BASELINE + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=True)
         f.write('\n')
     os.replace(tmp, BASELINE)
     return len(data)
+
+
+# ---- 基线里的"为什么红"（审核 §4.1）----
+# 现状（2026-11-06 复核）：178 个用例里有一批长期不绿。不写清原因，它们就永远不会被修，
+# 也没人敢把门禁设成"全绿"。这里把原因分档，`--reasons` 打印分组，`--set-reason` 可以改。
+REASON_KINDS = ('缺样本', '需游戏目录', '需 tkinter', '依赖已废弃接口', '待修', '环境限制')
+
+
+def reason_of(base, name):
+    return (base.get(name) or {}).get('reason') or ''
 
 
 ENV_MARKS = ('SAFE_DELETE', 'No such file', 'not exist', 'SKIP', '缺样本',
@@ -173,11 +201,63 @@ def judge(rows, base, full=True):
         elif b['status'] == r['status'] == 'ok' and r['passed'] < b['passed']:
             regress.append('%s：通过数 %d → %d（断言被删了？）'
                            % (r['name'], b['passed'], r['passed']))
+        elif b['status'] != 'ok' and r['status'] == 'ok':
+            # ★2026-11-06（审核 §4.1）：修好了就该从基线里清掉，否则"红名单"只增不减
+            notes.append('%s：已修好（基线里是 %s）⇒ 跑一次 --update / --drop-fixed'
+                         % (r['name'], b['status']))
     if full:
         seen = {r['name'] for r in rows}
         for n in sorted(set(base) - seen):
             notes.append('%s：基线里有，磁盘上没有（改名/删了？）' % n)
     return regress, notes
+
+
+def report_reasons(base):
+    """按原因分组打印基线里"不是绿的"那些（审核 §4.1）。"""
+    groups = {}
+    skipped = []
+    for name, ent in base.items():
+        st = ent.get('status')
+        if st == 'ok':
+            continue
+        if st == 'skip':
+            # ★2026-11-06（审核 §4.1）：skip 是"用例主动跳过"（缺样本/环境），**不是红**。
+            #   混进红名单会让"26 red 永远红着"这个数看着比实际更糟。
+            skipped.append(name)
+            continue
+        groups.setdefault(ent.get('reason') or '（未注明原因）', []).append(
+            '%s[%s]' % (name, st))
+    if not groups:
+        print('\n基线里没有红/错用例 —— 门禁可以设成全绿了')
+    else:
+        total = sum(len(v) for v in groups.values())
+        print('\n不是绿的用例：%d 个（另有 %d 个主动跳过），按原因分组：'
+              % (total, len(skipped)))
+        for reason in sorted(groups, key=lambda r: -len(groups[r])):
+            names = sorted(groups[reason])
+            print('  · %-10s %2d 个' % (reason, len(names)))
+            for nm in names:
+                note = (base.get(nm) or {}).get('note') or ''
+                print('      %-42s %s' % (nm, note))
+        if '（未注明原因）' in groups:
+            print('\n  未注明的用 `--set-reason 用例名=原因` 标注，'
+                  '可用的原因档：%s' % ' / '.join(REASON_KINDS))
+    if skipped:
+        print('  跳过（不算红）：%s%s'
+              % (', '.join(sorted(skipped)[:5]), '…' if len(skipped) > 5 else ''))
+
+
+def set_reason(base, spec):
+    """`用例名=原因` → 写进基线（只改人工字段，不动 status）。"""
+    if '=' not in spec:
+        return None, '格式应为 用例名=原因'
+    name, reason = spec.split('=', 1)
+    name, reason = name.strip(), reason.strip()
+    ent = base.get(name)
+    if ent is None:
+        return None, '基线里没有 %r' % name
+    ent['reason'] = reason
+    return name, reason
 
 
 def main():
@@ -189,19 +269,46 @@ def main():
     ap.add_argument('--only', default='', help='只跑名字含该子串的')
     ap.add_argument('--list', action='store_true', help='只列清单')
     ap.add_argument('--update', action='store_true', help='把当前结果写成新基线')
+    ap.add_argument('--reasons', action='store_true',
+                    help='只按原因分组列出基线里不是绿的用例（不跑）')
+    ap.add_argument('--set-reason', default='',
+                    help='给某个用例标注原因，例：--set-reason _selftest_ai=缺样本')
+    ap.add_argument('--drop-fixed', action='store_true',
+                    help='把"基线里红、这次跑绿"的用例从基线里删掉（红名单只减不增）')
+    ap.add_argument('--ci', action='store_true',
+                    help='CI 模式：只跑基线里标了 "ci": true 的用例，要求全绿')
     ap.add_argument('--timeout', type=int, default=300)
     a = ap.parse_args()
 
+    if a.reasons:
+        report_reasons(load_baseline())
+        return 0
+    if a.set_reason:
+        base = load_baseline()
+        name, reason = set_reason(base, a.set_reason)
+        if name is None:
+            print(reason)
+            return 2
+        tmp = BASELINE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(base, f, ensure_ascii=False, indent=1, sort_keys=True)
+            f.write('\n')
+        os.replace(tmp, BASELINE)
+        print('已标注：%s = %s' % (name, reason))
+        return 0
+
     names = discover()
+    if a.ci:
+        base0 = load_baseline()
+        names = [n for n in names if (base0.get(n) or {}).get('ci')]
+        if not names:
+            print('基线里没有标 "ci": true 的用例'); return 2
     if a.only:
         names = [n for n in names if a.only in n]
     if a.fast:
         names = [n for n in names if n not in SLOW]
     if not (a.all or a.only):
         names = [n for n in names if n not in KNOWN_HANG]
-    if a.redo_bad:
-        base0 = load_baseline()
-        names = [n for n in names if base0.get(n, {}).get('status') != 'ok']
     if a.redo_bad:
         base0 = load_baseline()
         names = [n for n in names if base0.get(n, {}).get('status') != 'ok']
@@ -247,9 +354,14 @@ def main():
              len([r for r in bad if r['status'] == 'timeout']), total))
     rest = [r for r in bad if not r['nosample']]
     if rest:
+        # ★2026-11-06（审核 §4.1）：每条后面带上"为什么红"——不写原因的红名单等于没有名单
+        base_r = load_baseline()
         print('\n不是绿的（基线里也是红的就不算退化）：')
         for r in rest:
-            print('  %-8s %-42s %s' % (r['status'], r['name'], r['note']))
+            rs = reason_of(base_r, r['name'])
+            print('  %-8s %-42s %s%s'
+                  % (r['status'], r['name'], r['note'],
+                     ('   ← %s' % rs) if rs else ''))
     if nos:
         print('\n缺样本（环境原因，不算退化）：%d 个，例如 %s'
               % (len(nos), ', '.join(r['name'] for r in nos[:6])))
@@ -257,7 +369,7 @@ def main():
     base = load_baseline()
     if not base:
         print('\n（还没有基线：这次结果可以直接 `--update` 存成基线）')
-    full_run = not (a.only or a.redo_bad or a.fast)
+    full_run = not (a.only or a.redo_bad or a.fast or a.ci)
     regress, notes = judge(rows, base, full=full_run)
     if notes:
         print('\n备注：')
@@ -273,6 +385,35 @@ def main():
     if a.update:
         n = save_baseline(rows)
         print('\n已写入基线：%s（%d 条）' % (os.path.basename(BASELINE), n))
+
+    if a.drop_fixed:
+        base2 = load_baseline()
+        last = {r['name']: r['status'] for r in rows}
+        gone = [k for k, v in list(base2.items())
+                if v.get('status') != 'ok' and last.get(k) == 'ok']
+        for k in gone:
+            del base2[k]
+        if gone:
+            tmp = BASELINE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(base2, f, ensure_ascii=False, indent=1, sort_keys=True)
+                f.write('\n')
+            os.replace(tmp, BASELINE)
+            print('\n已从基线删除 %d 个"已修好"的用例：%s'
+                  % (len(gone), ', '.join(sorted(gone)[:8])))
+        else:
+            print('\n没有"已修好"的用例可删')
+
+    if a.ci:
+        # CI 模式：清单是人工挑的（不依赖样本/游戏目录），要求**全绿**才算过
+        notok = [r for r in rows if r['status'] != 'ok']
+        if notok:
+            print('\n★ CI 失败 %d 项：' % len(notok))
+            for r in notok:
+                print('  ✗ %-40s %s %s' % (r['name'], r['status'], r['note']))
+            return 1
+        print('\n✓ CI 全绿（%d 个用例）' % len(rows))
+        return 0
 
     return 1 if regress else 0
 

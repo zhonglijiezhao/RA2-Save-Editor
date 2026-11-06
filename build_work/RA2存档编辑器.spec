@@ -33,6 +33,15 @@ for _n in ('rulesmd.ini', 'artmd.ini'):
     if os.path.exists(_p):
         _datas.append((_p, 'ini_builtin'))
 
+# ★2026-11-07（玩家要求换成鹰徽图标）：图标既是 exe 资源（`icon=`），也要作为数据文件
+#   带进去 —— 运行时要用它设**窗口标题栏/任务栏**的图标（exe 资源只管资源管理器里那个）。
+#   没有图标文件时跳过，保证从 GitHub clone（图标还没跟着进仓库）也能打包。
+_ICON_ICO = os.path.join(_ROOT, 'icon.ico')
+_ICON_PNG = os.path.join(_ROOT, 'icon.png')
+for _p in (_ICON_ICO, _ICON_PNG):
+    if os.path.exists(_p):
+        _datas.append((_p, '.'))
+
 
 a = Analysis(
     [os.path.join(_ROOT, 'app_main.py')],
@@ -48,7 +57,9 @@ a = Analysis(
                    #   这些模块都是函数内动态 import，不列在这里会被 PyInstaller 裁掉，
                    #   打出来的 exe 一选参数就 ImportError。
                    'mix_vfs', 'blowfish_tables', 'game_tables', 'csf', 'fa2_tables',
-                   'script_actions'],   # ★§253 脚本动作中文名表（动态 import，必须列在这里）
+                   'script_actions',      # ★§253 脚本动作中文名表（动态 import，必须列在这里）
+                   'errormsg'],  # ★2026-11-06 坏档人话提示（ui/page_search 顶部 import；
+                                 #   现在静态可被追到，列出防以后改成函数内 import 时被裁掉）
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -74,6 +85,9 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    # ★2026-11-07：exe 自己的图标（资源管理器 / 任务栏固定时看到的那个）。
+    #   `.ico` 里含 16~256 七档，Windows 按 DPI 自己挑。
+    icon=(_ICON_ICO if os.path.exists(_ICON_ICO) else None),
     # ★2026-10-28：版本资源（属性→详细信息里能看到 v1.4.0）。
     #   文件由 build.py 每次按版本号重写；没有它 exe 的"详细信息"全是空的，
     #   玩家报 bug 时也没法确认用的是哪一版。

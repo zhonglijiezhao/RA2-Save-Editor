@@ -6,6 +6,17 @@
   所以 `self.xxx` 照旧指向同一个 App 实例，行为零变化。
   边界 = 原来 `_tab_xxx()` 那整段（含它引用的私有辅助方法）。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 import sys
 
@@ -139,13 +150,13 @@ class GiftPage(object):
             try:
                 self.mv_unit['values'] = self._unit_type_names()
             except Exception:
-                pass
+                _swallow()
             if not self.mv_house.cget('values'):
                 self._fill_house_lists(log=False)
             self._mv_types_loaded = True
         except Exception:
             # 填不上不算错（玩家还能用「模板库」那条路），别打断切页
-            pass
+            _swallow()
 
     def _fill_type_lists(self):
         if not self.doc:
@@ -162,7 +173,7 @@ class GiftPage(object):
         try:
             self.mv_unit['values'] = self._unit_type_names()
         except Exception:
-            pass
+            _swallow()
         self._fill_house_lists()
         self._refresh_unit_rule_label()
         self._gift_log('类型列表刷新：%d 种（rules 建筑 ∩ 档内类型对象）；'
@@ -327,13 +338,13 @@ class GiftPage(object):
                 else:
                     L.append('⚠ 该格已被占用（建筑地基或单位站着）')
         except Exception:
-            pass
+            _swallow()
         try:
             w = d.terrain_warning(cx, cy)
             if w:
                 L.append(w)
         except Exception:
-            pass
+            _swallow()
         try:
             mk = d.map_cells() or {}
             if mk:
@@ -344,7 +355,7 @@ class GiftPage(object):
                 L.append('离地图边缘 %d 格%s' % (
                     edge, '（⚠ 不足 12 格：空军单位可能不显示，§212 实测）' if edge < 12 else ''))
         except Exception:
-            pass
+            _swallow()
         return '\n'.join(L) if L else '✓ 该格看起来可用（地形通行、无占用、离边缘够远）'
 
     def _spawn_dialog(self, tname, cell):
@@ -493,7 +504,7 @@ class GiftPage(object):
             self.refresh_ai()
             self._ai_select(self.tat, r['team']['sid'])
         except Exception:
-            pass
+            _swallow()
         script_line = '空（待命）' if scr == 0 else (
             '沿用模板' if scr == 1 else '新建「原地警戒」%s' % r['script']['sid'])
         messagebox.showinfo(
@@ -1120,7 +1131,7 @@ class GiftPage(object):
                     try:
                         self.mv_via.set(via)
                     except Exception:
-                        pass
+                        _swallow()
                 else:
                     return
             else:
@@ -1163,7 +1174,7 @@ class GiftPage(object):
         try:
             self.mv_via.set(via)          # 分支可能被上面的"换一种方式"改过
         except Exception:
-            pass
+            _swallow()
         if via:
             # 触发法：引擎读档后才造，建筑列表里暂时没有它 ⇒ 不要重绘建筑层
             _wd = info.get('warnings') or []
@@ -1363,7 +1374,7 @@ class GiftPage(object):
                 if self.doc.repair_building_anim(b['base'])['changed']:
                     ok += 1
             except Exception:
-                pass
+                _swallow()
         self.mv_state['blds'] = self.doc.buildings()
         self.mv_render()
         self.status.set('✅ 已修复 %d 栋（记得另存为新文件）' % ok)
@@ -1422,7 +1433,7 @@ class GiftPage(object):
                 try:
                     f()
                 except Exception:
-                    pass
+                    _swallow()
         self.status.set('补齐建筑动画：成功 %d，失败 %d（尚未保存）' % (ok, fail))
         messagebox.showinfo('完成',
                             '成功 %d 栋，失败 %d 栋。\n\n%s\n\n'

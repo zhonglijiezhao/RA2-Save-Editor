@@ -12,6 +12,17 @@
   6. 事件 / 行为：下拉框选类型（编号与地编一一对应）+ 参数编辑（只改已启用的触发，安全）
   7. 保存：默认另存为新文件（绝不覆盖原档）；可选原地保存（自动备份）
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os, sys, re, struct, threading, queue, time, traceback
 import json, subprocess, webbrowser
 import platform
@@ -60,6 +71,7 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
     def __init__(self):
         tk.Tk.__init__(self)
         self.title('RA2 / 尤里的复仇 — 存档编辑器')
+        self._apply_window_icon()        # ★2026-11-07：鹰徽图标（标题栏 + 任务栏）
         self._apply_geometry()           # ★P4-20：按屏幕 DPI 定窗口大小（封顶到屏幕）
         self.configure(bg=BG)
         self.doc = None
@@ -101,6 +113,99 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
         self.after(120, self._poll)
         self.refresh_list()
 
+    def _apply_window_icon(self):
+        """设窗口图标（标题栏 / 任务栏 / Alt+Tab）—— ★2026-11-07 玩家要求换成鹰徽。
+
+        两个来源各管一段，缺一个都会在某个位置露出默认的羽毛图标：
+          · `icon.ico`（16~256 七档）→ `iconbitmap(default=…)`：Windows 原生按 DPI 挑档，
+            而且 `default` 对**之后新建的 Toplevel 也生效**（触发编辑器那个子窗口）；
+          · `icon.png`（256）→ `iconphoto()`：兜底，也是 `iconbitmap` 失败时的唯一来源。
+
+        ★踩过的坑（2026-11-07 实测，两次）：
+          ① **`iconbitmap()` 遇到非 ASCII 路径会静默失败**。项目目录叫「1RA2存档分析工具」，
+             直接传绝对路径 ⇒ 返回 ''、图标不生效。同样的文件复制到 `%LOCALAPPDATA%\\RA2SED_cache`
+             再传就正常。所以先复制到纯 ASCII 路径再用（玩家把 exe 放中文目录也安全）。
+          ② **`iconbitmap(default=…)` 只改"类图标"，Windows 实际画的是窗口自己的 `WM_SETICON`**。
+             只写 default 的话，`SendMessage(WM_GETICON)` 仍是 0，标题栏继续显示 Tk 默认羽毛
+             （截图实测）。必须对本窗口再调一次**不带 default** 的 `iconbitmap(path)`。
+          ③ 新开的 `Toplevel`（触发编辑器）也一样，见 `_icon_on_map`。
+
+        ★`PhotoImage` 必须挂在 `self` 上：局部变量被回收后图标会变回默认（Tk 经典坑）。
+        """
+        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        ico = os.path.join(base, 'icon.ico')
+        png = os.path.join(base, 'icon.png')
+        self._icon_path = None
+        try:
+            if os.path.exists(png):
+                self._icon_img = tk.PhotoImage(file=png)
+                self.iconphoto(True, self._icon_img)
+        except Exception:
+            _swallow()
+        try:
+            if os.path.exists(ico):
+                p = self._icon_for_tk(ico)
+                self._icon_path = p
+                self.iconbitmap(p)          # ② 本窗口（真正生效的那一刀）
+                self.iconbitmap(default=p)  # 以后新建 Toplevel 的兜底
+                # ③ 子窗口首次显示时补一刀
+                self.bind_class('Toplevel', '<Map>', self._icon_on_map, add='+')
+        except Exception:
+            _swallow()
+
+    def _icon_on_map(self, ev):
+        """Toplevel（触发编辑器等）第一次显示时补设图标。
+
+        ★为什么必须补：`iconbitmap(default=…)` 只改类图标，Windows 画标题栏看的是
+          窗口自己的 `WM_SETICON` —— 实测新 Toplevel 的 `WM_GETICON` 是 0，
+          不补就会在子窗口标题栏露出 Tk 默认羽毛。用一个标记位保证只设一次。
+        """
+        try:
+            w = ev.widget
+            if not isinstance(w, tk.Toplevel):
+                return
+            if getattr(w, '_ra2sed_icon_done', False):
+                return
+            w._ra2sed_icon_done = True
+            if self._icon_path:
+                w.iconbitmap(self._icon_path)
+        except Exception:
+            _swallow()
+
+    @staticmethod
+    def _icon_for_tk(ico_path):
+        """把 .ico 复制到一个**纯 ASCII** 的固定路径并返回它（原因见上）。
+
+        依次试 `%LOCALAPPDATA%\\RA2SED_cache` → `%ProgramData%\\RA2SED` → 原地。
+        第一个"路径全是 ASCII 且能写"的胜出：账号名是中文时 `%LOCALAPPDATA%` 本身就带中文，
+        那就退到 `C:\\ProgramData`（基本都是 ASCII）。
+        大小一致就跳过复制 —— 换个图标通常伴随文件大小变化。
+        """
+        import shutil
+        cands = []
+        la = os.environ.get('LOCALAPPDATA')
+        if la:
+            cands.append(os.path.join(la, 'RA2SED_cache'))
+        pd = os.environ.get('ProgramData')
+        if pd:
+            cands.append(os.path.join(pd, 'RA2SED'))
+        for d in cands:
+            try:
+                d.encode('ascii')          # 目录本身必须全 ASCII，否则白折腾
+            except UnicodeEncodeError:
+                continue
+            try:
+                os.makedirs(d, exist_ok=True)
+                dst = os.path.join(d, 'app_icon.ico')
+                if not (os.path.exists(dst)
+                        and os.path.getsize(dst) == os.path.getsize(ico_path)):
+                    shutil.copyfile(ico_path, dst)
+                return dst
+            except Exception:
+                _swallow()
+                continue
+        return ico_path
+
     def _apply_geometry(self):
         """按屏幕 DPI 定窗口大小（★2026-10-28 审查 P4-20）。
 
@@ -138,7 +243,7 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
                                  '%s: %s\n\n详情见程序目录下的 crash.log'
                                  % (getattr(exc, '__name__', 'Error'), val))
         except Exception:
-            pass
+            _swallow()
 
     # ---------------- UI ----------------
     def _build_style(self):
@@ -313,11 +418,11 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
         try:
             self._sync_game_dir(persist=persist)        # → SaveDoc.set_game_dir + 界面配置
         except Exception:
-            pass
+            _swallow()
         try:
             game_ini.clear_cache()
         except Exception:
-            pass
+            _swallow()
         if persist and d:
             try:
                 cfg = game_ini.config_path()
@@ -329,7 +434,7 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
                 with open(cfg, 'w', encoding='utf-8') as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
             except Exception:
-                pass
+                _swallow()
         src = SaveDoc.rules_source() or {}
         rp = src.get('rules')
         kind = src.get('source')
@@ -349,12 +454,12 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
             try:
                 getattr(self, fn)()
             except Exception:
-                pass
+                _swallow()
         try:
             if getattr(self, 'doc', None):
                 self.mv_unit['values'] = self._unit_type_names()
         except Exception:
-            pass
+            _swallow()
         return bool(rp)
 
 
@@ -379,7 +484,7 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
             self.clipboard_append(t)
             self.update_idletasks()
         except Exception:
-            pass
+            _swallow()
         self.status.set('已复制版本信息：%s' % t)
         return t
 
@@ -410,7 +515,7 @@ class App(tk.Tk, OverviewPage, HousesPage, TriggersPage, EventsPage, ActionsPage
                                 'RA2 存档编辑器 %s\n\n%s%s'
                                 % (app_version.version_text(), url, tail))
         except Exception:
-            pass
+            _swallow()
         self.status.set('无法自动打开浏览器：%s' % url)
         return False
 
@@ -436,8 +541,18 @@ def write_crash_log(exc, val, tb, tag=''):
             f.write('\n===== %s  %s =====\n'
                     % (_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), tag))
             f.write(''.join(_tb.format_exception(exc, val, tb)))
+            # ★2026-11-06（审核 §3.3）：崩溃前一路上被 `except pass` 吞掉的异常，
+            #   常常才是真正的起因（崩溃只是最后一根稻草）。没有内容就不写这一段。
+            try:
+                from diag import summary as _diag_summary
+                s = _diag_summary(12)
+                if s:
+                    f.write('\n--- 静默异常（曾被 except pass 吞掉）---\n')
+                    f.write(s + '\n')
+            except Exception:
+                _swallow()
     except Exception:
-        pass
+        _swallow()
 
 
 def _install_crash_hooks():
@@ -448,9 +563,16 @@ def _install_crash_hooks():
         try:
             _old(exc, val, tb)
         except Exception:
-            pass
+            _swallow()
 
     sys.excepthook = _hook
+    # ★2026-11-06（审核 §3.3）：后台线程挂掉时原来是**彻底无声**的（threading 的默认钩子
+    #   只往 stderr 打，windowed exe 没有 stderr）⇒ 挂一份 diag 日志，再转交原钩子。
+    try:
+        from diag import install as _diag_install
+        _diag_install()
+    except Exception:
+        _swallow()
 
 
 if __name__ == '__main__':

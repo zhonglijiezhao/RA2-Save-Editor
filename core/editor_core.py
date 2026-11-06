@@ -12,6 +12,17 @@
     doc.actions() / set_action(ac, atype=, arg=)   # 行为（对象签名定位）
     doc.save(out_path)           # 重编码 + CFB 重建落盘
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import sys, os, re, struct, hashlib, datetime, shutil, json, bisect, base64, collections
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -114,7 +125,7 @@ def action_arg_off(atype, v72=None, v164=None):
         if int(atype) in ACTION_ARG72_TYPES:
             return OBJ_ARG_OFF
     except Exception:
-        pass
+        _swallow()
     return ACT_VAR_OFF
 
 
@@ -423,7 +434,7 @@ def find_scenario_map(save_path, name=None, extra_dirs=None, size=None):
                 break
             d = nd
     except Exception:
-        pass
+        _swallow()
     for d in (extra_dirs or []):
         if d and d not in dirs:
             dirs.append(d)
@@ -737,11 +748,12 @@ def _decode_txt(b):
     try:
         s8 = b.decode('utf-8')
     except Exception:
-        pass
+        # 设计内降级：GBK 老档必然在这里失败一次（实测一次解档 2962 次）⇒ 只计数不报警
+        _swallow('fallback')
     try:
         sg = b.decode('gbk')
     except Exception:
-        pass
+        _swallow('fallback')
     if s8 is not None and sg is not None:
         # ★ UTF-8 CJK 三字节序列（E4-E9 开头）计数：真 UTF-8 中文≥2 个基本必中；
         #   GBK 字节偶合概率低（2026-10-14：GBK 误解出的 CJK 数更多曾把
@@ -841,7 +853,7 @@ def load_signature_cache(path=None):
         if isinstance(d, dict) and isinstance(d.get('types'), dict):
             return d
     except Exception:
-        pass
+        _swallow()
     return {'version': 1, 'slots': ['0x%X' % o for o in _SIG_SLOTS], 'types': {}}
 
 
@@ -902,7 +914,7 @@ def read_isomap(map_path):
                 out, _ = lzo1x_decompress(ipk[q:q + i_s], o_s)
                 buf += out
             except Exception:
-                pass
+                _swallow()
             q += i_s
         out = {}
         for q in range(0, len(buf) - 10, 11):
@@ -926,7 +938,7 @@ class SaveDoc(object):
         try:
             self.note_save_dir(path)
         except Exception:
-            pass
+            _swallow()
         self.load()
 
     # ---------- 读取 ----------
@@ -962,7 +974,7 @@ class SaveDoc(object):
                         if rs and rs[-1][0] + rs[-1][1] == len(plain):
                             return plain, [tuple(r) for r in rs], 'cache'
             except Exception:
-                pass
+                _swallow()
         plain, ranges = self._decode(cc)
         if cp and getattr(self, 'write_cache', True):
             try:
@@ -978,9 +990,9 @@ class SaveDoc(object):
                     try:
                         os.remove(old)
                     except Exception:
-                        pass
+                        _swallow()
             except Exception:
-                pass
+                _swallow()
         return plain, ranges, 'decode'
 
     def load(self):
@@ -1084,7 +1096,7 @@ class SaveDoc(object):
             try:
                 self.info['忽略全局AI触发'] = self.ignore_ai_text(new)
             except Exception:
-                pass
+                _swallow()
         return {'old': old, 'new': new, 'off': self.IGNORE_AI_OFF}
 
     def _read_info(self):
@@ -1122,7 +1134,7 @@ class SaveDoc(object):
         try:
             _csf_txt, _csf_key, _csf_short = self._csf_task_name()
         except Exception:
-            pass
+            _swallow()
         if _csf_txt:
             info['任务名'] = _csf_txt
             info['任务名来源'] = 'CSF：%s' % _csf_key
@@ -1238,7 +1250,7 @@ class SaveDoc(object):
                 if d:
                     hints.append(d)
         except Exception:
-            pass
+            _swallow()
         path = _csf_mod.find_csf(*hints)
         if not path:
             return None, None, None
@@ -2592,7 +2604,7 @@ class SaveDoc(object):
                         _tag_sid = next((x['sid'] for x in self.tag_objects()
                                          if x['key'] == _tag_key), None)
             except Exception:
-                pass
+                _swallow()
         raw = v
         # ★★§SOV01（2026-11-03）：引擎用 `-1`（= 0xFFFFFFFF）表示"这个参数没有设置"。
         #   SOV01UMD.sav 的 01000211 / 01000213 两条事件就是这种（地图 INI 里也写 -1）。
@@ -2650,7 +2662,7 @@ class SaveDoc(object):
                 ids = set(r.sid for r in self.records if r.kind == '触发')
                 self._assoc_put(ids, path)
             except Exception:
-                pass
+                _swallow()
         return self._mapm['mode'] if self._mapm else 'no_map'
 
     # ---------- 路径点表（★★★2026-10-17 定案：**就在存档里**，不看地图） ----------
@@ -2836,7 +2848,7 @@ class SaveDoc(object):
             with open(self.MAP_ASSOC_FILE, 'w', encoding='utf-8') as f:
                 json.dump(d, f, ensure_ascii=False, indent=1)
         except Exception:
-            pass
+            _swallow()
 
     def auto_attach_map(self, extra_dirs=(), min_overlap=0.6):
         """按「触发ID 集合」在存档所在目录（及其子目录）里找地图并**自动挂载**。
@@ -2865,7 +2877,7 @@ class SaveDoc(object):
                         self._mapm['cached'] = True
                         return self._mapm['mode']
             except Exception:
-                pass
+                _swallow()
             self._map = None
             self._mapm = None
         seen = set()
@@ -2915,7 +2927,7 @@ class SaveDoc(object):
         try:                                  # ★记住"这份档配这张图"，换目录也认
             self._assoc_put(ids, best[1])
         except Exception:
-            pass
+            _swallow()
         # ★ 用地图的权威 ID 集合**修正记录分类** —— 大型自制任务的档里
         #   「触发定义」与「触发实例」是两个独立数组，定义数组的 +120 处不是
         #   01 01 01 01，启发式会把触发判成「未识别结构」（实测 SAVE5C7B：
@@ -3111,7 +3123,7 @@ class SaveDoc(object):
         try:
             st['tag_owner'] = self.trigger_tag_owner(sid)
         except Exception:
-            pass
+            _swallow()
         tsid = st['tag_owner'] or sid
         if tsid != sid:
             try:
@@ -3125,7 +3137,7 @@ class SaveDoc(object):
         try:
             st['attached'] = self.trigger_attach_count(tsid)
         except Exception:
-            pass
+            _swallow()
         # ★★2026-10-27（玩家："添加行为会卡，然后闪退"）：
         #   `remain` / `live` 都要跑 `attach_overview()`（对每个 CellTag 全档 find，
         #   本档 7.5 秒），而这两个数**只对"持久 1"有意义**（还差几个离场 / 漏账）。
@@ -3139,11 +3151,11 @@ class SaveDoc(object):
             try:
                 st['remain'] = self.semi_persist_remaining(tsid)
             except Exception:
-                pass
+                _swallow()
             try:
                 st['live'] = self.attach_live_count(tsid)
             except Exception:
-                pass
+                _swallow()
         if st['remain'] is not None and st['live'] is not None:
             st['leak'] = st['remain'] - st['live']
         if o['ev'] is not None and o['ev'] + 0x6C <= len(pl):
@@ -3161,7 +3173,7 @@ class SaveDoc(object):
         try:
             st['always_true'] = 8 in [e['type'] for e in self.trigger_event_list(sid)]
         except Exception:
-            pass
+            _swallow()
         if o['node'] is not None:
             _nd = o['node']
             st['ticks'] = int.from_bytes(
@@ -3825,7 +3837,7 @@ class SaveDoc(object):
                             if f and f[0] in ('0', '1', '2'):
                                 p = f[0]
                     except Exception:
-                        pass
+                        _swallow()
                 if p is not None:
                     vals.append(p)
         if vals:
@@ -3836,7 +3848,7 @@ class SaveDoc(object):
             try:
                 return self.trigger_repeat_type(ow)
             except Exception:
-                pass
+                _swallow()
         return None
 
     def detach_map(self):
@@ -4055,7 +4067,7 @@ class SaveDoc(object):
                     from game_tables import arg_label
                     return arg_label(tb, ptype, v)
                 except Exception:
-                    pass
+                    _swallow()
             return str(v)
         if ptype == 38:
             # ★★§SOV31：标签型（`70 摧毁标签`）—— 参数是标签对象的**实例键**（+96），
@@ -4395,7 +4407,7 @@ class SaveDoc(object):
                 try:
                     out.add(sid.decode('ascii'))
                 except Exception:
-                    pass
+                    _swallow()
         self._aiids = out
         return out
 
@@ -5262,7 +5274,7 @@ class SaveDoc(object):
         try:
             names = {r.sid: r.name for r in self.records}
         except Exception:
-            pass
+            _swallow()
         # 被节点引用的标签键
         used = set()
         for n in self.celltag_nodes():
@@ -5638,13 +5650,13 @@ class SaveDoc(object):
                 try:
                     _take(pl[o + 56:o + 64].decode('latin1'))
                 except Exception:
-                    pass
+                    _swallow()
         # 兜底：脚本组校验失败时用解析结果补（宁可多扫一遍，也不能撞号）
         try:
             for x in self.script_types():
                 _take(x.get('sid'))
         except Exception:
-            pass
+            _swallow()
         for r in getattr(self, 'records', []):
             _take(getattr(r, 'sid', ''))
 
@@ -5660,12 +5672,12 @@ class SaveDoc(object):
                     try:
                         best = max(best, int(pl[o + 56:o + 64].decode('latin1'), 16))
                     except Exception:
-                        pass
+                        _swallow()
             for r in getattr(self, 'records', []):
                 try:
                     best = max(best, int(str(r.sid), 16))
                 except Exception:
-                    pass
+                    _swallow()
             out = ['%08X' % (best + 1 + i) for i in range(max(1, int(count)))]
             return out if count > 1 else out[0]
 
@@ -6147,7 +6159,7 @@ class SaveDoc(object):
                     if o['off'] == off:
                         o['index'] = struct.unpack_from('<I', pl, off + 0xAC)[0]
         except Exception:
-            pass
+            _swallow()
         return out
 
     def clone_script(self, entries, tpl_sid=None, name=None, sid=None):
@@ -8463,7 +8475,7 @@ class SaveDoc(object):
                     if 0 < v < 0x1000000:
                         ids.append(v)
         except Exception:
-            pass
+            _swallow()
         old = struct.unpack_from('<I', blob, off)[0]
         new = (max(ids) if ids else old) + 0x10
         for _ in range(65536):
@@ -8528,7 +8540,7 @@ class SaveDoc(object):
                 if k:
                     out.setdefault(k, nm)
         except Exception:
-            pass
+            _swallow()
         return out
 
     def house_key_of(self, house):
@@ -8542,7 +8554,7 @@ class SaveDoc(object):
             if s.lower().startswith('0x'):
                 return int(s, 16)
         except ValueError:
-            pass
+            _swallow()
         hk = self.house_keys()
         s2 = s[:-6].strip() if s.lower().endswith(' house') else s
         cn2short = {v: k for k, v in HOUSE_CN.items()}
@@ -8558,7 +8570,7 @@ class SaveDoc(object):
                 if s in (h.get('short'), h.get('cn'), str(h.get('key'))):
                     return h['key']
         except Exception:
-            pass
+            _swallow()
         return None
 
     @staticmethod
@@ -8663,7 +8675,7 @@ class SaveDoc(object):
             if (sec.get('speedtype') or '').strip().lower() == 'foot':
                 return 'Walk'
         except Exception:
-            pass
+            _swallow()
         # 规则文件读不到（自制单位 / 没有原版 INI）⇒ 退到档内实例，**取多数**
         # （避免像 T54 那样被单个脏样本带偏）
         cnt = {}
@@ -8944,7 +8956,7 @@ class SaveDoc(object):
             for t in self.terrain_objects():
                 occ.add((t['x'], t['y']))
         except Exception:
-            pass
+            _swallow()
         self._occ_memo = (len(self.plain), occ)
         return occ
 
@@ -10105,7 +10117,7 @@ class SaveDoc(object):
                     nm = b['type']
                     break
         except Exception:
-            pass
+            _swallow()
         if state == 'half':
             txt = ('⚠ 半完成（显示残缺，如光棱塔"无头"）：+0x534=0（没建完）但 +0x6E4=1'
                    '（已被接受）⇒ 引擎把模型停在半完成帧，**而且已经按建成算电力**。\n'
@@ -10163,7 +10175,7 @@ class SaveDoc(object):
                 cnt[struct.unpack_from('<I', self.plain, off)[0]] += 1
                 n += 1
         except Exception:
-            pass
+            _swallow()
         if cnt:
             return {'phase': cnt.most_common(1)[0][0], 'src': 'peers', 'n': n}
         # 无同类参照：只有"全库已知"的类型才敢给值，其余不写
@@ -10400,7 +10412,7 @@ class SaveDoc(object):
                 cls._recent_save_dirs[0] if cls._recent_save_dirs else None,
                 cls.GAME_DIR)[0]
         except Exception:
-            pass
+            _swallow()
         return {'rules': rp, 'art': ap, 'game_dir': cls.GAME_DIR,
                 'ok': bool(rp), 'source': kind}
 
@@ -10492,7 +10504,7 @@ class SaveDoc(object):
                             try:
                                 tl[sec.upper()] = int(v)
                             except ValueError:
-                                pass
+                                _swallow()
                         elif k == 'BUILDCAT':
                             # ★BuildCat 决定侧栏归属：Combat ⇒ 「防御」栏（槽组2），
                             #   其余（Power/Resource/Tech/…）⇒ 「建筑」栏（槽组1）。
@@ -10506,7 +10518,7 @@ class SaveDoc(object):
                             try:
                                 cls._rules_power[sec.upper()] = int(float(v))
                             except ValueError:
-                                pass
+                                _swallow()
                 if buildings:
                     break
             except Exception:
@@ -11103,7 +11115,7 @@ class SaveDoc(object):
                                     w, h = fv.split('x')
                                     out[sec] = (int(w), int(h))
                                 except Exception:
-                                    pass
+                                    _swallow()
                 if out:
                     break
             except Exception:
@@ -11345,7 +11357,7 @@ class SaveDoc(object):
                         self._cellbase_memo = (len(pl), b0)
                         return b0
             except Exception:
-                pass
+                _swallow()
         hs, _ = self._bld_group()
         votes = {}
         placed = []                     # 只留"已落位"的建筑
@@ -11504,7 +11516,7 @@ class SaveDoc(object):
                     sum(1 for v in self.find_house_econ().values() if v) < 6:
                 names = [self.norm_house(x['name']) for x in cust]
         except Exception:
-            pass
+            _swallow()
         used = set()
         for nm in names:
             for suffix in ('%s House' % nm, nm):
@@ -12464,7 +12476,7 @@ class SaveDoc(object):
         try:
             return self._newtrig_groups()['ev_size']
         except Exception:
-            pass
+            _swallow()
         evs = self.events()
         if not evs:
             raise RuntimeError('档里没有任何事件对象，无法确定事件对象尺寸')
@@ -14999,7 +15011,7 @@ class SaveDoc(object):
                 if ids:
                     return max(ids)
             except Exception:
-                pass
+                _swallow()
         return None
 
     def nearest_waypoint(self, x, y):
@@ -15305,7 +15317,7 @@ class SaveDoc(object):
                     try:
                         info['cell'] = self.waypoint_cell(int(_wp))
                     except Exception:
-                        pass
+                        _swallow()
                 else:
                     warnings.append('行为 108「创建工具箱」没给路径点 ⇒ 箱子不会刷（引擎找不到落点）')
                 if ac_name:
@@ -15668,7 +15680,7 @@ class SaveDoc(object):
                 try:
                     ac_extra['cell'] = self.waypoint_cell(int(_wp))
                 except Exception:
-                    pass
+                    _swallow()
             else:
                 warnings.append('行为 108「创建工具箱」没给路径点 ⇒ 箱子不会刷（引擎找不到落点）')
             if ac_name:
@@ -16262,6 +16274,12 @@ class SaveDoc(object):
         写完**立即解码回验**；若回验不过（旧档 FAT 不干净会被它截断）则改用
         `cfb_write.rebuild`（从零重建容器）重写一遍 —— 两条路都回验，不允许静默写坏。
 
+        ★★2026-11-06（审核 P0/P1）：**先写同目录 `.rsed-tmp`，全部校验通过后
+          `os.replace` 原子替换目标**。所以：
+            · 任何一步失败 ⇒ 目标文件（含原地保存的原档）**一个字节都没被碰过**；
+            · 不存在"写到一半断电留下半截档"；
+            · 另存为覆盖已存在的文件时也会先备份（旧实现只在原地保存时备份）。
+
         ★★2026-10-27 铁律：**本工具的写盘只允许落到存档（.SAV）**。这里先挡一道：
           目标扩展名像地图（.map/.mmx/.yrm/.mpr）就直接抛 `MapWriteForbidden`，
           免得任何人（包括我以后改代码）把"另存为"指到地图上把玩家的图冲掉。
@@ -16297,45 +16315,84 @@ class SaveDoc(object):
                 '块布局自检不通过，已拒绝写盘：块数 %d（应为 %d，明文 %d B ÷ %d），'
                 '声明 unpacked 异常的块 %r'
                 % (_nb, _expect, len(new_plain), CONTENTS_CHUNK, _bad[:5]))
-        if backup and os.path.abspath(out_path) == os.path.abspath(self.path):
-            bdir = os.path.join(os.path.dirname(os.path.abspath(self.path)), '_备份存档')
-            os.makedirs(bdir, exist_ok=True)
-            ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-            bak = os.path.join(bdir, os.path.basename(self.path) + '.bak-' + ts)
-            shutil.copy2(self.path, bak)
+        # ★★2026-11-06（审核 P0/P1）：**先写同目录临时文件，回读校验通过后再原子替换**。
+        #   旧实现直接写 out_path，踩了三个坑：
+        #     ① 原地保存时 out_path 就是原档 —— surgery 失败后为了"清残档"把原档删了，
+        #        紧接着 `cfb_write.rebuild(self.path, ...)` 找不到源文件 ⇒
+        #        FileNotFoundError + 玩家看到"存档不见了"（审核时已复现）；
+        #     ② 写到一半断电/杀进程 ⇒ 目标文件是半截的（原地保存时半截的就是原档）；
+        #     ③ 另存为覆盖**已存在**的文件时没有任何备份。
+        #   现在：out_path 在 `os.replace` 之前一个字节都不会被碰，
+        #   任何一步失败的最坏结果都是"保持原样"，而不是"留半份坏档"。
+        _same = os.path.abspath(out_path) == os.path.abspath(self.path)
+        _tmp = out_path + '.rsed-tmp'
+        # 备份：原地保存备原档；另存为时若目标已存在，也先备一份（旧实现漏了，会裸覆盖）
+        if backup:
+            _bak_src = self.path if _same else (out_path if os.path.exists(out_path) else None)
+            if _bak_src:
+                bdir = os.path.join(os.path.dirname(os.path.abspath(out_path)), '_备份存档')
+                try:
+                    os.makedirs(bdir, exist_ok=True)
+                    ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+                    bak = os.path.join(bdir, os.path.basename(_bak_src) + '.bak-' + ts)
+                    n = 2
+                    while os.path.exists(bak):      # 同一秒连按两次保存时别互相覆盖
+                        bak = os.path.join(bdir, '%s.bak-%s-%d'
+                                           % (os.path.basename(_bak_src), ts, n))
+                        n += 1
+                    shutil.copy2(_bak_src, bak)
+                except Exception as e_bak:
+                    # 备份不了就不写 —— 没有退路的覆盖比不保存更糟
+                    raise RuntimeError('备份失败，已中止保存（原存档未改动）：%s' % e_bak)
+        # 清掉上一次异常退出留下的临时文件
+        try:
+            if os.path.exists(_tmp):
+                os.remove(_tmp)
+        except Exception:
+            _swallow()
         # ★2026-10-17 23:3x：surgery 自带的 read-back 断言在某些"引擎重写过"的档上会失败
         #   （实测 SAVE0364：插字节后读回不一致）。它是"最小侵入"路线，失败不该中断保存 ——
         #   下面本来就有 end-to-end 校验 + 从零重建容器（cfb_write.rebuild）的兜底，
         #   所以这里把异常接住，交给兜底路径。
         try:
-            cfb_surgery.surgery(self.path, out_path, [('rep', 0, self.contents, new_cc)])
+            cfb_surgery.surgery(self.path, _tmp, [('rep', 0, self.contents, new_cc)])
             surgery_err = None
         except Exception as e_surg:
             surgery_err = e_surg
         # 终验：重新解码并比对明文；不过关则改用「从零重建容器」重写一遍
         def _verify(p):
-            raw = open(p, 'rb').read()
+            with open(p, 'rb') as f:
+                raw = f.read()
             pl2, _ = self._decode(CFB(raw).open('CONTENTS'))
             return raw, pl2
 
         writer = 'surgery'
         try:
-            chk_raw, pl2 = _verify(out_path)
+            chk_raw, pl2 = _verify(_tmp)
         except Exception:
             pl2 = None
             chk_raw = b''
         if surgery_err is not None or pl2 != new_plain:
-            # ★surgery 可能已经写了一半（assert 在写完之后才校验）⇒ 先删掉残档再重建
+            # 临时文件是坏的 ⇒ 删掉重来（**绝不碰 out_path**，原档完好）
             try:
-                if os.path.exists(out_path):
-                    os.remove(out_path)
+                if os.path.exists(_tmp):
+                    os.remove(_tmp)
             except Exception:
-                pass
-            info = cfb_write.rebuild(self.path, {'CONTENTS': new_cc}, out_path)
-            chk_raw, pl2 = _verify(out_path)
+                _swallow()
+            try:
+                info = cfb_write.rebuild(self.path, {'CONTENTS': new_cc}, _tmp)
+                chk_raw, pl2 = _verify(_tmp)
+            except Exception as e_re:
+                raise RuntimeError('保存失败：容器重建也没成功，原存档未改动。\n'
+                                   'surgery 异常：%s\nrebuild 异常：%s' % (surgery_err, e_re))
             writer = 'rebuild(%d 扇区)' % info['sectors']
             if pl2 != new_plain:
-                raise RuntimeError('保存后校验失败：解码明文不一致（surgery 与 rebuild 都不通过）'
+                try:
+                    os.remove(_tmp)
+                except Exception:
+                    _swallow()
+                raise RuntimeError('保存后校验失败：解码明文不一致（surgery 与 rebuild 都不通过）。'
+                                   '原存档未改动'
                                    + ('；surgery 异常：%s' % surgery_err if surgery_err else ''))
         # 分块自检：块数必须与游戏一致（明文/65536 向上取整），块头 unpacked 恒 65536
         cc2 = CFB(chk_raw).open('CONTENTS')
@@ -16344,18 +16401,36 @@ class SaveDoc(object):
         # 写盘前已经判过一次；这里是**落盘后回读**的二次确认（容器层可能改过块表）
         if bad or nblocks != expect:
             try:
-                if os.path.abspath(out_path) != os.path.abspath(self.path):
-                    os.remove(out_path)      # 别把坏档留在玩家选的位置上
+                os.remove(_tmp)
             except Exception:
-                pass
+                _swallow()
             raise RuntimeError(
-                '保存后回读的块布局不对，已删除该输出文件：块数 %d（应为 %d），异常块 %r'
+                '保存后回读的块布局不对，已放弃写入（原存档未改动）：块数 %d（应为 %d），异常块 %r'
                 % (nblocks, expect, bad[:5]))
+        # ★原子替换：同一分区上 `os.replace` 是原子的 ⇒ 要么是新档、要么还是旧档，
+        #   不存在"写了一半"的中间态。目标被游戏/杀毒软件占用时这里会抛错，原档仍完好。
+        try:
+            os.replace(_tmp, out_path)
+        except Exception as e_rep:
+            try:
+                if os.path.exists(_tmp):
+                    os.remove(_tmp)
+            except Exception:
+                _swallow()
+            raise RuntimeError('写入目标文件失败（原存档未改动）：%s' % e_rep)
         res = {'out': out_path, 'recompressed': recompressed,
                'contents': (len(self.contents), len(new_cc)),
                'file': len(chk_raw), 'md5': hashlib.md5(chk_raw).hexdigest(),
                'blocks': nblocks, 'blocks_expect': expect, 'writer': writer,
                'bad_declared': bad}
+        # ★★2026-11-06（审核 §2.3）：保存跑在后台线程，**期间界面仍可编辑**。
+        #   旧实现无条件 `self.plain = bytearray(new_plain)` —— 保存那几秒里做的编辑
+        #   会被"保存开始时的快照"整片覆盖，状态栏却显示"已保存"，玩家完全无感。
+        #   现在：发现明文已经变了 ⇒ **保留内存里的新改动**，只把基准推进到刚写出去的内容
+        #   （`plain_orig = new_plain`）。于是 `modified()` 仍为 True、标题栏继续挂 `*`，
+        #   玩家再点一次保存就能把这些改动写进去 —— 不静默丢，也不假装存过。
+        _concurrent = (self.plain != new_plain)
+        res['edited_during_save'] = _concurrent
         # ★★2026-10-28（审查 P1-5 连带修）：保存成功后把"基准"推进到刚写出的状态。
         #   以前这里什么都不更新，后果有三：
         #     ① `plain_orig` 还是**打开时**的明文 ⇒ `modified()` 永远 True，
@@ -16364,7 +16439,8 @@ class SaveDoc(object):
         #     ③ `self.contents` 还是旧容器流 ⇒ 第二次保存的 surgery 定位会落空（白走 rebuild）。
         self.path = out_path
         self.plain_orig = new_plain
-        self.plain = bytearray(new_plain)
+        if not _concurrent:               # 有并发编辑时不能覆盖，否则就是"静默丢改动"
+            self.plain = bytearray(new_plain)
         self.contents = new_cc
         self.raw = chk_raw                # 让 info['文件大小'] 等也跟着更新
         # `ranges` = [(明文偏移, 明文长度, 容器内偏移, packed 长度)]，`_rechunk` 下次靠它
@@ -16381,20 +16457,22 @@ class SaveDoc(object):
             if rs:
                 self.ranges = rs
         except Exception:
-            pass
-        # 清掉"延迟写"账本，`dirty()` 也跟着归零
-        self.pending_money = None
-        self.pending_houses = {}
-        self.pending_triggers = {}
-        self.pending_events = {}
-        self.pending_actions = {}
-        self.pending_attach = {}
-        self.pending_bld = False
-        self.pending_newtrig = False
+            _swallow()
+        if not _concurrent:
+            # 清掉"延迟写"账本，`dirty()` 也跟着归零
+            # （有并发编辑时不清：那些账目属于**还没写出去**的新改动）
+            self.pending_money = None
+            self.pending_houses = {}
+            self.pending_triggers = {}
+            self.pending_events = {}
+            self.pending_actions = {}
+            self.pending_attach = {}
+            self.pending_bld = False
+            self.pending_newtrig = False
         try:
             self.invalidate_caches()
         except Exception:
-            pass
+            _swallow()
         return res
 
     # ---------- 工具 ----------
@@ -16474,7 +16552,7 @@ class SaveDoc(object):
             try:
                 return raw.decode(code)
             except Exception:
-                pass
+                _swallow()
         return raw.decode('gbk', 'replace')
 
     def _write_name_at(self, off, text, span=52):
@@ -16833,7 +16911,7 @@ class SaveDoc(object):
             try:
                 self.invalidate_caches(rescan=True)
             except Exception:
-                pass
+                _swallow()
         return info
 
     def trigger_has_own_tag(self, sid):
@@ -16861,7 +16939,7 @@ class SaveDoc(object):
                 if not self.trigger_event_list(s):
                     continue
             except Exception:
-                pass
+                _swallow()
             out.append(s)
         return out
 
@@ -16892,7 +16970,7 @@ class SaveDoc(object):
             if self.trigger_has_own_tag(sid) and self.trigger_events_self_contained(sid):
                 return None             # 计时/自足型 + 自己的标签 ⇒ 不靠上级挂接
         except Exception:
-            pass
+            _swallow()
         try:
             chain = self.trigger_seq_info(sid).get('chain') or [sid]
         except Exception:
@@ -17009,7 +17087,7 @@ class SaveDoc(object):
                         '下级必失效，哪怕它自己也有标签）。'
                         % new_sid)
             except Exception:
-                pass
+                _swallow()
             others = [x for x in (self.trigger_link_parents().get(new_sid) or [])
                       if x != sid]
             if others:
@@ -17125,7 +17203,7 @@ class SaveDoc(object):
                 o['cell'] = _o2['cell']
                 o['shared_from'] = tag_owner
             except Exception:
-                pass
+                _swallow()
         rec = o['rec']
         d = {'sid': sid, 'name': rec.name, 'index': None, 'rec_off': rec.off,
              'owner': self.trigger_owner_name(rec), 'disabled': None,
@@ -17165,7 +17243,7 @@ class SaveDoc(object):
                         d['attached'] = nd.get('count') or 0
                         break
             except Exception:
-                pass
+                _swallow()
         evs = self.events()
         byk = self._actions_by_key()
         # ★2026-10-20：事件对象 `+0x50..+0x68` 是**运行期指针区**：
@@ -17947,7 +18025,7 @@ class SaveDoc(object):
                             pl[f:f + 4] = b'\x00' * 4
                             detached.append((bb.get('cx'), bb.get('cy')))
             except Exception:
-                pass
+                _swallow()
         # ② 计时表条目
         timer = False
         if o['cell_key'] is not None:
@@ -17998,7 +18076,7 @@ class SaveDoc(object):
                 self.set_trigger_link(up, child)
                 spliced.append({'up': up, 'down': child})
             except Exception:
-                pass
+                _swallow()
         if child and not link_ups:
             # ★§SOV07（2026-11-04 玩家实测）：**删除上级 ⇒ 下级必失效**，
             #   跟下级自己有没有标签无关（写 B 那种"每条各留标签"也一样）。

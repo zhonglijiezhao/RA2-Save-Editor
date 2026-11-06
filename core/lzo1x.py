@@ -3,6 +3,17 @@
 验证基准 1: 地图 IsoMapPack5 (8192B/块, 社区公认 miniLZO)
 验证基准 2: 存档 CONTENTS 的 64KB 块
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import sys, struct, re, base64
 
 M2_MAX_OFFSET = 0x800
@@ -23,7 +34,8 @@ def lzo1x_decompress(inp, expect_out=None):
             if o is not None and len(o) == expect_out:
                 return o, len(inp)
         except Exception:
-            pass
+            # 设计内降级：DLL 不可用 / 解不了 ⇒ 退回下面的纯 Python 实现（慢但一定对）
+            _swallow('fallback')
     n = len(inp)
     ip = 0
     out = bytearray()

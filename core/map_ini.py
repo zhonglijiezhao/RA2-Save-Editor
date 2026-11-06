@@ -17,6 +17,17 @@ RA2/YR 地图文件是 INI 文本（UTF-8 或 GBK），相关段：
 ★ 关键价值：这些段**以触发ID 为键**，所以是「哪个触发挂哪些事件/行为」的**唯一权威来源**
 （存档里没有这个归属信息）。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 
 
@@ -386,7 +397,7 @@ def find_maps(dirs, exts=('.map', '.yrm')):
                         if n2.lower().endswith(exts):
                             out.append(os.path.join(p, n2))
                 except Exception:
-                    pass
+                    _swallow()
             elif n.lower().endswith(exts):
                 out.append(p)
     return out

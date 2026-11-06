@@ -8,6 +8,17 @@
     （实测：200×200 的图地形跑在 x[6..399] y[1..399]）。画布按内容自动外扩。
   · 缺地形记录的格子 = 地图外（不参与高度判定，画暗色）。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import base64
 import os
 import re
@@ -78,7 +89,7 @@ def _read_isomap_blob(raw):
     try:
         return base64.b64decode(s + b'=' * ((-len(s)) % 4), validate=False)
     except Exception:
-        pass
+        _swallow()
     try:
         from ra2_pack import b64_decode_lenient
         return b64_decode_lenient(s)
@@ -203,7 +214,7 @@ def parse_map(path, use_cache=True):
                 structs.append({'owner': f[0], 'type': f[1],
                                 'x': int(f[3]), 'y': int(f[4]), 'tag': f[6]})
             except Exception:
-                pass
+                _swallow()
     _out = {'path': path, 'size': size, 'theater': theater, 'terrain': terrain,
             'has_terrain': bool(terrain), 'structures': structs, 'info': info,
             'name': name}

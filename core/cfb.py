@@ -11,6 +11,12 @@ NOSTREAM = 0xFFFFFFFF
 class CFB:
     def __init__(self, data):
         self.d = data
+        # ★2026-11-06（审核 §1.3 顺带）：先做**长度**检查再解头。
+        #   以前只有魔数、长度不够的文件会一路走到 `unpack_from` 抛 `struct.error`
+        #   或者更下游的 `IndexError`（两种都让玩家懵）。CFB 头本身就有 512 字节，
+        #   不到 512 的一定不是完整容器 ⇒ 直接给一句能读懂的话。
+        if len(data) < 512:
+            raise ValueError("not a CFB file (truncated: %d bytes)" % len(data))
         if data[:8] != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
             raise ValueError("not a CFB file")
         self.sector_shift = struct.unpack_from("<H", data, 30)[0]

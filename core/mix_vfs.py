@@ -34,6 +34,17 @@ MIX 的解密（Westwood RSA + Blowfish）全部在 `core/mix.py` 里用**纯标
     v.found()                          -> {'soundmd.ini': 'expandmd01.mix', ...}
     v.layers()                         -> [('expandmd99.mix', 1099), ...]（高优先在前）
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import hashlib
 import json
 import os
@@ -178,14 +189,14 @@ def _loose_file(game_dir, name):
         if os.path.isfile(p):
             return p
     except Exception:
-        pass
+        _swallow()
     low = name.lower()
     try:
         for fn in os.listdir(game_dir):
             if fn.lower() == low and os.path.isfile(os.path.join(game_dir, fn)):
                 return os.path.join(game_dir, fn)
     except Exception:
-        pass
+        _swallow()
     return None
 
 
@@ -240,7 +251,7 @@ def _save_cache(path, obj):
             json.dump(obj, f, ensure_ascii=False)
         os.replace(tmp, path)
     except Exception:
-        pass
+        _swallow()
 
 
 # ---------------- 扫描 ----------------
@@ -422,7 +433,7 @@ class GameVFS(object):
                 self._cache_src[key] = '散文件 %s' % os.path.basename(p)
                 return b, self._cache_src[key]
             except Exception:
-                pass
+                _swallow()
         # ② 归档
         rec = self.index().get(key)
         if rec:

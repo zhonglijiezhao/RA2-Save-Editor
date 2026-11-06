@@ -7,9 +7,9 @@
 - 平台：Windows（Python + tkinter，纯标准库，**不需要装任何第三方库**）
 - 语言：界面与文档为中文
 - 许可：**MIT**（见 [LICENSE](LICENSE)；游戏素材声明见 [NOTICE.md](NOTICE.md)）
-- 当前版本：**v1.7.3**（内部构建 `p351`）
+- 当前版本：**v1.7.4**（内部构建 `p353`）
 - **下载（最新）**：https://github.com/zhonglijiezhao/RA2-Save-Editor/releases/latest
-- 本版直达：[v1.7.3](https://github.com/zhonglijiezhao/RA2-Save-Editor/releases/tag/v1.7.3)
+- 本版直达：[v1.7.4](https://github.com/zhonglijiezhao/RA2-Save-Editor/releases/tag/v1.7.4)
 
 ---
 
@@ -57,8 +57,8 @@
 
 ### 3.1 直接用打包好的 exe（不需要 Python）
 
-1. 到 [Releases](https://github.com/zhonglijiezhao/RA2-Save-Editor/releases/latest) 下载 `RA2SaveEditor-v1.7.3-win64.zip`
-2. 解压到**任意**目录（会得到 `RA2SaveEditor-v1.7.3-win64\` 文件夹；不要只解压出 exe —— 必须连 `_internal` 文件夹一起解压）
+1. 到 [Releases](https://github.com/zhonglijiezhao/RA2-Save-Editor/releases/latest) 下载 `RA2SaveEditor-v1.7.4-win64.zip`
+2. 解压到**任意**目录（会得到 `RA2SaveEditor-v1.7.4-win64\` 文件夹；不要只解压出 exe —— 必须连 `_internal` 文件夹一起解压）
 3. 双击 `RA2存档编辑器.exe`
 4. **先备份存档**：把 `C:\Users\你\AppData\...` 或游戏目录 `save\` 里的 `.SAV` 复制一份
 5. 打开存档 → 改 → 用界面上的保存按钮另存为新文件 → 把新文件放回游戏存档目录
@@ -86,6 +86,10 @@ python "RA2存档编辑器.py"
 # 需要一个你自己的 .SAV 存档作为样本
 "RA2存档编辑器.exe" --selftest 你的存档.SAV
 # 结果写在 exe 旁边的 自检结果.txt，最后一行是 SELFTEST PASS 就正常
+
+# 只想验核心（解码/改钱/写盘/触发），不想建界面 —— 没装 tkinter 的 Python 也能跑
+"RA2存档编辑器.exe" --selftest-core 你的存档.SAV
+python app_main.py --selftest-core 你的存档.SAV      # 源码方式，服务器/CI 同理
 ```
 
 ---
@@ -117,20 +121,37 @@ core/
   lzo1x.py lzo_compress.py lzo_fast.*   LZO 解压/压缩（lzo_fast 是自家 C 实现的加速版）
   ai_objects.py        作战小队三大件
   game_ini.py map_ini.py fa2_tables.py 规则与地图 INI
+  errormsg.py          把底层异常翻成人话（坏档/没权限/磁盘满/内存不够）
+  diag.py              静默异常记账（`except pass` 的替代品；默认只记内存，不写盘）
   type_signature.json  建筑/单位的字段指纹（模板健康度检查用）
   ini_builtin/ unit_comp_lib/  内置查表数据
 docs/
   加建筑_所属方_20261017.md   ★主设计文档（190+ 节，存档格式逆向全过程，含全部实测结论）
   其它                   现场笔记 / 历史交接档
-_selftest_*.py         自检脚本（49 个，覆盖触发、局部变量、AI、单位、标签字段……）
+.github/workflows/selftest.yml   CI：语法编译 + 纯逻辑自检（不依赖样本/游戏目录/tkinter）
+ci_compile.py          CI 第一步：按 git ls-files 把仓库里的 .py 全编译一遍（语法门禁）
+icon.ico / icon.png    程序图标（16~256 七档 + 256 PNG）；源图不入库，用 make_icon.py 生成
+make_icon.py           从源图裁切生成图标（裁切参数写在文件头部常数里）
+_selftest_*.py         自检脚本（144 个，覆盖触发、局部变量、AI、单位、标签字段……）
+  _selftest_all.py     总入口（基线对比；`--ci` / `--reasons` / `--drop-fixed`）
+  _selftest_ci_pure.py CI 用的纯逻辑自检（几秒钟，无外部依赖）
 ```
 
 ## 6. 开发 / 打包
 
 ```bash
-# 自检（示例）
+# 语法门禁（和 CI 同一条命令）
+python ci_compile.py
+
+# 单个用例（示例）
 python _selftest_ev192.py
 python _selftest_unit_place.py
+
+# 全量 + 基线对比（只有"相对基线退化"才算失败）
+python _selftest_all.py                 # 发布前跑这个
+python _selftest_all.py --ci            # 只跑 CI 那批（= GitHub Actions 里跑的）
+python _selftest_all.py --reasons       # 看基线里"为什么红"（按原因分组，不跑）
+python _selftest_all.py --drop-fixed    # 已修好的用例从红名单里删掉（只减不增）
 
 # 打包（需要 pip install pyinstaller）
 cd build_work

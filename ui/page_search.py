@@ -6,6 +6,17 @@
   所以 `self.xxx` 照旧指向同一个 App 实例，行为零变化。
   边界 = 原来 `_tab_xxx()` 那整段（含它引用的私有辅助方法）。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 import sys
 
@@ -15,6 +26,7 @@ for _p in (_ROOT, os.path.join(_ROOT, 'core')):
         sys.path.insert(0, _p)
 
 from editor_core import SaveDoc
+from errormsg import explain as _explain_error
 from ui.msg import filedialog
 from ui.msg import messagebox
 from ui.msg import simpledialog
@@ -27,7 +39,6 @@ import struct
 import threading
 import time
 import tkinter as tk
-import traceback
 import ui_theme
 
 
@@ -85,7 +96,7 @@ class SearchPage(object):
         try:
             self.lbl_list_count.config(text='%d 个' % len(files))
         except Exception:
-            pass
+            _swallow()
         self._scan_meta(list(self.tree.get_children())[:12])
 
     # ---- 列表元信息缓存（★2026-10-28 审查 P3-13）----
@@ -128,7 +139,7 @@ class SearchPage(object):
                 json.dump(live, f, ensure_ascii=False)
             os.replace(tmp, p)
         except Exception:
-            pass
+            _swallow()
 
     def _scan_meta(self, items):
         """后台读取前 N 个存档的元信息（任务名/时间/金钱需要完整解码，较慢）。
@@ -227,9 +238,15 @@ class SearchPage(object):
                     self.pbar.stop()
                     self._pending_load = False
                     self._saving = False
-                    messagebox.showerror('出错', msg[1])
+                    # ★2026-11-06（审核 §1.3）：新格式是（标题, 正文）二元组；
+                    #   老格式（纯字符串）仍兼容 —— 别的地方要是还往队列里塞字符串也不会炸。
+                    payload = msg[1]
+                    if isinstance(payload, tuple) and len(payload) == 2:
+                        messagebox.showerror(payload[0], payload[1])
+                    else:
+                        messagebox.showerror('出错', payload)
         except queue.Empty:
-            pass
+            _swallow()
         except Exception as e:                    # 单条坏消息不能让轮询停摆
             self.status.set('后台消息处理异常：%s' % e)
         # ---- 看门狗：长时间没结果就把进度条停掉，绝不"一直转" ----
@@ -239,9 +256,13 @@ class SearchPage(object):
             self.pbar.stop()
             self.status.set('解码超时（>120 秒）—— 请重试，或换一个存档')
         if self._saving and now - self._t_save > 180:
-            self._saving = False
-            self.pbar.stop()
-            self.status.set('保存超时（>180 秒）—— 请确认文件未被占用后重试')
+            # ★2026-11-06（审核 §2.5）：以前这里把 `_saving` 置 False —— 但工作线程**还在写**，
+            #   玩家再点一次保存就会两个线程同时写同一个文件（大档 + 慢盘 + 杀软扫描时不是不可能）。
+            #   现在只提示、不解除锁：宁可让他等一下，也不能让两份写入打架。
+            if not getattr(self, '_save_timeout_warned', False):
+                self._save_timeout_warned = True
+                self.status.set('保存已超过 180 秒仍未结束 —— 请勿重复点击保存；'
+                                '若长时间无响应，关闭程序后可从「_备份存档」恢复')
         # ---- 标题栏的「*未保存」标记（约每 0.6 秒核一次，26MB 明文比较约 2ms）----
         self._title_tick = getattr(self, '_title_tick', 0) + 1
         if self._title_tick % 5 == 0:
@@ -268,7 +289,7 @@ class SearchPage(object):
             else:
                 self.title(base)
         except Exception:
-            pass
+            _swallow()
 
     def _confirm_discard(self, what='继续'):
         """有未保存改动时问一句。→ True 可以继续 / False 中止本次操作。
@@ -304,12 +325,20 @@ class SearchPage(object):
                         '当前存档还有**未保存**的改动，退出后会全部丢失。\n\n确定退出吗？',
                         icon='warning', default='no'):
                     return
+            # ★2026-11-06（审核 §3.3）：正常退出时把"这次会话里被 except pass 吞掉的
+            #   东西"写成一份日志（没有内容就不写文件）。玩家说"用着不对劲"时，
+            #   这份 diag-session-*.log 往往比口头描述有用得多。
+            try:
+                from diag import dump as _diag_dump
+                _diag_dump(prefix='session')
+            except Exception:
+                _swallow()
             self.destroy()
         except Exception:
             try:
                 self.destroy()
             except Exception:
-                pass
+                _swallow()
 
     def _bind_shortcuts(self):
         """★2026-10-28（审查 P1-7）：桌面软件的肌肉记忆。
@@ -324,7 +353,7 @@ class SearchPage(object):
             try:
                 self.bind(seq, fn, add='+')
             except Exception:
-                pass
+                _swallow()
 
         def _wrap(fn):
             def h(_e=None):
@@ -372,8 +401,10 @@ class SearchPage(object):
                 doc = SaveDoc(path)
                 self.q.put(('loaded', doc))
             except Exception as e:
-                self.q.put(('err', '解码 %s 失败：\n%s'
-                            % (os.path.basename(path), traceback.format_exc())))
+                # ★2026-11-06（审核 §1.3）：以前把整段 traceback 弹给玩家，
+                #   截断档会显示 `struct.error: unpack_from requires a buffer of...`。
+                #   现在交给 errormsg 翻成人话（完整 traceback 仍落盘，见提示里的日志路径）。
+                self.q.put(('err', _explain_error(e, path, '打开')))
         threading.Thread(target=work, daemon=True).start()
         # 结果统一由常驻的 _poll() 处理（不要在这里另开"临时等待链"）
 
@@ -415,14 +446,14 @@ class SearchPage(object):
                 _iai = None
             self.lbl_ignore_ai.config(text=self.doc.ignore_ai_text(_iai))
         except Exception:
-            pass
+            _swallow()
         # ★v1.3：操作条右侧显示当前打开的存档（原来只能看状态栏）
         try:
             self.lbl_cur.config(text='已打开　%s' % os.path.basename(self.doc.path)
                                 if getattr(self.doc, 'path', '') else '已打开',
                                 fg=ui_theme.T['ink'])
         except Exception:
-            pass
+            _swallow()
 
     def _st_records(self):
         """② 触发表（大档最慢的一步之一）。"""
@@ -431,13 +462,13 @@ class SearchPage(object):
             try:
                 getattr(self, b).config(state='normal')
             except Exception:
-                pass
+                _swallow()
         self._refresh_unit_rule_label()          # 规则跟着"存档所在目录"走 ⇒ 换档要刷新
         if hasattr(self, 'mv_unit'):
             try:
                 self.mv_unit['values'] = self._unit_type_names()
             except Exception:
-                pass
+                _swallow()
 
     def _st_houses(self):
         """③ 所属方金钱表 + 各下拉的所属方列表。"""
@@ -445,7 +476,7 @@ class SearchPage(object):
         try:
             self._fill_house_lists(log=False)      # ★所属方下拉随开档就绪（2026-10-17）
         except Exception:
-            pass
+            _swallow()
 
     def _st_ai(self):
         """④ 事件 / 行为 / AI（小队·特遣·脚本）/ 挂接。"""
@@ -470,7 +501,7 @@ class SearchPage(object):
         try:
             self.after(400, self._auto_scan_anim)
         except Exception:
-            pass
+            _swallow()
 
     def _set_doc(self, doc):
         """**同步**刷新（自检脚本 / 命令行用；界面上走 `_set_doc_async` 才有读条）。"""
@@ -501,7 +532,7 @@ class SearchPage(object):
             self.pbar.stop()
             self.pbar.config(mode='determinate', maximum=100, value=0)
         except Exception:
-            pass
+            _swallow()
         self.after(1, self._run_doc_stage)
 
     def _run_doc_stage(self):
@@ -515,7 +546,7 @@ class SearchPage(object):
             try:
                 self.pbar['value'] = int(done * 100.0 / self._st_total)
             except Exception:
-                pass
+                _swallow()
             self.status.set('正在载入 %s：%s…（%d/%d，已用 %.1f 秒）'
                             % (os.path.basename(self.doc.path), name,
                                done + 1, self._st_total, time.time() - self._st_t0))
@@ -531,7 +562,7 @@ class SearchPage(object):
                 self.pbar.stop()
                 self.pbar.config(mode='indeterminate')
             except Exception:
-                pass
+                _swallow()
             self.status.set('已载入 %s：%d 条记录 · %s（总耗时 %.1f 秒）' % (
                 os.path.basename(self.doc.path), len(self.doc.records),
                 '未挂地图' if getattr(self, '_map_mode', '') == 'no_map'
@@ -568,7 +599,7 @@ class SearchPage(object):
             self.mv_state['anim_bad'] = bad
             self.mv_state['anim_buildup'] = n_buildup
         except Exception:
-            pass
+            _swallow()
         if not bad:
             return
         names = '、'.join('%s(%d,%d)' % t for t in bad[:3])
@@ -579,7 +610,7 @@ class SearchPage(object):
             self.status.set('%s　⚠ %d 栋建造动画异常（%s）→ 地图页「⏩ 修成完成态」'
                             % (cur, len(bad), names))
         except Exception:
-            pass
+            _swallow()
 
     # ---------------- 操作 ----------------
     def apply_money(self):
@@ -849,6 +880,7 @@ class SearchPage(object):
             self._allow_long_name = True
         self._saving = True
         self._t_save = time.time()
+        self._save_timeout_warned = False
         self.pbar.start(12)
         self.status.set('正在重建压缩块并写盘…')
 
@@ -857,13 +889,21 @@ class SearchPage(object):
                 res = self.doc.save(path)
                 # ★2026-10-28（审查 P0-3）：把块布局核对结果**显式报给玩家**。
                 #   以前这两项算了但没人看，块数不对也照样报"已保存"。
-                self.q.put(('done', '已保存：%s\n重编码 %d 块 · 块布局核对 %d/%d 通过'
-                            ' · 文件 %d B · md5 %s'
-                            % (res['out'], res['recompressed'],
-                               res.get('blocks', -1), res.get('blocks_expect', -1),
-                               res['file'], res['md5'][:12])))
+                msg = ('已保存：%s\n重编码 %d 块 · 块布局核对 %d/%d 通过'
+                       ' · 文件 %d B · md5 %s'
+                       % (res['out'], res['recompressed'],
+                          res.get('blocks', -1), res.get('blocks_expect', -1),
+                          res['file'], res['md5'][:12]))
+                # ★2026-11-06（审核 §2.3）：保存期间界面还能编辑 ⇒ 那些改动没进这个文件，
+                #   必须明说，不能让人以为"已保存"就等于"全存进去了"。
+                if res.get('edited_during_save'):
+                    msg += ('\n\n⚠ 保存期间你还在编辑：这些**新改动没有写进刚保存的文件**，'
+                            '已原样留在界面上（标题栏仍有 *）。请再保存一次。')
+                self.q.put(('done', msg))
             except Exception as e:
-                self.q.put(('err', '%s\n%s' % (e, traceback.format_exc())))
+                # ★2026-11-06（审核 §1.3）：保存失败也走人话提示 —— 而且明确告诉玩家
+                #   "原文件没被改动"（§2.1/§2.2 修完之后这句才是真的）。
+                self.q.put(('err', _explain_error(e, path, '保存')))
         threading.Thread(target=work, daemon=True).start()
 
     def _suggest_save_name(self, src_path):
@@ -906,7 +946,7 @@ class SearchPage(object):
             if len(stem.encode('gbk', 'ignore')) > 40:
                 stem = base[:8] + '_修改'
         except Exception:
-            pass
+            _swallow()
         return _free(stem)
 
     def save_as(self):

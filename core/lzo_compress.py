@@ -11,6 +11,17 @@ v4：长匹配上限抬到 65535（M3 的 0x20 扩展 = 33+255z+last；M4 扩展
   · M4  ：字段 = 实际距离（16384..32767 / 32768..49151，由 token bit3 分档）
 state 恒 0 ⇒ 继续保留"让末尾剩 1..3 字节的匹配放弃"的老规矩。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 MINM, MAXM = 3, 0xFFFF
 M2_MAX_OFF = 2048          # 实际距离上限（token >= 64，长度 3..8）
 M3_MAX_OFF = 16384         # 实际距离上限（token >= 32，长度 3..33；>=34 走 0x20 扩展）
@@ -100,7 +111,7 @@ def compress(data):
         if pk is not None:
             return pk
     except Exception:
-        pass
+        _swallow()
     n = len(data)
     out = bytearray()
     if n == 0:

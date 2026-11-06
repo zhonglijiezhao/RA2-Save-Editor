@@ -2,6 +2,7 @@
  "_selftest": {
   "failed": 0,
   "passed": 0,
+  "reason": "待修",
   "status": "error"
  },
  "_selftest_ai": {
@@ -12,31 +13,55 @@
  "_selftest_attach": {
   "failed": 0,
   "passed": 0,
+  "reason": "待修",
   "status": "error"
+ },
+ "_selftest_ci_pure": {
+  "ci": true,
+  "failed": 0,
+  "passed": 0,
+  "status": "ok"
  },
  "_selftest_country_param": {
   "failed": 2,
   "passed": 5,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_ctrig": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_del_big": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_destroy4": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
+ },
+ "_selftest_diag": {
+  "ci": true,
+  "failed": 0,
+  "passed": 0,
+  "status": "ok"
+ },
+ "_selftest_errormsg": {
+  "ci": true,
+  "failed": 0,
+  "passed": 0,
+  "status": "ok"
  },
  "_selftest_ev13": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_ev168": {
@@ -47,16 +72,19 @@
  "_selftest_ev169": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_ev170": {
   "failed": 13,
   "passed": 34,
+  "reason": "待修",
   "status": "red"
  },
  "_selftest_ev171": {
   "failed": 1,
   "passed": 55,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_ev174": {
@@ -67,11 +95,13 @@
  "_selftest_ev175": {
   "failed": 5,
   "passed": 47,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_ev183": {
   "failed": 3,
   "passed": 11,
+  "reason": "待修",
   "status": "red"
  },
  "_selftest_ev184": {
@@ -87,6 +117,7 @@
  "_selftest_ev193": {
   "failed": 0,
   "passed": 0,
+  "reason": "待修",
   "status": "error"
  },
  "_selftest_ev194": {
@@ -112,26 +143,31 @@
  "_selftest_ev202": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_selftest_ev203": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_selftest_ev204": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_selftest_ev205": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_ev206": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_ev210": {
@@ -142,6 +178,7 @@
  "_selftest_ev211": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_selftest_ev215": {
@@ -157,21 +194,25 @@
  "_selftest_ev217": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_ev218": {
   "failed": 0,
   "passed": 0,
+  "reason": "待修",
   "status": "error"
  },
  "_selftest_ev222": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_ev224": {
   "failed": 0,
   "passed": 0,
+  "reason": "待修",
   "status": "error"
  },
  "_selftest_ev234": {
@@ -207,6 +248,7 @@
  "_selftest_ev252": {
   "failed": 3,
   "passed": 16,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_ev253": {
@@ -252,11 +294,13 @@
  "_selftest_ev265": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_ev271": {
   "failed": 17,
   "passed": 7,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_ev272": {
@@ -267,6 +311,7 @@
  "_selftest_ev273": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_selftest_ev274": {
@@ -287,16 +332,19 @@
  "_selftest_ev279": {
   "failed": 1,
   "passed": 20,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_ev280": {
   "failed": 2,
   "passed": 24,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_ev281": {
   "failed": 1,
   "passed": 34,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_ev283": {
@@ -382,16 +430,19 @@
  "_selftest_game_ini": {
   "failed": 3,
   "passed": 24,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_house": {
   "failed": 1,
   "passed": 36,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_houses": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_lzo": {
@@ -407,6 +458,7 @@
  "_selftest_mapmatch": {
   "failed": 5,
   "passed": 3,
+  "reason": "待修",
   "status": "red"
  },
  "_selftest_mix_encrypted": {
@@ -417,31 +469,37 @@
  "_selftest_mktrig": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_selftest_multi": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_selftest_newtrig": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_newtrig_pieces": {
   "failed": 1,
   "passed": 18,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_persist_write": {
   "failed": 0,
   "passed": 0,
+  "reason": "待修",
   "status": "error"
  },
  "_selftest_record_kind": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_selftest_remove": {
@@ -457,26 +515,37 @@
  "_selftest_repair": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_selftest_repeat_edit": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_selftest_retarget": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_selftest_runtime_state": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
+ },
+ "_selftest_save_atomic": {
+  "ci": true,
+  "failed": 0,
+  "passed": 0,
+  "status": "ok"
  },
  "_selftest_sell3": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_soft_disable": {
@@ -487,21 +556,25 @@
  "_selftest_template": {
   "failed": 2,
   "passed": 11,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_trig_editor_gui": {
   "failed": 1,
   "passed": 62,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_trig_type_col": {
   "failed": 1,
   "passed": 23,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_trigger_editor": {
   "failed": 1,
   "passed": 27,
+  "reason": "缺样本",
   "status": "red"
  },
  "_selftest_trigger_executed": {
@@ -517,6 +590,7 @@
  "_selftest_trigowner": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_trigplace": {
@@ -537,6 +611,7 @@
  "_selftest_var_persist": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_selftest_waypoints": {
@@ -562,61 +637,73 @@
  "_ui_ev202": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_ui_ev203": {
   "failed": 1,
   "passed": 1,
+  "reason": "待修",
   "status": "red"
  },
  "_ui_ev204": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_ui_ev206": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_ui_ev208": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_ui_ev216": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "skip"
  },
  "_ui_ev221": {
   "failed": 1,
   "passed": 8,
+  "reason": "缺样本",
   "status": "red"
  },
  "_ui_ev222": {
   "failed": 1,
   "passed": 4,
+  "reason": "缺样本",
   "status": "red"
  },
  "_ui_ev223": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_ui_ev225": {
   "failed": 1,
   "passed": 0,
+  "reason": "缺样本",
   "status": "red"
  },
  "_ui_ev226": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_ui_ev235": {
   "failed": 2,
   "passed": 8,
+  "reason": "缺样本",
   "status": "red"
  },
  "_ui_ev247": {
@@ -627,6 +714,7 @@
  "_ui_ev253": {
   "failed": 1,
   "passed": 18,
+  "reason": "待修",
   "status": "red"
  },
  "_ui_ev254": {
@@ -642,6 +730,7 @@
  "_ui_ev256": {
   "failed": 1,
   "passed": 11,
+  "reason": "缺样本",
   "status": "red"
  },
  "_ui_ev257": {
@@ -652,6 +741,7 @@
  "_ui_ev258": {
   "failed": 1,
   "passed": 34,
+  "reason": "缺样本",
   "status": "red"
  },
  "_ui_ev259": {
@@ -682,16 +772,19 @@
  "_ui_ev267": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_ui_ev268": {
   "failed": 0,
   "passed": 0,
+  "reason": "缺样本",
   "status": "error"
  },
  "_ui_ev269": {
   "failed": 0,
   "passed": 0,
+  "reason": "待修",
   "status": "error"
  },
  "_ui_ev283": {

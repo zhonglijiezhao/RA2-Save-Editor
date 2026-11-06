@@ -6,6 +6,17 @@
   所以 `self.xxx` 照旧指向同一个 App 实例，行为零变化。
   边界 = 原来 `_tab_xxx()` 那整段（含它引用的私有辅助方法）。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 import sys
 
@@ -250,7 +261,7 @@ class WeaponsPage(object):
                     self._btn_wpn_export.pack_forget()   # 导出的武器表，单位视图下不适用
                     self.lbl_wpn_count.config(text='')
                 except Exception:
-                    pass
+                    _swallow()
                 self._wpn_wrap.pack_forget()
                 self._unit_wrap.pack(fill='both', expand=True, before=self._wpn_bot)
                 self._o_wpn_stats.pack_forget()
@@ -263,7 +274,7 @@ class WeaponsPage(object):
                 try:
                     self._btn_wpn_export.pack(side='right')
                 except Exception:
-                    pass
+                    _swallow()
                 self._wpn_wrap.pack(fill='both', expand=True, before=self._wpn_bot)
                 self._o_unit.pack_forget()
                 self._o_wpn_stats.pack(fill='x')
@@ -273,7 +284,7 @@ class WeaponsPage(object):
             try:
                 self.lbl_wpn_mode.config(text='切换视图失败：%s' % e)
             except Exception:
-                pass
+                _swallow()
 
     def refresh_units(self):
         """填「单位」列表：型号 / 名称 / 主武器 / 副武器 / 精英主武器。"""
@@ -282,11 +293,11 @@ class WeaponsPage(object):
         try:
             self.utw.delete(*self.utw.get_children())
         except Exception:
-            pass
+            _swallow()
         try:
             self.lbl_unit_msg.config(text='')
         except Exception:
-            pass
+            _swallow()
         self._unit_rows = {}
         rows = []
         try:
@@ -295,7 +306,7 @@ class WeaponsPage(object):
             try:
                 self.lbl_wpn_mode.config(text='读不到单位表：%s' % e)
             except Exception:
-                pass
+                _swallow()
         for i, r in enumerate(rows):
             sl = r['slots']
             self.utw.insert('', 'end', iid=str(i),
@@ -308,7 +319,7 @@ class WeaponsPage(object):
             self.lbl_wpn_mode.config(
                 text='可改型号 %d 个（深色 = 本局场上出现过）' % len(rows))
         except Exception:
-            pass
+            _swallow()
         try:
             names = sorted({w['name'] for w in self.doc.weapon_objects()}) if self.doc else []
         except Exception:
@@ -317,7 +328,7 @@ class WeaponsPage(object):
             try:
                 cb['values'] = names
             except Exception:
-                pass
+                _swallow()
 
     def _unit_pick(self, _e=None):
         """选中一个型号 ⇒ 把它的 4 个槽填进下拉。"""
@@ -325,7 +336,7 @@ class WeaponsPage(object):
         try:
             sel = self.utw.selection()
         except Exception:
-            pass
+            _swallow()
         if not sel:
             return
         r = (getattr(self, '_unit_rows', None) or {}).get(sel[0])
@@ -337,13 +348,13 @@ class WeaponsPage(object):
                 text='%s ｜ %s%s' % (r['type'], r['cn'] or '—',
                                      '' if r['in_game'] else '（本局没造）'))
         except Exception:
-            pass
+            _swallow()
         for key, _rel, _lab in SaveDoc.UNIT_WEAPON_SLOTS:
             nm = r['slots'][key]['name'] or ''
             try:
                 self._unit_slot_var[key].set(nm)
             except Exception:
-                pass
+                _swallow()
             self._unit_slot_old[key] = nm
         # ★这里**不要**清消息：`selection_set()` 排队的 <<TreeviewSelect>> 会在
         #   update 时才派发，如果这里清空，就会把「应用」刚写好的提示擦掉
@@ -356,7 +367,7 @@ class WeaponsPage(object):
             try:
                 self.lbl_unit_msg.config(text='先在左边选一个单位')
             except Exception:
-                pass
+                _swallow()
             return
         todo = []
         for key, _rel, _lab in SaveDoc.UNIT_WEAPON_SLOTS:
@@ -371,7 +382,7 @@ class WeaponsPage(object):
             try:
                 self.lbl_unit_msg.config(text='没有改动')
             except Exception:
-                pass
+                _swallow()
             return
         lab = {k: l for k, _o, l in SaveDoc.UNIT_WEAPON_SLOTS}
         lines = ['%s（%s）' % (r['type'], r['cn'] or '—'), '',
@@ -398,7 +409,7 @@ class WeaponsPage(object):
                     self.utw.selection_set(iid)
                     self.utw.see(iid)
                 except Exception:
-                    pass
+                    _swallow()
                 self._unit_pick()
                 break
         if errs:
@@ -413,11 +424,11 @@ class WeaponsPage(object):
             try:
                 self.lbl_unit_msg.config(text='已改：' + '；'.join(bits)[:140])
             except Exception:
-                pass
+                _swallow()
             try:
                 self.status.set('已改 %s 的武器：%s' % (r['type'], '；'.join(bits)[:90]))
             except Exception:
-                pass
+                _swallow()
 
     def _unit_revert(self):
         """把选中型号的武器按 rules 还原（只在 rules 里有值时才动）。"""
@@ -426,7 +437,7 @@ class WeaponsPage(object):
             try:
                 self.lbl_unit_msg.config(text='先在左边选一个单位')
             except Exception:
-                pass
+                _swallow()
             return
         kv = (SaveDoc._rules_all() or {}).get(r['type']) or {}
         todo = []
@@ -438,7 +449,7 @@ class WeaponsPage(object):
             try:
                 self.lbl_unit_msg.config(text='已经和 rules 一致')
             except Exception:
-                pass
+                _swallow()
             return
         lab = {k: l for k, _o, l in SaveDoc.UNIT_WEAPON_SLOTS}
         lines = ['%s（%s）按 rules 还原：' % (r['type'], r['cn'] or '—'), '']
@@ -461,7 +472,7 @@ class WeaponsPage(object):
                     self.utw.selection_set(iid)
                     self.utw.see(iid)
                 except Exception:
-                    pass
+                    _swallow()
                 self._unit_pick()
                 break
         if errs:
@@ -470,7 +481,7 @@ class WeaponsPage(object):
             try:
                 self.lbl_unit_msg.config(text='已按 rules 还原 %d 个槽' % len(todo))
             except Exception:
-                pass
+                _swallow()
 
     def _wpn_export(self):
         """导出武器表（★2026-10-28：玩家要求 INI 格式，更符合红警）。
@@ -537,7 +548,7 @@ class WeaponsPage(object):
                     if kv.get(k, '').strip() == weapon:
                         out.append('%s %s（%s）' % (sec, kv.get('Name', ''), k))
         except Exception:
-            pass
+            _swallow()
         return out
 
     def _wpn_diff_of(self, w):
@@ -571,7 +582,7 @@ class WeaponsPage(object):
             else:
                 self.refresh_weapons()
         except Exception:
-            pass
+            _swallow()
 
     def refresh_weapons(self):
         """填左侧武器列表（★2026-10-28）。"""
@@ -646,7 +657,7 @@ class WeaponsPage(object):
         try:
             wh = next((x for x in self.doc.warhead_objects() if x['name'] == whname), None)
         except Exception:
-            pass
+            _swallow()
         self.lbl_wh_name.config(text=whname if wh else '%s（存档里没有这个弹头对象）' % whname)
         for i, v in enumerate(self._verse_var):
             if wh:

@@ -213,12 +213,6 @@ def main():
             semver = args[args.index('--ver') + 1]
         except Exception:
             print('--ver 后面要跟版本号（如 1.4.0）'); return 2
-    semver = '1.4.0'
-    if '--ver' in args:
-        try:
-            semver = args[args.index('--ver') + 1]
-        except Exception:
-            print('--ver 后面要跟版本号（如 1.4.0）'); return 2
     if '--clean' in args:
         print('清理旧构建目录（保留最近 %d 个 build_dist_p*）' % KEEP_DISTS)
         return prune_dists(dry=('--dry' in args))

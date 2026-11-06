@@ -22,6 +22,17 @@
   ② UTF-16LE 原样
   ③ GBK
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 import struct
 
@@ -73,15 +84,15 @@ def _decode(raw):
     try:
         cands.append(bytes(b ^ 0xFF for b in raw).decode('utf-16le', 'replace'))
     except Exception:
-        pass
+        _swallow()
     try:
         cands.append(raw.decode('utf-16le', 'replace'))
     except Exception:
-        pass
+        _swallow()
     try:
         cands.append(raw.decode('gbk', 'replace'))
     except Exception:
-        pass
+        _swallow()
     if not cands:
         return ''
     return max(cands, key=_score).strip('\x00').strip()

@@ -4,6 +4,17 @@
 ★2026-10-28（审查 P2-8）：从主程序拆出来 —— 触发页要用它，
   留在主文件里就成了"页面 ↔ 主程序"的循环导入。
 """
+# ★2026-11-06（审核 §3.3）：静默异常统一记账（绝不抛、默认只记内存）。
+#   本文件里原来的 `except ...: pass` 已换成 `_swallow()` —— 行为完全不变，
+#   但被吞掉的东西会进 diag 缓冲区，随错误日志/退出时落盘，排障不再靠猜。
+try:
+    from diag import swallow as _swallow
+except Exception:                    # diag 不可达（极端情况）⇒ 退化成原来的 pass
+    try:
+        from core.diag import swallow as _swallow
+    except Exception:
+        def _swallow(*a, **k):
+            pass
 import os
 import sys
 
@@ -65,7 +76,7 @@ class TriggerEditor(tk.Toplevel):
                         sid = _r.sid
                         break
                 except Exception:
-                    pass
+                    _swallow()
         self.reload(sid)
         self.bind('<Escape>', lambda e: self.destroy())
         if new:
@@ -84,7 +95,7 @@ class TriggerEditor(tk.Toplevel):
             self.geometry('%dx%d' % (max(880, self.winfo_reqwidth()),
                                      max(740, self.winfo_reqheight())))
         except Exception:
-            pass
+            _swallow()
 
     # ---------------- 构建 ----------------
     def _build(self):
@@ -322,7 +333,7 @@ class TriggerEditor(tk.Toplevel):
             me = self.doc.player_house()
             self.cb_owner.set(me if me in hs else (hs[0] if hs else ''))
         except Exception:
-            pass
+            _swallow()
         self.cb_rep.current(0)
         self.lbl_rep_hint.config(text='')
         self.var_dis.set(False)
@@ -358,7 +369,7 @@ class TriggerEditor(tk.Toplevel):
             self.cb_link.set('（新建 · 建完再设）')
             self.lbl_link.config(text='新触发 = 新链的链头（自带标签），建完再选下级')
         except Exception:
-            pass
+            _swallow()
         self.app.status.set('新建触发：现在还没写进存档，点「✔ 保存该触发」才创建')
 
     def _blocked_in_new(self):
@@ -513,7 +524,7 @@ class TriggerEditor(tk.Toplevel):
                         and isinstance(_rs['remain'], int)):
                     state += '·持久1 还差 %d 个对象离场' % _rs['remain']
         except Exception:
-            pass
+            _swallow()
         # ★§SOV03：关联触发（FA2「关联触发」= 主触发把标签共享给从触发，从触发标签已删）
         try:
             _sh = self.doc.trigger_shared_info(sid)
@@ -529,7 +540,7 @@ class TriggerEditor(tk.Toplevel):
                 state = ('⚠ 上级 %s 已禁用 ⇒ 本条永远不会触发　｜　'
                          % _rs['blocked_by']) + state
         except Exception:
-            pass
+            _swallow()
         self.lbl_state.config(text=state)
         self._fill_link(sid)
         # 事件下拉（选项 = 编号 + 名称）
@@ -619,7 +630,7 @@ class TriggerEditor(tk.Toplevel):
                 self.tv_ev.selection_set(kids[0])
                 self.tv_ev.focus(kids[0])
         except Exception:
-            pass
+            _swallow()
 
     def _ev_count_hint(self):
         n = len(getattr(self, '_ev_rows', []) or [])
@@ -630,7 +641,7 @@ class TriggerEditor(tk.Toplevel):
         try:
             self.lbl_evcnt.config(text=txt, foreground=col)
         except Exception:
-            pass
+            _swallow()
 
     def _ev_pick(self):
         """选中列表某行 → 把类型/参数回填到上面的编辑控件（与行为列表同样的手感）。"""
@@ -779,7 +790,7 @@ class TriggerEditor(tk.Toplevel):
                 me = '（自己）' if r.sid == getattr(self, '_cur', None) else ''
                 out.append(('%s %s%s' % (r.sid, r.name, me), r.sid))
         except Exception:
-            pass
+            _swallow()
         return out
 
     def _tag_ref_text(self, v):
@@ -811,7 +822,7 @@ class TriggerEditor(tk.Toplevel):
                     nm += '（自己的标签）'
                 out.append((nm, t['sid']))
         except Exception:
-            pass
+            _swallow()
         return out
 
     def _tag_from_text(self):
@@ -963,7 +974,7 @@ class TriggerEditor(tk.Toplevel):
                                           '  〔自己有标签〕' if r.sid in has_tag else ''),
                             r.sid))
         except Exception:
-            pass
+            _swallow()
         return out
 
     def _fill_link(self, sid=None):
@@ -973,13 +984,13 @@ class TriggerEditor(tk.Toplevel):
         try:
             self.cb_link['values'] = [c[0] for c in self._link_choices_cache]
         except Exception:
-            pass
+            _swallow()
         if not sid:
             try:
                 self.cb_link.set('（无 · 链尾）')
                 self.lbl_link.config(text='')
             except Exception:
-                pass
+                _swallow()
             return
         names = {}
         try:
@@ -987,7 +998,7 @@ class TriggerEditor(tk.Toplevel):
                 if r.kind == '触发':
                     names.setdefault(r.sid, r.name)
         except Exception:
-            pass
+            _swallow()
         info, down = None, None
         try:
             info = self.doc.trigger_seq_info(sid)
@@ -1005,7 +1016,7 @@ class TriggerEditor(tk.Toplevel):
         try:
             self.cb_link.set(cur)
         except Exception:
-            pass
+            _swallow()
         parts = []
         if info:
             up = info.get('up')
@@ -1055,11 +1066,11 @@ class TriggerEditor(tk.Toplevel):
                 elif up:
                     parts.append('本条是链尾')
             except Exception:
-                pass
+                _swallow()
         try:
             self.lbl_link.config(text='　·　'.join(parts))
         except Exception:
-            pass
+            _swallow()
 
     def apply_link(self):
         """把下拉里选的那条写成**本条的下级** —— 只写记录帧 +132 的 4 个字节。
@@ -1173,7 +1184,7 @@ class TriggerEditor(tk.Toplevel):
                 self.clipboard_append(text)
                 self.app.status.set('已复制 %d 个单元标记坐标' % len(cells))
             except Exception:
-                pass
+                _swallow()
         ttk.Button(row, text='复制全部', command=_copy).pack(side='left')
         ttk.Button(row, text='关闭', command=dlg.destroy).pack(side='right')
 
@@ -1230,7 +1241,7 @@ class TriggerEditor(tk.Toplevel):
         try:
             self._refresh_state_only()
         except Exception:
-            pass
+            _swallow()
 
     def clear_celltag_flags(self):
         """把 CellTag 的抑制位 `+0x34` / 重入残留 `+0x35` 清零（正常档本来就是 0）。"""
@@ -1377,7 +1388,7 @@ class TriggerEditor(tk.Toplevel):
                             combo.set(arg_label(tb, ptype, cur))
                         return
                 except Exception:
-                    pass
+                    _swallow()
                 combo['values'] = []
                 return
             if ptype == 31:
@@ -1515,7 +1526,7 @@ class TriggerEditor(tk.Toplevel):
                     continue
                 out.append(('%s  %s' % (t['sid'], t['name']), t['key']))
         except Exception:
-            pass
+            _swallow()
         return out
 
     def _fill_team_values(self, combo, cur_key):
@@ -1541,7 +1552,7 @@ class TriggerEditor(tk.Toplevel):
                 if t['sid'] and t['sid'] in s:
                     return t['key']
         except Exception:
-            pass
+            _swallow()
         if s.lower().startswith('0x'):
             try:
                 return int(s, 16)
@@ -1564,7 +1575,7 @@ class TriggerEditor(tk.Toplevel):
                 self.lbl_wp_hint.config(
                     text='（上面的「参数」= 小队，这里 = 刷出来的位置；留空 = 0）')
         except Exception:
-            pass
+            _swallow()
 
     def _show_wp(self, show):
         try:
@@ -1574,7 +1585,7 @@ class TriggerEditor(tk.Toplevel):
             else:
                 self.row_wp.pack_forget()
         except Exception:
-            pass
+            _swallow()
 
     def _trig_from_text(self):
         """从参数框文字里取触发 sid（`01000000 AAAAAA（自己）` → `01000000`）。"""
@@ -1729,7 +1740,7 @@ class TriggerEditor(tk.Toplevel):
                               '（实测存在行为对象 +164，不是 +72）') + \
                              ('　' + nt if nt else '')
         except Exception:
-            pass
+            _swallow()
         # ★2026-10-20：附带「引擎口径」的参数类型（来自地图 [Actions] 真实数据），
         #   避免再拿地编口径的数字去填——两者编号不同（见主文档 §126）。
         try:
@@ -1741,7 +1752,7 @@ class TriggerEditor(tk.Toplevel):
                                     for x in sorted(_pts))
                     nt = ('引擎参数类型：%s' % _t) + ('　' + nt if nt else '')
         except Exception:
-            pass
+            _swallow()
         self.lbl_achint.config(text=nt or '（该行为没有备注）')
 
     def _ac_pick(self):
@@ -1885,7 +1896,7 @@ class TriggerEditor(tk.Toplevel):
             self.app.status.set('正在插入行为…（大档约 2 秒）')
             self.app.update_idletasks()
         except Exception:
-            pass
+            _swallow()
         try:
             self.doc.add_action(self._cur, _t, arg, **kw)
         except Exception as e:
@@ -1895,7 +1906,7 @@ class TriggerEditor(tk.Toplevel):
             try:
                 self.config(cursor='')
             except Exception:
-                pass
+                _swallow()
         self.after_change('已添加行为：%s（%s）'
                           % (ACTION_TYPES[_t][0],
                              self._ac_text(_t, arg, kw.get('team') or 0,
@@ -2033,7 +2044,7 @@ class TriggerEditor(tk.Toplevel):
             self.after(60, lambda: (self.ent_name.focus_set(),
                                     self.ent_name.select_range(0, 'end')))
         except Exception:
-            pass
+            _swallow()
 
     def copy_trigger(self):
         if self._blocked_in_new():
@@ -2260,14 +2271,14 @@ class TriggerEditor(tk.Toplevel):
                     '名字太长：存档里触发名是 52 字节的 GBK 字段（上限 %d 字节，'
                     '约 25 个汉字 / 50 个英文字符）—— 这次**没有写入**' % self.NAME_MAX_BYTES)
             except Exception:
-                pass
+                _swallow()
             return
         if getattr(self, '_new_mode', False):
             self._pending_name = nm
             try:
                 self.app.status.set('新建触发名：%s（点「新建」立即创建）' % nm)
             except Exception:
-                pass
+                _swallow()
             return
         cur = getattr(self, '_cur', None)
         if not cur:
@@ -2280,7 +2291,7 @@ class TriggerEditor(tk.Toplevel):
             self.app._lists_dirty = True
             self.app.status.set('触发名 → %s（已写进内存，回主窗口「保存」才落盘）' % nm)
         except Exception:
-            pass
+            _swallow()
 
     def after_change(self, msg, new_sid=None):
         """改完一处后的收尾。
@@ -2293,7 +2304,7 @@ class TriggerEditor(tk.Toplevel):
         try:
             self.app._lists_dirty = True
         except Exception:
-            pass
+            _swallow()
         self.app.status.set(msg + '（尚未保存）')
         self.reload(new_sid or self._cur)
 
@@ -2306,8 +2317,8 @@ class TriggerEditor(tk.Toplevel):
                 self.app.refresh_events()
                 self.app.refresh_actions()
         except Exception:
-            pass
+            _swallow()
         try:
             tk.Toplevel.destroy(self)
         except Exception:
-            pass
+            _swallow()
