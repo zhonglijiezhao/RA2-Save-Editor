@@ -1357,9 +1357,61 @@ class TriggerEditor(tk.Toplevel):
             raise ValueError('参数要以数字开头：%r' % t)
         return int(m.group(1))
 
+    def _var_choices(self, limit=99):
+        """局部变量型参数的候选 → `[(显示文字, 引擎索引), …]`。
+
+        ★★§SOV32（2026-11-07 玩家：「新建局部变量后 触发行为 下拉表为空」）：
+        地编 ptype=3 = **局部变量型**（行为 56/57 设置·清除局部变量、事件 36/37
+        局部变量被设置·清除），参数存的是**引擎索引（0 基）** —— 就是局部变量页
+        「引擎索引」那一列，不是「地编第几条」。地编的下拉就是这个变量清单，
+        所以这里等价照搬：0..98 共 99 条（FA2 只开放 99 条），有名字的显示名字。
+        """
+        out = []
+        try:
+            rows = self.doc.local_var_table() or []
+        except Exception:
+            return out
+        for r in rows:
+            i = int(r['index'])
+            if i >= limit:
+                continue
+            nm = (r.get('name') or '').strip()
+            if nm:
+                lab = '%d %s' % (i, nm)
+                if r.get('source') != 'map':
+                    lab += '（仅存档）'      # 地编 FA2 里选不中，但它照样能跑
+            elif (r.get('name_map') or '').strip():
+                lab = '%d %s（地图）' % (i, r['name_map'].strip())
+            else:
+                lab = '%d （未定义）' % i
+            out.append((lab, i))
+        return out
+
+    def _var_label(self, idx):
+        """局部变量号 → `'0 V1'` 这种人话（认不出就给原号）。"""
+        try:
+            for lab, i in self._var_choices():
+                if i == int(idx):
+                    return lab
+        except Exception:
+            _swallow()
+        return '变量 %s' % idx
+
     def _fill_arg_values(self, combo, ptype, cur):
         """按参数类型给参数下拉填候选值（所属方型 = 阵营顺序，0 恒为玩家自己）。"""
         try:
+            if ptype == 3:
+                # ★★§SOV32（2026-11-07 玩家：新建局部变量后参数下拉为空）：
+                #   ptype=3 = 局部变量型 —— 以前没有这一支，直接落到最后的 else
+                #   `combo['values'] = []` ⇒ 行为 56/57 和事件 36/37 的参数下拉恒空，
+                #   玩家只能盲填数字。现在下拉 = 本档局部变量清单（引擎索引）。
+                _ch = self._var_choices()
+                combo['values'] = [c[0] for c in _ch]
+                if isinstance(cur, int) and _ch:
+                    combo.set(self._var_label(cur))
+                elif not _ch:
+                    combo.set('%s' % (cur if cur is not None else 0))
+                return
             if ptype == 38:
                 # ★★§SOV31（2026-11-05 玩家：「地编的做法就是列表就是标签的列表」）：
                 #   行为 `70 摧毁标签` —— 下拉 = 本档全部标签（Tag），存的是标签对象的实例键。
@@ -1716,6 +1768,14 @@ class TriggerEditor(tk.Toplevel):
                         nt = ('标签型：参数 = 目标标签（存在行为对象 +96 的实例键）—— '
                               '执行后这个标签连同挂在它上面的所有触发一起被销毁') + \
                              ('　' + nt if nt else '')
+                    elif pt == 3:
+                        # ★★§SOV32（2026-11-07）：局部变量型（56/57 设置·清除局部变量）
+                        _ch3 = self._var_choices()
+                        _n_named = len([1 for l, _i in _ch3 if '未定义' not in l])
+                        nt = ('局部变量型：参数 = 引擎索引（0 起），下拉就是「局部变量…」'
+                              '窗口里那 99 条清单（有名字的 %d 条，含地图 [VariableNames]）。'
+                              'FA2 里选不中不影响执行 —— 引擎只认存档里这个号。'
+                              % _n_named) + ('　' + nt if nt else '')
                     elif k == self.doc.CRATE_ACTION:
                         nt = ('创建工具箱：参数 = 奖励箱类型（+164）；下面「路径点」= 箱子刷到哪个点'
                               '（+0x58，和援军/建建筑同一个字段）。路径点留空/为 0 ⇒ 箱子不刷。') + \
