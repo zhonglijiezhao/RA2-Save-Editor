@@ -750,12 +750,24 @@ _CACHE = {}
 
 
 def get_types(save_dir=None, game_dir=None, map_path=None):
-    """进程内缓存（同一套规则文件只解析一次）。"""
+    """进程内缓存（同一套规则文件只解析一次）。
+
+    ★★2026-11-07（玩家：「地图页卡一会儿」）：原来先 `GameTypes(...)`（**构造里就把 rulesmd /
+      artmd / 地图 INI 全解析一遍**，本档 0.42 秒 ×3 次），**然后才查缓存** —— 缓存命中等于没命中。
+      现在先只用 `find_sources()` 求出路径（纯文件存在性检查，微秒级）再拿它当键。
+    """
+    try:
+        _kind, _dir, rules_path, art_path = find_sources(save_dir, game_dir)
+    except Exception:
+        rules_path = art_path = None
+    mp = map_path if (map_path and os.path.isfile(map_path)) else None
+    key = (rules_path, art_path, mp)
+    g = _CACHE.get(key)
+    if g is not None:
+        return g
     g = GameTypes(save_dir, game_dir, map_path)
-    key = (g.rules_path, g.art_path, g.map_path)
-    if key not in _CACHE:
-        _CACHE[key] = g
-    return _CACHE[key]
+    _CACHE[key] = g
+    return g
 
 
 def clear_cache():
