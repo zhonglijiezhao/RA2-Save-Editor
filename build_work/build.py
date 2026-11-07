@@ -134,7 +134,26 @@ def version_text():
 '''
 
 
-def write_app_version(ver, semver='1.4.2'):
+def _current_semver(default='0.0.0'):
+    """读 `core/app_version.py` 里**现有**的 SEMVER —— 打包没给 `--ver` 时就用它。
+
+    ★2026-11-07（玩家：「推送」时发现界面版本倒退成 1.4.0）：原来 `main()` 里缺省是
+      **硬编码 '1.4.0'**，于是「忘了传 --ver 的打包」会把 SEMVER 从 1.7.5 直接冲回 1.4.0
+      （p361 → p371 就是这么坏的：构建号前进了，版本号反而倒退）。
+      缺省语义应该是"只刷构建号，不动版本号"，所以缺省值必须**读当前值**，
+      而不是钉死某个历史版本。
+    """
+    try:
+        s = open(APPVER, encoding='utf-8').read()
+        m = re.search(r"(?m)^SEMVER\s*=\s*['\"]([^'\"]+)['\"]", s)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return default
+
+
+def write_app_version(ver, semver=None):
     """把 `core/app_version.py` 的 SEMVER / BUILD 刷成本次打包的值 → 路径。
 
     ★2026-10-29（玩家要求「主页面加版本号」）：界面要显示版本，就得有个**程序自己能读**
@@ -145,6 +164,8 @@ def write_app_version(ver, semver='1.4.2'):
         v = int(ver)
     except Exception:
         v = 0
+    if not semver:
+        semver = _current_semver()
     try:
         s = open(APPVER, encoding='utf-8').read()
     except Exception:
@@ -162,7 +183,7 @@ def write_app_version(ver, semver='1.4.2'):
     return APPVER
 
 
-def write_version_info(ver, semver='1.4.0'):
+def write_version_info(ver, semver=None):
     """写 `_version_info.txt`（PyInstaller 版本资源）→ 路径。
 
     ★2026-10-28：以前 exe 的"属性→详细信息"全是空的 —— 玩家报 bug 时说不出
@@ -176,6 +197,8 @@ def write_version_info(ver, semver='1.4.0'):
         v = int(ver)
     except Exception:
         v = 0
+    if not semver:
+        semver = _current_semver()
     try:
         a, b, c = (list(map(int, str(semver).split('.'))) + [0, 0, 0])[:3]
     except Exception:
@@ -207,12 +230,12 @@ def check(dist_inner=DIST_INNER):
 
 def main():
     args = sys.argv[1:]
-    semver = '1.4.0'
+    semver = _current_semver()          # ★缺省沿用当前版本号，只前进构建号（见 _current_semver）
     if '--ver' in args:
         try:
             semver = args[args.index('--ver') + 1]
         except Exception:
-            print('--ver 后面要跟版本号（如 1.4.0）'); return 2
+            print('--ver 后面要跟版本号（如 %s）' % semver); return 2
     if '--clean' in args:
         print('清理旧构建目录（保留最近 %d 个 build_dist_p*）' % KEEP_DISTS)
         return prune_dists(dry=('--dry' in args))

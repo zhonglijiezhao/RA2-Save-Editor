@@ -11,8 +11,8 @@
 源码直接跑时，用的就是上次打包写下的值 —— 这也是"代码现在对应哪个构建"的最实际记录。
 """
 
-SEMVER = '1.7.5'
-BUILD = 361
+SEMVER = '1.7.5'     # ★2026-11-07 修：p371 打包忘了传 --ver，build.py 的硬编码缺省把它冲成 1.4.0
+BUILD = 371
 
 # 仓库地址（界面上「GitHub ↗」点开的就是它）
 REPO = 'https://github.com/zhonglijiezhao/RA2-Save-Editor'
