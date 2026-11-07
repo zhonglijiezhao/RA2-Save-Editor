@@ -43,6 +43,7 @@ import os
 import re
 import sys
 import errno
+import struct
 import datetime
 import traceback
 
@@ -68,6 +69,53 @@ def _file_size(path):
         return os.path.getsize(path)
     except Exception:
         return None
+
+
+# ★2026-11-08（玩家实测「VERA20k 的存档我们的编辑器打不开」）：
+#   VERA20k（github YuriPlanet/vera20k，Rust 重写的引擎）把**自己的私有格式**
+#   也存成 `.sav`（`01UMD.sav` 这类名字），玩家拿它点开只会得到"这不是红警存档"——
+#   结论没错，但没告诉他这到底是什么。认出来就直说：哪个引擎、哪个任务、第几 tick。
+VERA_MAGIC = b'VERA20K\x00'
+
+
+def _vera20k_head(path):
+    """→ `(格式版本, 任务名, tick)`；不是 VERA20k 存档时返回 None。
+
+    头部布局（本机 0.2.6 build 20261104 的四个存档互相印证：
+    `ALL01UMD.sav` / `SOV01UMD.sav` / 两个手动档 tick 对得上文件名）::
+
+        0..8    b'VERA20K\\0'
+        8..12   u32 格式版本（实测 = 1）
+        12..16  4 字节固定标记（实测都是 bd 93 fc fb）
+        16..24  u64 任务名长度（UTF-8 字节数，实测 17~20）
+        24..    任务名（不带方括号 = 手动档；带 [] = 自动档）
+        之后     16 字节场景 hash + u64 tick + u64 unix 时间
+    """
+    try:
+        with open(path, 'rb') as f:
+            d = f.read(128)
+    except Exception:
+        return None
+    if len(d) < 24 or d[:8] != VERA_MAGIC:
+        return None
+    try:
+        ver = struct.unpack_from('<I', d, 8)[0]
+        n = struct.unpack_from('<Q', d, 16)[0]
+    except Exception:
+        return (-1, '', 0)
+    name, tick = '', 0
+    if 0 < n <= 200 and len(d) >= 24 + n:
+        try:
+            name = d[24:24 + n].decode('utf-8')
+        except Exception:
+            name = ''
+        o = 24 + n + 16                      # 16 字节场景 hash 之后再是 tick
+        if len(d) >= o + 8:
+            try:
+                tick = struct.unpack_from('<Q', d, o)[0]
+            except Exception:
+                tick = 0
+    return (ver, name, tick)
 
 
 def _type_name(exc):
@@ -206,6 +254,18 @@ def explain(exc, path=None, action='打开'):
                 '`.bak-*` 副本恢复。')
 
     # ---- 2. 解密/解析层面 ----
+    elif _vera20k_head(path):
+        # ★2026-11-08：VERA20k 把私有格式也命名成 `.sav`，必须先于 CFB 分支判断，
+        #   否则玩家只会看到"这不是红警存档"（对，但没用）。
+        _ver, _name, _tick = _vera20k_head(path)
+        head = '这是 VERA20k 的存档，不是原版红警2 / 尤里的复仇存档。'
+        why = ('文件头是 `VERA20K`（格式版本 %s），任务「%s」，第 %d tick。\n路径：%s'
+               % (_ver if _ver and _ver > 0 else '未知', _name or '未记录',
+                  _tick or 0, path or '?'))
+        todo = ('VERA20k（YuriPlanet/vera20k，用 Rust 从零重写的引擎）有自己的存档格式，'
+                '和原版 CFB(.SAV) 完全不同 —— 所以本工具打不开它是**正常的，不是文件坏了**。\n'
+                '要改这种存档请用 VERA20k 自己的功能；本工具只处理原版 gamemd.exe 存出来的 .SAV。')
+
     elif isinstance(exc, ValueError) and 'CFB' in str(exc).upper():
         head = '这不是一份红警2 / 尤里的复仇存档。'
         if size is not None and size < 512:

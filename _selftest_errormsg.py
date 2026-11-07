@@ -162,6 +162,35 @@ chk('磁盘' in body or '空间' in body, '磁盘满：认出来了（ENOSPC）'
 
 print()
 print('=' * 72)
+print('F. VERA20k 存档识别（另一个引擎的私有格式，也命名成 .sav）')
+print('=' * 72)
+import struct as _st
+_p = os.path.join(_TMP, 'SOV01UMD.sav')
+_nm = '蘇聯01：沙蛇'.encode('utf-8')
+with open(_p, 'wb') as f:
+    f.write(b'VERA20K\x00')                    # 魔数
+    f.write(_st.pack('<I', 1))                 # 格式版本
+    f.write(bytes.fromhex('bd93fcfb'))         # 4 字节标记
+    f.write(_st.pack('<Q', len(_nm)))          # 任务名长度
+    f.write(_nm)                               # 任务名（UTF-8）
+    f.write(b'\x11' * 16)                      # 场景 hash
+    f.write(_st.pack('<Q', 557))               # tick
+    f.write(_st.pack('<Q', 1794066427))        # unix 时间
+    f.write(b'\x00' * 64)
+t, body = ask(ValueError('not a CFB file'), _p, '打开')
+chk('VERA20k' in body, '认出 VERA20k（不再笼统说"这不是红警存档"）')
+chk('蘇聯01：沙蛇' in body and '557' in body, '读出任务名与 tick（帮玩家确认是哪个档）')
+chk('不是文件坏了' in body, '明确告诉玩家：打不开是正常的，不是文件损坏')
+chk('原版' in body, '指出本工具只读原版 CFB(.SAV)')
+
+_p2 = os.path.join(_TMP, 'random.sav')
+with open(_p2, 'wb') as f:
+    f.write(b'hello world' * 64)
+t, body = ask(ValueError('not a CFB file'), _p2, '打开')
+chk('VERA20k' not in body, '普通乱文件不会被误判成 VERA20k')
+
+print()
+print('=' * 72)
 print('E. GUI 接得上（静态检查，不需要 tkinter）')
 print('=' * 72)
 ps = os.path.join(HERE, 'ui', 'page_search.py')
