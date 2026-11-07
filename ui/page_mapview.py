@@ -80,7 +80,7 @@ class MapViewPage(object):
                   text='显示（视图区第二行）：路径点 / 单元标记 / 单位 / 树·石 四个勾选直接横排。'
                        '路径点**以存档为准**（引擎读档走存档）：绿圆白字 = 存档里的号、画在存档坐标；'
                        '橙圈 +「号*」= 地图 [Waypoints] 里同号坐标不同（两边不一致，看绿圆）；'
-                       '灰空心圈 = 只有地图有、存档里没有的号。单位要 ≥20 倍才画。\n'
+                       '灰空心圈 = 只有地图有、存档里没有的号。单位要 ≥5 倍才画。\n'
                        '单元标记（CellTag 挂接点）：默认开，同一个 CellTag 的格子画成同色。点中一格，'
                        '信息栏会写「★单元标记：N 个（CellTag → 触发名）」；'
                        '「🧹 删该格标记」把这格从 CellTag 上解挂（清 CellClass +80、挂接数 −1，'
@@ -165,6 +165,18 @@ class MapViewPage(object):
         ttk.Checkbutton(r, text='覆盖物', variable=self.mv_ovl, command=self.mv_render,
                         style='Surface.TCheckbutton').pack(side='left', padx=(8, 0))
         ttk.Button(r, text='重绘', command=self.mv_render).pack(side='left', padx=(10, 0))
+        # ★★2026-11-07（玩家：「地图的显示方式 能不能向左旋转90度 更符合观感」）：
+        #   存档地形是**等距坐标**（0..2W × 0..2H 的菱形空间），按直角坐标画出来就是一整块
+        #   斜 45° 的菱形。给四个方向让人自己挑"看着顺"的那个（默认左旋 90°）。
+        #   旋转**只影响显示**：点格子、定位、写盘用的永远是存档原始坐标。
+        self.mv_rot_kind = tk.IntVar(value=4)          # 4 = 俯视（展开），玩家 2026-11-07 要的
+        ttk.Label(r, text='方向', style=LB).pack(side='left', padx=(16, 0))
+        self._cb_mv_rot = ttk.Combobox(
+            r, width=11, state='readonly',
+            values=['俯视（展开）', '原始（菱形）', '左旋 90°', '转 180°', '右旋 90°'])
+        self._cb_mv_rot.current(0)
+        self._cb_mv_rot.pack(side='left', padx=(4, 0))
+        self._cb_mv_rot.bind('<<ComboboxSelected>>', self._mv_on_rot_cb)
 
         # ★★§SOV13（2026-11-04 玩家：「路径点、单元标记、单位、树石这些选项，不用叠加，
         #   直接向右边排列显示」）⇒ 原来收在「叠加 ▾」里的 4 个勾选**摊平成一行**，
@@ -348,7 +360,8 @@ class MapViewPage(object):
         self.mv_state = {'mp': None, 'ok': False, 'scale': 8, 'img': None,
                          'blds': [], 'occ': {}, 'sel': None, 'path': None,
                          'gdata': None, 'wpdata': None, 'udata': None,
-                         'marks': None, 'canv': None}
+                         'marks': None, 'canv': None, 'last_disp': None,
+                         'ortho': None, 'size0': None}
         return f
 
     def _mv_reset(self, lazy=False):
@@ -367,7 +380,8 @@ class MapViewPage(object):
         p = getattr(getattr(self.doc, '_map', None), 'path', st.get('path')) if self.doc else None
         st.update({'mp': None, 'ok': False, 'img': None, 'blds': [],
                    'occ': {}, 'sel': None, 'path': p, 'gdata': None, 'dims': None,
-                   'wpdata': None, 'udata': None, 'canv': None, 'marks': None})
+                   'wpdata': None, 'udata': None, 'canv': None, 'marks': None,
+                   'last_disp': None, 'ortho': None, 'size0': None})
         self.mv_canvas.delete('all')
         self.mv_info.config(text='')
         if self.doc and not (p and os.path.exists(p)):
@@ -463,6 +477,7 @@ class MapViewPage(object):
         旧行为（`messagebox.showwarning` 弹框 + 不加载）已移除。
         """
         st = self.mv_state
+        self._mv_cancel_render_job()        # 换图/换档：作废还没执行的缩放重绘
         # ★§285：没有 .MAP（path 为空 / 文件不在了）也照样能画 —— 地形改用存档格对象。
         if path and not os.path.exists(str(path)):
             st['map_err'] = '地图文件不在了：%s' % os.path.basename(str(path))
@@ -689,10 +704,8 @@ class MapViewPage(object):
         """
         st = self.mv_state
         s = max(1, int(st.get('scale') or 8))
-        try:
-            W, H = (st['mp']['size'] if st.get('mp') else self._mv_dims())
-        except Exception:
-            W, H = 160, 160
+        sx = s * self._mv_xscale()
+        W, H = self._mv_disp_size()          # ★2026-11-07 旋转：按显示空间判边界
         mp, _only = self._mv_wp_points()
         try:
             sv = dict(self.doc.waypoints_save() or {}) if self.doc else {}
@@ -701,17 +714,18 @@ class MapViewPage(object):
         r = max(5.0, min(13.0, s * 0.62))
         fs = max(6, min(11, int(s * 0.52)))
         # ① 存档里的点（权威）
-        for n, (x, y) in sorted(sv.items()):
+        for n, (x0, y0) in sorted(sv.items()):
+            x, y = self._mv_cell(x0, y0)
             if not (0 <= x < W and 0 <= y < H):
                 continue
-            cx, cy = x * s + s / 2.0, y * s + s / 2.0
+            cx, cy = x * sx + sx / 2.0, y * s + s / 2.0
             c.create_oval(cx - r, cy - r, cx + r, cy + r,
                           fill=ui_theme.MAP['wp'], outline=ui_theme.T['on_dark'], width=1,
                           tags=('wp',))
             c.create_text(cx, cy, text=str(n), fill=ui_theme.T['on_dark'],
                           font=('Consolas', fs, 'bold'), tags=('wp',))
             p = mp.get(n)
-            if p and (int(p[0]), int(p[1])) != (int(x), int(y)):
+            if p and (int(p[0]), int(p[1])) != (int(x0), int(y0)):
                 c.create_oval(cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2,
                               outline=ui_theme.T['warn'], width=1, tags=('wp',))
                 if s >= 8:
@@ -720,12 +734,13 @@ class MapViewPage(object):
                                   font=('Consolas', 7), tags=('wp',))
         # ② 只有地图有、存档里没有的号（灰空心圈）
         _grey = ui_theme.T.get('muted_soft') or ui_theme.T['muted']
-        for n, (x, y) in sorted(mp.items()):
+        for n, (x0, y0) in sorted(mp.items()):
             if n in sv:
                 continue
+            x, y = self._mv_cell(x0, y0)
             if not (0 <= x < W and 0 <= y < H):
                 continue
-            cx, cy = x * s + s / 2.0, y * s + s / 2.0
+            cx, cy = x * sx + sx / 2.0, y * s + s / 2.0
             c.create_oval(cx - r, cy - r, cx + r, cy + r,
                           outline=_grey, width=1, tags=('wp',))
             if s >= 10:
@@ -763,6 +778,7 @@ class MapViewPage(object):
             return 0
         st = getattr(self, 'mv_state', None) or {}
         s = max(1, int(st.get('scale') or 8))
+        sx = s * self._mv_xscale()
         if s < 2:                     # 1 倍时一格只有 1 像素，画了也只是噪点
             return 0
         marks = self._mv_marks_data()
@@ -772,7 +788,8 @@ class MapViewPage(object):
         # 倍率小 ⇒ 只画 1~2px 的点；放大后补十字，密集区也能数清
         r = 1 if s <= 3 else (2 if s < 9 else 3)
         for m in marks:
-            cx, cy = m['x'] * s + s / 2.0, m['y'] * s + s / 2.0
+            mx, my = self._mv_cell(m['x'], m['y'])          # ★旋转：存档坐标 → 显示坐标
+            cx, cy = mx * sx + sx / 2.0, my * s + s / 2.0
             cc = col.get(m['cell_key'], '#FF7A00')
             c.create_rectangle(cx - r, cy - r, cx + r, cy + r,
                                outline=cc, width=1, tags=('cellmark',))
@@ -1032,17 +1049,37 @@ class MapViewPage(object):
             self.status.set('重载地形失败：%s' % e)
 
     def _mv_toggle_units(self):
-        """勾上「单位」时，若缩放还没到 20 倍就自动放大到 20 倍（并说一句为什么）。"""
-        st = self.mv_state
-        if self.mv_units.get() and int(st.get('scale') or 8) < 20:
-            st['scale'] = 20
-            self.mv_render()
+        """勾/取消「单位」：**只重画单位这一层**，不动底图、也不改缩放。
+
+        ★★2026-11-07（玩家：「点击单位后 地图会放大20倍 会卡一会儿 有没有优化空间」）：
+          旧行为是"勾上就自动把缩放拉到 20 倍并整图重绘"（20 倍 = 7880×7840 = 6180 万像素，
+          实测 5.2 秒）。两条都不必要：
+            · 单位标记本来就是**画布图元**（不是烘焙进底图的），可以单独删/画；
+            · 倍率门槛已放宽到 5 倍（方块随倍率缩放），8 倍下就看得清。
+          现在是毫秒级：`delete('unit')` + 只画单位。
+        """
+        c = self.mv_canvas
+        st = getattr(self, 'mv_state', None) or {}
+        if not st.get('ok') and not st.get('canv'):
+            return
+        try:
+            c.delete('unit')
+            if self.mv_units.get():
+                n = self._mv_draw_units(c)
+                s = int(st.get('scale') or 8)
+                if n:
+                    self.status.set('已显示 %d 个单位位置（%d 倍；滚轮/± 放大看细节）' % (n, s))
+                elif s < 5:
+                    self.status.set('单位标记要 5 倍以上才画（当前 %d 倍，点「+」或滚轮放大）' % s)
+                else:
+                    self.status.set('这份存档没读到带坐标的单位')
+            else:
+                self.status.set('已隐藏单位标记')
+        except Exception as e:
             try:
-                self.status.set('单位标记只在 ≥20 倍显示（太小会糊成一片），已自动放大到 20 倍')
+                self.status.set('画单位标记失败：%s' % e)
             except Exception:
                 _swallow()
-            return
-        self.mv_render()
 
     def _mv_units(self):
         """存档里的**单位**（步兵/载具实例记录）→ `[(x, y, 类型, 所属方)]`。
@@ -1092,6 +1129,7 @@ class MapViewPage(object):
             return 0
         st = self.mv_state
         s = int(st.get('scale') or 8)
+        sx = s * self._mv_xscale()
         if s < 2:                      # 1 倍时一格 1 像素，画不出东西
             return 0
         try:
@@ -1106,14 +1144,22 @@ class MapViewPage(object):
             x, y = t.get('x'), t.get('y')
             if not isinstance(x, int) or not isinstance(y, int):
                 continue
-            cx, cy = x * s + s / 2.0, y * s + s / 2.0
+            x, y = self._mv_cell(x, y)                  # ★旋转：存档坐标 → 显示坐标
+            cx, cy = x * sx + sx / 2.0, y * s + s / 2.0
             c.create_oval(cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0,
                           fill=ui_theme.MAP['terrain'], outline=ui_theme.MAP['terrain_line'], width=1, tags=('terr',))
             n += 1
         return n
 
     def _mv_draw_units(self, c):
-        """单位标记（只在 **≥20 倍** 且勾了「单位」时画）：琥珀色小方块 + 白描边，同格多台标 ×N。
+        """单位标记（勾了「单位」就画）：琥珀色小方块 + 白描边，同格多台标 ×N。
+
+        ★★2026-11-07 改（玩家：「勾单位后跳 20 倍，卡一会儿」）：
+          以前门槛是 **≥20 倍**（所以勾选时要把视图强行拉到 20 倍，那一下 5 秒）。
+          现在门槛降到 **5 倍**，方块尺寸随倍率线性缩放（`s*0.32`，夹在 2..11 像素）：
+            · 8 倍 ⇒ 每格 8px、方块约 5px ⇒ 一眼能看出"这格有单位"；
+            · 20 倍以上 ⇒ 方块封顶 11px，不再变大；「×N」只在 ≥14 倍才标，
+              否则低倍率下文字会把邻格糊住。
 
         ★为什么不按敌我上色：`houses()` 的 `is_player` 在部分档上不可靠 ——
           实测 `光棱 飞碟干净.SAV` 判成 `Russians`，可档里 1365 台单位**一台 Russians 都没有**
@@ -1122,29 +1168,30 @@ class MapViewPage(object):
         """
         st = self.mv_state
         s = int(st.get('scale') or 8)
-        if s < 20:
+        sx = s * self._mv_xscale()
+        if s < 5:                      # 5 倍以下方块会盖住邻格，看不出东西
             return 0
         if not (self.mv_units.get() if hasattr(self, 'mv_units') else False):
             return 0
-        try:
-            W, H = (st['mp']['size'] if st.get('mp') else self._mv_dims())
-        except Exception:
-            W, H = 160, 160
+        W, H = self._mv_disp_size()             # ★旋转：按显示空间判边界
         us = self._mv_units()
         if not us:
             return 0
+        # ★2026-11-07：按**显示格**合并（俯视时两个 iso 半格压在同一格，
+        #   分开画会得到两个完全重叠的方块；合并后 ×N 显示这一格的总台数）。
         per = {}
-        for x, y, _t, _h in us:
-            per[(x, y)] = per.get((x, y), 0) + 1
-        r = max(6, min(11, int(s * 0.3)))
+        for x0, y0, _t, _h in us:
+            d = self._mv_cell(x0, y0)
+            per[d] = per.get(d, 0) + 1
+        r = max(2.0, min(11.0, s * 0.32))       # ★随倍率缩放：8 倍≈2.6px、20 倍≈6.4px
         n = 0
         for (x, y), cnt in per.items():
             if not (0 <= x < W and 0 <= y < H):
                 continue
-            cx, cy = x * s + s / 2.0, y * s + s / 2.0
+            cx, cy = x * sx + sx / 2.0, y * s + s / 2.0
             c.create_rectangle(cx - r, cy - r, cx + r, cy + r, fill=ui_theme.MAP['unit'],
                                outline=ui_theme.T['on_dark'], width=1, tags=('unit',))
-            if cnt > 1:
+            if cnt > 1 and s >= 14:              # 低倍率不标 ×N（会糊住邻格）
                 c.create_text(cx, cy - r - 6, text='×%d' % cnt, fill=ui_theme.T['ink'],
                               font=('Consolas', 8, 'bold'), tags=('unit',))
             n += 1
@@ -1168,7 +1215,12 @@ class MapViewPage(object):
         """**无地图模式**：按坐标范围画格子 —— 依然可以点选格子（触发法放置不需要地图）。"""
         st = self.mv_state
         c = self.mv_canvas
-        W, H = self._mv_dims()
+        W0, H0 = self._mv_dims()            # 原始（存档）坐标空间
+        st['size0'] = (int(W0), int(H0))
+        if self._mv_rot_kind_now() in (1, 3):   # ★2026-11-07 旋转：90°/270° 宽高互换
+            W, H = int(H0), int(W0)
+        else:
+            W, H = int(W0), int(H0)
         st['canv'] = (int(W), int(H))       # ★§SOV11：网格模式的画布格子数
         s = max(2, int(st.get('scale') or 8))
         st['scale'] = s
@@ -1180,24 +1232,41 @@ class MapViewPage(object):
             c.create_line(x * s, 0, x * s, H * s, fill=ui_theme.MAP['grid'] if x % 10 else ui_theme.MAP['grid_major'])
         for y in range(0, H + 1):
             c.create_line(0, y * s, W * s, y * s, fill=ui_theme.MAP['grid'] if y % 10 else ui_theme.MAP['grid_major'])
+        # ★旋转后刻度仍写**存档坐标**（玩家定位/日志都是原始坐标）：
+        #   k=1 左旋：横轴=存档 y，纵轴=W0-1-x；k=2：两轴都反向；k=3 右旋：横轴=H0-1-y，纵轴=存档 x
+        _rk = self._mv_rot_kind_now()
         for x in range(0, W, 10):
-            c.create_text(x * s + 2, 2, text=str(x), anchor='nw',
+            if _rk == 2:
+                _lh = int(W0) - 1 - x
+            elif _rk == 3:
+                _lh = int(H0) - 1 - x
+            else:
+                _lh = x
+            c.create_text(x * s + 2, 2, text=str(_lh), anchor='nw',
                           fill=ui_theme.MAP['grid_text'], font=('Consolas', 7))
         for y in range(0, H, 10):
-            c.create_text(2, y * s + 2, text=str(y), anchor='nw',
+            if _rk == 1:
+                _lv = int(W0) - 1 - y
+            elif _rk == 2:
+                _lv = int(H0) - 1 - y
+            else:
+                _lv = y
+            c.create_text(2, y * s + 2, text=str(_lv), anchor='nw',
                           fill=ui_theme.MAP['grid_text'], font=('Consolas', 7))
-        for (x, y), t in bld.items():
+        for (x0, y0), t in bld.items():
+            x, y = self._mv_cell(x0, y0)
             if x < W and y < H:
                 c.create_rectangle(x * s, y * s, (x + 1) * s, (y + 1) * s,
                                    fill=ui_theme.MAP['building'], outline='', stipple='gray50')
-        # ★§267：单位标记改成与地图模式同一套画法（默认关 + ≥20 倍才画），
+        # ★§267：单位标记改成与地图模式同一套画法（默认关 + ≥5 倍才画），
         #   原来"一直画蓝椭圆"的行为撤掉 —— 小比例下几百个单位糊成一片，看不出东西。
         # ★§266：路径点（与地图模式同一套画法：绿圆=地图定义，蓝框=只有存档有）
         if bool(self.mv_wp.get() if hasattr(self, 'mv_wp') else True):
             try:
                 self._mv_draw_waypoints(c)
             except Exception:
-                for n, (x, y) in wp.items():
+                for n, (x0, y0) in wp.items():
+                    x, y = self._mv_cell(x0, y0)
                     if x < W and y < H:
                         c.create_text(x * s + s / 2, y * s + s / 2, text=str(n),
                                       fill=ui_theme.MAP['wp_text'], font=('Consolas', 7))
@@ -1267,6 +1336,7 @@ class MapViewPage(object):
             return 0
         st = self.mv_state
         s = int(st.get('scale') or 8)
+        sx = s * self._mv_xscale()
         if s < 3:
             return 0
         try:
@@ -1275,18 +1345,16 @@ class MapViewPage(object):
             return 0
         if not cells:
             return 0
-        try:
-            W, H = (st['mp']['size'] if st.get('mp') else self._mv_dims())
-        except Exception:
-            W, H = 160, 160
+        W, H = self._mv_disp_size()             # ★旋转：按显示空间判边界
         cols = self._ovl_colors()
         d = max(2.0, min(s - 1, s * 0.5))
         n = 0
-        for (x, y), idx in cells.items():
+        for (x0, y0), idx in cells.items():
+            x, y = self._mv_cell(x0, y0)
             if not (0 <= x < W and 0 <= y < H):
                 continue
             col = cols.get(idx, ui_theme.T['muted_soft'])
-            cx, cy = x * s + s / 2.0, y * s + s / 2.0
+            cx, cy = x * sx + sx / 2.0, y * s + s / 2.0
             if col == ui_theme.MAP['block']:            # 墙类：实心方块（一眼看出"这格不能放"）
                 c.create_rectangle(cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0,
                                    fill=col, outline=ui_theme.MAP['outline_soft'], width=1, tags=('ovl',))
@@ -1300,6 +1368,10 @@ class MapViewPage(object):
     def mv_render(self):
         import base64
         import map_render as mr
+        # ★2026-11-07：手动重绘/勾选项重绘时，把还没执行的"合并缩放"任务撤掉，
+        #   免得 130ms 后又被它按旧倍率覆盖一次（任务回调里会先把自己置空，不会自取消）。
+        if getattr(self, '_mv_job', None):
+            self._mv_cancel_render_job()
         st = getattr(self, 'mv_state', None)
         if not st:
             return
@@ -1309,10 +1381,29 @@ class MapViewPage(object):
             return
         # ★★§SOV11：选中格**不再烘焙进位图**（原来每次点格子都要整图重渲染：
         #   509×493 @10 倍 = 2.5 秒）。现在选中框是画布图元，点选/跳转只更新这一层。
-        W, H, buf, meta = mr.render_rgb(st['mp'], st['blds'], st['scale'],
-                                        sel=None, grid=bool(self.mv_grid.get()))
+        # ★2026-11-07 旋转：先按**原始**数据算出坐标空间 W0×H0（`_mv_cell` 靠它做映射），
+        #   再按需要旋转一份给渲染用 —— `st['mp']` / `st['blds']` 本身永远是原始数据。
+        mp0, blds0 = st['mp'], st['blds']
+        W0, H0 = mr.canvas_size(mp0, blds0)
+        st['size0'] = (int(W0), int(H0))
+        _rk = self._mv_rot_kind_now()
+        if _rk == 4:
+            # ★俯视：等距逆变换，菱形展开成矩形（玩家 2026-11-07 要的那个效果）
+            mp, blds, _osz, _oinfo = mr.ortho_map(mp0, blds0)
+            st['ortho'] = dict(_oinfo, size=tuple(_osz))
+        elif _rk:
+            st['ortho'] = None
+            mp, blds, _sz = mr.rot_map(mp0, blds0, (W0, H0), kind=_rk)
+        else:
+            st['ortho'] = None
+            mp, blds = mp0, blds0
+        W, H, buf, meta = mr.render_rgb(mp, blds, st['scale'],
+                                        sel=None, grid=bool(self.mv_grid.get()),
+                                        xscale=self._mv_xscale())
         st['canv'] = (int(W), int(H))       # ★§SOV11：居中/越界要用**这块画布**的格子数
-        png = mr.to_png(W * st['scale'], H * st['scale'], buf)
+        # ★2026-11-07：PNG 用 level=1 —— 大图（20 倍 = 6180 万像素）压缩从 0.84s 降到 0.37s，
+        #   体积 1.2MB→3.4MB 只多占几兆内存，玩家体感是"少等半秒"。
+        png = mr.to_png(meta['px'][0], meta['px'][1], buf, level=1)
         try:
             st['img'] = tk.PhotoImage(data=base64.b64encode(png))
         except tk.TclError:                 # 退路：落临时文件再读
@@ -1320,7 +1411,9 @@ class MapViewPage(object):
             fp = os.path.join(tempfile.gettempdir(), '_ra2_mapview.png')
             open(fp, 'wb').write(png)
             st['img'] = tk.PhotoImage(file=fp)
-        st['occ'] = meta['occupancy']
+        # ★2026-11-07 旋转：occupancy 必须按**原始**建筑算 —— `meta['occupancy']` 来自
+        #   渲染用的（可能已旋转的）建筑表，键是显示坐标；信息栏查询用的是存档坐标。
+        st['occ'] = mr.occupancy(st['blds'])
         c = self.mv_canvas
         c.delete('all')
         c.create_image(0, 0, anchor='nw', image=st['img'])
@@ -1345,12 +1438,12 @@ class MapViewPage(object):
             self._mv_draw_overlays(c)
         except Exception:
             _swallow()
-        # ★§267：单位标记（默认关；≥20 倍才画，画在路径点之上）
+        # ★§267：单位标记（默认关；≥5 倍才画，画在路径点之上）
         try:
             self._mv_draw_units(c)
         except Exception:
             _swallow()
-        c.configure(scrollregion=(0, 0, W * st['scale'], H * st['scale']))
+        c.configure(scrollregion=(0, 0, meta['px'][0], meta['px'][1]))
         try:
             self._mv_draw_sel()
         except Exception:
@@ -1368,13 +1461,14 @@ class MapViewPage(object):
         if c is None:
             return None
         s = self._mv_scale_now()
+        sx = s * self._mv_xscale()
         W, H = self._mv_cell_space()
         try:
             cx = c.canvasx(max(1, c.winfo_width()) / 2.0)
             cy = c.canvasy(max(1, c.winfo_height()) / 2.0)
         except Exception:
             return None
-        x, y = int(cx // s), int(cy // s)
+        x, y = int(cx // sx), int(cy // s)
         if 0 <= x < W and 0 <= y < H:
             return (x, y)
         return None
@@ -1387,26 +1481,57 @@ class MapViewPage(object):
         #   否则每点一次 ± 视图就漂回左上，找远处的格子等于白找。
         anchor = self._mv_view_center_cell()
         st['scale'] = max(1, min(24, st['scale'] + d))
-        # 全量重绘在大图上要 2~4 秒（纯 Python 逐像素）⇒ 先给一句"正在画"，
-        # 免得玩家以为点空了又去点（§SOV11）
+        # ★2026-11-07：全量重绘在大图上要 1~3 秒（20 倍 = 6180 万像素）。
+        #   改成"130ms 内连点只画最后一帧"（`_mv_schedule_render`），
+        #   连点 5 下不再串 5 次重绘。
+        self._mv_schedule_render(anchor)
+
+    def _mv_cancel_render_job(self):
+        """取消还没执行的"合并重绘"任务（换图/适应窗口/重绘前必须调，否则旧任务会覆盖新视图）。"""
+        j = getattr(self, '_mv_job', None)
+        if j:
+            try:
+                self.after_cancel(j)
+            except Exception:
+                _swallow()
+        self._mv_job = None
+
+    def _mv_schedule_render(self, anchor=None, delay=130):
+        """★2026-11-07：连点「+」时**合并成一次重绘**。
+
+        20 倍整图要 2~3 秒（6180 万像素 + PNG + Tk 解码），连点 5 下 = 5 次全量重绘。
+        改成 130ms 内的连点只画最后一帧：点 5 下从"5 次 × 1~3 秒"变成"1 次"。
+        单次点击只多 0.13 秒（远小于重绘本身），换来连点时体感顺畅。
+        """
+        self._mv_cancel_render_job()
+        st = self.mv_state
+        s = int(st.get('scale') or 8)
         try:
-            self.status.set('正在按 %d 倍重绘地图…' % st['scale'])
+            self.status.set('正在按 %d 倍重绘地图…' % s)
             self.update_idletasks()
         except Exception:
             _swallow()
-        self.mv_render()
-        if anchor:
-            self._mv_center_on(*anchor)
-        try:
-            self.status.set('缩放 = 每格 %d 像素（滚轮/± 再调；「适应窗口」一键铺满）'
-                            % st['scale'])
-        except Exception:
-            _swallow()
+
+        def _do():
+            self._mv_job = None
+            try:
+                self.mv_render()
+                if anchor:
+                    self._mv_center_on(*anchor)
+                self.status.set('缩放 = 每格 %d 像素（滚轮/± 再调；「适应窗口」一键铺满）' % s)
+            except Exception as e:
+                try:
+                    self.status.set('重绘失败：%s' % e)
+                except Exception:
+                    _swallow()
+
+        self._mv_job = self.after(delay, _do)
 
     def mv_fit(self):
         st = getattr(self, 'mv_state', None)
         if not st:
             return
+        self._mv_cancel_render_job()
         if not st['ok'] or not st['mp']:
             if not self.doc:
                 return
@@ -1442,11 +1567,12 @@ class MapViewPage(object):
         if not sel:
             return
         s = self._mv_scale_now()
-        x, y = sel
+        x, y = self._mv_cell(*sel)          # ★旋转：存档坐标 → 显示坐标（sel 本身仍是存档坐标）
         try:
-            c.create_rectangle(x * s, y * s, (x + 1) * s, (y + 1) * s,
+            sx = s * self._mv_xscale()
+            c.create_rectangle(x * sx, y * s, (x + 1) * sx, (y + 1) * s,
                                outline='#FFD400', width=2, tags=('selbox',))
-            c.create_rectangle(x * s + 1, y * s + 1, (x + 1) * s - 1, (y + 1) * s - 1,
+            c.create_rectangle(x * sx + 1, y * s + 1, (x + 1) * sx - 1, (y + 1) * s - 1,
                                outline='#1E78C8', width=1, tags=('selbox',))
         except Exception:
             _swallow()
@@ -1489,6 +1615,250 @@ class MapViewPage(object):
             W, H = 160, 160
         return int(W), int(H)
 
+    # ---------------- ★2026-11-07 视图旋转（玩家：「地图向左旋转 90 度 更符合观感」） ----------------
+    #
+    # 存档里的地形坐标是**等距坐标**（0..2W × 0..2H 的菱形空间），按直角坐标直接画出来
+    # 就是一整块斜 45° 的菱形。这里给一个"左旋 90°"的显示变换：
+    #     格 (x, y) → (y, W0-1-x)        （逆时针；新宽 = H0，新高 = W0）
+    # 变换**只发生在显示层**：存档坐标（`st['sel']`、写盘、日志）永远是原始坐标，
+    # 只有"画到哪里"和"点到哪一格"过一下 `_mv_cell` / `_mv_unrot`。
+    # 显示方式：0 原始（菱形）/ 1 左旋 90° / 2 转 180° / 3 右旋 90° / 4 俯视（菱形展开成矩形）
+    MV_ROT_NAMES = ('原始（菱形）', '左旋 90°', '转 180°', '右旋 90°', '俯视（展开）')
+    MV_ROT_KINDS = (4, 0, 1, 2, 3)          # 下拉 index → kind（俯视排第一，按玩家要求做默认）
+
+    def _mv_rot_kind_now(self):
+        """当前显示方式（0..4，见 `MV_ROT_NAMES`）。"""
+        try:
+            return int(self.mv_rot_kind.get() or 0) % 5
+        except Exception:
+            return 0
+
+    def _mv_on_rot_cb(self, _e=None):
+        """下拉选了某一项 ⇒ 写进变量再重绘。"""
+        try:
+            i = self._cb_mv_rot.current()
+            if 0 <= i < len(self.MV_ROT_KINDS):
+                self.mv_rot_kind.set(self.MV_ROT_KINDS[i])
+        except Exception:
+            _swallow()
+        self._mv_on_rot()
+
+    def _mv_sync_rot_cb(self):
+        """把变量里的 kind 反映到下拉（自检/程序改 kind 时用）。"""
+        try:
+            k = self._mv_rot_kind_now()
+            i = self.MV_ROT_KINDS.index(k)
+            if self._cb_mv_rot.current() != i:
+                self._cb_mv_rot.current(i)
+        except Exception:
+            _swallow()
+
+    def _mv_rot_on(self):
+        """是否发生了旋转（宽高要互换的那种：左旋/右旋 90°）。"""
+        return self._mv_rot_kind_now() != 0
+
+    def _mv_size0(self):
+        """**旋转前**的画布格子数 `(W0, H0)` —— 坐标变换的基准空间。"""
+        st = getattr(self, 'mv_state', None) or {}
+        s0 = st.get('size0')
+        if s0:
+            try:
+                return int(s0[0]), int(s0[1])
+            except Exception:
+                _swallow()
+        c = st.get('canv')
+        if c:
+            a, b = int(c[0]), int(c[1])
+            # 只有 90°/270° 才换宽高；180° 宽高不变
+            return (b, a) if self._mv_rot_kind_now() in (1, 3) else (a, b)
+        try:
+            W, H = st['mp']['size'] if st.get('mp') else self._mv_dims()
+            return int(W), int(H)
+        except Exception:
+            return 160, 160
+
+    def _mv_xscale(self):
+        """每格**宽** / 高的比：俯视展开时 2:1（和地编 minimap 同一比例），其它 1:1。
+
+        ★2026-11-07：RA2 的 cell 在屏幕上本来就是扁的（tile 60×30），地编 minimap 也是 2:1；
+          展开后按正方形画会显得"纵向拉长"，所以这里统一把横向乘 2。
+        """
+        return 2 if self._mv_ortho_ready() else 1
+
+    def _mv_ortho(self):
+        """俯视展开的参数 `{'s0','d0','cells','size'}`（没渲染过时是空的）。"""
+        st = getattr(self, 'mv_state', None) or {}
+        o = st.get('ortho')
+        return o if isinstance(o, dict) else {}
+
+    def _mv_ortho_ready(self):
+        """有地图 + 选「俯视」+ 已经算过展开表 ⇒ 才走等距逆变换。"""
+        st = getattr(self, 'mv_state', None) or {}
+        return (self._mv_rot_kind_now() == 4 and st.get('ok') and st.get('mp')
+                and bool(self._mv_ortho().get('size')))
+
+    def _mv_disp_size(self):
+        """**显示**用的画布格子数（90°/270° 宽高互换；俯视 ⇒ 展开后的矩形）。"""
+        if self._mv_ortho_ready():
+            return tuple(self._mv_ortho()['size'])
+        W0, H0 = self._mv_size0()
+        return (H0, W0) if self._mv_rot_kind_now() in (1, 3) else (W0, H0)
+
+    def _mv_cell(self, x, y):
+        """存档（等距）格坐标 → 显示格坐标。"""
+        x, y = int(x), int(y)
+        if self._mv_ortho_ready():
+            o = self._mv_ortho()
+            # ★等距逆变换：u = x-y, v = x+y（详见 map_render.ortho_map 的注释）
+            return ((x - y - int(o['s0'])) // 2, (x + y - int(o['d0'])) // 2)
+        k = self._mv_rot_kind_now()
+        if not k or k == 4:             # 4 但没展开表（网格模式）⇒ 当作不转
+            return x, y
+        W0, H0 = self._mv_size0()
+        if k == 1:                      # 左旋 90°
+            return y, (W0 - 1 - x)
+        if k == 2:                      # 180°
+            return (W0 - 1 - x), (H0 - 1 - y)
+        return (H0 - 1 - y), x          # 3 右旋 90°
+
+    def _mv_unrot(self, u, v):
+        """显示格坐标 → 存档（等距）格坐标。俯视走反查表 ⇒ 点哪格就是哪格。"""
+        u, v = int(u), int(v)
+        if self._mv_ortho_ready():
+            o = self._mv_ortho()
+            hit = (o.get('cells') or {}).get((u, v))
+            if hit:
+                return int(hit[0]), int(hit[1])
+            uu = int(o['s0']) + 2 * u        # 空格：按公式反算（可能偏半格，不影响选位）
+            vv = int(o['d0']) + 2 * v
+            return int((uu + vv) // 2), int((vv - uu) // 2)
+        k = self._mv_rot_kind_now()
+        if not k or k == 4:
+            return u, v
+        W0, H0 = self._mv_size0()
+        if k == 1:                      # u=y, v=W0-1-x
+            return (W0 - 1 - v), u
+        if k == 2:                      # u=W0-1-x, v=H0-1-y
+            return (W0 - 1 - u), (H0 - 1 - v)
+        return v, (H0 - 1 - u)          # 3 右旋：u=H0-1-y, v=x
+
+    # ---------------- ★2026-11-07 俯视「半格」：点单位圆点却选中隔壁格 ----------------
+    # 展开公式 i=(x−y−s0)//2、j=(x+y−d0)//2 是 2:1 合并：一个显示格压着**两个**
+    # 存档 iso 半格（u、v 同奇偶的那两组解），例如本档显示格 (183,20) = iso (204,37)
+    # 与 iso (205,37)。`cells` 反查表只留了其中一个（地形里先到的那个），于是点在
+    # (205,37) 的 HTK 上的方块会被换算成 (204,37) ⇒ 「格 (204,37) 上没有单位」。
+    # 修法：点选时把两个候选都算出来，优先落在**真有东西**的那个半格上。
+    def _mv_ortho_candidates(self, u, v):
+        """俯视显示格 `(u,v)` → 它压住的存档 iso 半格列表（最多 2 个，反查表那个排第一）。"""
+        o = self._mv_ortho()
+        try:
+            s0, d0 = int(o['s0']), int(o['d0'])
+        except Exception:
+            return []
+        out = []
+        for p in (0, 1):
+            for q in (0, 1):
+                uu, vv = s0 + 2 * int(u) + p, d0 + 2 * int(v) + q
+                if (vv - uu) % 2:           # u、v 必须同奇偶，否则 x/y 不是整数
+                    continue
+                c = ((uu + vv) // 2, (vv - uu) // 2)
+                if c not in out:
+                    out.append(c)
+        hit = (o.get('cells') or {}).get((int(u), int(v)))
+        if hit:
+            hit = (int(hit[0]), int(hit[1]))
+            if hit in out:
+                out.remove(hit)
+            out.insert(0, hit)              # 地形反查表那个 = 默认（空格时仍按旧行为）
+        return out
+
+    def _mv_half_score(self, c, unit_counts, occ, wps, marks):
+        """这个半格「有多少东西」——点选时用来挑真正想操作的那一格。"""
+        # ★单位压倒一切：点在单位方块上，就一定选到有单位的那半个格，
+        #   别被另一半的建筑/路径点抢走（不然「删除该格单位」又会假阴性）。
+        n = unit_counts.get(c, 0)
+        s = (1000000 + min(n, 50)) if n else 0
+        if c in occ:
+            s += 10000
+        if c in wps:
+            s += 200
+        if c in marks:
+            s += 100
+        return s
+
+    def _mv_half_context(self):
+        """一次性把点选打分要用的四张表备好（都走缓存，点一下不查全档）。"""
+        st = getattr(self, 'mv_state', None) or {}
+        unit_counts = {}
+        try:
+            for x, y, _t, _h in self._mv_units():
+                unit_counts[(x, y)] = unit_counts.get((x, y), 0) + 1
+        except Exception:
+            _swallow()
+        occ = st.get('occ') or {}
+        wps = set()
+        try:
+            _mp, _only = self._mv_wp_points()
+            for cc in list(_mp.values()) + list(_only.values()):
+                wps.add((int(cc[0]), int(cc[1])))
+        except Exception:
+            _swallow()
+        marks = set()
+        try:
+            if st.get('marks') is not None:      # 没缓存就不为一次点击去扫全档
+                for m in (st.get('marks') or []):
+                    marks.add((int(m['x']), int(m['y'])))
+        except Exception:
+            _swallow()
+        return unit_counts, occ, wps, marks
+
+    def _mv_pick_cell(self, u, v):
+        """显示格 → 存档 iso 格（点选专用；非俯视/无地图仍走原来的 `_mv_unrot`）。"""
+        if not self._mv_ortho_ready():
+            return self._mv_unrot(u, v)
+        cands = self._mv_ortho_candidates(u, v)
+        if len(cands) < 2:
+            return cands[0] if cands else self._mv_unrot(u, v)
+        st = self.mv_state
+        try:
+            ctx = self._mv_half_context()
+            scores = [self._mv_half_score(c, *ctx) for c in cands]
+        except Exception:
+            _swallow()
+            return cands[0]
+        pairs = sorted(zip(cands, scores), key=lambda t: -t[1])
+        content = [c for c, s in pairs if s > 0]
+        if not content:
+            return pairs[0][0]                   # 两个半格都空 ⇒ 地形反查表那个
+        if len(content) == 1:
+            return content[0]                    # ★玩家那一例：只有 (205,37) 有 HTK
+        # 两个半格都有东西：连点同一显示格 ⇒ 在它们之间轮换（否则永远够不到另一半）
+        cur = tuple(st.get('sel') or ()) if st.get('sel') else None
+        if st.get('last_disp') == (u, v) and cur in content:
+            return content[(content.index(cur) + 1) % len(content)]
+        return content[0]
+
+    def _mv_on_rot(self):
+        """切「左旋90°」⇒ 整图重绘（底图 + 所有叠加层都跟着换轴）。"""
+        st = getattr(self, 'mv_state', None) or {}
+        st['sel'] = None
+        st['last_disp'] = None               # 换方向后不要接着上次的「半格轮换」
+        self._mv_sync_rot_cb()
+        self._mv_cancel_render_job()
+        try:
+            self.mv_render()
+        except Exception as e:
+            try:
+                self.status.set('旋转重绘失败：%s' % e)
+            except Exception:
+                _swallow()
+            return
+        try:
+            self.status.set('地图显示：%s（点格子 / 定位坐标仍是存档里的原始坐标）'
+                            % self.MV_ROT_NAMES[self._mv_rot_kind_now()])
+        except Exception:
+            _swallow()
+
     def _mv_scale_now(self):
         """当前每格像素数（渲染用同一套口径，别各算各的）。"""
         st = getattr(self, 'mv_state', None) or {}
@@ -1526,11 +1896,12 @@ class MapViewPage(object):
         except Exception:
             _swallow()
         s = self._mv_scale_now()
+        sx = s * self._mv_xscale()
         W, H = self._mv_cell_space()
-        tw, th = W * s, H * s
+        tw, th = W * sx, H * s
         vw = max(1, c.winfo_width())
         vh = max(1, c.winfo_height())
-        cx, cy = (x + 0.5) * s, (y + 0.5) * s
+        cx, cy = (x + 0.5) * sx, (y + 0.5) * s
         left = 0 if tw <= vw else max(0, min(tw - vw, cx - vw / 2.0))
         top = 0 if th <= vh else max(0, min(th - vh, cy - vh / 2.0))
         try:
@@ -1547,7 +1918,7 @@ class MapViewPage(object):
             self.status.set('先在地图上点一格，或在 X / Y 里填坐标后点「跳到格」')
             return
         x, y = st['sel']
-        self._mv_center_on(x, y)
+        self._mv_center_on(*self._mv_cell(x, y))     # ★旋转：存档坐标 → 显示坐标
         self.status.set('视图已居中到 (%d,%d)' % (x, y))
 
     def mv_goto(self, x, y, why=''):
@@ -1558,20 +1929,22 @@ class MapViewPage(object):
         if not self.doc:
             self.status.set('先打开一个存档')
             return False
-        W, H = self._mv_cell_space()
+        W, H = self._mv_size0()         # ★旋转：边界按**存档**坐标空间判（不是显示空间）
         if not (0 <= int(x) < W and 0 <= int(y) < H):
             self.status.set('%s 超出范围：当前这张图是 %d×%d（x 0..%d，y 0..%d）'
                             % (why or '目标坐标', W, H, W - 1, H - 1))
             return False
         x, y = int(x), int(y)
         st['sel'] = (x, y)
+        st['last_disp'] = None           # 手动输坐标 ⇒ 不参与「连点轮换半格」
         self._mv_refresh_sel()          # ★只换选中框：跳转不再等 2 秒重绘
-        self._mv_center_on(x, y)
+        _ux, _uy = self._mv_cell(x, y)  # ★旋转：居中/准星都按显示坐标画
+        self._mv_center_on(_ux, _uy)
         # 跳转后画个醒目的十字准星（下次重绘就清掉 —— 正好只标"这一次跳转"）
         try:
             s = self._mv_scale_now()
             c = self.mv_canvas
-            cx, cy = (x + 0.5) * s, (y + 0.5) * s
+            cx, cy = (_ux + 0.5) * s * self._mv_xscale(), (_uy + 0.5) * s
             r = max(9.0, s * 1.8)
             c.create_line(cx - r, cy, cx + r, cy, fill='#FFD400', width=2, tags=('goto',))
             c.create_line(cx, cy - r, cx, cy + r, fill='#FFD400', width=2, tags=('goto',))
@@ -1869,6 +2242,24 @@ class MapViewPage(object):
         import map_render as mr
         st = getattr(self, 'mv_state', None) or {}
         head = '选中格 (%d,%d)' % (x, y)
+        if self._mv_ortho_ready():          # ★俯视：同时报"俯视格"，方便和地编 minimap 对位
+            try:
+                _i, _j = self._mv_cell(x, y)
+                head += '　俯视格 (%d,%d)' % (_i, _j)
+                # ★2026-11-07：一个俯视格压着两个 iso 半格。若另一半上有单位，
+                #   明说出来（玩家手输坐标时不会误以为"这格真没单位"）。
+                _sib = [tuple(c) for c in self._mv_ortho_candidates(_i, _j)
+                        if tuple(c) != (x, y)]
+                if _sib:
+                    _uc = {}
+                    for _ux, _uy, _t, _h in self._mv_units():
+                        _uc[(_ux, _uy)] = _uc.get((_ux, _uy), 0) + 1
+                    _notes = ['(%d,%d) %d 台单位' % (c[0], c[1], _uc[c])
+                              for c in _sib if _uc.get(c)]
+                    if _notes:
+                        head += '　⚠ 同格另一半：%s（点该格切过去）' % '、'.join(_notes)
+            except Exception:
+                _swallow()
         try:
             if self.doc and self.doc.cell_visible(x, y, map_path=st.get('path')) is False:
                 head += '　⚠ 在蓝线外（游戏里不显示这块地图）'
@@ -1960,18 +2351,24 @@ class MapViewPage(object):
             if not self.doc:
                 return
             s = max(2, int(st.get('scale') or 8))
-            x = int(self.mv_canvas.canvasx(event.x) // s)
-            y = int(self.mv_canvas.canvasy(event.y) // s)
-            W, H = self._mv_dims()
-            if not (0 <= x < W and 0 <= y < H):
+            sx = s * self._mv_xscale()
+            u = int(self.mv_canvas.canvasx(event.x) // sx)
+            v = int(self.mv_canvas.canvasy(event.y) // s)
+            W, H = self._mv_disp_size()
+            if not (0 <= u < W and 0 <= v < H):
                 return
+            x, y = self._mv_pick_cell(u, v)  # ★旋转：显示格 → 存档格（俯视挑有东西的半格）
             st['sel'] = (x, y)
+            st['last_disp'] = (u, v) if self._mv_ortho_ready() else None
             self._mv_refresh_sel()
         else:
             s = st['scale']
-            x = int(self.mv_canvas.canvasx(event.x) // s)
-            y = int(self.mv_canvas.canvasy(event.y) // s)
+            sx = s * self._mv_xscale()
+            u = int(self.mv_canvas.canvasx(event.x) // sx)
+            v = int(self.mv_canvas.canvasy(event.y) // s)
+            x, y = self._mv_pick_cell(u, v)  # ★旋转：显示格 → 存档格（俯视挑有东西的半格）
             st['sel'] = (x, y)
+            st['last_disp'] = (u, v) if self._mv_ortho_ready() else None
             self._mv_refresh_sel()
         # ★§SOV11：坐标回填到「定位」的两个输入框 —— 点一格就能看到精确坐标，
         #   想微调/复制也不必再算（拖到别处后点「居中选中」也能回来）。

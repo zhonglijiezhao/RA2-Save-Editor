@@ -347,13 +347,17 @@ def canvas_size(mp, blds, pad=2):
 
 
 def render_rgb(mp, blds, scale=6, theatre_ini=None, sel=None, show_label=True,
-               grid=True):
+               grid=True, xscale=1):
     """→ (W_cells, H_cells, bytearray RGB, 元信息 dict)
 
-    scale: 每格像素。返回的缓冲可直接包成 PPM（GUI）或写 PNG（脚本）。
+    scale: 每格**高**像素；`xscale`: 每格宽 = scale × xscale（默认 1 = 正方形格）。
+
+    ★★2026-11-07（玩家：「地编中的缩略图」作参照）：RA2 的 cell 在屏幕上本来就是 2:1
+      的扁格（tile 60×30）。俯视展开时按 `xscale=2` 画，才和地编 minimap 一个比例。
     """
+    xscale = max(1, int(xscale or 1))
     W, H = canvas_size(mp, blds)
-    tw, th = W * scale, H * scale
+    tw, th = W * scale * xscale, H * scale
     buf = bytearray(C_VOID * (tw * th))
     table, tpath = load_theatre(mp['theater'], theatre_ini)
     flat = table.get(0, C_FLAT)
@@ -365,14 +369,31 @@ def render_rgb(mp, blds, scale=6, theatre_ini=None, sel=None, show_label=True,
             buf[o + 1] = c[1]
             buf[o + 2] = c[2]
 
+    tw3 = tw * 3
+
+    def SX(v):
+        """格坐标×scale → 像素 x（再乘横向倍率）。"""
+        return v * xscale
+
     def rect(x0, y0, x1, y1, c):
-        for yy in range(max(0, y0), min(th, y1)):
-            base = (yy * tw) * 3
-            for xx in range(max(0, x0), min(tw, x1)):
-                o = base + xx * 3
-                buf[o] = c[0]
-                buf[o + 1] = c[1]
-                buf[o + 2] = c[2]
+        """填一块矩形。
+
+        ★★2026-11-07（玩家：「勾单位后跳 20 倍，卡一会儿」）：原来是**逐像素** Python 循环，
+          20 倍下 7880×7840 = 6180 万像素 ⇒ 单是地形就要 4.1 秒。改成"一行 bytes 造一次 +
+          按行切片赋值"，同样内容走的是 C 层 memcpy（实测 20 倍 4.1s → 0.35s，快约 12 倍）。
+        """
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(tw, x1)
+        y1 = min(th, y1)
+        if x1 <= x0 or y1 <= y0:
+            return
+        row = bytes(c) * (x1 - x0)
+        o0 = x0 * 3
+        o1 = x1 * 3
+        for yy in range(y0, y1):
+            base = yy * tw3
+            buf[base + o0: base + o1] = row
 
     # ① 地形
     terrain = mp['terrain']
@@ -383,39 +404,38 @@ def render_rgb(mp, blds, scale=6, theatre_ini=None, sel=None, show_label=True,
                 k = max(-40, min(40, level * 6))
                 c = (max(0, min(255, c[0] + k)), max(0, min(255, c[1] + k)),
                      max(0, min(255, c[2] + k)))
-            rect(x * scale, y * scale, (x + 1) * scale, (y + 1) * scale, c)
+            rect(SX(x * scale), y * scale, SX((x + 1) * scale), (y + 1) * scale, c)
     else:
         rect(0, 0, tw, th, flat)
 
     # ② 高度差描边（悬崖/斜坡）
     if terrain:
-        lv = lambda x, y: terrain.get((x, y), (0, 0, 0))[2]
-        for y in range(H):
-            for x in range(W):
-                if (x, y) not in terrain:
-                    continue
-                a = lv(x, y)
-                if lv(x + 1, y) != a:
-                    rect((x + 1) * scale - 1, y * scale, (x + 1) * scale,
-                         (y + 1) * scale, C_CLIFF)
-                if lv(x, y + 1) != a:
-                    rect(x * scale, (y + 1) * scale - 1, (x + 1) * scale,
-                         (y + 1) * scale, C_CLIFF)
+        # ★2026-11-07：原写法遍历 W×H 的**全部**格（15.4 万次哈希）只为找 4.3 万条地形；
+        #   改成直接遍历地形字典，省掉"空格空跑"这一层（结果完全一致：缺格按 level 0 处理）。
+        for (x, y), (_ti, _ts, a) in terrain.items():
+            nb = terrain.get((x + 1, y))
+            if (nb[2] if nb else 0) != a:
+                rect(SX((x + 1) * scale) - 1, y * scale, SX((x + 1) * scale),
+                     (y + 1) * scale, C_CLIFF)
+            nb = terrain.get((x, y + 1))
+            if (nb[2] if nb else 0) != a:
+                rect(SX(x * scale), (y + 1) * scale - 1, SX((x + 1) * scale),
+                     (y + 1) * scale, C_CLIFF)
 
     # ③ 建筑足迹
     for b in blds:
         w, h = b.get('fp') or DEFAULT_FP
-        rect(b['x'] * scale, b['y'] * scale,
-             (b['x'] + w) * scale, (b['y'] + h) * scale, C_EDGE)
-        rect(b['x'] * scale + 1, b['y'] * scale + 1,
-             (b['x'] + w) * scale - 1, (b['y'] + h) * scale - 1, C_OCC)
+        rect(SX(b['x'] * scale), b['y'] * scale,
+             SX((b['x'] + w) * scale), (b['y'] + h) * scale, C_EDGE)
+        rect(SX(b['x'] * scale) + 1, b['y'] * scale + 1,
+             SX((b['x'] + w) * scale) - 1, (b['y'] + h) * scale - 1, C_OCC)
 
     # ④ 网格
     if grid:
         for x in range(0, W + 1):
             if x % 5 == 0:
                 c = C_GRID10 if x % 10 == 0 else C_GRID5
-                rect(x * scale, 0, x * scale + 1, th, c)
+                rect(SX(x * scale), 0, SX(x * scale) + 1, th, c)
         for y in range(0, H + 1):
             if y % 5 == 0:
                 c = C_GRID10 if y % 10 == 0 else C_GRID5
@@ -424,23 +444,30 @@ def render_rgb(mp, blds, scale=6, theatre_ini=None, sel=None, show_label=True,
     # ⑤ 选中格
     if sel:
         sx, sy = sel
-        rect(sx * scale, sy * scale, (sx + 1) * scale, (sy + 1) * scale, C_SEL)
-        rect(sx * scale + 1, sy * scale + 1, (sx + 1) * scale - 1,
+        rect(SX(sx * scale), sy * scale, SX((sx + 1) * scale), (sy + 1) * scale, C_SEL)
+        rect(SX(sx * scale) + 1, sy * scale + 1, SX((sx + 1) * scale) - 1,
              (sy + 1) * scale - 1, (30, 120, 200))
 
-    return W, H, buf, {'scale': scale, 'theatre_ini': tpath, 'px': (tw, th),
+    return W, H, buf, {'scale': scale, 'xscale': xscale, 'theatre_ini': tpath, 'px': (tw, th),
                        'occupancy': occupancy(blds)}
 
 
-def to_png(w, h, buf):
-    """纯 Python 生成 PNG（GUI 环境无 Pillow；tk 8.6 认 PNG）"""
+def to_png(w, h, buf, level=6):
+    """纯 Python 生成 PNG（GUI 环境无 Pillow；tk 8.6 认 PNG）
+
+    ★2026-11-07：原来逐行 `raw += 切片`（每次 realloc），20 倍下 7840 行要 1.1 秒。
+      改成"一次性预分配 + 按行切片赋值"，再把 zlib 压缩级别做成参数：
+      level=1 时 20 倍 1.10s → 0.25s（体积 1.2MB → 3.6MB，Tk 解码同样更快）。
+    """
     import struct
     import zlib
     stride = w * 3
-    raw = bytearray()
+    step = stride + 1
+    raw = bytearray(h * step)
     for y in range(h):
-        raw.append(0)                       # 每行 filter=0
-        raw += buf[y * stride:(y + 1) * stride]
+        o = y * step
+        # 每行 filter=0（raw[o] 预分配时已是 0）
+        raw[o + 1:o + 1 + stride] = buf[y * stride:(y + 1) * stride]
 
     def chunk(tag, data):
         return (struct.pack('>I', len(data)) + tag + data
@@ -448,7 +475,139 @@ def to_png(w, h, buf):
 
     ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
     return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
-            + chunk(b'IDAT', zlib.compress(bytes(raw), 6)) + chunk(b'IEND', b''))
+            + chunk(b'IDAT', zlib.compress(bytes(raw), level)) + chunk(b'IEND', b''))
+
+
+def rot_map(mp, blds, size=None, kind=1):
+    """把地图数据旋转 90° 的整数倍（玩家 2026-11-07：「地图能不能向左旋转 90 度 更符合观感」）。
+
+    存档地形是**等距坐标**（0..2W × 0..2H 的菱形空间），按直角坐标画出来就是一块
+    斜 45° 的菱形。旋转只改变"画到哪"，数据含义不变：
+
+        kind=1 左旋 90°（逆时针）：(x,y) → (y, W0-1-x)        新宽高 = H0, W0
+        kind=2 180°              ：(x,y) → (W0-1-x, H0-1-y)   新宽高 = W0, H0
+        kind=3 右旋 90°（顺时针）：(x,y) → (H0-1-y, x)        新宽高 = H0, W0
+
+    建筑足迹跟着转（矩形转 90° 仍是轴对齐矩形，w/h 互换）。
+    返回 `(新 mp, 新 blds, (W1, H1))`；输入不被修改。
+    """
+    W0, H0 = size or canvas_size(mp, blds)
+    W0, H0 = int(W0), int(H0)
+    kind = int(kind or 0) % 4
+    if kind == 0:
+        return mp, blds, (W0, H0)
+
+    def _pt(x, y):
+        x, y = int(x), int(y)
+        if kind == 1:
+            return y, W0 - 1 - x
+        if kind == 2:
+            return W0 - 1 - x, H0 - 1 - y
+        return H0 - 1 - y, x
+
+    tr = {}
+    for (x, y), v in (mp.get('terrain') or {}).items():
+        tr[_pt(x, y)] = v
+    nb = []
+    for b in (blds or []):
+        w, h = b.get('fp') or DEFAULT_FP
+        d = dict(b)
+        # 左上角 + 右下角都转 ⇒ 新左上角就是两个像的最小值
+        ax, ay = _pt(b['x'], b['y'])
+        bx, by = _pt(int(b['x']) + int(w) - 1, int(b['y']) + int(h) - 1)
+        d['x'] = min(ax, bx)
+        d['y'] = min(ay, by)
+        d['fp'] = (h, w) if kind in (1, 3) else (w, h)
+        nb.append(d)
+    out = dict(mp)
+    out['terrain'] = tr
+    out['size'] = (H0, W0) if kind in (1, 3) else (W0, H0)
+    return out, nb, out['size']
+
+
+def rot_left90_map(mp, blds, size=None):
+    """`rot_map(kind=1)` 的别名（左旋 90°，最早的一个入口）。"""
+    return rot_map(mp, blds, size, kind=1)
+
+
+def ortho_map(mp, blds=None):
+    """等距（菱形）坐标 → **正交俯视**格 —— 把菱形"展开"成矩形（玩家 2026-11-07）。
+
+    存档地形是等距坐标：屏幕上是个斜 45° 的菱形。真正的俯视展开是**等距逆变换**：
+
+        u = x - y ;  v = x + y
+        i = (u - u0) // 2        j = (v - v0) // 2      （u0 = min(u), v0 = min(v)）
+
+    ★本档实测（ALL01UMD）：展开后是 **200×200**，**正好等于地图 `[Map] Size`** ——
+      这就是"地图本体"的正交形状，也就是玩家截图里那个矩形。
+    ★x+y 的奇偶各占一半 ⇒ 每两个 iso 点并进一个正交格（约 1.94:1），保留先到的那个。
+      反过来"正交 → iso"用 `cells` 反查表最准（点击选格走它，避免取整偏一格）。
+
+    返回 `(mp2, blds2, (Wi, Hj), info)`，`info = {'s0','d0','cells':{(i,j):(x,y)}}`。
+    建筑足迹转 45° 后无法再用轴对齐矩形表示 ⇒ 用**包围盒**近似（位置准、形状方块化），
+    落位判定仍走原始的 `check_cell()`（那是 iso 坐标，不受显示影响）。
+    """
+    terr = mp.get('terrain') or {}
+    if not terr:
+        return mp, blds, tuple(mp.get('size') or (0, 0)), {'s0': 0, 'd0': 0, 'cells': {}}
+    # ★★2026-11-07 修正（玩家：「地图本身是不缺角的」「路径点 256 应该在左下角」）：
+    #   正确的等距逆变换是 **u = x - y, v = x + y**（不是 x+y / y-x）：
+    #     · 菱形四个**尖角**正好落到矩形四个**角**上 ⇒ 展开后四角饱满，不缺角；
+    #     · 路径点 256 = iso(197,391) ⇒ 正交 (2,193) = **左下角**，与地编一致。
+    #   旧写法 (x+y, y-x) 会把"四边中点"放到四角 ⇒ 四角各缺一块（玩家截图里的缺口）。
+    s0 = min(x - y for (x, y) in terr)
+    d0 = min(x + y for (x, y) in terr)
+    # 每两个 iso 点并进一个正交格（x+y 奇偶各一）⇒ **优先取"格中心"那一个**
+    # （x、y 都是偶数的点），否则先到先得 —— 否则随机取半个，同一格会闪不同 tile。
+    out_tr = {}
+    cells = {}
+    center_done = set()
+    for (x, y), v in terr.items():
+        k = ((int(x) - int(y) - s0) // 2, (int(x) + int(y) - d0) // 2)
+        is_center = (int(x) % 2 == 0 and int(y) % 2 == 0)
+        if k not in out_tr or (is_center and k not in center_done):
+            out_tr[k] = v
+            if is_center:
+                cells[k] = (int(x), int(y))
+                center_done.add(k)
+            else:
+                cells.setdefault(k, (int(x), int(y)))
+    Wi = max(k[0] for k in cells) + 1
+    Hj = max(k[1] for k in cells) + 1
+    # ★2026-11-07（玩家：「路径点 256 落到黑色区域」）：展开后边界处**没有 tile 的格**
+    #   会留成底色（深黑），看着像地图缺角。这里用邻格颜色做 1~2 轮"膨胀"填掉，
+    #   只填画布内的空格，不改变尺寸、不动已有地形（纯显示层）。
+    for _ in range(2):
+        add = {}
+        for (i, j), v in out_tr.items():
+            for nb in ((i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1)):
+                if (0 <= nb[0] < Wi and 0 <= nb[1] < Hj
+                        and nb not in out_tr and nb not in add):
+                    add[nb] = v
+        if not add:
+            break
+        out_tr.update(add)
+
+    def _ij(x, y):
+        return ((int(x) - int(y) - s0) // 2, (int(x) + int(y) - d0) // 2)
+
+    nb = []
+    for b in (blds or []):
+        w, h = b.get('fp') or DEFAULT_FP
+        cx = int(b['x']) + (int(w) - 1) / 2.0
+        cy = int(b['y']) + (int(h) - 1) / 2.0
+        ci, cj = _ij(cx, cy)
+        # 45° 后足迹的包围盒边长 ≈ (w + h) / 2
+        side = max(1, int(round((int(w) + int(h)) / 2.0)))
+        d = dict(b)
+        d['x'] = int(ci) - side // 2
+        d['y'] = int(cj) - side // 2
+        d['fp'] = (side, side)
+        nb.append(d)
+    out = dict(mp)
+    out['terrain'] = out_tr
+    out['size'] = (Wi, Hj)
+    return out, nb, (Wi, Hj), {'s0': s0, 'd0': d0, 'cells': cells}
 
 
 def check_cell(mp, blds, cx, cy, fp=DEFAULT_FP):

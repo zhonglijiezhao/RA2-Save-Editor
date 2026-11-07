@@ -71,6 +71,8 @@ _build*.log
 *.bak*
 自检_*.txt
 _view_*.png
+# 调试图/对比图目录（_tmp_localvar/ 这类，一次几十张 PNG，只对本地排查有用）
+_tmp_*/
 
 # 图标制作的中间产物（对比图、各尺寸预览、HICON 渲染）
 _icon_build/

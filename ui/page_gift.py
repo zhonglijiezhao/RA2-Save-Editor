@@ -616,9 +616,32 @@ class GiftPage(object):
         if not sel:
             messagebox.showwarning('提示', '请先在地图上点选一个格子')
             return None
-        recs = [r for r in (self.doc.unit_records() or [])
-                if isinstance(r.get('x'), int) and (r['x'], r['y']) == (sel[0], sel[1])]
+        allrecs = [r for r in (self.doc.unit_records() or [])
+                   if isinstance(r.get('x'), int)]
+        recs = [r for r in allrecs if (r['x'], r['y']) == (sel[0], sel[1])]
         if need_units and not recs:
+            # ★2026-11-07 俯视「半格」兜底：展开后一个显示格压着两个 iso 半格，
+            #   手输坐标/旧选格可能落在空的那一半，而单位其实在隔壁半格（本档实测
+            #   显示格 (183,20)：(204,37) 空、(205,37) 有 1 台 HTK）。
+            #   只在同一显示格里找，且**只有一个半格有单位**时才自动换，避免误删别的格。
+            try:
+                if self._mv_ortho_ready():
+                    _u, _v = self._mv_cell(sel[0], sel[1])
+                    _sib = [tuple(c) for c in self._mv_ortho_candidates(_u, _v)
+                            if tuple(c) != (sel[0], sel[1])]
+                    _hits = []
+                    for c in _sib:
+                        rr = [r for r in allrecs if (r['x'], r['y']) == c]
+                        if rr:
+                            _hits.append((c, rr))
+                    if len(_hits) == 1:
+                        c, rr = _hits[0]
+                        self.status.set(
+                            '格 (%d,%d) 无单位；已改用同一俯视格另一半 (%d,%d) 的 %d 台单位'
+                            % (sel[0], sel[1], c[0], c[1], len(rr)))
+                        return c, rr
+            except Exception:
+                _swallow()
             messagebox.showinfo('提示', '格 (%d,%d) 上没有单位' % (sel[0], sel[1]))
             return None
         return sel, recs

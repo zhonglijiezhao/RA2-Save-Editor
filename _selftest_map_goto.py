@@ -25,8 +25,20 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 from editor_core import SaveDoc                                      # noqa: E402
 
-SAV = r'E:\YURI\SAVE6784.SAV'
+# ★2026-11-07：游戏根目录的 .sav 会被同名默认档顶替/清走 ⇒ 动态找样本，
+#   找不到就跳过而不是判 FAIL（项目既定方针，见 .workbuddy/memory）。
+SAV = next((p for p in (r'E:\YURI\SAVE6784.SAV',
+                        r'E:\YURI\新建文件夹 (32)\SAVE6784.SAV',
+                        r'E:\YURI\新建文件夹 (31)\SAVE6784.SAV',
+                        r'E:\YURI\新建文件夹 (28)\SAVE6784.SAV',
+                        r'E:\YURI\新建文件夹 (26)\SAVE6784.SAV',
+                        r'E:\YURI\新建文件夹 (25)\SAVE6784.SAV',
+                        r'E:\YURI\新建文件夹 (20)\SAVE6784.SAV')
+            if os.path.exists(p)), None)
 MAP = r'E:\YURI\sov01umd.map'
+if not SAV or not os.path.exists(MAP):
+    print('跳过：样本缺失（%s / %s）' % (SAV, MAP))
+    sys.exit(0)
 
 OK = FAIL = 0
 
@@ -71,6 +83,10 @@ app._set_doc(SaveDoc(SAV))
 app.update()
 app.nb.select(6)
 app.update()
+# ★2026-11-07：这份老自检是按「原始菱形 1:1」写的（视口/居中/点击都按 s 计），
+#   而现在默认视图是「俯视展开 2:1」。显式切回 kind=0，测的仍是原来那套定位逻辑。
+app.mv_rot_kind.set(0)
+app._mv_sync_rot_cb()
 
 print('== A. 控件齐不齐 ==')
 chk(hasattr(app, 'mv_gx') and hasattr(app, 'mv_gy'), '有 X / Y 输入框')
@@ -170,6 +186,13 @@ print('== F. 缩放锚点 ==')
 app.mv_goto(40, 40)
 app.update()
 before = view_center_cell(app)
+# ★2026-11-07：缩放现在走 130ms 合并重绘（连点只画最后一帧）。这份老自检
+#   没有跑主循环，定时器不会触发 ⇒ 这里把「延迟重绘」换成同步重绘，测的仍是锚点。
+def _sync_render(anchor=None, delay=130):
+    app.mv_render()
+    if anchor:
+        app._mv_center_on(*anchor)
+app._mv_schedule_render = _sync_render
 app.mv_zoom(1)
 app.update()
 after = view_center_cell(app)

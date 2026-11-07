@@ -4051,6 +4051,23 @@ class SaveDoc(object):
             return '所属方#%d' % v
         if ptype == 6:
             return str(v)
+        if ptype == 3:
+            # ★★§SOV32（2026-11-07 玩家：「新建局部变量后 触发行为 下拉表为空」）：
+            #   ptype=3 = **局部变量型**（行为 56/57 设置·清除局部变量、事件 36/37
+            #   「局部变量被设置/清除」）。参数 = **引擎索引（0 基）**，翻成「0 V1」，
+            #   名字优先取存档镜像、其次地图 `[VariableNames]`。
+            try:
+                for r in self.local_var_table():
+                    if int(r['index']) == int(v):
+                        nm = (r.get('name') or r.get('name_map') or '').strip()
+                        if not nm:
+                            return '%d（未定义）' % v
+                        # 与触发编辑器下拉同一套文字：名字只在存档里的标「（仅存档）」
+                        return ('%d %s' % (v, nm)) + (
+                            '' if r.get('source') == 'map' else '（仅存档）')
+            except Exception:
+                _swallow()
+            return '变量 %s（本档没有这一条）' % v
         if ptype == 31:
             # ★§SOV16：地编 ptype=31 = 「奖励箱类型」（108 创建工具箱 用的那个下拉）
             return crate_name(v)
@@ -9157,20 +9174,63 @@ class SaveDoc(object):
         self._localsize_memo = (p, ls)
         return ls
 
+    def ortho_origin(self, path=None):
+        """等距逆变换的基准 `(u0, v0)` —— `u0=min(x-y)`、`v0=min(x+y)`（按地图地形算，带缓存）。
+
+        与 `map_render.ortho_map()` 用的是**同一套**公式（俯视展开就靠它），
+        换图自动失效（按路径 + 地形格数缓存）。
+        """
+        try:
+            p = path or self.scenario_map_path()
+        except Exception:
+            p = path
+        memo = getattr(self, '_ortho_memo', None)
+        if memo is not None and memo[0] == p:
+            return memo[1]
+        uv = None
+        if p and os.path.exists(p):
+            try:
+                import map_render as _mr
+                t = (_mr.parse_map(p) or {}).get('terrain') or {}
+                if t:
+                    uv = (min(x - y for (x, y) in t), min(x + y for (x, y) in t))
+            except Exception:
+                uv = None
+        self._ortho_memo = (p, uv)
+        return uv
+
+    def iso_to_cell(self, cx, cy, map_path=None):
+        """存档等距坐标 → **正交 cell 坐标**（= 地编 minimap 上的格子）→ (i, j) 或 None。
+
+        `i = (x - y - u0) // 2`、`j = (x + y - v0) // 2`（玩家 2026-11-07 用
+        「路径点 256 应在地编左下角」+「地图四角不缺」两条证据标定过）。
+        """
+        uv = self.ortho_origin(map_path)
+        if not uv:
+            return None
+        u0, v0 = uv
+        return ((int(cx) - int(cy) - u0) // 2, (int(cx) + int(cy) - v0) // 2)
+
     def cell_visible(self, cx, cy, map_path=None):
         """该格是否在**可见区域（蓝线）内** → True / False / None（地图读不出来就别拦）。
 
-        ★换算（§271 玩家标定）：**存档格坐标 = 地编 tile 坐标 × 2**。
-          验证：`SAVE4823` 那张图 `LocalSize=5,4,174,107` ⇒ 地编 x∈[5,179)、y∈[4,111)
-          ⇒ 存档坐标 x∈[10,358)、y∈[8,222)。
-          玩家给的三个点全部吻合：`(16,179)` 界内 ✔、`(1,180)` 界外 ✔、`(19,177)` 界内 ✔。
-          （按 ×1 换算则 `(16,179)` 的 y=179 > 111 会被判界外，与实测矛盾 ⇒ 只有 ×2 成立。）
+        ★★2026-11-07 修正（玩家：「提示在蓝线外，这个不对」）：
+          地编「地图参数 ▸ 可见区域」写的是**正交 cell 坐标**（本图 `2,4,190,190`），
+          而本函数的入参是**存档等距坐标**（如路径点 256 = (197,391)）。旧实现按
+          "存档坐标 = tile × 2" 硬乘，把 (197,391) 判到界外，可它在 FA2 的蓝框里。
+          现在统一走 `iso_to_cell()` 换算（与俯视展开同一套公式），再比 [l, l+w) × [t, t+h)。
+          `SAVE0029`：256 ⇒ 正交 (2,193)，可见区 2..191 × 4..193 ⇒ **界内** ✓
         `map_path`：GUI 传"当前打开的地图"，做到**以你看到的那张图为准**。
         """
         ls = self.map_local_size(map_path)
         if not ls:
             return None
         l, t, w, h = ls
+        ij = self.iso_to_cell(cx, cy, map_path)
+        if ij:
+            i, j = ij
+            return l <= i < l + w and t <= j < t + h
+        # 没地形（只有 .map 壳）⇒ 退回旧口径（存档坐标 = tile×2），至少不误判成"界内"
         return (2 * l) <= int(cx) < 2 * (l + w) and (2 * t) <= int(cy) < 2 * (t + h)
 
 
@@ -16804,6 +16864,13 @@ class SaveDoc(object):
 
         数据来自两半：坐标/键靠扫 `CellClass +80`，归属（标签/触发名）复用
         `attach_overview()` 的键链解析（它已有缓存）。
+
+        ★★2026-11-07（玩家：「地图页卡一会儿」）：旧实现对**每条 CellTag 都在 43MB 明文里
+          全文搜自己的自键**（`pl.find(pat, q)` 循环）⇒ 实测 16.6 万次 `bytearray.find`、
+          **4.4 秒**，而且地图页每次新建 state 都要重扫一遍。
+          改成：**一次扫完 CellClass 对象**（`_cell_by_key()` 本来就走一遍 GUID 索引，
+          12 720 个格对象，已有缓存），再读每个对象的 `+80` 挂接键 —— 命中集合完全等价
+          （老逻辑的判据是「key 是本档某个 CellTag 的自键 + 后面恒 -1」）。
         """
         self._invalidate_if_shifted()
         c = getattr(self, '_cellmarks', None)
@@ -16811,46 +16878,67 @@ class SaveDoc(object):
             return c[1]
         pl = self.plain
         n = len(pl)
+        # ★★2026-11-07（第二步）：**不再调用 `attach_overview()`**。
+        #   那个函数要建"每个 CellTag 挂了哪些建筑/单位"的全表，本档 2.5 秒；
+        #   而 marker 只用它的 `tagid / trigger / trigger_name` 三个字段 ——
+        #   这三个字段走**键链**就能拿到（CellTag+56 = 标签自键 → 标签对象+180 = 触发
+        #   实例键 → 实例+56 = 触发 ID），几十毫秒。
+        #   `attach_overview()` 里那套"建筑 → 地图 [Structures] Tag 列"的兜底只影响
+        #   "键链断了的怪档"的名字显示，marker 用不到（认不出就留空，不影响位置/键值）。
+        tag_by_key = {}
+        for t in (self.tag_objects() or []):
+            tag_by_key.setdefault(int(t['key']), t)
         try:
-            meta = {b.get('node'): b for b in (self.attach_overview() or [])}
+            im = self._instance_maps() or {}
         except Exception:
-            meta = {}
+            im = {}
+        sid_of_inst = im.get('sid') or {}
+        try:
+            names = {r.sid: r.name for r in self.records}
+        except Exception:
+            names = {}
+        # CellTag 自键 → 节点偏移（只有这些键才算"单元标记"）
+        node_of = {}
+        for nd in (self.celltag_nodes() or []):
+            k = nd.get('x')
+            if k:
+                node_of.setdefault(int(k), int(nd['node']))
         out = []
-        for nd in self.celltag_nodes():
-            off, key, cnt = nd['node'], nd['x'], nd['count']
-            if not key:
-                continue
-            m = meta.get(off) or {}
-            tag_key = struct.unpack_from('<I', pl, off + CELL_TAGKEY_OFF)[0]
-            pat = struct.pack('<I', key)
-            q = 0
-            while True:
-                i = pl.find(pat, q)
-                if i < 0:
-                    break
-                q = i + 1
-                if off <= i < off + TRIG_CELL_SIZE:
-                    continue                  # CellTag 自己的自键字段
-                if i < self.CELL_TAGLINK_OFF or i + 12 > n:
+        if node_of:
+            try:
+                self._cell_by_key()             # 顺带填好 obj → (x, y)
+            except Exception:
+                _swallow()
+            for obj, (x, y) in (getattr(self, '_cell_offs', None) or {}).items():
+                i = int(obj) + self.CELL_TAGLINK_OFF
+                if i + 12 > n:
+                    continue
+                key = struct.unpack_from('<I', pl, i)[0]
+                off = node_of.get(int(key))
+                if off is None:                 # +80 = 0（99% 的格）或挂了别的东西
                     continue
                 if pl[i + 8:i + 12] != self.CELL_MARK_TAIL:
-                    continue                  # 挂接点后面恒为 -1
-                obj = i - self.CELL_TAGLINK_OFF
-                if pl[obj:obj + 16] != self.CELL_GUID:
-                    continue                  # 不是 CellClass 对象 ⇒ 不认
-                x = int.from_bytes(pl[i + self.CELL_MARK_DX:i + self.CELL_MARK_DX + 2],
-                                   'little')
-                y = int.from_bytes(pl[i + self.CELL_MARK_DX + 2:
-                                      i + self.CELL_MARK_DX + 4], 'little')
+                    continue                    # 挂接点后面恒为 -1
                 if not (0 <= x < 2048 and 0 <= y < 2048):
                     continue
+                tag_key = int(struct.unpack_from('<I', pl, off + CELL_TAGKEY_OFF)[0])
+                tag = tag_by_key.get(tag_key) or {}
+                t_off = int(tag.get('off') or 0)
+                tid = None
+                if t_off:
+                    try:
+                        k_trig = int(struct.unpack_from('<I', pl, t_off + 180)[0])
+                        tid = sid_of_inst.get(k_trig)
+                    except Exception:
+                        tid = None
                 out.append({'x': int(x), 'y': int(y),
                             'cell_off': off, 'cell_key': int(key),
-                            'tag_key': int(tag_key), 'count': int(cnt),
-                            'tagid': m.get('tagid'),
-                            'trigger': m.get('trigger_id'),
-                            'trigger_name': m.get('trigger_name'),
-                            'obj_off': obj, 'link_off': i})
+                            'tag_key': tag_key,
+                            'count': int(struct.unpack_from('<I', pl, off + 64)[0]),
+                            'tagid': tag.get('sid'),
+                            'trigger': tid,
+                            'trigger_name': names.get(tid, '') if tid else '',
+                            'obj_off': int(obj), 'link_off': i})
         out.sort(key=lambda r: (r['y'], r['x'], r['cell_key']))
         self._cellmarks = (n, out)
         return out
