@@ -105,6 +105,12 @@ with zipfile.ZipFile(OUT, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
             continue
         if name in SKIP_TOP or name.lower().endswith(SKIP_EXT_TOP):
             continue
+        # ★2026-11-07（发 1.7.6 时踩到）：`build.py` 覆盖被占用的 exe 时会留下
+        #   `RA2存档编辑器.exe.p367bak` 这种改名备份。它不在 SKIP_EXT_TOP 里，
+        #   会被原样打进发布包 —— 3.6 MB 的**过期程序**，玩家双击就跑错版本。
+        if 'bak' in name.lower():
+            print('  跳过旧备份：%s' % name)
+            continue
         z.write(p, name)
         n += 1
         total += os.path.getsize(p)
