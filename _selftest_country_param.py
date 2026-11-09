@@ -75,6 +75,11 @@ chk(d._arg_text(2, 8) == '苏俄（玩家）', '_arg_text(2,8) = %r' % d._arg_te
 chk(d._arg_text(2, 0) == '美国', '_arg_text(2,0) = %r（旧版错标成「苏俄（玩家）」）'
     % d._arg_text(2, 0))
 chk(d._arg_text(2, 12) == '中立', '_arg_text(2,12) = %r' % d._arg_text(2, 12))
+# ★2026-11-09（玩家样本 所有国家都触发.SAV + FA2 截图）：-1 = 任意所属方，不是"未设置"
+chk(d._arg_text(2, -1) == '任意所属方', '_arg_text(2,-1) = %r（旧版错标成「-1 = 未设置」）'
+    % d._arg_text(2, -1))
+chk(d._arg_text(6, -1) == '（-1 = 未设置）', '非所属方型的 -1 仍是「未设置」（%r）'
+    % d._arg_text(6, -1))
 
 print('\n== B: 胜利者/失败者行为的参数含义 ==')
 own = d.action_owner_sids()

@@ -685,6 +685,12 @@ ENGINE_PTYPE_TEXT = {
 COUNTRY_CHAIN = HOUSE_CHAIN + ['GDI', 'Nod', 'Neutral', 'Special']     # 0..13
 COUNTRY_INDEX = {n: i for i, n in enumerate(COUNTRY_CHAIN)}
 COUNTRY_ORDER = COUNTRY_CHAIN        # 兼容旧名（**按国家序号升序**，下标即参数值）
+# ★★2026-11-09（玩家样本 `所有国家都触发.SAV` + FA2「所属方(Countries注册表)」截图）：
+#   **-1 = 任意所属方**（不分国家，谁的兵进楼都满足）。FA2 下拉最后一项就是
+#   `-1 - 任意所属方`（语言表 `FAChinese Anyhouse=任意所属方`）。
+#   存档里存成 0xFFFFFFFF；`set_event/set_action` 早就允许原样写回，只是显示时被当成
+#   "未设置" ⇒ 01000211/01000213「靠近出核弹」看着像坏数据。
+COUNTRY_ANY = -1
 # ★ 2026-10-17：建筑载荷 `+1344` 用的「运行期阵营序号」兜底表（10 国 = 注册序 0..9；Neutral = 12）。
 #   ⚠ 只有前 10 国与 Neutral 有实测支撑（母本 / 大任务档两档一致）；Special 未实测（取 11 兜底）。
 #   能用时**一律优先从本档已有建筑反解**（`SaveDoc.house_run_index()`），本表只做兜底。
@@ -4102,7 +4108,14 @@ class SaveDoc(object):
 
     def _arg_text(self, ptype, v):
         """把参数按类型翻译成人话（能翻就翻，翻不了给原值）"""
-        if v == -1:                        # ★§SOV01：引擎的"未设置"哨兵（存档里 0xFFFFFFFF）
+        if ptype == 2 and v == -1:
+            # ★★2026-11-09（玩家样本 `所有国家都触发.SAV` + FA2「所属方(Countries注册表)」截图）：
+            #   所属方型参数 **-1 = 任意所属方**（不分国家，谁的兵进楼都算），
+            #   FA2 下拉最后一项写的就是 `-1 - 任意所属方`。
+            #   以前这里统一当"未设置"，于是 01000211/01000213「靠近出核弹」那两条
+            #   显示成"（-1 = 未设置）"，看着像坏数据。
+            return '任意所属方'
+        if v == -1:                        # ★§SOV01：其它类型下的 -1（存档里 0xFFFFFFFF）
             return '（-1 = 未设置）'
         if ptype == 0:
             return ''
@@ -4196,9 +4209,11 @@ class SaveDoc(object):
             ev['ptype'] = event_ptype(etype)
         if arg is not None:
             arg = int(arg)
-            # ★§SOV01：-1 = 引擎的"未设置"哨兵（存档里存成 0xFFFFFFFF），允许原样写回。
+            # ★§SOV01：-1（存档里 0xFFFFFFFF）允许原样写回。
+            #   所属方型（ptype 2）的 -1 = **任意所属方**，别按"未设置"理解。
             if not (-1 <= arg <= 0xFFFFFF):
-                raise ValueError('参数需在 0 ~ 16777215 之间（或 -1 = 未设置）')
+                raise ValueError('参数需在 0 ~ 16777215 之间'
+                                 '（所属方型另有 -1 = 任意所属方）')
             self.plain[ev['off'] + 8:ev['off'] + 12] = (arg & 0xFFFFFFFF).to_bytes(4, 'little')
             ev['arg'] = arg
             # ★「13 流逝时间」：事件里的秒数只是"地图 INI 的副本"，引擎计时用的是
@@ -4310,9 +4325,11 @@ class SaveDoc(object):
             ac['ptype'] = action_ptype(atype)
         if arg is not None:
             arg = int(arg)
-            # ★§SOV01：-1 = 引擎的"未设置"哨兵（存档里存成 0xFFFFFFFF），允许原样写回。
+            # ★§SOV01：-1（存档里 0xFFFFFFFF）允许原样写回。
+            #   所属方型（ptype 2）的 -1 = **任意所属方**，别按"未设置"理解。
             if not (-1 <= arg <= 0xFFFFFF):
-                raise ValueError('参数需在 0 ~ 16777215 之间（或 -1 = 未设置）')
+                raise ValueError('参数需在 0 ~ 16777215 之间'
+                                 '（所属方型另有 -1 = 任意所属方）')
             # ★★§SOV19：参数位置按**地编参数类型**决定（`action_arg_off`）——
             #   ptype 3/6/31（局部变量 / 数值 / 奖励箱）在对象 **+164**，其余在 +72。
             #   `off` 是"类型字段"= 对象+64 ⇒ +164 就是 off + 100。

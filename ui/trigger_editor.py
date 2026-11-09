@@ -1464,13 +1464,18 @@ class TriggerEditor(tk.Toplevel):
                 # ★★2026-11-09：所属方型 = **地图 [Countries] 的国家序号**
                 #   （0 美国 / 7 古巴 / **8 苏俄** / 12 中立 / 13 特殊），不是"玩家恒为 0"。
                 #   下拉文字就用 idx 打头，`_parse_arg` 取前导数字 ⇒ 显示什么就写什么。
+                #   ★最后一项 `-1 任意所属方` 与 FA2「所属方(Countries注册表)」下拉一致
+                #     （玩家 2026-11-09 样本：改成 -1 后"不分国家都能触发"）。
                 hs = self.doc.country_order() or []
                 vals = ['%d %s%s' % (h['idx'], (h['cn'] or h['short']),
                                      '（玩家）' if h['is_player'] else '')
                         for h in hs]
+                vals.append('-1 任意所属方')
                 combo['values'] = vals
                 if cur is not None:
                     lab = next((v for v, h in zip(vals, hs) if h['idx'] == cur), None)
+                    if lab is None and cur == -1:
+                        lab = vals[-1]
                     if lab is None:
                         lab = '%d（表里没这一项）' % cur      # 模型加了阵营：原样显示，别吞掉
                         combo['values'] = vals + [lab]
@@ -1492,7 +1497,7 @@ class TriggerEditor(tk.Toplevel):
             cur = self._parse_arg(var.get())
         except Exception:
             cur = 0
-        if cur not in (0, -1):
+        if cur != 0:            # 只兜"还没填过"的 0；-1 = 用户明确选了「任意所属方」，别动
             return
         try:
             pl = next((h for h in (self.doc.country_order() or []) if h['is_player']), None)
@@ -1524,7 +1529,8 @@ class TriggerEditor(tk.Toplevel):
             hs = self.doc.country_order() or []
             pl = next((h for h in hs if h['is_player']), None)
             t = ('所属方型：参数 = 地图 [Countries] 的国家序号'
-                 '（0 美国 / 7 古巴 / 8 苏俄 / 12 中立 / 13 特殊）—— 本档玩家 = %s%s'
+                 '（0 美国 / 7 古巴 / 8 苏俄 / 12 中立 / 13 特殊）'
+                 '，最后一项 -1 = 任意所属方（不分国家）—— 本档玩家 = %s%s'
                  % ('%d %s' % (pl['idx'], pl['cn']) if pl else '?',
                     '，要"玩家自己"就选它' if pl else ''))
         elif pt == 0:
@@ -1803,7 +1809,7 @@ class TriggerEditor(tk.Toplevel):
                         _pl = next((h for h in _hs if h['is_player']), None)
                         nt = ('所属方型：参数 = 地图 [Countries] 的国家序号'
                               '（0 美国 / 7 古巴 / 8 苏俄 / 12 中立 13 特殊）；'
-                              '本档玩家 = %s'
+                              '-1 = 任意所属方（不分国家）；本档玩家 = %s'
                               % ('%d %s' % (_pl['idx'], _pl['cn']) if _pl else '?')) + \
                              ('　' + nt if nt else '')
                     elif pt == 14:
