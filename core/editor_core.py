@@ -3976,15 +3976,60 @@ class SaveDoc(object):
     # ★★2026-11-09 定案，推翻 2026-10-20 那条"玩家恒为 0"的旧结论（那次实测用的是
     #   **盟军第一关**，玩家恰好 = Americans = 国家序号 0，结论碰巧对上；换到苏俄关就翻车）。
     #   判据见文件头部 `COUNTRY_CHAIN` 上方那段（地编档 / 编辑器档 只差 `+0x48` 这一个 u32）。
+    def house_slot_map(self):
+        """阵营短名 → **HouseClass 数组槽号**（= 触发「所属方型」参数值）。取不到返回 `{}`。
+
+        ★★2026-11-09：这是**不依赖地图**的那一路。存档里自带一整排 464 字节的所属方记录
+          （`find_house_array()` 定位），**槽号本身就是引擎索引**：
+
+              Americans=0 Alliance=1 French=2 Germans=3 British=4 Africans=5
+              Arabs=6 Confederation=7 Russians=8 YuriCountry=9
+              （GDI=10 / Nod=11 占位）Neutral=12 Special=13
+
+        实测三档（`SOV01UMD.sav` / `SAVE0029.SAV` / `所有国家都触发.SAV`）：11 个阵营
+        **全部落在整槽上**，且 Neutral 恰好 = **12**（10/11 被 GDI/Nod 占着）——
+        与地图 `[Countries]`、FA2 下拉三方完全一致 ⇒ 参数不是"玩家优先"，是这张数组的下标。
+
+        校验（任一不满足就当没有，退回地图/内置表）：步长必须整除 `HOUSE_STEP`、槽号 ≤15、
+        槽号互不相同、至少认出 `HOUSE_MIN_CHAIN` 个（防"插字节后偏移漂移"读到垃圾）。
+        """
+        memo = getattr(self, '_hslot_memo', None)
+        if memo is not None:
+            return memo
+        out = {}
+        try:
+            arr = self.find_house_array() or {}
+        except Exception:
+            arr = {}
+        if len(arr) >= HOUSE_MIN_CHAIN:
+            base = min(arr.values())
+            tmp = {}
+            for nm, off in arr.items():
+                d = off - base
+                if d < 0 or d % HOUSE_STEP or d // HOUSE_STEP > 15:
+                    tmp = {}
+                    break
+                tmp[nm] = d // HOUSE_STEP
+            if tmp and len(set(tmp.values())) == len(tmp):
+                out = tmp
+        self._hslot_memo = out
+        return out
+
     def country_index_map(self):
         """阵营短名 → 「所属方型」参数里那个国家序号（缓存）。
 
-        **挂载了地图就以地图 `[Countries]` 为准**（MOD 可能增删阵营、插号）；
-        没有地图时用内置表（= rulesmd `[Countries]`：0..13，10/11 是 GDI/Nod 空号）。
+        三路来源，**优先级：存档自己的阵营数组 > 地图 `[Countries]` > 内置表**：
+
+        1. `house_slot_map()` —— 存档里那排 464B 记录的槽号，**运行时真相、不需要地图**
+           （引擎就是按这个下标给事件/行为解释参数的）；
+        2. 地图 `[Countries]` —— 任务定义（MOD 增删阵营、插号时以它为准）；
+        3. 内置表 = rulesmd `[Countries]`（0..13，10/11 是 GDI/Nod 空号）。
         """
         m = getattr(self, '_map', None)
+        slots = self.house_slot_map()
+        key = (m, tuple(sorted(slots.items())))
         memo = getattr(self, '_cidx_memo', None)
-        if memo is not None and memo[0] is m:
+        if memo is not None and memo[0] == key:
             return memo[1]
         out = dict(COUNTRY_INDEX)
         if m is not None:
@@ -4000,7 +4045,9 @@ class SaveDoc(object):
                     out.update(got)          # 地图写了几号就是几号（含它自己新增的阵营）
             except Exception:
                 _swallow()
-        self._cidx_memo = (m, out)
+        if slots:
+            out.update(slots)                # ★存档数组优先：这才是引擎真正用的下标
+        self._cidx_memo = (key, out)
         return out
 
     def country_order(self):
@@ -4009,22 +4056,23 @@ class SaveDoc(object):
         ★ `idx` 才是要写进存档/显示的那个数（0 美国 … 7 古巴 … **8 苏俄** … 12 中立 13 特殊）。
           **不要用列表下标**：10/11 是 GDI/Nod 空号、Neutral 是 12 —— 下标和参数值不是一回事。
         """
-        m = getattr(self, '_map', None)
         me = None
         try:
             me = self.player_house()          # 玩家阵营换了 ⇒ 「（玩家）」标记要跟着变
         except Exception:
             _swallow()
+        idx = self.country_index_map()
+        key = (tuple(sorted(idx.items())), me)
         memo = getattr(self, '_corder_memo', None)
-        if memo is not None and memo[0] is m and memo[1] == me:
-            return memo[2]
+        if memo is not None and memo[0] == key:
+            return memo[1]
         rows = []
-        for nm, i in self.country_index_map().items():
+        for nm, i in idx.items():
             rows.append({'idx': int(i), 'short': nm,
                          'cn': HOUSE_CN.get(nm, '') or nm,
                          'is_player': bool(me and nm == me)})
         rows.sort(key=lambda d: d['idx'])
-        self._corder_memo = (m, me, rows)
+        self._corder_memo = (key, rows)
         return rows
 
     def house_order(self):
@@ -16654,6 +16702,7 @@ class SaveDoc(object):
                   '_linkmaps',              # ★§SOV03：关联触发链（跟着记录帧 +132 走）
                   '_sid2inst',              # ★§SOV03：sid → 实例自键（同上，偏移相关）
                   '_houses_memo',          # ★P3-14：houses() 的结构 memo
+                  '_hslot_memo',           # ★2026-11-09：阵营数组槽号（偏移相关，增删字节后要重扫）
                   '_tagrecs', '_mapm', '_aiids',
                   '_tagpairs_memo', '_tagpersist_memo',   # ★2026-10-28 标签配对/持久性 memo
                   # ★2026-10-27：`_horder` 只是 [{'short','cn','is_player'}]，**与偏移无关**，

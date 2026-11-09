@@ -81,6 +81,30 @@ chk(d._arg_text(2, -1) == '任意所属方', '_arg_text(2,-1) = %r（旧版错�
 chk(d._arg_text(6, -1) == '（-1 = 未设置）', '非所属方型的 -1 仍是「未设置」（%r）'
     % d._arg_text(6, -1))
 
+print('\n== E: 不依赖地图也能认出（存档自带阵营数组的槽号）==')
+slots = d.house_slot_map()
+print('   槽号表: %s' % dict(sorted(slots.items(), key=lambda x: x[1])))
+chk(bool(slots), '读得到槽号表（%d 个阵营）' % len(slots))
+chk(slots.get('Americans') == 0, 'Americans = 0（%r）' % slots.get('Americans'))
+chk(slots.get('Russians') == 8, 'Russians = 8（%r）' % slots.get('Russians'))
+chk(slots.get('Neutral') == 12, 'Neutral = 12（%r）—— 10/11 是 GDI/Nod 的空位'
+    % slots.get('Neutral'))
+# 把地图摘掉，模拟"存档旁边没有 .map"
+_d0 = d.country_index_map()
+d._map = None
+d._cidx_memo = None
+d._corder_memo = None
+chk(d.house_index('苏俄') == 8, '无地图 house_index(苏俄) = %r' % d.house_index('苏俄'))
+chk(d._arg_text(2, 8) == '苏俄（玩家）', '无地图 _arg_text(2,8) = %r' % d._arg_text(2, 8))
+_o = d.country_index_map()
+chk(_o.get('Russians') == 8 and _o.get('Neutral') == 12,
+    '无地图时整张表仍对（Russians=%r / Neutral=%r）'
+    % (_o.get('Russians'), _o.get('Neutral')))
+if os.path.exists(MAP):
+    d.attach_map(MAP)
+    d._cidx_memo = None
+    d._corder_memo = None
+
 print('\n== B: 胜利者/失败者行为的参数含义 ==')
 own = d.action_owner_sids()
 vic = [(a['arg'], a['arg_text'], own.get(a['key'])) for a in d.actions() if a['type'] in (1, 2)]
