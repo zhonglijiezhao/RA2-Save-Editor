@@ -668,7 +668,23 @@ ENGINE_PTYPE_TEXT = {
     11: '数值 + 附加(token8)',
 }
 
-COUNTRY_ORDER = HOUSE_ORDER                           # 所属方型参数的取值顺序（同注册序）
+# ★★2026-11-09 定案（玩家样本：`SAVE4AE1_修改.SAV` 不触发 / `SAVE0029.SAV` 地编改完能触发）：
+#   **事件/行为里「所属方型」参数 = 地图 `[Countries]` 的「国家序号」，不是"玩家恒为 0"的显示序。**
+#   证据链：
+#     · `sov01umd.map` 的 `[Countries]`：0=Americans 1=Alliance … 7=Confederation **8=Russians**
+#       … 10=GDI 11=Nod **12=Neutral 13=Special**；`[Basic] Player=Russians House` ⇒ **8 = 苏俄 = 玩家**。
+#     · 同一条触发 01000284「间谍进入科技电厂摧毁铁塔」，事件对象 `+0x48`（参数）：
+#       地编档 = **8**（进游戏正常触发）；编辑器档 = **0**（= 美国，玩家苏俄的间谍进楼永不满足）。
+#       其余字段（事件类型 1、行为 95@wp183 + 21、标签/CellTag/挂接建筑、TagNode 帧数、难度位）
+#       两份档**逐字节一致** ⇒ 一个 u32 定生死。
+#     · 旁证：地图给"中立"写的是 **12**，而 `houses()`（玩家置顶）只有 0..11，根本表达不了 12
+#       ⇒ 那套序号不可能是这张图的口径。
+#   ⚠ 旧实现用 `houses()`（**玩家置顶**排序）的下标当参数值 ⇒ 把 8 显示成「古巴」、把 0 显示成
+#     「苏俄（玩家）」，玩家在下拉里选"苏俄"就被写成 0，触发永远不执行（2026-11-09 踩坑实录）。
+#   取值表：与 `rulesmd [Countries]` 完全对齐（10/11 = GDI/Nod 空号，用来占位）。
+COUNTRY_CHAIN = HOUSE_CHAIN + ['GDI', 'Nod', 'Neutral', 'Special']     # 0..13
+COUNTRY_INDEX = {n: i for i, n in enumerate(COUNTRY_CHAIN)}
+COUNTRY_ORDER = COUNTRY_CHAIN        # 兼容旧名（**按国家序号升序**，下标即参数值）
 # ★ 2026-10-17：建筑载荷 `+1344` 用的「运行期阵营序号」兜底表（10 国 = 注册序 0..9；Neutral = 12）。
 #   ⚠ 只有前 10 国与 Neutral 有实测支撑（母本 / 大任务档两档一致）；Special 未实测（取 11 兜底）。
 #   能用时**一律优先从本档已有建筑反解**（`SaveDoc.house_run_index()`），本表只做兜底。
@@ -3948,33 +3964,81 @@ class SaveDoc(object):
             head = '地图部分对照'
         return '%s：%s' % (head, '；'.join(parts))
 
-    def house_order(self):
-        """「所属方序号」的真实顺序（缓存）：**玩家恒为 0**，其余按存档注册序。
+    # ------------------------------------------------------------------
+    # 「所属方型」参数（事件/行为）= 地图 `[Countries]` 的国家序号
+    # ------------------------------------------------------------------
+    # ★★2026-11-09 定案，推翻 2026-10-20 那条"玩家恒为 0"的旧结论（那次实测用的是
+    #   **盟军第一关**，玩家恰好 = Americans = 国家序号 0，结论碰巧对上；换到苏俄关就翻车）。
+    #   判据见文件头部 `COUNTRY_CHAIN` 上方那段（地编档 / 编辑器档 只差 `+0x48` 这一个 u32）。
+    def country_index_map(self):
+        """阵营短名 → 「所属方型」参数里那个国家序号（缓存）。
 
-        ★★2026-10-20 玩家实测定案：行为/事件的「所属方型」参数用的是**这个序号**，
-          不是地编 `[Countries]` 的国家枚举。证据（改.SAV）：
-            · 玩家 = Russians；任务自带的「1a最后胜利a」触发行为 1 参数 = **0** ⇒ 0 = 玩家自己；
-            · 玩家把参数填成 8（按国家枚举 8=苏俄）⇒ 实际指向**古巴**（本序列表第 9 个）
-              ⇒ 读档变成"古巴获胜" ⇒ 玩家失败。与玩家反馈完全一致。
+        **挂载了地图就以地图 `[Countries]` 为准**（MOD 可能增删阵营、插号）；
+        没有地图时用内置表（= rulesmd `[Countries]`：0..13，10/11 是 GDI/Nod 空号）。
         """
-        if getattr(self, '_horder', None) is not None:
-            return self._horder
-        out = []
-        try:
-            for h in (self.houses() or []):
-                out.append({'short': h.get('short') or '', 'cn': h.get('cn') or '',
-                            'is_player': bool(h.get('is_player'))})
-        except Exception:
-            out = []
-        self._horder = out
+        m = getattr(self, '_map', None)
+        memo = getattr(self, '_cidx_memo', None)
+        if memo is not None and memo[0] is m:
+            return memo[1]
+        out = dict(COUNTRY_INDEX)
+        if m is not None:
+            try:
+                sec = (getattr(m, 'sections', {}) or {}).get('countries') or {}
+                got = {}
+                for k, v in sec.items():
+                    ks = str(k).strip()
+                    nm = self.norm_house(str(v).split(';')[0])
+                    if ks.isdigit() and nm:
+                        got[nm] = int(ks)
+                if got:
+                    out.update(got)          # 地图写了几号就是几号（含它自己新增的阵营）
+            except Exception:
+                _swallow()
+        self._cidx_memo = (m, out)
         return out
 
+    def country_order(self):
+        """「所属方型」下拉/文案的数据源 → `[{'idx','short','cn','is_player'}]`，按 `idx` 升序。
+
+        ★ `idx` 才是要写进存档/显示的那个数（0 美国 … 7 古巴 … **8 苏俄** … 12 中立 13 特殊）。
+          **不要用列表下标**：10/11 是 GDI/Nod 空号、Neutral 是 12 —— 下标和参数值不是一回事。
+        """
+        m = getattr(self, '_map', None)
+        me = None
+        try:
+            me = self.player_house()          # 玩家阵营换了 ⇒ 「（玩家）」标记要跟着变
+        except Exception:
+            _swallow()
+        memo = getattr(self, '_corder_memo', None)
+        if memo is not None and memo[0] is m and memo[1] == me:
+            return memo[2]
+        rows = []
+        for nm, i in self.country_index_map().items():
+            rows.append({'idx': int(i), 'short': nm,
+                         'cn': HOUSE_CN.get(nm, '') or nm,
+                         'is_player': bool(me and nm == me)})
+        rows.sort(key=lambda d: d['idx'])
+        self._corder_memo = (m, me, rows)
+        return rows
+
+    def house_order(self):
+        """**已废弃的旧名**，等价于 `country_order()`。
+
+        ⚠ 2026-11-09 之前这里返回的是 `houses()` 的"玩家置顶"顺序（0 恒为玩家），
+          拿它的**列表下标**当「所属方型」参数写进存档 ⇒ 苏俄关写 0（= 美国）⇒ 触发永不执行。
+          现在返回按国家序号升序的行，`idx` 字段就是参数值。旧调用点用 `enumerate()`
+          的地方必须改成读 `h['idx']`（10/11 空号 + 12 中立会让下标错位）。
+        """
+        return self.country_order()
+
     def house_index(self, name):
-        """阵营短名/中文名 → 所属方序号（用于写"所属方型"参数）；找不到返回 None。"""
+        """阵营短名/中文名 → **国家序号**（写事件/行为「所属方型」参数用）；找不到返回 None。"""
         name = (name or '').strip()
-        for i, h in enumerate(self.house_order()):
-            if name and name in (h['short'], h['cn']):
-                return i
+        if not name:
+            return None
+        for h in self.country_order():
+            if name in (h['short'], h['cn']):
+                return h['idx']
         return None
 
     def game_lists(self):
@@ -4043,11 +4107,13 @@ class SaveDoc(object):
         if ptype == 0:
             return ''
         if ptype == 2:
-            ho = self.house_order()
-            if 0 <= v < len(ho):
-                h = ho[v]
-                nm = h['cn'] or h['short']
-                return ('%s（玩家）' % nm) if h['is_player'] else nm
+            # ★★2026-11-09：参数 = 地图 `[Countries]` 的国家序号（0 美国 … 8 苏俄 … 12 中立）。
+            #   以前按 `house_order()` 的**列表下标**取名字 ⇒ 8 被翻成「古巴」、0 翻成
+            #   「苏俄（玩家）」，正是玩家"选苏俄却写成 0"的根因。现在按 `idx` 精确匹配。
+            for h in self.country_order():
+                if h['idx'] == v:
+                    nm = h['cn'] or h['short']
+                    return ('%s（玩家）' % nm) if h['is_player'] else nm
             return '所属方#%d' % v
         if ptype == 6:
             return str(v)

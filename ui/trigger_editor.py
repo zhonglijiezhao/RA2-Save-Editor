@@ -205,7 +205,7 @@ class TriggerEditor(tk.Toplevel):
         ttk.Label(r4, text='事件类型').pack(side='left')
         self.cb_ev = ttk.Combobox(r4, width=30, state='readonly')
         self.cb_ev.pack(side='left', padx=6)
-        self.cb_ev.bind('<<ComboboxSelected>>', lambda e: self._ev_hint())
+        self.cb_ev.bind('<<ComboboxSelected>>', lambda e: self._ev_type_changed())
         ttk.Label(r4, text='参数').pack(side='left', padx=(8, 0))
         self.var_evarg = tk.StringVar()
         # ★2026-10-20：「所属方型」参数改成下拉（0 = 玩家自己，其余按存档阵营顺序）
@@ -242,7 +242,7 @@ class TriggerEditor(tk.Toplevel):
         ttk.Label(r5, text='行为类型').pack(side='left')
         self.cb_ac = ttk.Combobox(r5, width=34, state='readonly')
         self.cb_ac.pack(side='left', padx=6)
-        self.cb_ac.bind('<<ComboboxSelected>>', lambda e: self._ac_hint())
+        self.cb_ac.bind('<<ComboboxSelected>>', lambda e: self._ac_type_changed())
         ttk.Label(r5, text='参数').pack(side='left', padx=(8, 0))
         self.var_acarg = tk.StringVar()
         self.cb_acarg = ttk.Combobox(r5, textvariable=self.var_acarg, width=20)
@@ -1461,17 +1461,52 @@ class TriggerEditor(tk.Toplevel):
                     combo.set(lab or ('%s' % cur))
                 return
             if ptype == 2:
-                hs = self.doc.house_order() or []
-                vals = ['%d %s%s' % (i, (h['cn'] or h['short']),
+                # ★★2026-11-09：所属方型 = **地图 [Countries] 的国家序号**
+                #   （0 美国 / 7 古巴 / **8 苏俄** / 12 中立 / 13 特殊），不是"玩家恒为 0"。
+                #   下拉文字就用 idx 打头，`_parse_arg` 取前导数字 ⇒ 显示什么就写什么。
+                hs = self.doc.country_order() or []
+                vals = ['%d %s%s' % (h['idx'], (h['cn'] or h['short']),
                                      '（玩家）' if h['is_player'] else '')
-                        for i, h in enumerate(hs)]
+                        for h in hs]
                 combo['values'] = vals
-                if cur is not None and 0 <= cur < len(vals):
-                    combo.set(vals[cur])       # 显示成 "0 苏俄（玩家）"
+                if cur is not None:
+                    lab = next((v for v, h in zip(vals, hs) if h['idx'] == cur), None)
+                    if lab is None:
+                        lab = '%d（表里没这一项）' % cur      # 模型加了阵营：原样显示，别吞掉
+                        combo['values'] = vals + [lab]
+                    combo.set(lab)
             else:
                 combo['values'] = []           # 其它类型：自由填数字
         except Exception:
             combo['values'] = []
+
+    def _default_country_arg(self, var):
+        """「所属方型」参数框里那个没意义的 0 → 换成**本档玩家的国家序号**。
+
+        ★2026-11-09：只给"用户手动切换事件/行为类型"这条路用（`reload` / `_ev_pick` 不走，
+          免得把已存的值偷偷改掉）。苏俄关里参数 0 = **美国**，留着它写下去就是一条永不触发
+          的死触发 —— 01000284「间谍进入科技电厂摧毁铁塔」就是这么废掉的。
+        参数不是 0 / -1（说明人家自己填过）就一律不动。
+        """
+        try:
+            cur = self._parse_arg(var.get())
+        except Exception:
+            cur = 0
+        if cur not in (0, -1):
+            return
+        try:
+            pl = next((h for h in (self.doc.country_order() or []) if h['is_player']), None)
+        except Exception:
+            pl = None
+        if pl is not None and pl['idx']:
+            var.set(str(pl['idx']))
+
+    def _ev_type_changed(self):
+        """用户手动换了事件类型：切到「所属方型」就把参数默认成玩家所属方。"""
+        i = self.cb_ev.current()
+        if 0 <= i < len(self._ev_keys) and EVENT_TYPES[self._ev_keys[i]][1] == 2:
+            self._default_country_arg(self.var_evarg)
+        self._ev_hint()
 
     def _ev_hint(self):
         i = self.cb_ev.current()
@@ -1486,11 +1521,12 @@ class TriggerEditor(tk.Toplevel):
             cur = None
         self._fill_arg_values(self.cb_evarg, pt, cur)
         if pt == 2:
-            hs = self.doc.house_order() or []
-            t = ('所属方型：0 = 玩家自己（本档 %s），其余按存档阵营顺序 —— %s'
-                 % (next((h['cn'] for h in hs if h['is_player']), '?'),
-                    ' / '.join('%d %s' % (j, h['cn'] or h['short'])
-                               for j, h in enumerate(hs[:6])) + ' …'))
+            hs = self.doc.country_order() or []
+            pl = next((h for h in hs if h['is_player']), None)
+            t = ('所属方型：参数 = 地图 [Countries] 的国家序号'
+                 '（0 美国 / 7 古巴 / 8 苏俄 / 12 中立 / 13 特殊）—— 本档玩家 = %s%s'
+                 % ('%d %s' % (pl['idx'], pl['cn']) if pl else '?',
+                    '，要"玩家自己"就选它' if pl else ''))
         elif pt == 0:
             t = '没有参数（参数会被忽略）'
         elif pt == 6:
@@ -1701,6 +1737,14 @@ class TriggerEditor(tk.Toplevel):
             return self._parse_arg(self.var_acarg.get()), {'waypoint': wp}
         return self._parse_arg(self.var_acarg.get()), {}
 
+    def _ac_type_changed(self):
+        """用户手动换了行为类型：切到「所属方型」就把参数默认成玩家所属方。"""
+        keys = getattr(self, '_ac_keys', [])
+        j = self.cb_ac.current()
+        if 0 <= j < len(keys) and ACTION_TYPES[keys[j]][1] == 2:
+            self._default_country_arg(self.var_acarg)
+        self._ac_hint()
+
     def _ac_hint(self):
         nt = ''
         sel = self.tv_ac.focus()
@@ -1755,9 +1799,12 @@ class TriggerEditor(tk.Toplevel):
                     self._set_wp_hint(k)
                     self._show_wp(k in self.doc.WAYPOINT_ACTIONS)
                     if pt == 2:
-                        hs = self.doc.house_order() or []
-                        nt = ('所属方型：0 = 玩家自己（本档 %s）；其余按存档阵营顺序'
-                              % next((h['cn'] for h in hs if h['is_player']), '?')) + \
+                        _hs = self.doc.country_order() or []
+                        _pl = next((h for h in _hs if h['is_player']), None)
+                        nt = ('所属方型：参数 = 地图 [Countries] 的国家序号'
+                              '（0 美国 / 7 古巴 / 8 苏俄 / 12 中立 13 特殊）；'
+                              '本档玩家 = %s'
+                              % ('%d %s' % (_pl['idx'], _pl['cn']) if _pl else '?')) + \
                              ('　' + nt if nt else '')
                     elif pt == 14:
                         nt = ('触发型：参数 = 目标触发（存档里存在行为对象 +100 的实例键，'
