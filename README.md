@@ -7,9 +7,9 @@
 - 平台：Windows（Python + tkinter，纯标准库，**不需要装任何第三方库**）
 - 语言：界面与文档为中文
 - 许可：**MIT**（见 [LICENSE](LICENSE)；游戏素材声明见 [NOTICE.md](NOTICE.md)）
-- 当前版本：**v1.7.7**（内部构建 `p376`）
+- 当前版本：**v1.8.0**（内部构建 `p378`）
 - **下载（最新）**：https://github.com/zhonglijiezhao/RA2-Save-Editor/releases/latest
-- 本版直达：[v1.7.7](https://github.com/zhonglijiezhao/RA2-Save-Editor/releases/tag/v1.7.7)
+- 本版直达：[v1.8.0](https://github.com/zhonglijiezhao/RA2-Save-Editor/releases/tag/v1.8.0)
 
 ---
 
@@ -57,8 +57,8 @@
 
 ### 3.1 直接用打包好的 exe（不需要 Python）
 
-1. 到 [Releases](https://github.com/zhonglijiezhao/RA2-Save-Editor/releases/latest) 下载 `RA2SaveEditor-v1.7.7-win64.zip`
-2. 解压到**任意**目录（会得到 `RA2SaveEditor-v1.7.7-win64\` 文件夹；不要只解压出 exe —— 必须连 `_internal` 文件夹一起解压）
+1. 到 [Releases](https://github.com/zhonglijiezhao/RA2-Save-Editor/releases/latest) 下载 `RA2SaveEditor-v1.8.0-win64.zip`
+2. 解压到**任意**目录（会得到 `RA2SaveEditor-v1.8.0-win64\` 文件夹；不要只解压出 exe —— 必须连 `_internal` 文件夹一起解压）
 3. 双击 `RA2存档编辑器.exe`
 4. **先备份存档**：把 `C:\Users\你\AppData\...` 或游戏目录 `save\` 里的 `.SAV` 复制一份
 5. 打开存档 → 改 → 用界面上的保存按钮另存为新文件 → 把新文件放回游戏存档目录

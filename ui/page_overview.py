@@ -83,8 +83,10 @@ class OverviewPage(object):
         # ── ③ 地图与规则（贴铁律：本工具只读地图）──
         gcard, gbody = ui_theme.card(row2, '地图与规则')
         gcard.pack(side='left', fill='both', expand=True, padx=(12, 0))
-        for c in (1, 3):
-            gbody.columnconfigure(c, weight=1, uniform='v')
+        # ★只让最后那列吃剩余空间 —— 给 col1 也加 weight/uniform 的话，
+        #   这张卡只有 ~280px 宽，Tk 会等比压缩各列 ⇒「可见区域 0,0,80,80」被截成
+        #   「0,0,80,8」（2026-11-10 截图发现）。
+        gbody.columnconfigure(3, weight=1)
         self.lbl_map = ttk.Label(gbody, text='-', style='Value.TLabel', anchor='w')
         self.lbl_map_mode = ttk.Label(gbody, text='-', style='Value.TLabel', anchor='w')
         # ★§SOV05：地图 [Basic] IgnoreGlobalAITriggers（FA2「忽略全局AI」）的存档镜像
@@ -98,9 +100,24 @@ class OverviewPage(object):
             wid.grid(row=r, column=col + 1, sticky='w', padx=(14, 0), pady=6)
         ttk.Button(gbody, text='切换', command=self.toggle_ignore_ai).grid(
             row=2, column=2, sticky='w', padx=(8, 0))
+
+        # ── ★2026-11-10：可见区域（地编「地图参数 ▸ 可见区域」）──
+        #   显示**存档里**的值（= 读档后游戏真正用的那个矩形）；
+        #   与地图 `[Map] LocalSize` 不一致时变橙 + 打 ⚠（图改过、档还是旧的）。
+        #   ★卡片只有 280px 宽，四段数字 + 输入框 + 按钮塞不下 ⇒ 编辑走弹窗
+        #     （地编也是点「更改」弹窗填，交互一致）。
+        ttk.Label(gbody, text='可见区域', style='Field.TLabel', width=9).grid(
+            row=3, column=0, sticky='w', pady=(6, 0))
+        self.lbl_visible = tk.Label(gbody, text='-', bg=T['surface'], fg=T['ink'],
+                                    font=(ui_theme.FONT_MONO, 10), anchor='w')
+        self.lbl_visible.grid(row=3, column=1, sticky='w', padx=(14, 0), pady=(6, 0))
+        ttk.Button(gbody, text='改…', width=5,
+                   command=self.edit_visible_area).grid(
+            row=3, column=2, sticky='w', padx=(8, 0), pady=(6, 0))
+
         ttk.Label(gbody, text='本工具只读地图：不写 .map，一个字节都不改 '
-                             '（「忽略全局AI」改的是存档里的镜像）',
-                  style='Field.TLabel').grid(row=3, column=0, columnspan=4,
+                             '（「忽略全局AI」「可见区域」改的是存档里的镜像）',
+                  style='Field.TLabel').grid(row=4, column=0, columnspan=4,
                                              sticky='w', pady=(6, 0))
 
         # ── ④ 存档修复：清除空气墙（★2026-11-01 新增）──
@@ -178,13 +195,164 @@ class OverviewPage(object):
         self.status.set('忽略全局AI触发：%s → %s（内存已改，点「保存」才落盘）'
                         % (doc.ignore_ai_text(r['old']), doc.ignore_ai_text(r['new'])))
 
+    # ------------------------------------------------------------------
+    #  可见区域（★★2026-11-10）
+    #  地编「地图参数 ▸ 可见区域」= 地图 `[Map] LocalSize`，存档里有一份镜像：
+    #  明文里一对紧邻的 4×int32（Size 在前、LocalSize 在后），是**唯一副本**，
+    #  读档后游戏用的就是它 ⇒ 改存档即可，地图文件一个字节都不碰。
+    #  证据与定位判据见 `SaveDoc._scan_visible_area` 的注释（两档数值逐字对上地图）。
+    # ------------------------------------------------------------------
+    def refresh_visible_area(self):
+        """把存档里的可见区域刷到概览页（只读，不写）。
+
+        和地图 `[Map] LocalSize` 不一致（图改过、档还是旧的）⇒ 变橙 + 打 ⚠。
+        """
+        doc = getattr(self, 'doc', None)
+        lbl = getattr(self, 'lbl_visible', None)
+        if lbl is None:
+            return
+        va = None
+        if doc:
+            try:
+                va = doc.visible_area()
+            except Exception:
+                va = None
+        if not doc or not va:
+            lbl.config(text='-' if not doc else '读不到', fg=ui_theme.T['muted'])
+            return
+        l, t, w, h = va['local']
+        try:
+            ml = doc.map_local_size()
+        except Exception:
+            ml = None
+        same = bool(ml) and tuple(ml) == (l, t, w, h)
+        lbl.config(text='%d,%d,%d,%d%s' % (l, t, w, h, '' if (not ml or same) else '  ⚠'),
+                   fg=ui_theme.T['ink'] if (not ml or same) else ui_theme.T['warn'])
+
+    def edit_visible_area(self):
+        """弹窗改「可见区域」（原地改存档那 16 字节；地图文件一个字节都不碰）。
+
+        ★为什么是弹窗：这张卡片只有 280px 宽，四段数字 + 输入框 + 按钮挤不下，
+          而且地编本身就是「地图参数 ▸ 可见区域 + 更改」弹窗填 —— 交互也一致。
+        """
+        doc = getattr(self, 'doc', None)
+        if not doc:
+            messagebox.showinfo('可见区域', '请先打开一个存档。', parent=self)
+            return
+        try:
+            va = doc.visible_area()
+        except Exception:
+            va = None
+        if not va:
+            messagebox.showwarning(
+                '读不到', '这条存档里没定位到「可见区域」字段（结构判据不成立），'
+                          '为安全起见不改。', parent=self)
+            return
+        try:
+            ml = doc.map_local_size()
+        except Exception:
+            ml = None
+        T = ui_theme.T
+        sw, sh = va['size']
+        top = tk.Toplevel(self)
+        top.title('可见区域')
+        top.transient(self.winfo_toplevel())
+        top.configure(bg=T['surface'])
+        top.resizable(False, False)
+        body = tk.Frame(top, bg=T['surface'])
+        body.pack(fill='both', expand=True, padx=18, pady=14)
+
+        tk.Label(body, text='格式：左, 上, 宽, 高（单位 = 地编格子，与「地图参数」同口径）',
+                 bg=T['surface'], fg=T['ink_2'],
+                 font=(ui_theme.FONT_UI, 9)).grid(row=0, column=0, columnspan=4,
+                                                  sticky='w', pady=(0, 10))
+        cur = '存档当前：%d,%d,%d,%d' % va['local']
+        cur += ('　　地图 [Map] LocalSize：%d,%d,%d,%d' % tuple(ml)) if ml else \
+            '　　地图：未挂接（无从对照）'
+        tk.Label(body, text=cur, bg=T['surface'],
+                 fg=T['ink'] if (ml and tuple(ml) == va['local']) else T['warn'],
+                 font=(ui_theme.FONT_MONO, 9)).grid(row=1, column=0, columnspan=4,
+                                                    sticky='w')
+        tk.Label(body, text='地图尺寸 %d×%d —— 可见区域必须落在里面（左/上 ≥ 0，'
+                            '左+宽 ≤ %d，上+高 ≤ %d）' % (sw, sh, sw, sh),
+                 bg=T['surface'], fg=T['muted'],
+                 font=(ui_theme.FONT_UI, 9)).grid(row=2, column=0, columnspan=4,
+                                                  sticky='w', pady=(4, 12))
+
+        names = (('左', 'l'), ('上', 't'), ('宽', 'w'), ('高', 'h'))
+        vars_ = {}
+        erow = tk.Frame(body, bg=T['surface'])
+        erow.grid(row=3, column=0, columnspan=8, sticky='w')
+        first_ent = None
+        for i, (lab, key) in enumerate(names):
+            tk.Label(erow, text=lab, bg=T['surface'], fg=T['ink_2'],
+                     font=(ui_theme.FONT_UI, 9)).pack(side='left',
+                                                      padx=(0 if i == 0 else 18, 5))
+            v = tk.StringVar(value=str(va['local'][i]))
+            ent = ttk.Entry(erow, textvariable=v, width=6, justify='center')
+            ent.pack(side='left')
+            vars_[key] = v
+            if first_ent is None:
+                first_ent = ent
+        if first_ent is not None:
+            first_ent.focus_set()
+            first_ent.select_range(0, 'end')
+
+        def _set(vals):
+            for k, n in zip(('l', 't', 'w', 'h'), vals):
+                vars_[k].set(str(n))
+
+        brow = tk.Frame(body, bg=T['surface'])
+        brow.grid(row=4, column=0, columnspan=8, sticky='ew', pady=(14, 0))
+        ttk.Button(brow, text='整张图',
+                   command=lambda: _set((0, 0, sw, sh))).pack(side='left')
+        if ml:
+            ttk.Button(brow, text='用地图的值',
+                       command=lambda: _set(tuple(ml))).pack(side='left', padx=(8, 0))
+        ttk.Button(brow, text='取消', command=top.destroy).pack(side='right')
+        ttk.Button(brow, text='确定', style='Primary.TButton',
+                   command=lambda: _apply(top)).pack(side='right', padx=(0, 8))
+
+        def _apply(win):
+            try:
+                vals = tuple(int(vars_[k].get().strip()) for k in ('l', 't', 'w', 'h'))
+            except Exception:
+                messagebox.showwarning('格式不对', '四个框都要填整数（左、上、宽、高）。',
+                                       parent=win)
+                return
+            try:
+                r = doc.set_visible_area(*vals)
+            except Exception as e:
+                messagebox.showerror('改不了', str(e), parent=win)
+                return
+            win.destroy()
+            self.refresh_visible_area()
+            try:
+                self.app._lists_dirty = True
+            except Exception:
+                _swallow()
+            self.status.set(
+                '可见区域：%d,%d,%d,%d → %d,%d,%d,%d（内存已改，点「保存」才落盘）'
+                % (r['old'] + r['new']))
+
+        top.update_idletasks()
+        try:
+            px, py = self.winfo_rootx(), self.winfo_rooty()
+            w, h = top.winfo_width(), top.winfo_height()
+            top.geometry('+%d+%d' % (px + max(0, (self.winfo_width() - w) // 2),
+                                     py + max(0, (self.winfo_height() - h) // 3)))
+        except Exception:
+            _swallow()
+        top.grab_set()
+        top.bind('<Escape>', lambda e: top.destroy())
+
+
     def _airwall_doc(self):
         doc = getattr(self, 'doc', None)
         if not doc:
             messagebox.showinfo('清除空气墙', '请先打开一个存档。', parent=self)
             return None
         return doc
-
     def scan_air_walls(self):
         """只扫描、不写 → 刷新首页那一行结果。"""
         doc = self._airwall_doc()

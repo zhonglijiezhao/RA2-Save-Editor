@@ -445,6 +445,11 @@ class SearchPage(object):
             except Exception:
                 _iai = None
             self.lbl_ignore_ai.config(text=self.doc.ignore_ai_text(_iai))
+            # ★2026-11-10：可见区域（存档镜像 + 地图对照，输入框由它预填）
+            try:
+                self.refresh_visible_area()
+            except Exception:
+                _swallow()
         except Exception:
             _swallow()
         # ★v1.3：操作条右侧显示当前打开的存档（原来只能看状态栏）

@@ -1121,6 +1121,101 @@ class SaveDoc(object):
                 _swallow()
         return {'old': old, 'new': new, 'off': self.IGNORE_AI_OFF}
 
+    # ★★2026-11-10：可见区域（地编「地图参数 ▸ 可见区域」= 地图 `[Map] LocalSize`）
+    #   的**存档镜像**。明文里是一对紧邻的 4×int32：
+    #      +0x00 MapSize   = left, top, width, height   （= 地图 `[Map] Size`）
+    #      +0x10 LocalSize = left, top, width, height   （← 要改的就是这 16 字节）
+    #      +0x20 三个 iso 尺寸数 = H+2 / W+H-1 / W-2    （定位校验位）
+    #   两档实证（数值与地图逐字对上，不是猜的）：
+    #      all01umd  80×80    LocalSize 3,5,74,69    → 明文 off 0x8F29C
+    #      sov01umd  110×400  LocalSize 4,8,102,188  → 明文 off 0x982AC
+    #   ★偏移**不固定**（取决于前面 chunk 的长度）⇒ 一律走结构判据搜索；
+    #     E:/YURI 下 15 个存档全部**唯一**命中 1 处，且该四元组在明文里只有 1 份副本。
+    #   ★明文里搜不到 `[Map]` / `LocalSize=` 文本（字符串 0 命中）⇒ 这就是唯一来源，
+    #     改它 = 改读档后游戏用的那个矩形（配合铁律「存档自足」）。
+    #   ⚠ 地图一侧是 `map_local_size()`（只读，本工具不写 .map）。
+    VISIBLE_SCAN_LIMIT = 8 * 1024 * 1024
+
+    def _scan_visible_area(self):
+        """结构判据扫明文 → `(off_local, (Sw,Sh), (l,t,w,h))` 或 None。
+
+        判据三重（缺一不可，误命中概率极低）：
+          · Size = `i-4..i-1`，`1 ≤ Sw,Sh ≤ 512`；
+          · Local = `i..i+3`，`l,t ≥ 0`、`w,h > 0`、`l+w ≤ Sw`、`t+h ≤ Sh`；
+          · 紧随其后 3 个数必须正好是 `Sh+2`、`Sw+Sh-1`、`Sw-2`
+            （`Sw+Sh-1` 就是这张图的 iso 宽度，天然强约束）。
+        """
+        import array
+        pl = self.plain
+        n = min(len(pl), self.VISIBLE_SCAN_LIMIT)
+        n -= n % 4
+        if n < 64:
+            return None
+        a = array.array('i')
+        a.frombytes(bytes(pl[:n]))
+        for i in range(4, len(a) - 7):
+            if a[i + 5] != a[i - 2] + a[i - 1] - 1:
+                continue
+            sw, sh = a[i - 2], a[i - 1]
+            if not (1 <= sw <= 512 and 1 <= sh <= 512):
+                continue
+            if a[i + 4] != sh + 2 or a[i + 6] != sw - 2:
+                continue
+            l, t, w, h = a[i], a[i + 1], a[i + 2], a[i + 3]
+            if w <= 0 or h <= 0 or l < 0 or t < 0 or l + w > sw or t + h > sh:
+                continue
+            return i * 4, (sw, sh), (l, t, w, h)
+        return None
+
+    def visible_area(self):
+        """存档里的可见区域 → `{'off','size','local'}` 或 None（定位不到）。
+
+        `local` = `(左, 上, 宽, 高)`，**地编 tile 坐标**，与地图 `[Map] LocalSize` 同口径。
+        `size`  = 地图 `[Map] Size` 的 `(宽, 高)`。
+        结果带缓存；明文长度变了或该处内容对不上 ⇒ 自动重扫。
+        """
+        memo = getattr(self, '_va_memo', None)
+        if memo and memo.get('plen') == len(self.plain):
+            off = memo['off']
+            if (off + 32 <= len(self.plain)
+                    and tuple(struct.unpack_from('<4i', self.plain, off)) == memo['local']):
+                return memo
+        hit = self._scan_visible_area()
+        self._va_memo = None
+        if not hit:
+            return None
+        off, size, local = hit
+        self._va_memo = {'off': off, 'size': size, 'local': local,
+                         'plen': len(self.plain)}
+        return self._va_memo
+
+    def set_visible_area(self, left, top, width, height):
+        """改存档里的可见区域（原地 16 字节，明文长度不变、布局不动）。
+
+        校验：必须落在 `[Map] Size` 内（左/上 ≥ 0、左+宽 ≤ 宽、上+高 ≤ 高），
+        否则引擎会去读不存在的地形 ⇒ 直接抛错、**一个字节都不写**。
+        返回 `{'old','new','off','size'}`。
+        """
+        va = self.visible_area()
+        if not va:
+            raise RuntimeError(
+                '这条存档里没定位到「可见区域」字段（结构判据不成立）⇒ 拒绝写入')
+        sw, sh = va['size']
+        l, t, w, h = int(left), int(top), int(width), int(height)
+        if w <= 0 or h <= 0:
+            raise RuntimeError('可见区域的宽度/高度必须大于 0（给的是 %d×%d）' % (w, h))
+        if l < 0 or t < 0 or l + w > sw or t + h > sh:
+            raise RuntimeError(
+                '可见区域 (%d,%d,%d,%d) 超出地图尺寸 %d×%d —— '
+                '左/上要 ≥ 0，且「左+宽」≤ %d、「上+高」≤ %d'
+                % (l, t, w, h, sw, sh, sw, sh))
+        old = va['local']
+        off = va['off']
+        self.plain[off:off + 16] = struct.pack('<4i', l, t, w, h)
+        self._va_memo = {'off': off, 'size': (sw, sh), 'local': (l, t, w, h),
+                         'plen': len(self.plain)}
+        return {'old': old, 'new': (l, t, w, h), 'off': off, 'size': (sw, sh)}
+
     def _read_info(self):
         pl = self.plain
         c = self.cfb
