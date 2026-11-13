@@ -4662,33 +4662,66 @@ class SaveDoc(object):
         def _nxt(o):
             return next((x for x in offs if x > o), min(len(pl), o + 2400))
 
+        # ★★2026-11-12：200B「新格式」记录的运行期启用位不在记录里，在该触发的
+        #   **运行期节点 TagNode +88 最低位**。这里按需建 sid→节点偏移表
+        #   （老格式档全程不会触发这次扫描，`_instance_maps()` 本身也有缓存）。
+        _node_by_sid = []
+
+        def _nodes():
+            if _node_by_sid:
+                return _node_by_sid[0]
+            try:
+                _m = self._instance_maps()
+                _node_by_sid.append({_m['sid'].get(k): o
+                                     for k, o in _m['node_of_inst'].items()
+                                     if o is not None})
+            except Exception:
+                _node_by_sid.append({})
+            return _node_by_sid[0]
+
         for r in out:
             if r.kind == '触发':
-                # 启用位 = 触发类 GUID 前 8 字节。★搜索窗硬上限 400 字节：
+                # ① 老格式：启用位 = 触发类 GUID 前 8 字节。★搜索窗硬上限 400 字节：
                 # 老档 GUID 在记录 +236/+328 处；窗口放开会把**后面别的对象**的
                 # GUID 误认成自己的（大档里对象数组彼此挨得很近，实测风险）。
                 fo = trig_flag_offset(pl, r.off, min(_nxt(r.off), r.off + 400))
-                r.flag_off = fo
-                if fo is None and all(b in (0, 1) for b in pl[r.off + 120:r.off + 124]) \
+                nd = None if fo is not None else _nodes().get(r.sid)
+                if fo is not None:
+                    r.flag_off = fo
+                    r.enabled = bool(pl[fo] & 1)
+                    r.can_toggle = True
+                    r.note = '启用位@+%d = %d' % (fo - r.off, pl[fo])
+                elif nd is not None:
+                    # ② 新格式（200B 记录，类 GUID 91152DC0 / C02D1590）：
+                    #   运行期启用位 = 该触发的 TagNode +88 最低位（u32）。
+                    #   2026-11-12 SAVE5E40 / SAVE2CD6 对拍定案（地图禁用 ⇒ 0，启用 ⇒ 1；
+                    #   地图里本来就禁用的 01000032 / 01000100 也是 0，3/3 吻合）。
+                    a = nd + NODE_FLAG_OFF
+                    r.flag_off = a
+                    r.enabled = bool(pl[a] & 1)
+                    r.can_toggle = True
+                    r.note = '运行期启用位@TagNode+88 = %d' % (1 if r.enabled else 0)
+                elif all(b in (0, 1) for b in pl[r.off + 120:r.off + 124]) \
                         and (TRIG_CLASS_GUID2 in pl[r.off:r.off + 200]
                              or self.TRIG_CLASS_GUID_FAM0 in pl[r.off:r.off + 200]):
-                    # 新格式（200B 记录，2026-10-14 SAVE2DD8）：无 243509BA GUID，
-                    # 启用位固定在 +123（难度位后一字节）；47/47 与地图禁用标志对拍。
-                    # ⚠ 老格式里 +123 是地图定义副本（无效），两种格式不要混淆。
-                    fo = r.off + 123
-                    r.flag_off = fo
-                if fo is None:
+                    # ③ 最后兜底：200B 记录里的 `+123` 只是地图 `[Triggers]` 禁用位的**副本**。
+                    #   没有运行期节点时它不会影响游戏行为（2026-11-12 玩家实测：只改它 "禁用无效"），
+                    #   所以照旧允许写（老流程/老自检依赖它），但备注必须说清楚。
+                    r.flag_off = r.off + 123
+                    r.enabled = bool(pl[r.off + 123])
+                    r.can_toggle = True
+                    r.note = ('⚠ 仅地图定义副本 +123 = %d（该触发无运行期节点，'
+                              '改它游戏里未必生效）' % pl[r.off + 123])
+                else:
+                    r.flag_off = None
                     r.enabled = None
                     r.can_toggle = False
                     if pl[r.off + 176:r.off + 192] == self.TRIGDEF_GUID:
                         r.note = ('大任务格式：这里只有「触发定义」，运行期启用位'
                                   '不在这条记录里（未定位）· 只读')
                     else:
-                        r.note = '启用位未定位（该记录内无触发类 GUID）· 只读'
-                else:
-                    r.enabled = bool(pl[fo])
-                    r.can_toggle = True
-                    r.note = '启用位@+%d = %d' % (fo - r.off, pl[fo])
+                        r.note = ('启用位未定位（该记录内无触发类 GUID，'
+                                  '也没有运行期节点）· 只读')
             elif r.kind == '标签':
                 r.flag_off = None
                 r.enabled = None
@@ -4701,34 +4734,38 @@ class SaveDoc(object):
                 r.note = '未识别结构（只读）'
         self.layout_ok = any(r.flag_off is not None for r in out)
 
-    def _trig_flag_off(self, rec):
-        """该触发记录的「运行时启用位」相对偏移；定位不到返回 None。
+    def _flag_abs(self, rec):
+        """该触发「启用位」的**绝对偏移**；定位不到返回 None。
 
-        ★★★ 判据（2026-10-13 定案，跨图通用）：
-          触发对象体内含恒定 16 字节**类 GUID** `243509BA-4CF4-11D2-BC26-00104B8FB04D`，
-          **启用位 = 该 GUID 前 8 字节处的 1 个字节**（1=启用 / 0=禁用）。
-
-        ★ 记录内偏移**随图变化**（实测新图 +236、旧图 +328）—— 因为 GUID 前有变长内容
-          （指针数组等）⇒ **绝不能写死偏移**（我前面几轮就是栽在这上面）。
-        ★ 归属：GUID 必须落在「本条记录起点 ~ 下一条记录起点」之间，否则会误认后面对象的 GUID。
-
-        证据链（全部为游戏内可验证的状态）：
-          · 外挂禁用实验：T0(启用)/T1(禁用)/T2(恢复) 三档，**只有这一字节** 1→0→1；
-          · 旧图成对档 6691(禁用)/6692(启用)：该字节 0/1，且用户游戏内实测「不胜利/胜利」；
-          · `测试B禁用.sav`、`无外挂 测试B已禁用.sav`、`单触发 禁用状态.sav` 均读出 0；
-          · 60+ 档扫描：该位置**要么不是 0/1（则判只读），要么就是 0/1**，零误报。
+        ★★两种落点（2026-11-12 定案）：
+          · **老格式**：记录体内含类 GUID `243509BA-…` ⇒ 启用位 = GUID 前 8 字节（记录内，1 字节）；
+          · **新格式**（200B 记录，类 GUID `91152DC0` / `C02D1590`）：启用位 =
+            该触发的运行期节点 **TagNode +88** 的最低一位（记录外，u32）。
+            记录里的 `+123` 只是地图 `[Triggers]` 禁用位的**副本**，改它游戏里毫无反应。
         """
         fo = getattr(rec, 'flag_off', None)
-        if fo is not None:
-            return fo - rec.off
-        recs = getattr(self, 'records', None) or []
-        offs = sorted(r.off for r in recs)
-        nxt = next((x for x in offs if x > rec.off), min(len(self.plain), rec.off + 2400))
-        p = trig_flag_offset(self.plain, rec.off, nxt)
-        return None if p is None else p - rec.off
+        if fo is not None and 0 <= fo < len(self.plain):
+            return fo
+        if rec.kind != '触发':
+            return None
+        # 兜底重算（记录被重扫过 / 缓存过期）
+        try:
+            m = self._instance_maps()
+            ikey = next((k for k, s in m['sid'].items() if s == rec.sid), None)
+            nd = m['node_of_inst'].get(ikey)
+        except Exception:
+            nd = None
+        rec.flag_off = (nd + NODE_FLAG_OFF) if nd is not None else None
+        return rec.flag_off
+
+    def _trig_flag_off(self, rec):
+        """该触发启用位相对记录起点的位移（老格式在记录内；新格式会落在记录外）。
+        定位不到返回 None。给需要「记录内偏移」的老调用方保留。"""
+        fo = self._flag_abs(rec)
+        return None if fo is None else fo - rec.off
 
     def can_toggle_trigger(self, rec):
-        return rec.kind == '触发' and self._trig_flag_off(rec) is not None
+        return rec.kind == '触发' and self._flag_abs(rec) is not None
 
     # ---------- 挂接（CellTag）管理 ----------
     # 2026-10-14 五轮实验定案（详见 SKILL.md「正向挂接定案」）：
@@ -14721,6 +14758,164 @@ class SaveDoc(object):
             self._addr_memo = None        # 地址表不受影响，但长度/内容变了保险起见清掉
         return info
 
+    # ---- ★★2026-11-13（玩家游戏内**验收通过**）：免疫心灵控制 ----
+    #   TypeClass 对象上的 **`+0xD49`，1 字节**（0 能被心控 / 1 免疫）。
+    #
+    #   为什么这条必须改存档、改 rules 没用：
+    #     玩家把 `[APOC] ImmuneToPsionics=yes` 写进 rulesmd.ini，**重启游戏读旧档仍然能被心控**；
+    #     直接改这一个字节后，读档立刻免疫。原因与武器槽同源 —— 类型对象在存档里有副本，
+    #     读档取存档那份（见 `RA2-Wiki/c06-ini键归属与作用域` §10）。
+    #
+    #   偏移怎么定的（可复现）：
+    #     拿 rules 里**显式**写了 `ImmuneToPsionics=` 的 111 个型号当样本，逐偏移做
+    #     「yes 侧为 1 / no 侧为 0」的相关性扫描（byte / dword / bit 三套判据、
+    #     窗口 `0x00–0xE00`、只取对象间距 ≥0xE00 的干净样本）：
+    #       · `+0xD49` 命中 **110/111**，周边是连续的 0/1 字节（bool 数组）；
+    #       · 唯一"例外" AMBU 也解释得通 —— 它在**地图 ini** 里写了这条，
+    #         地图段优先级高于 rules，所以存档里本来就是 1 ⇒ 实际 **111/111**。
+    #     对照：`+0xB4`=Strength、`+0x624`=Cost 都能 8/8 对上，说明这层快照是真的。
+    TYPE_IMMUNE_PSI_OFF = 0xD49
+
+    # ---- ★★2026-11-13：TypeClass 全字段表（相关性扫描定出来的，两份存档交叉验证）----
+    #   `(键, 偏移, 类型, rules 键, 中文, 下限, 上限, 样本)`：
+    #     · 类型 `i32` = 4 字节有符号 int；`u8` = 1 字节布尔（0/1）
+    #     · `样本` 是**定案时的匹配率**（`SAVE0E29_修改.SAV` / `ALL01UMD.sav` 各扫一遍），
+    #       看它就知道这条有多硬 —— 全中是布局常量级的证据，低分的是"弱证据"，界面上也会标。
+    #
+    #   定法（`_probe_typefields*.py`，可复现）：拿 rules 里**显式**给了这个键的型号当样本，
+    #   对 0x00–0x1400 逐偏移 × u8/u16/u32/f32 比"存档值 == rules 值"，
+    #   再换第二份存档重算；换档还成立才收。**注意**：地图 ini 的覆盖会表现成个别不符
+    #   （例：AMBU 的免疫、QIN/YUEYAO 的自造数值），这是正常的，不是判据错。
+    #
+    #   ⚠这些键**扫不到**（→ 存档里根本没有这个副本，引擎每次读 rules）：
+    #     `Speed` `TechLevel` `Size` `Weight` `Power` `Storage` `BuildTimeMultiplier`
+    #     （逐偏移比下来连 50% 匹配都没有；想改这几个只能改 rules / 地图 ini）
+    TYPE_FIELDS = (
+        ('strength', 0x0B4, 'i32', 'Strength', '血量上限', 0, 100000, '510/510'),
+        ('sight', 0x5FC, 'i32', 'Sight', '视野', 0, 20, '463/463'),
+        ('maxdebris', 0x5D0, 'i32', 'MaxDebris', '碎片数（残骸）', 0, 64, '405/405'),
+        ('cost', 0x624, 'i32', 'Cost', '造价', 0, 100000, '219/219'),
+        ('soylent', 0x628, 'i32', 'Soylent', '回收价', 0, 100000, '136/136'),
+        ('threatposed', 0x684, 'i32', 'ThreatPosed', '威胁值', 0, 1000, '221/221'),
+        ('points', 0x688, 'i32', 'Points', '击毁得分', 0, 10000, '508/508'),
+        ('rot', 0x730, 'i32', 'ROT', '转向速度', 0, 255, '98/98'),
+        ('zfudgecol', 0xDD8, 'i32', 'ZFudgeColumn', '柱状遮挡补偿', 0, 64, '54/54'),
+        ('zfudgetun', 0xDDC, 'i32', 'ZFudgeTunnel', '隧道遮挡补偿', 0, 64, '54/54'),
+        ('selfheal', 0xD28, 'u8', 'SelfHealing', '自我修复', 0, 1, '24/24'),
+        ('explodes', 0xD29, 'u8', 'Explodes', '爆炸（散架成残骸）', 0, 1, '21/21'),
+        ('crusher', 0xD3C, 'u8', 'Crusher', '可碾压', 0, 1, '72/72'),
+        ('imm_psi', 0xD49, 'u8', 'ImmuneToPsionics', '免疫心灵控制', 0, 1, '111/112'),
+        ('imm_rad', 0xD4B, 'u8', 'ImmuneToRadiation', '免疫辐射', 0, 1, '42/42'),
+        ('turret', 0xCB5, 'u8', 'Turret', '有炮塔（可转向）', 0, 1, '76/76'),
+        ('crewed', 0xCE1, 'u8', 'Crewed', '被毁后出乘员', 0, 1, '102/102'),
+        ('selectable', 0xDD0, 'u8', 'IsSelectableCombatant', '可框选为战斗单位', 0, 1, '93/93'),
+        ('crate', 0xE21, 'u8', 'CrateGoodie', '箱子能开出', 0, 1, '67/67'),
+    )
+    TYPE_FIELD_BY_KEY = {f[0]: f for f in TYPE_FIELDS}
+    # 扫不到的那些（界面要如实说明，别让人以为工具坏了）
+    TYPE_FIELDS_NOT_IN_SAVE = ('Speed', 'TechLevel', 'Size', 'Weight', 'Power',
+                               'Storage', 'BuildTimeMultiplier')
+
+    def type_field(self, type_name, key):
+        """读某型号的一个字段 → `{'key','label','off','kind','value','rules','samples'}`。"""
+        f = self.TYPE_FIELD_BY_KEY.get(key)
+        if not f:
+            raise KeyError('没有字段「%s」' % key)
+        off, info = self._type_obj(type_name)
+        k, rel, kind, rkey, label, lo, hi, samples = f
+        o = off + rel
+        if kind == 'i32':
+            if o + 4 > len(self.plain):
+                raise KeyError('型号「%s」的对象越界' % type_name)
+            v = struct.unpack_from('<i', self.plain, o)[0]
+        else:
+            v = self.plain[o]
+        try:
+            kv = self._rules_all().get(info) or {}
+        except Exception:
+            kv = {}
+        rv = kv.get(rkey)
+        alt = None
+        if rv is None and kv:
+            # ★★引擎的 ini 键**大小写敏感**（2026-11-13 实测）：`MaxDebris`（碎片数）与
+            #   `Maxdebris`（只写了这个的 17 个型号）是两个键，后者引擎不认 ⇒ 存档里就是缺省 0。
+            #   这里把"只有大小写变体"的情况捞出来给界面看，别让人以为工具读不到。
+            for k2, v2 in kv.items():
+                if k2 != rkey and str(k2).lower() == str(rkey).lower():
+                    alt = {'key': k2, 'value': v2}
+                    break
+        return {'key': k, 'label': label, 'off': o, 'rel': rel, 'kind': kind,
+                'value': v, 'rules': rv, 'rules_alt': alt,
+                'rules_key': rkey, 'type': info,
+                'min': lo, 'max': hi, 'samples': samples}
+
+    def type_fields(self, type_name):
+        """一次读出该型号全部已知字段（顺序同 `TYPE_FIELDS`）。"""
+        return [self.type_field(type_name, f[0]) for f in self.TYPE_FIELDS]
+
+    def set_type_field(self, type_name, key, value, dry_run=False):
+        """写某型号的一个字段（定长原地写：i32 4 字节 / u8 1 字节，明文长度不变）。
+
+        **改的是 Type 对象 ⇒ 本档内该型号的所有单位都受影响**。
+        返回 `{'type','key','label','off','old','new','changed','dry_run'}`。
+        """
+        cur = self.type_field(type_name, key)
+        lo, hi, kind = cur['min'], cur['max'], cur['kind']
+        try:
+            v = int(str(value).strip(), 0) if isinstance(value, str) else int(value)
+        except Exception:
+            raise ValueError('「%s」要填整数（收到 %r）' % (cur['label'], value))
+        if not (lo <= v <= hi):
+            raise ValueError('「%s」超出允许范围 %d..%d（收到 %d）'
+                             % (cur['label'], lo, hi, v))
+        if kind == 'u8' and v not in (0, 1):
+            raise ValueError('「%s」是布尔字段，只能是 0 或 1' % cur['label'])
+        old = cur['value']
+        if not dry_run and old != v:
+            if kind == 'i32':
+                struct.pack_into('<i', self.plain, cur['off'], v)
+            else:
+                self.plain[cur['off']] = v
+        return {'type': cur.get('type', type_name), 'key': key, 'label': cur['label'],
+                'off': cur['off'], 'old': old, 'new': v, 'changed': old != v,
+                'kind': kind, 'dry_run': bool(dry_run)}
+
+    def _type_obj(self, type_name):
+        """型号名 → `(对象起点, 规范化型号名)`；找不到就抛 KeyError。"""
+        want = str(type_name).strip().upper()
+        info = self.unit_type_objects().get(want)
+        if not info:
+            raise KeyError('本档没有型号「%s」的类型对象' % type_name)
+        off = info['off']
+        if off + self.TYPE_IMMUNE_PSI_OFF + 1 > len(self.plain):
+            raise KeyError('型号「%s」的类型对象越界（偏移异常）' % type_name)
+        return off, (info.get('name') or want)
+
+    def type_immune_psionics(self, type_name):
+        """读该型号的「免疫心灵控制」→ bool；该字节不是 0/1 时返回 None（判据不成立）。"""
+        off, _nm = self._type_obj(type_name)
+        v = self.plain[off + self.TYPE_IMMUNE_PSI_OFF]
+        return bool(v) if v in (0, 1) else None
+
+    def set_type_immune_psionics(self, type_name, on, dry_run=False):
+        """写该型号的「免疫心灵控制」（1 字节，明文长度不变）。
+
+        **改的是 Type 对象 ⇒ 该型号在本档内的所有单位都变**（含敌方、含以后新造的）。
+        返回 `{'type','off','old','new','changed','dry_run'}`。
+        """
+        off, nm = self._type_obj(type_name)
+        o = off + self.TYPE_IMMUNE_PSI_OFF
+        old = self.plain[o]
+        if old not in (0, 1):
+            raise ValueError('型号「%s」的 +0x%X 当前是 %d（不是 0/1）—— '
+                             '这份存档的布局和判据不符，拒绝写'
+                             % (nm, self.TYPE_IMMUNE_PSI_OFF, old))
+        new = 1 if on else 0
+        if not dry_run and old != new:
+            self.plain[o] = new
+        return {'type': nm, 'off': o, 'old': old, 'new': new,
+                'changed': old != new, 'dry_run': bool(dry_run)}
+
     def weapon_projectiles(self):
         """→ `[{'name','off','ptr','projectile'}]`：每把武器**档内**记的抛射体。
 
@@ -15145,30 +15340,50 @@ class SaveDoc(object):
                         % ('匹配' if ok else '不匹配', rate_in * 100, info))}
 
     def toggle_trigger(self, rec, on):
-        """启用 / 禁用触发 —— **只写「触发类 GUID 前 8 字节」那 1 个字节**。
+        """启用 / 禁用触发 —— 按 records 格式写**两套落点里的对应那一个**。
 
-        ★ 实测判据（2026-10-13）：
-          · 该字节 = 1 → 读档后触发**执行**（旧图 6692 实测"胜利"）；
-          · 该字节 = 0 → 同一档触发**不执行**（6691 实测"不胜利"；外挂实验 T1 同）；
-          · 两档/三档之间**只差这 1 个字节**，其它字段（含 `+123`、事件、行为）完全一致。
-        ⚠ **不要动 `+123`**（那只是地图级定义的副本，改它不影响行为，实测无效）。
-        ⚠ 定位不到（该处不是 0/1）时**拒绝写入** —— 说明记录布局与本工具预期不同，
-          宁可不给，也不乱写。
+        ★★2026-11-12 修正（玩家样本 SAVE5E40 / SAVE5E40_修改_3 / SAVE2CD6 三方对拍）：
+          · **老格式**（记录体内有类 GUID `243509BA-…`）：
+            启用位 = 该 GUID 前 8 字节的 1 个字节（2026-10-13 T0/T1/T2 + 6691/6692 实测）。
+          · **新格式**（200B 记录，类 GUID `91152DC0` / `C02D1590`）：
+            启用位 = 该触发运行期节点 **TagNode +88 的最低位**（u32）。
+            地编禁用后重开的档：+88 = 0；启用 = 1（地图里本来就禁用的
+            `01000032` / `01000100` 也是 0，3/3 吻合）。
+          · ⚠ 记录里的 `+123` 只是地图 `[Triggers]` 禁用位的**副本**，**改它游戏里毫无反应**
+            —— 旧实现把它当启用位写，玩家实测「禁用无效」就是栽在这。
+            新格式下本方法会顺手把 +123 一起同步（与地编禁用后引擎写出的档一致），
+            但**起作用的是 TagNode+88**。
+        ⚠ 定位不到时**拒绝写入** —— 宁可不给，也不乱写。
         """
         if rec.kind != '触发':
             raise RuntimeError('只有「触发」记录支持启用 / 禁用')
-        off = self._trig_flag_off(rec)
-        if off is None:
+        a = self._flag_abs(rec)
+        if a is None:
             raise RuntimeError(
-                '这条触发记录的启用位**未定位到**（记录里找不到触发类 GUID，\n'
-                '或 GUID 前 8 字节不是 0/1）—— 记录布局可能与本工具预期不同。\n'
-                '为避免改坏数据，已拒绝写入。\n\n'
-                '可先用「事件」页把它的条件改成永不满足（等效禁用），\n'
-                '或在地编（FA2）里改启用状态后重开新局。')
-        self.plain[rec.off + off] = 1 if on else 0
+                '这条触发没有可写的启用位：\n'
+                '· 记录里既没有触发类 GUID（老格式），\n'
+                '· 也没有对应的运行期节点 TagNode（新格式 ⇒ 引擎本来就不会执行它）。\n\n'
+                '为避免改坏数据，已拒绝写入。\n'
+                '若确实要它永不执行，可用「事件」页把条件改成永不满足（等效禁用）。')
+        in_record = (rec.off <= a < rec.off + 400)
+        if in_record:
+            self.plain[a] = 1 if on else 0
+            if a == rec.off + 123:
+                rec.note = ('仅写了地图定义副本 +123 = %d（无运行期节点 ⇒ 游戏里未必生效）'
+                            % self.plain[a])
+            else:
+                rec.note = '启用位@+%d = %d' % (a - rec.off, self.plain[a])
+        else:
+            # TagNode +88：只动最低位，高位（有的节点把它当指针用，如 0x1BAE1701）必须原样保留
+            v = int.from_bytes(self.plain[a:a + 4], 'little')
+            v = (v | 1) if on else (v & ~1)
+            self.plain[a:a + 4] = v.to_bytes(4, 'little')
+            # 地图级定义副本一起同步（+123 与地图 [Triggers] 禁用位反相）
+            if all(b in (0, 1) for b in self.plain[rec.off + 120:rec.off + 124]):
+                self.plain[rec.off + 123] = 1 if on else 0
+            rec.note = '运行期启用位@TagNode+88 = %d' % (v & 1)
         rec.enabled = bool(on)
-        rec.note = '启用位@+%d = %d' % (off, self.plain[rec.off + off])
-        rec.flag_off = rec.off + off
+        rec.flag_off = a
         self.pending_triggers[rec.sid] = bool(on)
 
     # ---------- 新写触发（2026-10-14 五轮实验 + V1/V2/V4 游戏内实测通过）----------
@@ -17736,9 +17951,19 @@ class SaveDoc(object):
         if disabled is not None:
             w[3] = 0 if disabled else 1
         self.plain[p:p + 4] = bytes(w)
-        rec.enabled = bool(w[3])
-        rec.flag_off = p + 3
-        rec.note = '启用位@+%d = %d' % (p + 3 - rec.off, w[3])
+        # ★★2026-11-12：`+120..+122` 是难度位（地编口径），`+123` 只是地图禁用位的**副本**。
+        #   「禁用」真正生效的落点交给 `toggle_trigger()`（老格式 = GUID 前 8 字节；
+        #   新格式 = TagNode+88），这里不再把 `+123` 当启用位记到 rec.flag_off 上。
+        if disabled is not None:
+            try:
+                self.toggle_trigger(rec, not bool(disabled))
+            except Exception as _e:
+                rec.enabled = bool(w[3])
+                rec.flag_off = None
+                rec.note = str('只写了地图定义副本 +%d = %d（运行期启用位不可写：%s）'
+                               % (p + 3 - rec.off, w[3], _e)).splitlines()[0]
+        else:
+            rec.note = '难度位@+120..+122 = %d/%d/%d' % (w[0], w[1], w[2])
         return {'old': bytes(nop), 'new': bytes(w)}
 
     # ---------- 行为（可多条，链表） ----------

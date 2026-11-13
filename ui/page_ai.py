@@ -37,6 +37,34 @@ import traceback
 import ui_theme
 
 
+def _place_sash_once(pw, want_bottom, min_bottom=140, min_top=120):
+    """第一次**真正排版**之后，把竖向分栏 `pw` 的 sash 摆一次（之后永不再管）。
+
+    为什么要这一步：`weight` 只决定"多出来的空间怎么分"，**管不了空间不够时谁先让** ——
+    实测把上下两格都 `weight=1` 塞进 700px 高，上面那格按请求值独吞 531，
+    下面只剩 163（`tk.PanedWindow` 的 squeeze 按当前尺寸比例缩，不按 weight）。
+    所以首屏得自己摆一次；而"只摆一次"是硬要求 —— 玩家拖过的位置必须留住。
+
+    `want_bottom(h)` 返回下半格的目标高度，结果夹到 `[min_bottom, h - min_top]`。
+    """
+    done = {'x': False}
+
+    def _go(_e=None):
+        if done['x']:
+            return
+        try:
+            h = pw.winfo_height()
+            if h < 220:                 # 还没排版（初始 1px），等下一次 Configure
+                return
+            done['x'] = True
+            want = max(min_bottom, min(int(want_bottom(h)), h - min_top))
+            pw.sashpos(0, h - want)
+        except Exception:
+            _swallow()
+    pw.bind('<Configure>', _go, add='+')
+    return _go
+
+
 class AiPage(object):
     def _tab_ai(self, nb):
         """AI 三大件：作战小队 TeamType / 特遣部队 TaskForce / 动作脚本 ScriptType（只读）。
@@ -91,16 +119,24 @@ class AiPage(object):
                              '小队键 +0x44、路径点 +0x58，与刷兵是同一条路）',
                   foreground=ui_theme.T['muted']).pack(side='left', padx=6)
 
-        sub = ttk.Notebook(f)
-        sub.pack(fill='both', expand=True)
+        # ★2026-11-13（玩家：「箭头处的窗口太小了 加大；上面的主窗口可以缩小」）：
+        #   三大件表格 + 下方明细改成**上下可拖的分栏**（`ttk.PanedWindow`，sash 8px 能拖）。
+        #   旧写法两者都 `pack(fill='both', expand=True)` ⇒ 笔记本先吃掉全部富余高度，
+        #   明细只剩两行、而总请求高度一旦超出窗口就被**底边直接裁掉**（截图那个箭头处）。
+        #   分栏由 PanedWindow 自己分空间 ⇒ 无论窗口多矮都不会裁；默认明细 14 行、
+        #   上面表格压到 6 行（玩家明确说"上面的主窗口可以缩小"）。
+        split = ttk.PanedWindow(f, orient='vertical')
+        sub = ttk.Notebook(split)         # ★父控件必须是 split（ttk 分栏只收自己的子窗口）
         self.ai_sub = sub
+        self.ai_split = split
 
         # ① 作战小队
         f1 = ttk.Frame(sub, padding=4)
         c1 = ('id', 'name', 'house', 'max', 'pri', 'vet', 'grp', 'wp', 'tf', 'sc', 'n', 'flag')
         # ★2026-10-28（玩家要求）：小队一多就没滚动条，只能靠滚轮 ⇒ 换成带横竖条的容器，
         #   跟触发页 / 事件页同一套（`_tree_scrolled`），列宽超出时也能拖。
-        wrap1, self.tat = self._tree_scrolled(f1, c1, 10)
+        # ★2026-11-13：请求高度 10 → 6 —— 给下面的明细区腾地方（分栏初始位置按"请求高度"分）
+        wrap1, self.tat = self._tree_scrolled(f1, c1, 6)
         wrap1.pack(fill='both', expand=True)
         for c, t, w, a in (('id', '小队ID', 84, 'w'), ('name', '名称', 240, 'w'),
                            ('house', '国家', 92, 'w'), ('max', 'Max', 42, 'e'),
@@ -120,9 +156,16 @@ class AiPage(object):
         # ② 特遣部队
         f2 = ttk.Frame(sub, padding=4)
         c2 = ('id', 'name', 'grp', 'n', 'mem')
+        # ★2026-11-13：这一页也改成**上下可拖的分栏**（列表 ｜ 成员表）。
+        #   理由：整页被上面那道分栏压矮时（默认 1280×820 窗口只有 ~310px），
+        #   成员表那框固定要 250px ⇒ 列表只剩 43px（1 行半，等于废掉）。
+        #   分栏 + 首屏 sash 之后：列表 5 行 / 成员表 2~3 行，两边都能拖。
+        split2 = ttk.PanedWindow(f2, orient='vertical')
+        split2.pack(fill='both', expand=True)
+        self.ai_tf_split = split2
         # ★2026-10-28：同上，特遣部队列表也加横竖滚动条（成员列一宽就看不全）
-        wrap2, self.tft = self._tree_scrolled(f2, c2, 10)
-        wrap2.pack(fill='both', expand=True)
+        # ★2026-11-13：请求高度 10 → 6（这一页还有成员表，别把明细挤没了）
+        wrap2, self.tft = self._tree_scrolled(split2, c2, 6)
         for c, t, w, a in (('id', '特遣ID', 84, 'w'), ('name', '名称', 300, 'w'),
                            ('grp', '编组', 50, 'e'), ('n', '种数', 50, 'e'),
                            ('mem', '成员', 460, 'w')):
@@ -134,13 +177,13 @@ class AiPage(object):
         self.tft.configure(cursor='hand2')
         # ★2026-10-18 第二步写入：改「数量 / 型号」（定长槽位 +0xB8 + 8×序号）
         # ★2026-10-19 仿 FA2「特遣部队」对话框：成员列表 + 数目/类型 + 添加/删除/应用
-        box = ttk.LabelFrame(f2, text='选中的特遣部队（成员表，仿地编样式）', padding=6)
-        box.pack(fill='x', pady=(6, 0))
+        box = ttk.LabelFrame(split2, text='选中的特遣部队（成员表，仿地编样式）', padding=6)
 
         rowL = ttk.Frame(box)
-        rowL.pack(fill='both', expand=True)
+        # ★2026-11-13：成员表这一格**最后 pack**（见下面两行 side='bottom'）——
+        #   框被压矮时先缩它，两行控件的按钮必须留住（旧写法它们会被压成 1px 消失）。
         self.tfm = ttk.Treeview(rowL, columns=('i', 'cnt', 'type', 'name'),
-                                show='headings', height=6, selectmode='browse')
+                                show='headings', height=4, selectmode='browse')
         for c, t, w, a in (('i', '#', 34, 'e'), ('cnt', '数目', 60, 'e'),
                            ('type', '类型', 110, 'w'), ('name', '名称', 260, 'w')):
             self.tfm.heading(c, text=t)
@@ -152,7 +195,6 @@ class AiPage(object):
         self.tfm.bind('<<TreeviewSelect>>', lambda e: self._ai_tf_load_mem())
 
         rowE2 = ttk.Frame(box)
-        rowE2.pack(fill='x', pady=(6, 0))
         ttk.Label(rowE2, text='数目').pack(side='left')
         self.tf_cnt = tk.StringVar(value='1')
         ttk.Spinbox(rowE2, from_=0, to=200, width=5,
@@ -166,7 +208,6 @@ class AiPage(object):
         ttk.Button(rowE2, text='删除', command=self._ai_tf_del).pack(side='left', padx=2)
 
         rowTF = ttk.Frame(box)
-        rowTF.pack(fill='x', pady=(6, 0))
         ttk.Label(rowTF, text='种数').pack(side='left')
         self.tf_n = tk.StringVar(value='2')
         ttk.Spinbox(rowTF, from_=0, to=6, width=3,
@@ -177,12 +218,23 @@ class AiPage(object):
                    command=self._ai_clear_tf).pack(side='left', padx=(12, 4))
         ttk.Label(rowTF, text='只写槽位/种数这几个 dword，记录长度不变',
                   foreground=ui_theme.T['muted']).pack(side='left', padx=6)
+        # ★先占底部：先 pack 的贴底 ⇒ rowTF 在最下、rowE2 在它上面、成员表吃剩下的空间
+        rowTF.pack(side='bottom', fill='x', pady=(6, 0))
+        rowE2.pack(side='bottom', fill='x', pady=(6, 0))
+        rowL.pack(fill='both', expand=True)
+        # ★分栏的格子由 PanedWindow 自己摆，**不能再 pack**（会和分栏抢几何管理）
+        split2.add(wrap2, weight=1)             # 上：特遣部队列表
+        split2.add(box, weight=1)               # 下：成员表 + 控件（默认给它 6 成）
+        # 成员表这框固定内容高 ~250px；矮窗口下别让它独吞，按 6 成摆 sash。
+        _place_sash_once(split2, lambda h: min(250, h * 0.62),
+                         min_bottom=120, min_top=90)
         sub.add(f2, text='  特遣部队 TaskForce  ')
 
         # ③ 动作脚本
         f3 = ttk.Frame(sub, padding=4)
         c3 = ('id', 'name', 'n', 'brief')
-        self.tst = ttk.Treeview(f3, columns=c3, show='headings', height=10)
+        # ★2026-11-13：请求高度 10 → 6（同上，明细区优先）
+        self.tst = ttk.Treeview(f3, columns=c3, show='headings', height=6)
         for c, t, w, a in (('id', '脚本ID', 84, 'w'), ('name', '名称', 300, 'w'),
                            ('n', '条目', 50, 'e'), ('brief', '动作摘要', 520, 'w')):
             self.tst.heading(c, text=t)
@@ -229,12 +281,32 @@ class AiPage(object):
         ttk.Label(rowE, text='只改 +0xB4/+0xB9/+0xD8/+0xE8/+0xE4，长度不变',
                   foreground=ui_theme.T['warn']).pack(side='left', padx=6)
 
-        ttk.Label(f, text='选中任一页里的一行 ⇒ 下方显示明细，并在另外两页里高亮它关联的对象'
-                          '（选小队看它的特遣/脚本；选特遣看谁在用它）',
-                  foreground=ui_theme.T['muted']).pack(anchor='w', pady=(6, 2))
-        self.ai_text = tk.Text(f, height=8, wrap='none',
+        # ---- 下半：明细区（★2026-11-13 放大：8 行 → 14 行，并带竖滚动条）----
+        #   以前这是 `tk.Text(f, height=8)` 直接 pack 在最后 —— 空间不够时它被窗口底边裁掉，
+        #   放大窗口反而只多出两行。现在它是分栏的下半格：height 只是"请求高度"，
+        #   实际高度由 sash 决定（拖一下就能更大/更小），内容超长用滚动条。
+        split.pack(fill='both', expand=True, pady=(6, 0))
+        split.add(sub, weight=1)                    # 上：三大件表格（可缩小）
+        det = ttk.Frame(split)
+        split.add(det, weight=2)                    # 下：明细（默认占大头）
+        ttk.Label(det, text='选中任一页里的一行 ⇒ 下方显示明细，并在另外两页里高亮它关联的对象'
+                            '（选小队看它的特遣/脚本；选特遣看谁在用它）',
+                  foreground=ui_theme.T['muted']).pack(anchor='w', pady=(0, 2))
+        tbox = ttk.Frame(det)
+        tbox.pack(fill='both', expand=True)
+        # ★2026-11-13：`wrap` 由 none 改 word —— 明细里那行「标志：可装载=否 …（16 个）」
+        #   在 1920 宽窗口下也会超出右边界，而这里没有横向滚动条 ⇒ 尾巴永远看不见。
+        #   软换行后窄窗口也读得全，不用再为它加第三条滚动条。
+        self.ai_text = tk.Text(tbox, height=14, wrap='word',
                                font=('Consolas', 9), background=ui_theme.T['surface_2'])
-        self.ai_text.pack(fill='both', expand=True)
+        _ai_vsb = ttk.Scrollbar(tbox, orient='vertical', command=self.ai_text.yview)
+        self.ai_text.configure(yscrollcommand=_ai_vsb.set)
+        _ai_vsb.pack(side='right', fill='y')
+        self.ai_text.pack(side='left', fill='both', expand=True)
+        # ★2026-11-13：**首屏把 sash 摆到明细占 4 成**（细节见 `_place_sash_once` 的注释）。
+        #   上格至少留 440px：特遣部队那页是"列表 + 成员表 + 两行控件"，
+        #   低于这个数列表就只剩一两行（实测 1920 窗口 440 ⇒ 列表 7 行，够用）。
+        _place_sash_once(split, lambda h: h * 0.42, min_bottom=160, min_top=440)
         self._ai = None
         self._ai_teams, self._ai_tfs, self._ai_scripts = {}, {}, {}
         self._ai_rows = {'team': [], 'tf': [], 'script': []}

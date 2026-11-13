@@ -207,16 +207,31 @@ class WeaponsPage(object):
         ttk.Checkbutton(in3, text='同时改精英武器（用 …E 版）',
                         variable=self._unit_also_elite).grid(
             row=6, column=0, columnspan=3, sticky='w', pady=(6, 0))
+        # ★★2026-11-13（玩家验收）：类型级布尔 —— 免疫心灵控制（存档 `+0xD49`，1 字节）。
+        #   为什么放在这一页：这一页改的就是**类型对象**（武器槽也是它），写入路径同源；
+        #   而且玩家已经实测过「改 rules 对旧档无效、改这个字节立刻生效」。
+        self._unit_immune = tk.BooleanVar(value=False)
+        ttk.Checkbutton(in3, text='免疫心灵控制（ImmuneToPsionics）',
+                        variable=self._unit_immune,
+                        command=self._unit_immune_toggle).grid(
+            row=7, column=0, columnspan=3, sticky='w', pady=(4, 0))
+        self.lbl_unit_immune = tk.Label(in3, text='', bg=T['surface'], fg=T['muted'],
+                                        font=(ui_theme.FONT_UI, 8), anchor='w',
+                                        justify='left', wraplength=ui_theme.px(330))
+        self.lbl_unit_immune.grid(row=8, column=0, columnspan=4, sticky='w')
         bar3 = tk.Frame(in3, bg=T['surface'])
-        bar3.grid(row=7, column=0, columnspan=4, sticky='w', pady=(8, 0))
+        bar3.grid(row=9, column=0, columnspan=4, sticky='w', pady=(8, 0))
         ttk.Button(bar3, text='应用改动', style='Primary.TButton',
                    command=self._unit_apply).pack(side='left')
         ttk.Button(bar3, text='还原选中型号', style='Ghost.TButton',
                    command=self._unit_revert).pack(side='left', padx=6)
+        # ★2026-11-13：TypeClass 全字段（19 项，偏移靠相关性扫描定、两份存档交叉验证）
+        ttk.Button(bar3, text='型号属性…', style='Ghost.TButton',
+                   command=self._unit_fields_dialog).pack(side='left', padx=(0, 6))
         self.lbl_unit_msg = tk.Label(in3, text='', bg=T['surface'], fg=T['ink_2'],
                                      font=(ui_theme.FONT_UI, 9), anchor='w',
                                      justify='left', wraplength=ui_theme.px(330))
-        self.lbl_unit_msg.grid(row=8, column=0, columnspan=4, sticky='w',
+        self.lbl_unit_msg.grid(row=10, column=0, columnspan=4, sticky='w',
                                pady=(6, 0))
         self.lbl_wh_name = tk.Label(in2, text='—', bg=T['surface'], fg=T['ink'],
                                     font=(ui_theme.FONT_UI, 10, 'bold'), anchor='w')
@@ -270,15 +285,22 @@ class WeaponsPage(object):
                 self.refresh_units()
             else:
                 self._unit_wrap.pack_forget()
+                # ★★2026-11-13（玩家截图：「武器 按把 列表出不来」）：
+                #   这里原来先 `_wpn_qrow.pack(..., before=self._wpn_wrap)`，
+                #   可是切到「单位」视图时 `_wpn_wrap` 已经被 pack_forget 掉了 ——
+                #   Tk 的 `before=` **要求目标控件此刻是已 pack 的**，否则报
+                #   `window "...!frame2" isn't packed`，异常被外层 try 接住 ⇒ 列表整个不显示。
+                #   顺序必须是：先把列表 pack 回去，再把搜索行插到它前面。
+                self._wpn_wrap.pack(fill='both', expand=True, before=self._wpn_bot)
                 self._wpn_qrow.pack(fill='x', pady=(0, 6), before=self._wpn_wrap)
                 try:
                     self._btn_wpn_export.pack(side='right')
                 except Exception:
                     _swallow()
-                self._wpn_wrap.pack(fill='both', expand=True, before=self._wpn_bot)
                 self._o_unit.pack_forget()
                 self._o_wpn_stats.pack(fill='x')
                 self._o_wpn_verse.pack(fill='both', expand=True, pady=(8, 0))
+                self.lbl_wpn_mode.config(text='')      # 清掉上一次的「切换失败」红字
                 self.refresh_weapons()
         except Exception as e:
             try:
@@ -332,6 +354,7 @@ class WeaponsPage(object):
 
     def _unit_pick(self, _e=None):
         """选中一个型号 ⇒ 把它的 4 个槽填进下拉。"""
+        T = ui_theme.T
         sel = ()
         try:
             sel = self.utw.selection()
@@ -359,6 +382,65 @@ class WeaponsPage(object):
         # ★这里**不要**清消息：`selection_set()` 排队的 <<TreeviewSelect>> 会在
         #   update 时才派发，如果这里清空，就会把「应用」刚写好的提示擦掉
         #   （2026-11-04 自检抓到的）。消息由 refresh_units() 统一清。
+
+        # ★2026-11-13：把「免疫心灵控制」勾选框同步成这个型号当前的值
+        try:
+            cur = self.doc.type_immune_psionics(r['type']) if self.doc else None
+            self._unit_immune.set(bool(cur))
+            self.lbl_unit_immune.config(
+                text=('当前：免疫（+0xD49 = 1）' if cur else '当前：不免疫（+0xD49 = 0）')
+                if cur is not None else '当前：读不出（+0xD49 不是 0/1，别改）',
+                fg=(T['ink_2'] if cur is not None else T['warn']))
+        except Exception:
+            _swallow()
+
+    def _unit_immune_toggle(self):
+        """勾上/取消「免疫心灵控制」⇒ 直接写存档那 1 个字节（问一句再写）。"""
+        T = ui_theme.T
+        r = getattr(self, '_unit_cur', None)
+        if not r or not self.doc:
+            self._unit_immune.set(False)
+            try:
+                self.lbl_unit_msg.config(text='先在左边选一个单位')
+            except Exception:
+                _swallow()
+            return
+        want = bool(self._unit_immune.get())
+        try:
+            old = self.doc.type_immune_psionics(r['type'])
+        except Exception as e:
+            self._unit_immune.set(False)
+            self.lbl_unit_msg.config(text='读不出当前值：%s' % e)
+            return
+        if old is None:
+            self._unit_immune.set(False)
+            self.lbl_unit_msg.config(text='这个型号 +0xD49 不是 0/1，判据不成立，已拒绝')
+            return
+        if old == want:                    # 没真变化（比如勾选框被程序同步过）
+            return
+        lines = ['%s（%s）' % (r['type'], r['cn'] or '—'), '',
+                 '　免疫心灵控制：%s → %s' % ('是' if old else '否', '是' if want else '否'),
+                 '',
+                 '改的是**型号**（TypeClass +0xD49，1 字节，明文长度不变）：',
+                 '该型号在本档内的所有单位都会跟着变（含敌方、含以后新造的）。',
+                 '只影响这一份存档；rulesmd.ini 一个字节不动。',
+                 '', '不可撤销 —— 建议先在主窗口「备份存档」。', '', '确定写入吗？']
+        if not messagebox.askyesno('免疫心灵控制', '\n'.join(lines), parent=self):
+            self._unit_immune.set(old)     # 取消 ⇒ 勾选框回到原值
+            return
+        try:
+            info = self.doc.set_type_immune_psionics(r['type'], want)
+        except Exception as e:
+            self._unit_immune.set(old)
+            self.lbl_unit_msg.config(text='写入失败：%s' % e)
+            return
+        self.lbl_unit_immune.config(
+            text=('当前：免疫（+0xD49 = 1）' if want else '当前：不免疫（+0xD49 = 0）'),
+            fg=T['ink_2'])
+        self.lbl_unit_msg.config(
+            text='已写入 %s 的 +0x%X：%d → %d（还没保存，记得点主窗口「原地保存」）'
+                 % (info['type'], SaveDoc.TYPE_IMMUNE_PSI_OFF,
+                    info['old'], info['new']))
 
     def _unit_apply(self):
         """把下拉里改过的槽写进存档（定长 u32）。"""
@@ -429,6 +511,181 @@ class WeaponsPage(object):
                 self.status.set('已改 %s 的武器：%s' % (r['type'], '；'.join(bits)[:90]))
             except Exception:
                 _swallow()
+
+    def _unit_fields_dialog(self):
+        """「型号属性」对话框：把 TypeClass 里已知的字段一次列全（★2026-11-13）。
+
+        字段与偏移来自 `SaveDoc.TYPE_FIELDS` —— 都是**相关性扫描**定出来的
+        （rules 显式给了值的型号当样本，逐偏移比对，再换第二份存档复验），
+        所以每行都带「证据」（匹配数/样本数）：全中的是布局常量级证据，低分的自己掂量。
+        """
+        T = ui_theme.T
+        r = getattr(self, '_unit_cur', None)
+        if not r or not self.doc:
+            messagebox.showinfo('型号属性', '先在左边选一个单位', parent=self)
+            return
+        try:
+            fields = self.doc.type_fields(r['type'])
+        except Exception as e:
+            messagebox.showerror('型号属性', '读不出来：%s' % e, parent=self)
+            return
+
+        win = tk.Toplevel(self)
+        win.title('型号属性 — %s' % r['type'])
+        win.transient(self)
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill='both', expand=True)
+
+        tk.Label(body, text='%s ｜ %s' % (r['type'], r['cn'] or '—'),
+                 bg=T['surface'], fg=T['ink'],
+                 font=(ui_theme.FONT_UI, 12, 'bold'), anchor='w').grid(
+            row=0, column=0, columnspan=6, sticky='w')
+        tk.Label(body, text='改的是「型号」：本档内该型号的所有单位都变（含敌方、以后新造的）。'
+                            '只写存档，rulesmd.ini 一个字节不动。\n'
+                            '⚠ Speed / TechLevel / Size / Weight / Power 这几项「存档里没有副本」'
+                            '（扫描时连 50% 匹配都找不到），这里改不了 —— 只能改 rules 或地图 ini。',
+                 bg=T['surface'], fg=T['muted'], font=(ui_theme.FONT_UI, 8),
+                 anchor='w', justify='left', wraplength=ui_theme.px(620)).grid(
+            row=1, column=0, columnspan=6, sticky='w', pady=(2, 8))
+
+        heads = ('字段（rules 键）', '存档值', 'rules（原样）', '新值', '偏移', '证据')
+        widths = (35, 8, 13, 8, 8, 10)
+        for c, (h, w) in enumerate(zip(heads, widths)):
+            tk.Label(body, text=h, bg=T['surface'], fg=T['muted'],
+                     font=(ui_theme.FONT_UI, 9), anchor='w', width=w).grid(
+                row=2, column=c, sticky='w', padx=(0, 6))
+
+        vars_, val_lbl = {}, {}
+        # 留给自检/重启对话框时用（跟 `_unit_slot_var` 一个路子）
+        self._uf_win, self._uf_vars, self._uf_fields = win, vars_, fields
+        for i, f in enumerate(fields):
+            row = 3 + i
+            tk.Label(body, text='%s（%s）' % (f['label'], f['rules_key']),
+                     bg=T['surface'], fg=T['ink_2'], font=(ui_theme.FONT_UI, 9),
+                     anchor='w', width=widths[0]).grid(row=row, column=0, sticky='w',
+                                                       pady=1)
+            v0 = tk.Label(body, text=str(f['value']), bg=T['surface'],
+                          fg=(T['warn'] if f['value'] in (0, 1) else T['ink']),
+                          font=(ui_theme.FONT_MONO, 9), anchor='e', width=widths[1])
+            v0.grid(row=row, column=1, sticky='e', padx=(0, 6))
+            val_lbl[f['key']] = v0
+            # rules 列：原样大小写。没有这个键时，若只有"大小写变体"就把它摆出来
+            # （`MaxDebris` vs `Maxdebris` —— 引擎只认前者，后者是死键，见 c06 §11 注）
+            if f['rules'] is None and f.get('rules_alt'):
+                rtxt = '%s=%s' % (f['rules_alt']['key'], f['rules_alt']['value'])
+            else:
+                rtxt = '—' if f['rules'] is None else str(f['rules'])
+            tk.Label(body, text=rtxt,
+                     bg=T['surface'], fg=T['muted_soft'],
+                     font=(ui_theme.FONT_MONO, 8), anchor='e', width=widths[2]).grid(
+                row=row, column=2, sticky='e', padx=(0, 6))
+            sv = tk.StringVar(value=str(f['value']))
+            vars_[f['key']] = sv
+            ttk.Entry(body, textvariable=sv, width=6).grid(row=row, column=3,
+                                                           sticky='w', padx=(0, 6))
+            tk.Label(body, text='+%#05x' % f['rel'], bg=T['surface'],
+                     fg=T['muted_soft'], font=(ui_theme.FONT_MONO, 8),
+                     anchor='w', width=widths[4]).grid(row=row, column=4, sticky='w')
+            tk.Label(body, text=f['samples'], bg=T['surface'], fg=T['muted_soft'],
+                     font=(ui_theme.FONT_MONO, 8), anchor='w', width=widths[5]).grid(
+                row=row, column=5, sticky='w')
+
+        foot = ttk.Frame(body)
+        foot.grid(row=3 + len(fields), column=0, columnspan=6, sticky='w', pady=(10, 0))
+        lbl_msg = tk.Label(foot, text='', bg=T['surface'], fg=T['ink_2'],
+                           font=(ui_theme.FONT_UI, 9), anchor='w',
+                           justify='left', wraplength=ui_theme.px(420))
+        btn_apply = ttk.Button(foot, text='应用改动')
+        btn_fill = ttk.Button(foot, text='按 rules 填一遍')
+        btn_apply.pack(side='left')
+        btn_fill.pack(side='left', padx=6)
+        ttk.Button(foot, text='关闭', command=win.destroy).pack(side='left')
+        lbl_msg.pack(side='left', padx=8)
+
+        def do_fill():
+            """把每个输入框按 rules 的值填好（没有 rules 值的保持不动）。"""
+            n = 0
+            for f in fields:
+                rv = f['rules']
+                if rv is None:
+                    continue
+                s = str(rv).strip().lower()
+                if f['kind'] == 'u8':
+                    if s in ('yes', 'true', '1'):
+                        vars_[f['key']].set('1')
+                        n += 1
+                    elif s in ('no', 'false', '0'):
+                        vars_[f['key']].set('0')
+                        n += 1
+                else:
+                    try:
+                        vars_[f['key']].set(str(int(float(s.rstrip('%')))))
+                        n += 1
+                    except Exception:
+                        _swallow()
+            lbl_msg.config(text='已按 rules 填了 %d 项（还要点「应用改动」才写入）' % n)
+
+        def do_apply():
+            todo, bad = [], []
+            for f in fields:
+                raw = (vars_[f['key']].get() or '').strip()
+                if not raw:
+                    raw = str(f['value'])       # 空 = 不改
+                try:
+                    new = int(raw, 0)
+                except Exception:
+                    bad.append('%s（%s）不是整数' % (f['label'], raw))
+                    continue
+                if new != f['value']:
+                    todo.append((f, new))
+            if bad:
+                messagebox.showwarning('有格子填错了', '\n'.join(bad), parent=win)
+                return
+            if not todo:
+                lbl_msg.config(text='没有改动')
+                return
+            lines = ['%s（%s）改 %d 项：' % (r['type'], r['cn'] or '—', len(todo)), '']
+            for f, new in todo:
+                lines.append('　· %-14s %s → %s' % (f['label'], f['value'], new))
+            lines += ['', '改的是型号 ⇒ 本档该型号所有单位都变。只写存档。',
+                      '不可撤销 —— 建议先在主窗口「备份存档」。', '', '确定写入吗？']
+            if not messagebox.askyesno('型号属性', '\n'.join(lines), parent=win):
+                return
+            errs, done = [], []
+            for f, new in todo:
+                try:
+                    info = self.doc.set_type_field(r['type'], f['key'], new)
+                    done.append(info)
+                    f['value'] = info['new']
+                    val_lbl[f['key']].config(text=str(info['new']),
+                                             fg=(T['warn'] if info['new'] in (0, 1)
+                                                 else T['ink']))
+                except Exception as e:
+                    errs.append('%s：%s' % (f['label'], e))
+            # 卡片上的免疫勾选框要跟着变
+            try:
+                cur = self.doc.type_immune_psionics(r['type'])
+                self._unit_immune.set(bool(cur))
+                self.lbl_unit_immune.config(
+                    text=('当前：免疫（+0xD49 = 1）' if cur
+                          else '当前：不免疫（+0xD49 = 0）') if cur is not None
+                    else '当前：读不出（+0xD49 不是 0/1，别改）')
+            except Exception:
+                _swallow()
+            if done:
+                self.lbl_unit_msg.config(
+                    text='已写入 %s 的 %d 个字段（还没保存，记得点主窗口「原地保存」）：%s'
+                         % (r['type'], len(done),
+                            '、'.join('%s=%d' % (d['label'], d['new']) for d in done[:5])
+                            + ('…' if len(done) > 5 else '')))
+            lbl_msg.config(text=('写入 %d 项' % len(done)) if done else '')
+            if errs:
+                messagebox.showwarning('部分没改成', '\n'.join(errs), parent=win)
+
+        btn_apply.config(command=do_apply)
+        btn_fill.config(command=do_fill)
+        self._uf_apply, self._uf_fill = btn_apply, btn_fill      # 自检要按得着
 
     def _unit_revert(self):
         """把选中型号的武器按 rules 还原（只在 rules 里有值时才动）。"""
