@@ -12059,6 +12059,129 @@ class SaveDoc(object):
                 return HOUSE_RUN_INDEX.get(self.norm_house(short))
         return None
 
+    # ---------------- 地编「所属方」窗口的属性（★2026-11-17 定案） ----------------
+    #   基准 = **House 对象的 GUID 位置**（明文里 `HOUSE_GUID` 命中处；
+    #   `house_keys()` 返回的键在 GUID+16，两者差 16）。
+    #   证据（`SAVE01EB.SAV` + `all01umd.map`，12 个阵营逐一对上）：
+    #     地图 [Americans House] IQ=5 / TechLevel=8 / Credits=100 / PlayerControl=yes
+    #     地图 [Alliance House]  IQ=1 / TechLevel=2 / Credits=0   / PlayerControl=no
+    #     存档里 +0x1E4 读出来正是 [5,1,5,5,5,5,5,5,5,5,5,5]
+    #             +0x1E8 读出来正是 [8,2,10,10,…]        …12/12
+    #   ★`+0x1EC`（盟友）= u32 位掩码，bit i = 第 i 个 House（单阵营图是单 bit，
+    #     大任务档 `SAVE0029` 里是 1627/1643 这种多 bit 联盟）—— 本版**不做读写**。
+    #   ★颜色（`Color`）在存档里是**颜色方案指针**（+0x5714/+0x5718 → 0x7E3880/0x7E38B0），
+    #     明文里根本没有 `[Colors]` 的 RGB（`DarkBlue=154,64,243` 全文件 0 命中）—— 别去碰。
+    #   ★`+0x1F0` 是**起始资金**（地编 `Credits=` × 100），不是当前金钱；
+    #     当前金钱走 `Balance`（House +800，见 `houses()` / `set_house_money()`）。
+    #   ★House 对象约 90 KB（内含 `ThreatPosedEstimates[130][130]`），定位只能按 GUID 扫。
+    HOUSE_IQ_OFF = 0x1E4          # int32
+    HOUSE_TECH_OFF = 0x1E8        # int32
+    HOUSE_ALLIES_OFF = 0x1EC      # u32 位掩码（本版只读不写）
+    HOUSE_CREDITS0_OFF = 0x1F0    # int32 起始资金（= 地编 Credits × 100）
+    HOUSE_EDGE_OFF = 0x1F4        # int32 enum（North=0）
+    HOUSE_CURPLAYER_OFF = 0x200   # u8：当前玩家（本机）
+    HOUSE_PLAYERCTRL_OFF = 0x201  # u8：人类控制（地编「玩家控制」）
+    HOUSE_ATTR_LIMITS = {'iq': (0, 5), 'tech': (0, 10), 'credits': (0, 2147483647)}
+
+    def house_obj_off(self, house):
+        """House 对象在明文里的起点（GUID 命中位置）；定位不到返回 None。
+
+        12 个对象扫一遍要几十毫秒，按明文长度做 memo（增删字节后自动失效）。
+        """
+        key = None
+        try:
+            key = self.resolve_house(house)
+        except Exception:
+            return None          # 认不出的阵营：文档承诺返回 None，不往上抛
+        if key is None:
+            return None
+        memo = getattr(self, '_house_off_memo', None)
+        if memo is None or memo[0] != len(self.plain):
+            pl = bytes(self.plain)
+            pos = {}
+            q = 0
+            while True:
+                i = pl.find(self.HOUSE_GUID, q)
+                if i < 0:
+                    break
+                pos[struct.unpack_from('<I', pl, i + 16)[0]] = i
+                q = i + 1
+            memo = (len(self.plain), pos)
+            self._house_off_memo = memo
+        return memo[1].get(key)
+
+    def house_attr(self, house):
+        """读一个所属方的地编属性 → `{key,name,off,iq,tech,credits,player_ctrl}`。
+
+        `credits` 是**起始资金**（地编 `Credits=` × 100），改它不影响当前金钱。
+        `player_ctrl` 读的是 `+0x201`（人类控制）；`+0x200`（当前玩家）正常档里与它一致。
+        """
+        key = self.resolve_house(house)
+        if key is None:
+            raise RuntimeError('认不出这个所属方：%r' % (house,))
+        o = self.house_obj_off(key)
+        if o is None:
+            raise RuntimeError('定位不到 House 对象（键 %#x）' % key)
+        pl = self.plain
+        return {
+            'key': key, 'off': o, 'name': self.house_label(key),
+            'iq': struct.unpack_from('<i', pl, o + self.HOUSE_IQ_OFF)[0],
+            'tech': struct.unpack_from('<i', pl, o + self.HOUSE_TECH_OFF)[0],
+            'credits': struct.unpack_from('<i', pl, o + self.HOUSE_CREDITS0_OFF)[0],
+            'player_ctrl': bool(pl[o + self.HOUSE_PLAYERCTRL_OFF]),
+            'cur_player': bool(pl[o + self.HOUSE_CURPLAYER_OFF]),
+            'edge': struct.unpack_from('<i', pl, o + self.HOUSE_EDGE_OFF)[0],
+            'allies': struct.unpack_from('<I', pl, o + self.HOUSE_ALLIES_OFF)[0],
+        }
+
+    def set_house_attr(self, house, iq=None, tech=None, credits=None, player_ctrl=None):
+        """写地编「所属方」的四个属性（`None` = 该项不动）。
+
+        范围：IQ 0–5 / 科技等级 0–10 / 起始资金 0–2147483647（int32 上限，即"21 亿"）。
+        `player_ctrl` 会**同时写** `+0x201`（人类控制）与 `+0x200`（当前玩家）——
+        正常存档里两者总是一致，只改一个会造出"人类控制但不是当前玩家"的怪状态。
+        返回 `{'key','name','old','new','note'}`。
+        """
+        key = self.resolve_house(house)
+        if key is None:
+            raise RuntimeError('认不出这个所属方：%r' % (house,))
+        o = self.house_obj_off(key)
+        if o is None:
+            raise RuntimeError('定位不到 House 对象（键 %#x）' % key)
+        pl = self.plain
+        old = {'iq': struct.unpack_from('<i', pl, o + self.HOUSE_IQ_OFF)[0],
+               'tech': struct.unpack_from('<i', pl, o + self.HOUSE_TECH_OFF)[0],
+               'credits': struct.unpack_from('<i', pl, o + self.HOUSE_CREDITS0_OFF)[0],
+               'player_ctrl': bool(pl[o + self.HOUSE_PLAYERCTRL_OFF])}
+        want = dict(old)
+        for nm, v in (('iq', iq), ('tech', tech), ('credits', credits)):
+            if v is None:
+                continue
+            try:
+                v = int(v)
+            except Exception:
+                raise RuntimeError('%s 必须是整数（收到 %r）' % (nm, v))
+            lo, hi = self.HOUSE_ATTR_LIMITS[nm]
+            if not (lo <= v <= hi):
+                label = {'iq': 'IQ', 'tech': '科技等级', 'credits': '起始资金'}[nm]
+                raise RuntimeError('%s 超出范围：%d（允许 %d–%d）' % (label, v, lo, hi))
+            want[nm] = v
+        if player_ctrl is not None:
+            want['player_ctrl'] = bool(player_ctrl)
+        struct.pack_into('<i', pl, o + self.HOUSE_IQ_OFF, want['iq'])
+        struct.pack_into('<i', pl, o + self.HOUSE_TECH_OFF, want['tech'])
+        struct.pack_into('<i', pl, o + self.HOUSE_CREDITS0_OFF, want['credits'])
+        pl[o + self.HOUSE_PLAYERCTRL_OFF] = 1 if want['player_ctrl'] else 0
+        pl[o + self.HOUSE_CURPLAYER_OFF] = 1 if want['player_ctrl'] else 0
+        ch = []
+        for nm, label in (('iq', 'IQ'), ('tech', '科技等级'),
+                          ('credits', '起始资金'), ('player_ctrl', '玩家控制')):
+            if want[nm] != old[nm]:
+                ch.append('%s %s → %s' % (label, old[nm], want[nm]))
+        note = '%s：%s' % (self.house_label(key), '；'.join(ch) if ch else '（无变化）')
+        return {'key': key, 'name': self.house_label(key), 'old': old,
+                'new': want, 'note': note}
+
     def buildings_of_house(self, house=None):
         """本档某阵营的**全部建筑** → [{idx, base, key, type, x, y}]（house=None ⇒ 全部）。
 
