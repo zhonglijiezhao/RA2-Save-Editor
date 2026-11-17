@@ -4535,6 +4535,9 @@ class SaveDoc(object):
             _pt = action_ptype(ac.get('type', 0))
         ac['arg_text'] = self._arg_text(
             _pt, ac['tag_key'] if (_pt == 38 and ac.get('tag_key')) else ac['arg'])
+        # ★2026-11-17：清掉 `actions()` 缓存 —— `trigger_detail()` 走 `_actions_by_key()`
+        #   读的是缓存里那份 dict，不清的话玩家改完界面还显示旧参数（"改了没反应"）。
+        self._actions = None
         self.pending_actions[off] = (ac['type'], ac['arg'])
         return ac
 
@@ -15867,6 +15870,10 @@ class SaveDoc(object):
             _v164 = struct.unpack_from('<I', pl, a + ACT_VAR_OFF)[0]
             # ★§SOV19：按**现场**哪个非 0 取（2064 条实测：590 在 +164、4 在 +72、0 条两者同时非 0）
             argv = (_v164 if action_arg_off(atp, _v72, _v164) == ACT_VAR_OFF else _v72)
+            # ★2026-11-17：106 的等级允许 **-1**（= 不可建造，存档里是 0xFFFFFFFF）。
+            #   这里按有符号回读，否则界面会显示 4294967295。
+            if atp == 106 and argv >= 0x80000000:
+                argv -= 0x100000000
             # ★§255：行为 80/107（援军 / 超时空援军）的**小队键在 `+0x44`**
             #   （`+0x48` 不是！§218 实证）。这里统一回填，触发编辑器才能反查出小队名。
             # ★§283.9：4/5/7 也是小队型（小队键同样在 +0x44），别只认 80/107
@@ -18110,10 +18117,16 @@ class SaveDoc(object):
                     #   编辑器里参数框空、科技类型根本看不到（玩家 2026-11-17 反馈）。
                     tn = (bytes(pl[obj + 104:obj + 112]).split(b'\x00')[0]
                           .decode('ascii', 'ignore').strip())
+                    _lv = a.get('arg') or 0
+                    if isinstance(_lv, int) and _lv >= 0x80000000:
+                        _lv -= 0x100000000          # -1 = 不可建造（存档里是 0xFFFFFFFF）
                     a = dict(a)
+                    a['arg'] = _lv
                     a['tech_name'] = tn
-                    a['arg_text'] = '%s 等级 %s' % (tn or '（未设置科技类型）',
-                                                   a.get('arg') or 0)
+                    a['arg_text'] = '%s 等级 %s%s' % (
+                        tn or '（未设置科技类型）', _lv,
+                        # ★玩家口径：0–10 可建造；-1 或大于 10 = 不可建造
+                        '' if 0 <= _lv <= 10 else '（不可建造）')
                 elif a.get('type') == self.CRATE_ACTION:
                     # ★★2026-11-05（玩家：108 要填路径点）：`108 创建工具箱` 是**两参数**行为 ——
                     #   奖励箱类型在 `+164`（ptype 31），路径点在 **`+0x58`**（与 80/107/125 同字段）。

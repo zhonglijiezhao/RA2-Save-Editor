@@ -272,7 +272,9 @@ class TriggerEditor(tk.Toplevel):
         self.cb_ac_tech = ttk.Combobox(self.row_tech, textvariable=self.var_ac_tech, width=16)
         self.cb_ac_tech.pack(side='left', padx=6)
         self.lbl_tech_hint = ttk.Label(
-            self.row_tech, text='（上面的「参数」= 等级 0–10；这里 = 科技类型名，如 AEGIS / GAPILE）',
+            self.row_tech,
+            text='（上面「参数」= 等级：0–10 可建造；-1 或大于 10 = 不可建造。'
+                 '这里 = 科技类型名，如 AEGIS / GAPILE）',
             foreground=ui_theme.T['muted'])
         self.lbl_tech_hint.pack(side='left')
 
@@ -745,8 +747,16 @@ class TriggerEditor(tk.Toplevel):
     def _ac_text(self, atype, arg, team=0, waypoint=0, trigger=None, tag=None, tech=''):
         """「参数含义」列的文字：80/107 显示「小队名 · 路径点」，触发型显示「→ 哪条触发」。"""
         if atype == 106:
-            # ★2026-11-17：106 设置科技等级 = 科技类型（+104 ASCII）+ 等级（+164）
-            return '%s 等级 %s' % (tech or '（未设置科技类型）', arg)
+            # ★2026-11-17：106 设置科技等级 = 科技类型（+104 ASCII）+ 等级（+164）。
+            #   等级 0–10 可建造；-1 或大于 10 = 不可建造（玩家口径），显示时标出来。
+            try:
+                _lv = int(arg)
+            except Exception:
+                _lv = arg
+            _tag = ''
+            if isinstance(_lv, int) and not (0 <= _lv <= 10):
+                _tag = '（不可建造）'
+            return '%s 等级 %s%s' % (tech or '（未设置科技类型）', _lv, _tag)
         if atype in ACTION_TRIG_TYPES:
             return self._trig_ref_text(trigger)
         if atype in ACTION_TAG_TYPES:
@@ -1431,10 +1441,12 @@ class TriggerEditor(tk.Toplevel):
                     combo.set('%s' % (cur if cur is not None else 0))
                 return
             if ptype == 39:
-                # ★2026-11-17：106 设置科技等级的「参数」= 等级 0–10（科技类型在单独的框里）
-                combo['values'] = [str(i) for i in range(11)]
+                # ★2026-11-17：106 设置科技等级的「参数」= 等级（科技类型在单独的框里）。
+                #   玩家口径：一般 0–10；**10 以上或 -1 = 不可建造** ⇒ 下拉给常用值，
+                #   但框可编辑，填别的数照样能写进去。
+                combo['values'] = [str(i) for i in range(11)] + ['-1（不可建造）']
                 if cur is not None:
-                    combo.set(str(cur))
+                    combo.set('-1（不可建造）' if cur == -1 else str(cur))
                 return
             if ptype == 38:
                 # ★★§SOV31（2026-11-05 玩家：「地编的做法就是列表就是标签的列表」）：
@@ -1735,11 +1747,13 @@ class TriggerEditor(tk.Toplevel):
             if not tn:
                 raise ValueError('106「设置科技等级」要先填「科技类型」（如 AEGIS / GAPILE）')
             try:
-                lv = int((self.var_acarg.get() or '0').strip())
-            except Exception:
-                raise ValueError('106 的等级必须是整数 0–10')
-            if not (0 <= lv <= 10):
-                raise ValueError('106 的等级要在 0–10 之间（当前 %d）' % lv)
+                lv = self._parse_arg(self.var_acarg.get())
+            except ValueError:
+                raise ValueError('106 的等级要填整数：0–10 可建造；-1 或大于 10 = 不可建造')
+            # ★2026-11-17 玩家口径：**一般 0–10；10 以上或 -1 表示不可建造** ——
+            #   所以不能按 0–10 硬限，只挡住比 -1 更小的值。
+            if lv < -1:
+                raise ValueError('106 的等级不能小于 -1（要"不可建造"就填 -1 或大于 10 的数）')
             return lv, {'tech_name': tn}
         if atype in ACTION_TRIG_TYPES:
             # ★§SOV07：触发型参数写**对象 +100**（实例键），不是通用 +72
