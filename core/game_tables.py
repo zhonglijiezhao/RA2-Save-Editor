@@ -257,6 +257,13 @@ def load_tables(game_dir):
         #   ⇒ 两张表各自的，再合成一张"先行后弹"的表（见下方 merge）。
         'weapontypes': _parse_num_map(rules, 'WeaponTypes'),
         'warheads': _parse_num_map(rules, 'Warheads'),
+        # ★2026-11-17：行为 106「设置科技等级」的**科技类型**是类型 ID 字符串
+        #   （如 AEGIS / GAPILE），不是编号 —— 候选来自这四个注册表。
+        #   玩家口径：「能建造建筑和能被生产的单位」。
+        'buildingtypes': _parse_num_map(rules, 'BuildingTypes'),
+        'vehicletypes': _parse_num_map(rules, 'VehicleTypes'),
+        'infantrytypes': _parse_num_map(rules, 'InfantryTypes'),
+        'aircrafttypes': _parse_num_map(rules, 'AircraftTypes'),
     }
     data['weap_warhead'], data['weap_src'] = merge_weapon_warhead(
         data['weapontypes'], data['warheads'])
@@ -268,6 +275,13 @@ def load_tables(game_dir):
     data['csf_keys'] = csf['keys']
     data['csf_text'] = csf['text']
     data['csf'] = csf['index']
+    # ★2026-11-17：科技类型下拉要显示中文名（地编："AEGIS-神盾巡洋舰"）。
+    #   只算一次并挂进表里（跟着 _CACHE 走），别每次开下拉都扫 10MB 的 rules。
+    try:
+        data['type_cn'] = _type_name_map(
+            rules, tech_type_choices(data, with_cn=False), data['csf_text'])
+    except Exception:
+        data['type_cn'] = {}
     _CACHE[key] = (fp, data)
     return data
 
@@ -384,6 +398,79 @@ def choices_of(table, limit=4000, skip_disabled=True):
 def _ww_suffix(src, k):
     """「武器/弹头」表的来源后缀（地编同一栏里混着两种 ID，不标就分不清）。"""
     return '（武器）' if src.get(k) == 'W' else ('（弹头）' if src.get(k) == 'H' else '')
+
+
+# ★2026-11-17：行为 106「设置科技等级」的**科技类型** = 类型 ID 字符串（AEGIS/GAPILE…），
+#   地编就是从这四个注册表拼一个下拉 —— 玩家口径「能建造建筑和能被生产的单位」。
+TECH_TYPE_KEYS = ('buildingtypes', 'vehicletypes', 'infantrytypes', 'aircrafttypes')
+
+
+def tech_type_choices(tb, limit=4000, with_cn=True):
+    """科技类型下拉候选 → 类型 ID 列表（建筑 → 载具 → 步兵 → 飞机）。
+
+    三种注册写法都吃：`12=GAPOWR`、`+=SCHP1`（Ares 追加）、`SCHP1=SCHP1在扩展平台中`。
+    `;注释` 掉的条目跳过。取不到规则文件时返回 []（UI 退化成自由填写）。
+    `with_cn=True` 时拼成 `AEGIS 神盾巡洋舰`（中文名取自 rules 的 `Name=` → CSF）；
+    写入前 UI 会取第一个词，所以带不带中文都不影响落盘的值。
+    """
+    if not tb:
+        return []
+    cn_map = tb.get('type_cn') or {}
+    out, seen = [], set()
+    for key in TECH_TYPE_KEYS:
+        for _idx, val in sorted((tb.get(key) or {}).items()):
+            s = str(val or '').strip()
+            if not s or s.startswith(';'):
+                continue
+            s = s.split(',')[0].split(':')[0].strip()
+            if not s or not _NAME_TOKEN.match(s):
+                continue
+            u = s.upper()
+            if u in seen:
+                continue
+            seen.add(u)
+            cn = cn_map.get(u) if with_cn else None
+            out.append(('%s %s' % (u, cn[:14])) if cn else u)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _type_name_map(rules_text, want_ids, csf_text):
+    """`{类型ID(大写): 中文名}` —— 从 rules 每个 `[TYPE]` 段的 `Name=` 取 CSF 文本。
+
+    地编的科技类型下拉就是「AEGIS-神盾巡洋舰」这种写法；`+=` 追加注册的类型
+    没有自己的段，自然拿不到中文名（那就只显示 ID）。
+    """
+    if not rules_text:
+        return {}
+    want = set(str(x).split()[0].upper() for x in (want_ids or ()))
+    csf = csf_text or {}
+    out, cur = {}, None
+    for line in rules_text.splitlines():
+        s = line.strip()
+        if not s or s.startswith(';'):
+            continue
+        if s.startswith('['):
+            end = s.find(']')
+            cur = s[1:end].strip().upper() if end > 0 else None
+            continue
+        if not cur or cur not in want or cur in out:
+            continue
+        u = s.upper()
+        # ★2026-11-17：**`UIName=` 才是 CSF 标签**（`UIName=Name:AEGIS`），
+        #   `Name=` 是英文名（`Name=Aegis Cruiser`）。取错就一个中文名都拿不到。
+        if u.startswith('UINAME='):
+            lab = s[7:].strip()
+            nm = csf.get(lab.lower()) or csf.get(lab)
+            if nm:
+                out[cur] = ' '.join(nm.split())
+        elif u.startswith('NAME=') and cur not in out:
+            lab = s[5:].strip()
+            nm = csf.get(lab.lower()) or csf.get(lab)
+            if nm:
+                out[cur] = ' '.join(nm.split())
+    return out
 
 
 def arg_choices(tb, ptype, limit=4000):

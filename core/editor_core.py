@@ -12196,6 +12196,26 @@ class SaveDoc(object):
         return {'key': key, 'name': self.house_label(key), 'old': old,
                 'new': want, 'note': note}
 
+    def tech_type_choices(self):
+        """行为 106「科技类型」下拉候选 → 类型 ID 列表（建筑 + 载具 + 步兵 + 飞机）。
+
+        ★2026-11-17（玩家：「科技类型下拉框为空，这里应该可以选择能建造建筑和
+          能被生产的单位，可读取规则文件」）：
+          来源 = 存档所在游戏目录的 `rules(md).ini` 四个注册表
+          `[BuildingTypes] / [VehicleTypes] / [InfantryTypes] / [AircraftTypes]`。
+          走 `game_lists()` —— 散文件优先、MIX 数字大优先、加密 MIX 自动解密，
+          玩家不需要自己解包。取不到规则文件时返回 []（UI 退化成自由填写）。
+        """
+        try:
+            from game_tables import tech_type_choices as _f
+        except Exception:
+            return []
+        try:
+            tb = self.game_lists()
+        except Exception:
+            tb = None
+        return _f(tb)
+
     def buildings_of_house(self, house=None):
         """本档某阵营的**全部建筑** → [{idx, base, key, type, x, y}]（house=None ⇒ 全部）。
 

@@ -1718,11 +1718,27 @@ class TriggerEditor(tk.Toplevel):
             _swallow()
 
     def _show_tech(self, show):
-        """「科技类型」那一行只在行为 106 时出现（同 `_show_wp` 的套路）。"""
+        """「科技类型」那一行只在行为 106 时出现（同 `_show_wp` 的套路）。
+
+        显示时顺带把候选填进下拉 —— 来源是**规则文件的四个注册表**
+        （建筑 / 载具 / 步兵 / 飞机），玩家口径「能建造的建筑 + 能被生产的单位」。
+        取不到规则文件就保持空白（框可编辑，手打类型 ID 照样能写）。
+        """
         try:
             if show:
                 if not self.row_tech.winfo_ismapped():
                     self.row_tech.pack(fill='x', pady=(6, 0), before=self.frm_ac_body)
+                # 每个存档只填一次（换档按路径失效）；561 个候选，别每次按键都重设
+                key = getattr(self.doc, 'path', None) if self.doc else None
+                if getattr(self, '_tech_choices_key', None) != key:
+                    vals = []
+                    try:
+                        vals = self.doc.tech_type_choices() if self.doc else []
+                    except Exception:
+                        vals = []
+                    if vals:
+                        self.cb_ac_tech['values'] = tuple(vals)
+                        self._tech_choices_key = key
             else:
                 self.row_tech.pack_forget()
         except Exception:
@@ -1738,12 +1754,23 @@ class TriggerEditor(tk.Toplevel):
                 return tok.upper()
         return None
 
+    def _tech_from_text(self):
+        """从「科技类型」框取类型 ID：`AEGIS 神盾巡洋舰` / `AEGIS-神盾巡洋舰` → `AEGIS`。
+
+        下拉候选是「ID 中文名」的写法（地编口径），但存档里那个槽只有 8 字节 ASCII，
+        所以写入前必须剥掉中文名。
+        """
+        t = (self.var_ac_tech.get() or '').strip()
+        if not t:
+            return ''
+        return t.split()[0].split('-')[0].strip().upper()
+
     def _ac_payload(self, atype):
         """按行为类型算提交用的 `(arg, kwargs)` —— 小队型走小队+路径点，触发型走 trigger。"""
         if atype == 106:
             # ★2026-11-17：106「设置科技等级」= 科技类型（对象 +104，8B ASCII）+ 等级（+164）。
             #   实测 01000000：(+104='AEGIS', +164=5, +72=0)。
-            tn = (self.var_ac_tech.get() or '').strip().upper()
+            tn = self._tech_from_text()
             if not tn:
                 raise ValueError('106「设置科技等级」要先填「科技类型」（如 AEGIS / GAPILE）')
             try:
@@ -1971,8 +1998,18 @@ class TriggerEditor(tk.Toplevel):
             self.var_wp.set(str(a.get('waypoint') or ''))
         elif a['type'] == 106:
             # ★2026-11-17：等级回填到「参数」，科技类型回填到「科技类型」框
+            self._show_tech(True)      # 先把候选填好，下面才能回填带中文名的那一项
             self.var_acarg.set(str(a['arg']))
-            self.var_ac_tech.set(a.get('tech_name') or '')
+            _tn = a.get('tech_name') or ''
+            if _tn:
+                # 回填成下拉里那一项（带中文名），看着跟地编一致
+                try:
+                    _hit = next((v for v in self.cb_ac_tech.cget('values')
+                                 if str(v).split()[0].upper() == _tn.upper()), None)
+                except Exception:
+                    _hit = None
+                _tn = _hit or _tn
+            self.var_ac_tech.set(_tn)
             self.var_wp.set('')
         else:
             self.var_acarg.set(str(a['arg']))
