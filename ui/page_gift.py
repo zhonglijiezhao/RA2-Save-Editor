@@ -1332,6 +1332,145 @@ class GiftPage(object):
         self.status.set('✅ ' + r['note'])
         self._gift_log('[改所属方] %s' % r)
 
+    # ---------------- 建筑「耗能/工作」（= 地编 POWERED_ON）★2026-11-17 ----------------
+    def _mv_bld_at_sel(self):
+        """取选中格的建筑 dict；失败返回 `(None, 原因)`。
+
+        先用渲染时算好的占位表 `st['occ']`（建筑占多格，任意一格都命中），
+        没有地图/没渲染过时退回按「左上角坐标」匹配。
+        """
+        st = getattr(self, 'mv_state', None) or {}
+        sel = st.get('sel')
+        if not sel:
+            return None, '请先在地图上点选一格'
+        if not self.doc:
+            return None, '请先打开一个存档'
+        b = (st.get('occ') or {}).get(tuple(sel))
+        if b:
+            return b, None
+        hit = [x for x in self.doc.buildings() if (x['x'], x['y']) == tuple(sel)]
+        if not hit:
+            return None, '选中格 (%d,%d) 上没有建筑' % (sel[0], sel[1])
+        return hit[0], None
+
+    def _mv_power_refresh(self):
+        """把选中格建筑的「耗能/工作」写进工具条上的标签（点选时自动调用）。"""
+        lbl = getattr(self, 'mv_power_lbl', None)
+        if lbl is None:
+            return
+        b, _err = self._mv_bld_at_sel()
+        if b is None:
+            lbl.config(text='（先在地图上选中一栋建筑）')
+            return
+        try:
+            r = self.doc.building_power(b['base'])
+        except Exception as e:
+            lbl.config(text='这栋读不了：%s' % e)
+            return
+        head = '%s (%d,%d)：' % (r['type'], b['x'], b['y'])
+        if (r['power'] or 0) > 0:
+            lbl.config(text=head + '发电建筑（不适用）')
+        elif r['on']:
+            lbl.config(text=head + '耗能/工作 = 1（通电）')
+        else:
+            lbl.config(text=head + '耗能/工作 = 0（断电）')
+
+    def mv_set_power(self, on):
+        """把选中格建筑的「耗能/工作」写成 on（True=通电 / False=断电）。
+
+        底层 `set_building_power()` 会**三个字节一起写**（+1580 HasPower /
+        +1684 WasOnline / +1718 StuffEnabled）—— 只写一个会被引擎按实时电力重算覆盖。
+        """
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        b, err = self._mv_bld_at_sel()
+        if err:
+            messagebox.showwarning('提示', err)
+            return
+        try:
+            cur = self.doc.building_power(b['base'])
+        except Exception as e:
+            messagebox.showerror('读不了这栋建筑', str(e))
+            return
+        tgt = ('1（通电：可生产单位 / 可开火）' if on
+               else '0（断电：不能生产单位 / 不能开火 / 不播工作动画）')
+        extra = ''
+        pw = cur['power'] or 0
+        if pw > 0:
+            # ★实测口径：发电建筑不吃电，引擎强制把它算成 1，写这里不生效
+            extra = ('\n\n⚠ %s 是**发电**建筑（Power=%+d）。引擎会强制把它算成"通电"，'
+                     '改这里**不会生效**（实测：两座电厂在地图里写 0/1，存档里都是 1/1）。'
+                     % (cur['type'], pw))
+        if not messagebox.askyesno(
+                '确认改「耗能/工作」',
+                '类型：%s\n位置：(%d,%d)\n当前：%d\n\n改为：%s%s\n\n'
+                '写三个联动字节（+1580 / +1684 / +1718）—— 只写一个会被引擎按电力重算覆盖。\n'
+                '原档不会被覆盖，改完请「另存为新文件」。'
+                % (cur['type'], b['x'], b['y'],
+                   cur['vals'].get(self.doc.BLD_HASPOWER_OFF, 0), tgt, extra)):
+            return
+        try:
+            r = self.doc.set_building_power(bool(on), base=b['base'])
+        except Exception as e:
+            self.status.set('改「耗能/工作」失败')
+            messagebox.showerror('改「耗能/工作」失败（存档未改动）', str(e))
+            return
+        st = getattr(self, 'mv_state', None)
+        if st:
+            st['blds'] = self.doc.buildings()
+        self._mv_power_refresh()
+        self.status.set('✅ ' + r['note'])
+        self._gift_log('[耗能/工作] %s' % r)
+
+    def mv_scan_power(self):
+        """扫描全档，列出「耗能/工作 = 0」的建筑，可一键全部通电。"""
+        if not self.doc:
+            messagebox.showwarning('提示', '请先打开一个存档')
+            return
+        bs = self.doc.buildings()
+        if not bs:
+            messagebox.showinfo('扫描结果', '这份存档里没有建筑。')
+            return
+        off, gens = [], 0
+        for b in bs:
+            try:
+                r = self.doc.building_power(b['base'])
+            except Exception:
+                continue
+            if (r['power'] or 0) > 0:
+                gens += 1
+            if not r['on']:
+                off.append((b, r))
+        if not off:
+            tail = ('\n（其中 %d 栋是发电建筑，本来就不适用这个开关）' % gens) if gens else ''
+            messagebox.showinfo('扫描结果',
+                                '全档 %d 栋建筑都是「耗能/工作 = 1」（通电）。%s'
+                                % (len(bs), tail))
+            return
+        lines = ['%-10s (%3d,%3d)  %s'
+                 % (b['type'], b['x'], b['y'],
+                    '发电建筑（不适用）' if (r['power'] or 0) > 0 else '断电')
+                 for b, r in off[:20]]
+        more = '' if len(off) <= 20 else '\n…另有 %d 栋' % (len(off) - 20)
+        if messagebox.askyesno(
+                '发现 %d 栋「耗能/工作 = 0」' % len(off),
+                '这些楼现在是断电状态（不能生产单位 / 不能用武器 / 不播工作动画）：\n\n%s%s\n\n'
+                '把它们全部改成 1（通电）？\n（改完记得「另存为新文件」）'
+                % ('\n'.join(lines), more)):
+            n = 0
+            for b, _r in off:
+                try:
+                    self.doc.set_building_power(True, base=b['base'])
+                    n += 1
+                except Exception:
+                    pass
+            self._mv_power_refresh()
+            self.status.set('✅ 已把 %d 栋改成通电（记得另存）' % n)
+            self._gift_log('[耗能/工作] 批量通电 %d 栋' % n)
+        else:
+            self.status.set('发现 %d 栋断电建筑（未修改）' % len(off))
+
     def mv_scan_anim(self):
         """地图页：扫描全档，只列出真正有问题的建筑（§170 十四档定稿）。
 

@@ -7129,6 +7129,24 @@ class SaveDoc(object):
     BLD_ANIM_OFF = {'+0xAC': 120, '+0xC8': 128, '+0xBC': 136, '+0xD0': 156,
                     '+0x10C': 216, '+0x534': 1280, '+0x6E4': 1712}
     BLD_ANIM_OFF_ALIAS = {'+0xFC': '+0x10C', '+0x6E0': '+0x6E4'}   # 旧标签兼容
+    # ★★★★★ 2026-11-17 定案：**建筑「耗能/工作」= BuildingClass::HasPower**
+    #   对应地编「建筑选项」第 10 栏（地图 `[Structures]` 第 10 个字段 `POWERED_ON`），
+    #   文档原话：「为 0 则不考虑耗电量，不能使用武器或生产单位，不播放工作动画；
+    #   **发电的还是正常发电**」。
+    #   实证（2026-11-17，`SAVE41BB.SAV` 两座 GAPILE，地图分别写 0 / 1，游戏自己存的档）：
+    #     base 帧 +1580（对象 +0x660）= **HasPower**      → 0 / 1 与地图逐一对上
+    #     base 帧 +1684（对象 +0x6C8）= **WasOnline**     → 同上（Update 的上次状态）
+    #     base 帧 +1718（对象 +0x6EA）= **StuffEnabled**  → 同上（Enable/DisableStuff 的状态）
+    #   玩家游戏内验收：「0 的那座兵营不能生产单位」（与文档一致）。
+    #   ★三处必须**一起写**：引擎每次 Update 比较 HasPower 与 WasOnline，不一致就调
+    #     UpdatePowered 按实时电力重算 ⇒ 只改 +1580 会被立刻抹平。
+    #     （两轮实测：只改 `+1580`、或只改地图 `POWERED_ON`，读档后都被拉回 1。）
+    #   ★只对**耗电建筑**有意义：GAPOWR/NAPOWR 是发电建筑、本身不吃电，引擎强制把它
+    #     算成 1 —— 同一张地图里两座电厂写 0/1，存档里是 **1/1**（`SAVE5AF1.SAV` 实测）。
+    BLD_HASPOWER_OFF = 1580        # base 帧 → 对象 +0x660
+    BLD_WASONLINE_OFF = 1684       # base 帧 → 对象 +0x6C8
+    BLD_STUFFENABLED_OFF = 1718    # base 帧 → 对象 +0x6EA
+    BLD_POWER_OFFS = (1580, 1684, 1718)
     # ★★★「动画已完成」标记 = 这两个值同时成立（8989 栋里**各自只有 1 栋**不同）：
     #     +0x10C == 0   +0x534 == 1
     #   ⚠ `+0xD0` **不能**当通用判据 —— 它在 GAPOWR 上是 100，但 ATESLA/GTGCAN 等
@@ -10477,6 +10495,104 @@ class SaveDoc(object):
                 # ★§171：buildup 且 +0xD0 过大 ⇒ 会播两遍（不是坏档，但可一键优化成一遍）
                 'replay': state == 'buildup' and vals['+0xD0'] >= self.BLD_D0_REPLAY,
                 'phase': vals['+0xD0'], 'text': txt}
+
+    # ---------------- 建筑「耗能/工作」（地编 POWERED_ON）★2026-11-17 ----------------
+    def building_power(self, base):
+        """读一栋建筑的「耗能/工作」（= 地编建筑选项的 `POWERED_ON`）→ dict。
+
+        `on=False` 的含义（地编文档口径）：这栋楼**不能使用武器、不能生产单位、
+        不播放工作动画**；但**发电建筑照样发电**。
+        ★玩家 2026-11-17 游戏内验收：`POWERED_ON=0` 的兵营「不能生产单位」。
+
+        返回 `{base, type, on, vals, mixed, power, text}`：
+          · `on`   —— 以 `+1580`（HasPower）为准；
+          · `vals` —— 三个联动字节（+1580/+1684/+1718）的当前值；
+          · `mixed`—— 三者不一致 = 引擎跑到一半的中间态（写的时候会一起抹平）；
+          · `power`—— rules 里该类型的 `Power=`（正=发电），用于提示"改了没用"。
+        """
+        base = int(base)
+        if base - 52 < 0 or base + self.BLD_STUFFENABLED_OFF + 1 > len(self.plain):
+            raise RuntimeError('base=0x%08X 越界' % base)
+        vt = struct.unpack_from('<I', self.plain, base - 52)[0]
+        if vt != self.BLD_VTABLE:
+            raise RuntimeError('base=0x%08X 处不是设施建筑（vtable=%08X，期望 %08X）'
+                               % (base, vt, self.BLD_VTABLE))
+        vals = dict((o, self.plain[base + o]) for o in self.BLD_POWER_OFFS)
+        nm = '?'
+        for b in self.buildings():
+            if b['base'] == base:
+                nm = b['type']
+                break
+        on = bool(vals[self.BLD_HASPOWER_OFF])
+        mixed = len(set(vals.values())) > 1
+        try:
+            pw = self.power_of(nm)
+        except Exception:
+            pw = 0
+        if pw and pw > 0:
+            txt = ('⚡ %s 是**发电**建筑（Power=%+d）：引擎会强制把它算成"通电"，'
+                   '这里改不动它（实测两座电厂写 0/1，存档里是 1/1）。' % (nm, pw))
+        elif on:
+            txt = '✅ 耗能/工作 = 1（通电，可生产/可开火）'
+        else:
+            txt = ('⛔ 耗能/工作 = 0（断电）：不能生产单位、不能用武器、不播工作动画'
+                   '（发电建筑照样发电）')
+        if mixed:
+            txt += '\n⚠ 三个联动字节不一致（%s）—— 这是中间态，写一次就会统一。' % (
+                '/'.join(str(vals[o]) for o in self.BLD_POWER_OFFS))
+        return {'base': base, 'type': nm, 'on': on, 'vals': vals, 'mixed': mixed,
+                'power': pw, 'text': txt}
+
+    def set_building_power(self, on, base=None, cx=None, cy=None, key=None, idx=None):
+        """把一栋建筑的「耗能/工作」写成 on（True=工作 / False=断电）。
+
+        ★**三个字节一起写**（`+1580` HasPower / `+1684` WasOnline / `+1718` StuffEnabled）：
+          引擎每次 Update 会比较 HasPower 与 WasOnline，不一致就调 UpdatePowered
+          按实时电力重算 ⇒ 只写一个会被立刻覆盖（2026-11-17 两轮实测）。
+        定位优先级 `base` > `key`（记录 +0 = 自键）> `(cx,cy)` > `idx`（0 基，同 `buildings()`）。
+        返回 `{base, type, old, new, power, note}`。
+        """
+        want = 1 if on else 0
+        pl = self.plain
+        bs = self.buildings()
+        if not bs:
+            raise RuntimeError('这份存档里一栋建筑都没有')
+        b = None
+        if base is not None:
+            for x in bs:
+                if x['base'] == int(base):
+                    b = x
+                    break
+        if b is None and key is not None:
+            for x in bs:
+                if x['tag'] == int(key):
+                    b = x
+                    break
+        if b is None and cx is not None and cy is not None:
+            hit = [x for x in bs if (x['x'], x['y']) == (int(cx), int(cy))]
+            if hit:
+                b = hit[0]
+        if b is None and idx is not None and 0 <= int(idx) < len(bs):
+            b = bs[int(idx)]
+        if b is None:
+            raise RuntimeError('定位不到目标建筑（base/key/cx,cy/idx 都没命中）')
+        g = b['base']
+        vt = struct.unpack_from('<I', pl, g - 52)[0]
+        if vt != self.BLD_VTABLE:
+            raise RuntimeError('base=0x%08X 处不是设施建筑（vtable=%08X）' % (g, vt))
+        old = pl[g + self.BLD_HASPOWER_OFF]
+        for o in self.BLD_POWER_OFFS:
+            pl[g + o] = want
+        try:
+            pw = self.power_of(b['type'])
+        except Exception:
+            pw = 0
+        note = ('%s @(%d,%d)：耗能/工作 %d → %d（+1580/+1684/+1718 三处同写）'
+                % (b['type'], b['x'], b['y'], old, want))
+        if pw and pw > 0:
+            note += '；⚠ 发电建筑，引擎会强制算成通电，可能不生效'
+        return {'base': g, 'type': b['type'], 'old': old, 'new': want,
+                'power': pw, 'note': note}
 
     def anim_phase_default(self, type_key, base=None):
         """取「同类型建筑」的 `+0xD0` 众数，当完成度缺省值（§169 in-game 定案）。

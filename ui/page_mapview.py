@@ -321,6 +321,23 @@ class MapViewPage(object):
         ttk.Label(r, text='勾 = 引擎造 / 不勾 = 直接落成',
                   style=MU, font=SM).pack(side='left', padx=(10, 0))
 
+        # ── ★2026-11-17：建筑「耗能/工作」（= 地编建筑选项的 POWERED_ON）──
+        #   0 = 这栋不能生产单位、不能用武器、不播工作动画（发电建筑照样发电）。
+        #   写完要**另存**才生效；引擎会按电力重算，所以三字节必须一起写（见 core 注释）。
+        r = ttk.Frame(b3, style=SUF)
+        r.pack(fill='x', pady=(4, 0))
+        ttk.Label(r, text='开关', style=LB).pack(side='left')
+        self.mv_power_lbl = ttk.Label(r, text='（先在地图上选中一栋建筑）', style=MU)
+        self.mv_power_lbl.pack(side='left', padx=(6, 0))
+        ttk.Button(r, text='⚡ 通电', width=8,
+                   command=lambda: self.mv_set_power(True)).pack(side='left', padx=(8, 0))
+        ttk.Button(r, text='⛔ 断电', width=8,
+                   command=lambda: self.mv_set_power(False)).pack(side='left', padx=(4, 0))
+        ttk.Button(r, text='🔍 扫描全档断电',
+                   command=self.mv_scan_power).pack(side='left', padx=(8, 0))
+        ttk.Label(r, text='= 地编「耗能/工作」',
+                  style=MU, font=SM).pack(side='left', padx=(8, 0))
+
         # ── ④ 选中格：单位级操作（按格，不做框选）★§268 ──
         _s, b4 = ui_theme.section(f, '选中格', '单位操作')
 
@@ -1588,6 +1605,11 @@ class MapViewPage(object):
             self._mv_grid_safe()
             return
         self._mv_draw_sel()
+        # ★2026-11-17：顺手刷新「耗能/工作」提示（缺这个方法时静默跳过）
+        try:
+            self._mv_power_refresh()
+        except Exception:
+            _swallow()
 
     # ---------------- ★§SOV11（2026-11-04）按坐标 / 路径点定位并居中 ----------------
     def _mv_cell_space(self):
