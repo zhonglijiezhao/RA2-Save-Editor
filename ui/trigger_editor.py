@@ -263,6 +263,19 @@ class TriggerEditor(tk.Toplevel):
             foreground=ui_theme.T['muted'])
         self.lbl_wp_hint.pack(side='left')
 
+        # ★2026-11-17：行为 106「设置科技等级」专用行 ——
+        #   科技类型是**字符串**（对象 +104，8 字节 ASCII），等级才是「参数」框那个数（+164）。
+        #   以前 106 只有一个参数框、又没有这一支 ⇒ 参数框空、什么都填不进去（玩家反馈）。
+        self.var_ac_tech = tk.StringVar()
+        self.row_tech = ttk.Frame(ac)
+        ttk.Label(self.row_tech, text='科技类型').pack(side='left')
+        self.cb_ac_tech = ttk.Combobox(self.row_tech, textvariable=self.var_ac_tech, width=16)
+        self.cb_ac_tech.pack(side='left', padx=6)
+        self.lbl_tech_hint = ttk.Label(
+            self.row_tech, text='（上面的「参数」= 等级 0–10；这里 = 科技类型名，如 AEGIS / GAPILE）',
+            foreground=ui_theme.T['muted'])
+        self.lbl_tech_hint.pack(side='left')
+
         body = ttk.Frame(ac)
         body.pack(fill='both', expand=True, pady=(6, 0))
         self.frm_ac_body = body
@@ -729,8 +742,11 @@ class TriggerEditor(tk.Toplevel):
             return
         self.after_change('已删事件 %s' % event_name(r['type']))
 
-    def _ac_text(self, atype, arg, team=0, waypoint=0, trigger=None, tag=None):
+    def _ac_text(self, atype, arg, team=0, waypoint=0, trigger=None, tag=None, tech=''):
         """「参数含义」列的文字：80/107 显示「小队名 · 路径点」，触发型显示「→ 哪条触发」。"""
+        if atype == 106:
+            # ★2026-11-17：106 设置科技等级 = 科技类型（+104 ASCII）+ 等级（+164）
+            return '%s 等级 %s' % (tech or '（未设置科技类型）', arg)
         if atype in ACTION_TRIG_TYPES:
             return self._trig_ref_text(trigger)
         if atype in ACTION_TAG_TYPES:
@@ -853,7 +869,8 @@ class TriggerEditor(tk.Toplevel):
                     i, t, action_name(t),
                     (ttag if t in ACTION_TAG_TYPES else
                      (wp if t in self.doc.SPAWN_ACTIONS else a)),
-                    self._ac_text(t, a, tm, wp, tg, ttag)))
+                    self._ac_text(t, a, tm, wp, tg, ttag,
+                                  (it.get('tech_name') if isinstance(it, dict) else ''))))
             return
         for i, a in enumerate(self._det.get('actions') or [], 1):
             # ★§219.8：援军行为 80/107 的参数在 +0x44（小队键）/+0x58（路径点），
@@ -873,12 +890,13 @@ class TriggerEditor(tk.Toplevel):
                 argcol = next((t['sid'] for t in (self.doc.team_types() or [])
                                if t.get('key') == _tk), _tk)
             self.tv_ac.insert('', 'end', iid=str(i), values=(
-                i, a['type'], a['name'], argcol,
+                i, a['type'], action_name(a['type']), argcol,
                 self._ac_text(a['type'], a['arg'],
                               a.get('team') or a.get('team_key') or 0,
                               a.get('waypoint') or 0,
                               a.get('trigger'),
-                              a.get('tag') or a.get('tag_key'))))
+                              a.get('tag') or a.get('tag_key'),
+                              a.get('tech_name') or '')))
 
     # ---------------- 触发设置 ----------------
     def apply_name(self):
@@ -1412,6 +1430,12 @@ class TriggerEditor(tk.Toplevel):
                 elif not _ch:
                     combo.set('%s' % (cur if cur is not None else 0))
                 return
+            if ptype == 39:
+                # ★2026-11-17：106 设置科技等级的「参数」= 等级 0–10（科技类型在单独的框里）
+                combo['values'] = [str(i) for i in range(11)]
+                if cur is not None:
+                    combo.set(str(cur))
+                return
             if ptype == 38:
                 # ★★§SOV31（2026-11-05 玩家：「地编的做法就是列表就是标签的列表」）：
                 #   行为 `70 摧毁标签` —— 下拉 = 本档全部标签（Tag），存的是标签对象的实例键。
@@ -1681,6 +1705,17 @@ class TriggerEditor(tk.Toplevel):
         except Exception:
             _swallow()
 
+    def _show_tech(self, show):
+        """「科技类型」那一行只在行为 106 时出现（同 `_show_wp` 的套路）。"""
+        try:
+            if show:
+                if not self.row_tech.winfo_ismapped():
+                    self.row_tech.pack(fill='x', pady=(6, 0), before=self.frm_ac_body)
+            else:
+                self.row_tech.pack_forget()
+        except Exception:
+            _swallow()
+
     def _trig_from_text(self):
         """从参数框文字里取触发 sid（`01000000 AAAAAA（自己）` → `01000000`）。"""
         t = (self.var_acarg.get() or '').strip()
@@ -1693,6 +1728,19 @@ class TriggerEditor(tk.Toplevel):
 
     def _ac_payload(self, atype):
         """按行为类型算提交用的 `(arg, kwargs)` —— 小队型走小队+路径点，触发型走 trigger。"""
+        if atype == 106:
+            # ★2026-11-17：106「设置科技等级」= 科技类型（对象 +104，8B ASCII）+ 等级（+164）。
+            #   实测 01000000：(+104='AEGIS', +164=5, +72=0)。
+            tn = (self.var_ac_tech.get() or '').strip().upper()
+            if not tn:
+                raise ValueError('106「设置科技等级」要先填「科技类型」（如 AEGIS / GAPILE）')
+            try:
+                lv = int((self.var_acarg.get() or '0').strip())
+            except Exception:
+                raise ValueError('106 的等级必须是整数 0–10')
+            if not (0 <= lv <= 10):
+                raise ValueError('106 的等级要在 0–10 之间（当前 %d）' % lv)
+            return lv, {'tech_name': tn}
         if atype in ACTION_TRIG_TYPES:
             # ★§SOV07：触发型参数写**对象 +100**（实例键），不是通用 +72
             sid = self._trig_from_text()
@@ -1788,6 +1836,7 @@ class TriggerEditor(tk.Toplevel):
                     _spawn = k in self.doc.WAYPOINT_ACTIONS
                     self._set_wp_hint(k)
                     self._show_wp(_spawn)
+                    self._show_tech(k == 106)
                     nt = ('小队型：参数下拉 = 作战小队（本档 %d 个）' % len(_ch)) + \
                          ('；「路径点」= 刷出来的位置' if _spawn else '') + \
                          ('　' + nt if nt else '')
@@ -1804,6 +1853,7 @@ class TriggerEditor(tk.Toplevel):
                     # ★★2026-11-05：108 创建工具箱 在**非小队型**这一支，也要显示「路径点」
                     self._set_wp_hint(k)
                     self._show_wp(k in self.doc.WAYPOINT_ACTIONS)
+                    self._show_tech(k == 106)
                     if pt == 2:
                         _hs = self.doc.country_order() or []
                         _pl = next((h for h in _hs if h['is_player']), None)
@@ -1882,7 +1932,7 @@ class TriggerEditor(tk.Toplevel):
         if a['type'] in getattr(self, '_ac_keys', ()):
             self.cb_ac.current(self._ac_keys.index(a['type']))
         else:
-            self.cb_ac.set('%d  %s' % (a['type'], a.get('name') or ''))
+            self.cb_ac.set('%d  %s' % (a['type'], action_name(a['type'])))
         if self.doc.is_team_action(a['type']):
             # ★§283.9：小队型（4/5/7/80/107）—— 小队键在 +0x44；只有 80/107 有路径点
             self._fill_team_values(self.cb_acarg,
@@ -1905,6 +1955,11 @@ class TriggerEditor(tk.Toplevel):
             # ★★2026-11-05：41/48/55/95/109/112/125/128 —— 参数照常，另带路径点（+0x58）
             self.var_acarg.set(self.doc._arg_text(action_ptype(a['type']), a['arg']))
             self.var_wp.set(str(a.get('waypoint') or ''))
+        elif a['type'] == 106:
+            # ★2026-11-17：等级回填到「参数」，科技类型回填到「科技类型」框
+            self.var_acarg.set(str(a['arg']))
+            self.var_ac_tech.set(a.get('tech_name') or '')
+            self.var_wp.set('')
         else:
             self.var_acarg.set(str(a['arg']))
             self.var_wp.set('')

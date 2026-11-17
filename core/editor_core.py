@@ -4427,7 +4427,7 @@ class SaveDoc(object):
         return ev
 
     def set_action(self, ac, atype=None, arg=None, team=None, waypoint=None, trigger=None,
-                   tag=None):
+                   tag=None, tech_name=None):
         """改一条行为的类型 / 参数（**行为 80/107 还能改小队与路径点**）
 
         `ac` 需要带偏移，两种写法都认（§255 修正）：
@@ -4496,6 +4496,17 @@ class SaveDoc(object):
         if waypoint is not None:
             self.plain[off + 0x18:off + 0x1C] = (int(waypoint) & 0xFFFFFFFF).to_bytes(4, 'little')
             ac['waypoint'] = int(waypoint) & 0xFFFFFFFF
+        # ★★★★★ 2026-11-17：**行为 106「设置科技等级」的科技类型是 ASCII 字符串**，
+        #   存在对象 `+104`（8 字节、`\0` 补齐）—— 与行为 125「将建筑建于」的建筑类型名
+        #   是**同一个字段**（通用「名称」槽），不是数字参数。
+        #   实证（`SAVE0BB3.SAV` / `ALL01UMD.sav`，触发 01000000）：
+        #     +104..+111 = `41 45 47 49 53 00 00 00` = "AEGIS"，+164 = 5（等级）
+        #     +72 恒 0 ⇒ 地编那个「数值」走 +164、「科技类型」走 +104。
+        #   ⚠ `ac['name']` 已经被 `action_name()` 占用（行为类型的中文名），这里另存 `tech_name`。
+        if tech_name is not None:
+            nb = str(tech_name).strip().upper().encode('ascii', 'ignore')[:8].ljust(8, b'\x00')
+            self.plain[off + 40:off + 48] = nb      # +104 − OBJ_TYPE_OFF(64) = 40
+            ac['tech_name'] = nb.split(b'\x00')[0].decode('ascii', 'ignore')
         # ★§SOV07：触发型行为（53/54/12/22/499）的目标在 **+100**（实例键），不是 +72。
         #   `trigger` 收 sid（字符串）或实例键（整数）；给 None 表示"不动"。
         if trigger is not None:
@@ -15885,6 +15896,10 @@ class SaveDoc(object):
                         'tag': tag_sid,
                         'name': bytes(pl[a + 104:a + 112]).split(b'\x00')[0]
                                   .decode('ascii', 'ignore').strip(),
+                        # ★2026-11-17：行为 106 的「科技类型」就是 +104 那个字符串（见 set_action）
+                        'tech_name': (bytes(pl[a + 104:a + 112]).split(b'\x00')[0]
+                                      .decode('ascii', 'ignore').strip()
+                                      if atp == 106 else ''),
                         'waypoint': wp, 'cell': self.waypoint_cell(wp),
                         'key': struct.unpack_from('<I', pl, a + 16)[0]})
         return out
@@ -15969,7 +15984,8 @@ class SaveDoc(object):
         r = rows[n - 1]
         return {'trigger_id': sid, 'index': idx, 'action_off': r['action_off'],
                 'count': len(rows), 'ordinal': n, 'type': r['type'], 'arg': r['arg'],
-                'name': r['name'], 'waypoint': r['waypoint'], 'cell': r['cell']}
+                'name': r['name'], 'tech_name': r.get('tech_name', ''),
+                'waypoint': r['waypoint'], 'cell': r['cell']}
 
     def retarget_trigger(self, trigger_id, ac_type=125, ac_name='GAPOWR',
                          ac_cell=None, ac_waypoint=None, ac_arg=None, dry_run=False,
@@ -18087,6 +18103,17 @@ class SaveDoc(object):
                     a['tag'] = (next((t['sid'] for t in self.tag_objects()
                                       if t['key'] == tgk), None) if tgk else None)
                     a['arg_text'] = self._arg_text(38, tgk)
+                elif a.get('type') == 106:
+                    # ★2026-11-17：106「设置科技等级」是**两参数**行为 ——
+                    #   科技类型在对象 `+104`（8B ASCII，与 125 的建筑类型名同一个槽），
+                    #   等级就是通用参数（`+164`）。以前没有这一支 ⇒
+                    #   编辑器里参数框空、科技类型根本看不到（玩家 2026-11-17 反馈）。
+                    tn = (bytes(pl[obj + 104:obj + 112]).split(b'\x00')[0]
+                          .decode('ascii', 'ignore').strip())
+                    a = dict(a)
+                    a['tech_name'] = tn
+                    a['arg_text'] = '%s 等级 %s' % (tn or '（未设置科技类型）',
+                                                   a.get('arg') or 0)
                 elif a.get('type') == self.CRATE_ACTION:
                     # ★★2026-11-05（玩家：108 要填路径点）：`108 创建工具箱` 是**两参数**行为 ——
                     #   奖励箱类型在 `+164`（ptype 31），路径点在 **`+0x58`**（与 80/107/125 同字段）。
@@ -18304,7 +18331,7 @@ class SaveDoc(object):
                     pl[inst + 192:inst + 196], 'little'), 'ev_size': ev_size}
 
     def add_action(self, sid, atype, arg=0, name=None, waypoint=None, cell=None, team=None,
-                   trigger=None, tag=None):
+                   trigger=None, tag=None, tech_name=None):
         """给触发**追加一条行为**（§193 修正版）。
 
         ★2026-10-23 修正（原实现在 7MB 小档上"静默无效"的根因）：
@@ -18391,6 +18418,16 @@ class SaveDoc(object):
                     raise RuntimeError('认不出标签 %r 的实例键' % (tag,))
             buf[OBJ_TYPE_OFF + ACT_TAG_OFF:OBJ_TYPE_OFF + ACT_TAG_OFF + 4] = \
                 struct.pack('<I', tkk)
+        if atype == 106:
+            # ★2026-11-17：106「设置科技等级」= 科技类型（`+104` 8B ASCII）+ 等级（`+164`）。
+            #   实测 01000000：+104 = "AEGIS"、+164 = 5、+72 = 0。
+            tn = str(tech_name or name or '').strip().upper()
+            if not tn:
+                raise RuntimeError(
+                    '行为 106「设置科技等级」要给 name（科技类型名，如 AEGIS / GAPILE）')
+            buf[104:112] = tn.encode('ascii', 'ignore')[:8].ljust(8, b'\x00')
+            buf[OBJ_ARG_OFF:OBJ_ARG_OFF + 4] = struct.pack('<I', 0)
+            buf[ACT_VAR_OFF:ACT_VAR_OFF + 4] = struct.pack('<I', int(arg) & 0xFFFFFFFF)
         if atype == 125:
             if not name or (waypoint is None and cell is None):
                 raise RuntimeError('行为 125「将建筑建于…」必须同时给 name（建筑类型名）'
